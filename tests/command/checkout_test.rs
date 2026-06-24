@@ -256,6 +256,7 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
             pathspec: vec![util::working_dir_string()],
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            no_progress: false,
         },
         &OutputConfig::default(),
     )
@@ -1097,6 +1098,28 @@ fn test_checkout_ignore_other_worktrees_is_accepted_noop() {
     // checkout proceeds normally.
     let output = run_libra_command(&["checkout", "--ignore-other-worktrees", "feature"], p);
     assert_cli_success(&output, "checkout --ignore-other-worktrees feature");
+    let current = run_libra_command(&["branch", "--show-current"], p);
+    assert!(
+        String::from_utf8_lossy(&current.stdout).contains("feature"),
+        "checkout switched to feature"
+    );
+}
+
+#[test]
+fn test_checkout_no_progress_is_accepted_noop() {
+    use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], p),
+        "create feature",
+    );
+
+    // `--no-progress` is accepted and a no-op: Libra's checkout never renders a
+    // progress meter, so the checkout proceeds normally.
+    let output = run_libra_command(&["checkout", "--no-progress", "feature"], p);
+    assert_cli_success(&output, "checkout --no-progress feature");
     let current = run_libra_command(&["branch", "--show-current"], p);
     assert!(
         String::from_utf8_lossy(&current.stdout).contains("feature"),
