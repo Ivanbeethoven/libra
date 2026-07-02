@@ -1961,3 +1961,400 @@ fn push_no_progress_flag_is_accepted() {
         "--no-progress reaches the push-destination runtime check: {stderr}"
     );
 }
+
+// ── lore.md 2.10: real-git-server interop matrix ────────────────────────────
+
+/// Shared scaffold: bare git remote + libra local repo with one pushed
+/// commit, wired over the fake-ssh shim (a REAL `git receive-pack` runs).
+#[cfg(unix)]
+fn interop_setup(
+    temp_root: &Path,
+) -> (
+    PathBuf, /*remote*/
+    PathBuf, /*local*/
+    PathBuf, /*ssh*/
+) {
+    let remote_dir = temp_root.join("remote.git");
+    let local_dir = temp_root.join("local");
+    let ssh_script = create_fake_ssh_script(temp_root);
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("init bare remote")
+            .success()
+    );
+    fs::create_dir_all(&local_dir).expect("local dir");
+    let init_out = libra_command(&local_dir)
+        .args(["init"])
+        .output()
+        .expect("libra init");
+    assert!(init_out.status.success());
+    configure_local_identity(&local_dir);
+    fs::write(local_dir.join("base.txt"), "base\n").expect("write");
+    assert!(
+        libra_command(&local_dir)
+            .args(["add", "base.txt"])
+            .output()
+            .expect("add")
+            .status
+            .success()
+    );
+    assert!(
+        libra_command(&local_dir)
+            .args(["commit", "-m", "base", "--no-verify"])
+            .output()
+            .expect("commit")
+            .status
+            .success()
+    );
+    add_fake_ssh_remote(&local_dir, &remote_dir);
+    let push = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+        .args(["push", "origin", "main"])
+        .output()
+        .expect("initial push");
+    assert!(
+        push.status.success(),
+        "initial push: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+    (remote_dir, local_dir, ssh_script)
+}
+
+/// `--thin` round-trip against a real `git receive-pack`, exercising BOTH
+/// server completion paths (index-pack --fix-thin above the unpack limit,
+/// unpack-objects below it), with a fixture guaranteeing a real delta win.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_push_thin_roundtrip_real_git_both_unpack_paths() {
+    for unpack_limit in ["1", "10000"] {
+        let temp_root = tempfile::tempdir().expect("temp root");
+        let (remote_dir, local_dir, ssh_script) = interop_setup(temp_root.path());
+        assert!(
+            Command::new("git")
+                .args([
+                    "-C",
+                    remote_dir.to_str().unwrap(),
+                    "config",
+                    "receive.unpackLimit",
+                    unpack_limit,
+                ])
+                .status()
+                .expect("config unpackLimit")
+                .success()
+        );
+        // Large blob + small edit: guaranteed net delta win.
+        let big = "The quick brown fox jumps over the lazy dog. ".repeat(4000);
+        fs::write(local_dir.join("large.txt"), &big).expect("write large");
+        run_ok(&local_dir, &["add", "large.txt"]);
+        run_ok(&local_dir, &["commit", "-m", "large", "--no-verify"]);
+        let push = libra_command(&local_dir)
+            .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+            .args(["push", "origin", "main"])
+            .output()
+            .expect("push large");
+        assert!(
+            push.status.success(),
+            "{}",
+            String::from_utf8_lossy(&push.stderr)
+        );
+        // Edit a small region; push THIN.
+        let edited = big.replacen("quick", "QUICK-EDITED", 3);
+        fs::write(local_dir.join("large.txt"), &edited).expect("edit large");
+        run_ok(&local_dir, &["add", "large.txt"]);
+        run_ok(&local_dir, &["commit", "-m", "edit", "--no-verify"]);
+        let thin = libra_command(&local_dir)
+            .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+            .args(["push", "--thin", "origin", "main"])
+            .output()
+            .expect("thin push");
+        assert!(
+            thin.status.success(),
+            "thin push (unpackLimit={unpack_limit}): {}",
+            String::from_utf8_lossy(&thin.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&thin.stderr).contains("delta object(s)")
+                || String::from_utf8_lossy(&thin.stdout).contains("delta object(s)"),
+            "a delta was actually used: {}",
+            String::from_utf8_lossy(&thin.stderr)
+        );
+        // The REAL arbiter: git fsck + content check on the receiving side.
+        assert!(
+            Command::new("git")
+                .args(["-C", remote_dir.to_str().unwrap(), "fsck", "--strict"])
+                .status()
+                .expect("fsck")
+                .success(),
+            "remote repo consistent after thin push"
+        );
+        let shown = Command::new("git")
+            .args(["-C", remote_dir.to_str().unwrap(), "show", "main:large.txt"])
+            .output()
+            .expect("git show");
+        assert_eq!(
+            String::from_utf8_lossy(&shown.stdout),
+            edited,
+            "delta replay produced the exact content (unpackLimit={unpack_limit})"
+        );
+    }
+}
+
+/// Capability degrade paths must fail CLEAN (actionable error, nothing sent):
+/// stock git does not advertise push-options; atomic can be disabled.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_push_capability_degrades_clean_against_real_git() {
+    let temp_root = tempfile::tempdir().expect("temp root");
+    let (remote_dir, local_dir, ssh_script) = interop_setup(temp_root.path());
+    fs::write(local_dir.join("next.txt"), "x\n").expect("write");
+    run_ok(&local_dir, &["add", "next.txt"]);
+    run_ok(&local_dir, &["commit", "-m", "next", "--no-verify"]);
+    // push-options: NOT advertised by default → clean refusal.
+    let out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+        .args(["push", "-o", "ci.skip", "origin", "main"])
+        .output()
+        .expect("push -o");
+    assert!(
+        !out.status.success(),
+        "unadvertised push-options must refuse"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("push option") || err.contains("push-option"),
+        "actionable capability error, not a protocol failure: {err}"
+    );
+    // atomic: disable advertisement → clean refusal.
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                remote_dir.to_str().unwrap(),
+                "config",
+                "receive.advertiseAtomic",
+                "false",
+            ])
+            .status()
+            .expect("config")
+            .success()
+    );
+    let out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+        .args(["push", "--atomic", "origin", "main"])
+        .output()
+        .expect("push --atomic");
+    assert!(!out.status.success(), "unadvertised atomic must refuse");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("atomic"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Remote tip unchanged by either refusal.
+    let tip = Command::new("git")
+        .args([
+            "-C",
+            remote_dir.to_str().unwrap(),
+            "log",
+            "--format=%s",
+            "-n",
+            "1",
+            "main",
+        ])
+        .output()
+        .expect("log");
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), "base");
+}
+
+/// Push-options round-trip when the server ADVERTISES them (a pre-receive
+/// hook dumps $GIT_PUSH_OPTION_*).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_push_options_roundtrip_real_git() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp_root = tempfile::tempdir().expect("temp root");
+    let (remote_dir, local_dir, ssh_script) = interop_setup(temp_root.path());
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                remote_dir.to_str().unwrap(),
+                "config",
+                "receive.advertisePushOptions",
+                "true",
+            ])
+            .status()
+            .expect("config")
+            .success()
+    );
+    let hook_log = temp_root.path().join("options.log");
+    let hook = remote_dir.join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nset -eu\ncat >/dev/null\necho \"count=${{GIT_PUSH_OPTION_COUNT:-none}} first=${{GIT_PUSH_OPTION_0:-none}}\" > {}\n",
+            hook_log.display()
+        ),
+    )
+    .expect("hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+    fs::write(local_dir.join("opt.txt"), "x\n").expect("write");
+    run_ok(&local_dir, &["add", "opt.txt"]);
+    run_ok(&local_dir, &["commit", "-m", "opt", "--no-verify"]);
+    let out = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+        .args(["push", "-o", "ci.skip=true", "origin", "main"])
+        .output()
+        .expect("push -o");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let logged = fs::read_to_string(&hook_log).expect("hook log");
+    assert_eq!(logged.trim(), "count=1 first=ci.skip=true");
+}
+
+/// --force-if-includes accept/reject against the real remote: rejected when
+/// the tracking tip was never integrated, accepted after integration.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_push_force_if_includes_matrix_real_git() {
+    let temp_root = tempfile::tempdir().expect("temp root");
+    let (remote_dir, local_dir, ssh_script) = interop_setup(temp_root.path());
+    // Someone else advances the remote.
+    let other = temp_root.path().join("other");
+    assert!(
+        Command::new("git")
+            .args([
+                "clone",
+                remote_dir.to_str().unwrap(),
+                other.to_str().unwrap()
+            ])
+            .status()
+            .expect("clone")
+            .success()
+    );
+    for (key, value) in [("user.name", "o"), ("user.email", "o@o")] {
+        assert!(
+            Command::new("git")
+                .args(["-C", other.to_str().unwrap(), "config", key, value])
+                .status()
+                .expect("config")
+                .success()
+        );
+    }
+    // The bare remote's HEAD points at an unborn `master` — base the other
+    // clone's work on the real branch.
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                other.to_str().unwrap(),
+                "checkout",
+                "-b",
+                "work",
+                "origin/main",
+            ])
+            .status()
+            .expect("checkout work")
+            .success()
+    );
+    fs::write(other.join("remote-change.txt"), "r\n").expect("write");
+    for argv in [
+        vec!["add", "remote-change.txt"],
+        vec!["commit", "-m", "remote change"],
+        vec!["push", "origin", "HEAD:main"],
+    ] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(other.to_str().unwrap())
+            .args(&argv)
+            .output()
+            .expect("other git");
+        assert!(
+            out.status.success(),
+            "{argv:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Local: FETCH (tracking learns the new tip) but do NOT integrate; make
+    // a divergent local commit.
+    let fetch = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+        .args(["fetch", "origin"])
+        .output()
+        .expect("fetch");
+    assert!(
+        fetch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fetch.stderr)
+    );
+    fs::write(local_dir.join("local-change.txt"), "l\n").expect("write");
+    run_ok(&local_dir, &["add", "local-change.txt"]);
+    run_ok(&local_dir, &["commit", "-m", "local change", "--no-verify"]);
+    // Lease alone would pass (tracking == remote), but the tracking tip was
+    // never INTEGRATED → --force-if-includes rejects.
+    let rejected = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+        .args([
+            "push",
+            "--force-with-lease",
+            "--force-if-includes",
+            "origin",
+            "main",
+        ])
+        .output()
+        .expect("push rejected");
+    assert!(
+        !rejected.status.success(),
+        "unintegrated tracking tip must reject: {}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("integrated"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    // Integrate (merge the tracking ref), then the same push is accepted.
+    let merge = libra_command(&local_dir)
+        .args(["merge", "origin/main", "-m", "integrate"])
+        .output()
+        .expect("merge");
+    assert!(
+        merge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    let accepted = libra_command(&local_dir)
+        .env("LIBRA_SSH_COMMAND", ssh_script.to_str().unwrap())
+        .args([
+            "push",
+            "--force-with-lease",
+            "--force-if-includes",
+            "origin",
+            "main",
+        ])
+        .output()
+        .expect("push accepted");
+    assert!(
+        accepted.status.success(),
+        "integrated tip must be accepted: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn run_ok(dir: &Path, argv: &[&str]) {
+    let out = libra_command(dir).args(argv).output().expect("run libra");
+    assert!(
+        out.status.success(),
+        "{argv:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -28,6 +28,7 @@ pub mod storage_ext;
 pub mod telemetry;
 pub mod test;
 pub mod text;
+pub mod thin_pack;
 pub mod tree;
 pub mod util;
 pub mod worktree;

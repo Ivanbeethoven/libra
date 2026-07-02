@@ -46,8 +46,8 @@ separate `lfs push` step.
 | `-f`, `--force` | Allow non-fast-forward updates that overwrite remote history. | `libra push --force origin main` |
 | `-d`, `--delete` | Delete the named remote refs (each `<refspec>` is rewritten to a `:<ref>` deletion). Requires at least one ref; conflicts with `--set-upstream`/`--tags`/`--mirror`. | `libra push -d origin feature-x` |
 | `--force-with-lease[=<ref>[:<expect>]]` | Allow a non-fast-forward update only if the remote ref still matches the expected OID (the tracking-ref OID by default, or an explicit `<expect>`). Conflicts with `--force`. | `libra push --force-with-lease origin main` |
-| `--force-if-includes` | Accepted for `git push` compatibility; **no-op** (the lease check uses the tracking-ref OID only). | `libra push --force-with-lease --force-if-includes origin main` |
-| `--thin` / `--no-thin` | Accepted for compatibility; **no-op** (the pack encoder always produces a self-contained pack). | `libra push --thin origin main` |
+| `--force-if-includes` | With `--force-with-lease` (All/Ref forms): additionally require the remote-tracking tip to be integrated locally (reachable from the pushed branch's reflog). Silent no-op with the exact lease form or without a lease (Git parity). |
+| `--thin` | Send REF_DELTA entries against server-known bases (the advertised old tips) — smaller packs on large-blob edits; the server completes them (`index-pack --fix-thin`). Self-contained packs remain the default (unlike git). |
 | `--no-verify` | Bypass the `pre-push` hook. Accepted for compatibility; **no-op** (Libra's push runs no client-side `pre-push` hook, so there is nothing to bypass). | `libra push --no-verify origin main` |
 | `--no-progress` | Suppress the progress meter (the "Compressing objects" / "Writing objects" reporters) on stderr, matching `git push --no-progress`. | `libra push --no-progress origin main` |
 | `--porcelain` | Machine-readable output: a `To <url>` header then `<flag>\t<from>:<to>\t<summary>` per ref. Conflicts with `--json`/`--machine`. | `libra push --porcelain origin main` |
