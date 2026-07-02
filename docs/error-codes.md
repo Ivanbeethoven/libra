@@ -91,6 +91,7 @@ structured report is always present.
 | `128` | `LBR-CONFLICT-001` | `conflict` | Unresolved conflict is present | merge/rebase conflict still unresolved |
 | `128` | `LBR-CONFLICT-002` | `conflict` | Operation blocked to avoid overwriting state | non-fast-forward, destination exists, dirty worktree |
 | `128` | `LBR-POLICY-001` | `conflict` | Branch policy (protect/archive metadata) blocked the ref update | `branch reset` / `update-ref` on a protected or archived branch |
+| `128` | `LBR-CASE-001` | `conflict` | Paths that differ only by case collide on a case-insensitive filesystem | `add`/`checkout`/`switch`/`mv` under `core.casehandling=error` |
 | `128` | `LBR-NET-001` | `network` | Remote unreachable or transport unavailable | DNS, timeout, TLS, connection refused |
 | `128` | `LBR-NET-002` | `network` | Protocol, negotiation, or pack failure | packet-line, sideband, unpack/ref update protocol errors |
 | `128` | `LBR-AUTH-001` | `auth` | Missing identity, token, or credentials | missing commit identity, missing API key, missing SSH material |
@@ -132,6 +133,7 @@ structured report is always present.
 | `LBR-CONFLICT-001` | Unresolved conflict is present |
 | `LBR-CONFLICT-002` | Operation blocked to avoid overwriting state |
 | `LBR-POLICY-001` | Branch policy (protect/archive metadata) blocked the ref update. |
+| `LBR-CASE-001` | Paths that differ only by case collide on a case-insensitive filesystem. |
 
 ### Network
 

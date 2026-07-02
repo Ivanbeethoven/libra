@@ -762,6 +762,10 @@ async fn check_and_switch_branch(
 }
 
 async fn restore_to_commit(commit_id: ObjectHash, output: &OutputConfig) -> CliResult<()> {
+    // Case-collision preflight (lore.md 1.14) — checkout has its own copy of
+    // this restore path, so it gets its own guard (the review's must-fix:
+    // guarding only switch would leave `libra checkout <branch>` unprotected).
+    crate::command::switch::guard_target_tree_case(&commit_id).await?;
     let restore_args = RestoreArgs {
         overlay: false,
         no_overlay: false,
@@ -799,6 +803,11 @@ async fn checkout_detached(
             other => CheckoutError::DelegatedCli(CliError::from(other)),
         })?;
 
+    // Case-collision preflight BEFORE the HEAD update — refusing after it
+    // would strand a detached HEAD with an unrestored tree.
+    crate::command::switch::guard_target_tree_case(&commit_id)
+        .await
+        .map_err(CheckoutError::DelegatedCli)?;
     let head = Head::Detached(commit_id);
     Head::update(head, None).await;
     restore_to_commit(commit_id, output)

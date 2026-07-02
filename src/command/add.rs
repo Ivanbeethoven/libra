@@ -613,6 +613,78 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         return check_ignored_only_error(add_output);
     }
 
+    // Case-collision guard (lore.md 1.14): on a case-insensitive view, a
+    // candidate whose FOLD matches a DIFFERENT-cased tracked entry must never
+    // create an index twin (`Foo` + `foo`). Under the conservative default
+    // (`core.casehandling=error`) the whole add refuses BEFORE mutating the
+    // index; `warn`/`allow` skip the colliding candidates (staging under the
+    // existing casing is the engine's job — v1 skips, documented).
+    let ignore_case = crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|error| {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    let files = if ignore_case {
+        let policy = crate::utils::path_case::case_handling_from_config()
+            .await
+            .map_err(|error| {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+            })?;
+        let tracked_fold: std::collections::HashMap<String, String> = index
+            .tracked_files()
+            .iter()
+            .map(|path| {
+                let text = crate::utils::util::path_to_string(path);
+                (crate::utils::path_case::fold_path_key(&text), text)
+            })
+            .collect();
+        let mut kept = Vec::with_capacity(files.len());
+        let mut collisions: Vec<(String, String)> = Vec::new();
+        for file in files {
+            let text = crate::utils::util::path_to_string(&file);
+            match tracked_fold.get(&crate::utils::path_case::fold_path_key(&text)) {
+                Some(existing) if existing != &text => {
+                    collisions.push((text, existing.clone()));
+                }
+                _ => kept.push(file),
+            }
+        }
+        if !collisions.is_empty() {
+            match policy {
+                crate::utils::path_case::CaseHandling::Error => {
+                    let listing = collisions
+                        .iter()
+                        .map(|(candidate, tracked)| {
+                            format!("'{candidate}' collides with tracked '{tracked}'")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(
+                        CliError::failure(format!("case-fold path collision: {listing}"))
+                            .with_stable_code(StableErrorCode::ConflictCaseCollision)
+                            .with_hint(
+                                "rename deliberately with 'libra mv <Tracked> <tracked>', or set \
+                         core.casehandling=warn to proceed",
+                            ),
+                    );
+                }
+                crate::utils::path_case::CaseHandling::Warn => {
+                    for (candidate, tracked) in &collisions {
+                        crate::utils::error::emit_warning(format!(
+                            "case-fold collision: '{candidate}' matches tracked '{tracked}' \
+                             (skipped; use 'libra mv' for a deliberate case rename)"
+                        ));
+                    }
+                }
+                crate::utils::path_case::CaseHandling::Allow => {}
+            }
+        }
+        kept
+    } else {
+        files
+    };
+
     // Stage each file (`--renormalize` force-rewrites instead of diffing).
     for file in &files {
         let staged = if args.renormalize {

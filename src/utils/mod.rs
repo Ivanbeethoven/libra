@@ -17,6 +17,7 @@ pub mod object;
 pub mod object_ext;
 pub mod pager;
 pub mod path;
+pub mod path_case;
 pub mod path_ext;
 pub mod read_policy;
 pub mod redact;

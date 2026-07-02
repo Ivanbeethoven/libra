@@ -531,7 +531,18 @@ async fn run_init_internal(
     // vault setup run; those later stages persist their durable state through
     // this connection/path and assume schema bootstrap has completed.
     let conn = create_database_connection(&database_path).await?;
-    let repo_id = init_config(&conn, args.bare, &object_format, &ref_format).await?;
+    // Probe the actual filesystem (root_dir already exists at this point):
+    // non-bare repos probe the parent of `.libra`; bare repos have no
+    // worktree, so case handling is moot — record false.
+    let ignore_case = if args.bare {
+        false
+    } else {
+        root_dir
+            .parent()
+            .map(crate::utils::path_case::probe_dir_ignore_case)
+            .unwrap_or(false)
+    };
+    let repo_id = init_config(&conn, args.bare, &object_format, &ref_format, ignore_case).await?;
 
     progress.emit("Setting up refs ...");
     // INVARIANT: refs are initialized after core config so HEAD/branch rows are
@@ -1172,15 +1183,21 @@ async fn init_config(
     is_bare: bool,
     object_format: &str,
     ref_format: &RefFormat,
+    ignore_case: bool,
 ) -> Result<String, DbErr> {
     let txn = conn.begin().await?;
 
+    // `core.ignorecase` is PROBED, not platform-hard-coded (lore.md 1.14):
+    // Linux records false, macOS records what the volume actually is, and a
+    // case-sensitive NTFS volume on Windows records false too.
+    let ignorecase_text = if ignore_case { "true" } else { "false" };
     #[cfg(not(target_os = "windows"))]
     let entries = [
         ("repositoryformatversion", "0"),
         ("filemode", "true"),
         ("bare", if is_bare { "true" } else { "false" }),
         ("logallrefupdates", "true"),
+        ("ignorecase", ignorecase_text),
     ];
 
     #[cfg(target_os = "windows")]
@@ -1190,7 +1207,7 @@ async fn init_config(
         ("bare", if is_bare { "true" } else { "false" }),
         ("logallrefupdates", "true"),
         ("symlinks", "false"),
-        ("ignorecase", "true"),
+        ("ignorecase", ignorecase_text),
     ];
 
     let repo_id = uuid::Uuid::new_v4().to_string();

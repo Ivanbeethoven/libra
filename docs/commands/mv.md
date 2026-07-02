@@ -71,6 +71,17 @@ If every source is skipped, the command exits successfully without changing the 
 
 Accepted for Git CLI compatibility. Libra has no sparse-checkout cone state, so the flag does not change move planning, filesystem writes, index updates, or structured output.
 
+## Case-only renames (lore.md 1.14)
+
+`libra mv Foo foo` is a first-class case-only rename: on a case-insensitive
+filesystem the destination resolves to the source itself (same inode), which
+libra detects (device+inode) and renames in place — no `--force` needed, and
+the force-remove branch (which would have deleted the file's only copy) is
+bypassed. Directories work too (`mv Dir dir` renames instead of nesting).
+Related: `core.casehandling` (`error` default / `warn` / `allow`) governs
+implicit case collisions in `add`/`checkout`/`switch`; `core.ignorecase` is
+probed and recorded truthfully at `init` on every platform.
+
 ## Common Commands
 
 ```bash

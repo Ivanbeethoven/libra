@@ -195,6 +195,9 @@ pub enum StableErrorCode {
     /// first enforcement code of the 1.13 policy layer (branch reset +
     /// update-ref); future delete/push/merge enforcement reuses it.
     PolicyRefUpdateBlocked,
+    /// A case-fold path collision was refused under `core.casehandling=error`
+    /// (lore.md 1.14) — mv/add/checkout/switch on case-insensitive views.
+    ConflictCaseCollision,
     NetworkUnavailable,
     NetworkProtocol,
     AuthMissingCredentials,
@@ -242,6 +245,7 @@ impl StableErrorCode {
             Self::ConflictUnresolved => "LBR-CONFLICT-001",
             Self::ConflictOperationBlocked => "LBR-CONFLICT-002",
             Self::PolicyRefUpdateBlocked => "LBR-POLICY-001",
+            Self::ConflictCaseCollision => "LBR-CASE-001",
             Self::NetworkUnavailable => "LBR-NET-001",
             Self::NetworkProtocol => "LBR-NET-002",
             Self::AuthMissingCredentials => "LBR-AUTH-001",
@@ -273,7 +277,8 @@ impl StableErrorCode {
             | Self::ConflictOperationBlocked
             // Policy refusals ride the Conflict category (no dedicated
             // Policy category yet; the JSON envelope reads "conflict").
-            | Self::PolicyRefUpdateBlocked => CliErrorCategory::Conflict,
+            | Self::PolicyRefUpdateBlocked
+            | Self::ConflictCaseCollision => CliErrorCategory::Conflict,
             Self::NetworkUnavailable | Self::NetworkProtocol => CliErrorCategory::Network,
             Self::AuthMissingCredentials | Self::AuthPermissionDenied => CliErrorCategory::Auth,
             Self::IoReadFailed | Self::IoWriteFailed => CliErrorCategory::Io,
@@ -345,6 +350,9 @@ impl StableErrorCode {
             }
             Self::PolicyRefUpdateBlocked => {
                 "Branch policy (protect/archive metadata) blocked the ref update."
+            }
+            Self::ConflictCaseCollision => {
+                "Paths that differ only by case collide on a case-insensitive filesystem."
             }
             Self::ConflictOperationBlocked => {
                 "Operation was blocked to avoid overwriting local or remote state."
