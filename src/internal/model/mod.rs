@@ -30,6 +30,8 @@ pub mod operation_view_ref;
 pub mod operation_view_workspace;
 pub mod reference;
 pub mod reflog;
+pub mod revision_ordinal;
+pub mod revision_ordinal_meta;
 pub mod schema_version;
 pub mod source_call_log;
 pub mod working_dirty;

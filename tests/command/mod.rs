@@ -364,6 +364,7 @@ mod restore_test;
 mod rev_list_test;
 mod rev_parse_test;
 mod revert_test;
+mod revision_test;
 mod sandbox_status_test;
 mod schema_upgrade_test;
 mod service_test;

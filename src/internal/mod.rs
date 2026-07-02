@@ -37,6 +37,7 @@ pub mod pack_writer;
 pub mod protocol;
 pub mod publish;
 pub mod reflog;
+pub mod revision_ordinal;
 pub mod tag;
 pub mod tree_plumbing;
 pub mod tui;

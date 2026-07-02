@@ -113,6 +113,7 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "metadata",
     "dirty",
     "service",
+    "revision",
 ];
 
 #[test]

@@ -677,6 +677,16 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070202_working_dirty.sql"),
             include_str!("../../../sql/migrations/2026070202_working_dirty_down.sql"),
         ),
+        // 2026-07-03: revision ordinal index (lore.md 1.16) — rebuildable
+        // OID<->ordinal mapping over per-ref first-parent chains, freshness
+        // fingerprinted on tip OID + refs/replace digest. Owner API:
+        // `internal::revision_ordinal::RevisionOrdinalIndex`.
+        sql_migration(
+            2026070301,
+            "revision_ordinal",
+            include_str!("../../../sql/migrations/2026070301_revision_ordinal.sql"),
+            include_str!("../../../sql/migrations/2026070301_revision_ordinal_down.sql"),
+        ),
     ]
 }
 
@@ -805,9 +815,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 15);
+        assert_eq!(runner.len(), 16);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070202));
+        assert_eq!(runner.max_registered_version(), Some(2026070301));
     }
 
     #[test]

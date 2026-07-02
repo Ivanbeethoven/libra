@@ -32,7 +32,7 @@ const ROOT_AFTER_HELP: &str = "\
 Command Groups:
   Repository Setup        init, clone, config, completions
   Working Tree            status, add, rm, mv, restore, clean, stash, dirty, lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
-  History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive
+  History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, service
@@ -367,6 +367,11 @@ enum Commands {
         after_help = command::dirty::DIRTY_EXAMPLES
     )]
     Dirty(command::dirty::DirtyArgs),
+    #[command(
+        about = "Look up revisions by ordinal on a branch's first-parent chain (Libra extension)",
+        after_help = command::revision::REVISION_EXAMPLES
+    )]
+    Revision(command::revision::RevisionArgs),
     #[command(
         about = "Run a headless local service: notification bus + dirty-mark ingestion (Libra extension)",
         after_help = command::service::SERVICE_EXAMPLES
@@ -1463,6 +1468,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
         Commands::Metadata(cmd_args) => command::metadata::execute_safe(cmd_args, &output).await?,
         Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
+        Commands::Revision(cmd_args) => command::revision::execute_safe(cmd_args, &output).await?,
         Commands::Service(cmd_args) => command::service::execute_safe(cmd_args, &output).await?,
         Commands::Shortlog(cmd_args) => command::shortlog::execute_safe(cmd_args, &output).await?,
         Commands::Show(cmd_args) => command::show::execute_safe(cmd_args, &output).await?,

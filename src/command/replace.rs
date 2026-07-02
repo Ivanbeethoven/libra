@@ -52,6 +52,36 @@ fn peel_suppressed() -> bool {
         .unwrap_or(false)
 }
 
+/// Signature of the EFFECTIVE replacement map — the same process-cached
+/// snapshot [`resolve`] (and therefore every `load_object` walk) uses. The
+/// revision ordinal index (lore.md 1.16) stamps this alongside its rows so
+/// the freshness fingerprint can never disagree with the object graph the
+/// build actually walked: within one process both are frozen together; a
+/// replace change made mid-process is picked up by the NEXT process, whose
+/// differing signature triggers an honest rebuild.
+pub(crate) fn effective_replace_signature() -> String {
+    let map = REPLACE_MAP.get_or_init(load_replace_map);
+    if map.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<String> = map
+        .iter()
+        .map(|(from, to)| format!("{from}={to}"))
+        .collect();
+    pairs.sort();
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    for pair in &pairs {
+        hasher.update(pair.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 pub const REPLACE_EXAMPLES: &str = "\
 EXAMPLES:
     libra replace <object> <replacement>   Replace one object with another on read
