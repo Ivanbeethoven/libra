@@ -748,8 +748,15 @@ async fn store_global_unseal_key(unseal_key: &[u8]) -> Result<()> {
 pub async fn lazy_init_vault_for_scope(scope: &str) -> Result<Vec<u8>> {
     match scope {
         "global" => {
-            // Global scope: just generate a random unseal key (no vault.db needed,
-            // we use the raw AES-256-GCM key directly for encrypt_token/decrypt_token)
+            // ACTUALLY lazy: reuse the persisted key when one exists —
+            // regenerating on every call would rotate the key and make every
+            // previously-encrypted global value (auth tokens, encrypted
+            // config) permanently undecryptable.
+            if let Some(existing) = load_global_unseal_key().await
+                && existing.len() == 32
+            {
+                return Ok(existing);
+            }
             use ring::rand::{SecureRandom, SystemRandom};
             let rng = SystemRandom::new();
             let mut key = vec![0u8; 32];

@@ -106,38 +106,65 @@ pub async fn execute_safe(args: CredentialArgs, _output: &OutputConfig) -> CliRe
 /// `fill`: print the stored credential, or nothing. Always exits 0 — a miss is
 /// indistinguishable from "no vault" or "expired" from the caller's side.
 async fn fill(attrs: &CredentialAttrs) -> CliResult<()> {
+    match repo_scoped_credential(attrs).await {
+        Some(stored) => emit_fill(
+            attrs,
+            &stored.username,
+            &stored.password,
+            Some(stored.expires_at),
+        ),
+        // Global-token fallback (lore.md 1.6, gh-style): https only, silent
+        // on every miss — store/erase never manage auth tokens.
+        None => {
+            if attrs.protocol == "https"
+                && !attrs.host.is_empty()
+                && let Ok(scope) = crate::internal::auth::HostScope::parse(&attrs.host)
+                && let crate::internal::auth::Lookup::Valid { username, token } =
+                    crate::internal::auth::lookup(&scope).await
+            {
+                // Username pinning applies to the fallback too.
+                if let Some(asked) = &attrs.username
+                    && asked != &username
+                {
+                    return Ok(());
+                }
+                return emit_fill(attrs, &username, &token, None);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The pre-1.6 repo-scoped lookup, unchanged in semantics.
+async fn repo_scoped_credential(attrs: &CredentialAttrs) -> Option<StoredCredential> {
     // Outside a repository there is no vault to consult — a clean miss, not an
     // error (the vault loader panics if called outside a repo).
-    if util::try_get_storage_path(None).is_err() {
-        return Ok(());
-    }
-    let Some(unseal_key) = vault::load_unseal_key().await else {
-        return Ok(());
-    };
-    let Some(entry) = ConfigKv::get(&credential_key(attrs)).await.ok().flatten() else {
-        return Ok(());
-    };
-    let Ok(raw) = hex::decode(entry.value) else {
-        return Ok(());
-    };
+    util::try_get_storage_path(None).ok()?;
+    let unseal_key = vault::load_unseal_key().await?;
+    let entry = ConfigKv::get(&credential_key(attrs)).await.ok().flatten()?;
+    let raw = hex::decode(entry.value).ok()?;
     // A decryption failure (e.g. the vault unseal key was rotated) is a miss,
     // not an error: the caller is asked to re-authenticate.
-    let Ok(plaintext) = vault::decrypt_token(&unseal_key, &raw) else {
-        return Ok(());
-    };
-    let Ok(stored) = serde_json::from_str::<StoredCredential>(&plaintext) else {
-        return Ok(());
-    };
+    let plaintext = vault::decrypt_token(&unseal_key, &raw).ok()?;
+    let stored = serde_json::from_str::<StoredCredential>(&plaintext).ok()?;
     if stored.expires_at <= now_unix() {
-        return Ok(());
+        return None;
     }
     // If the caller pinned a username, it must match the stored one.
     if let Some(asked) = &attrs.username
         && asked != &stored.username
     {
-        return Ok(());
+        return None;
     }
+    Some(stored)
+}
 
+fn emit_fill(
+    attrs: &CredentialAttrs,
+    username: &str,
+    password: &str,
+    expires_at: Option<u64>,
+) -> CliResult<()> {
     let mut response = String::new();
     if !attrs.protocol.is_empty() {
         response.push_str(&format!("protocol={}\n", attrs.protocol));
@@ -148,9 +175,11 @@ async fn fill(attrs: &CredentialAttrs) -> CliResult<()> {
     if !attrs.path.is_empty() {
         response.push_str(&format!("path={}\n", attrs.path));
     }
-    response.push_str(&format!("username={}\n", stored.username));
-    response.push_str(&format!("password={}\n", stored.password));
-    response.push_str(&format!("password_expiry_utc={}\n", stored.expires_at));
+    response.push_str(&format!("username={username}\n"));
+    response.push_str(&format!("password={password}\n"));
+    if let Some(expires_at) = expires_at {
+        response.push_str(&format!("password_expiry_utc={expires_at}\n"));
+    }
     print!("{response}");
     Ok(())
 }

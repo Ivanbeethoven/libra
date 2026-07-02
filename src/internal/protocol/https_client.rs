@@ -56,7 +56,9 @@ static AUTH: Mutex<Option<BasicAuth>> = Mutex::new(None);
 impl BasicAuth {
     /// set username & password manually
     pub async fn set_auth(auth: BasicAuth) {
-        AUTH.lock().expect("AUTH mutex poisoned").replace(auth);
+        AUTH.lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .replace(auth);
     }
 
     /// send request with basic auth, retry 3 times
@@ -69,10 +71,68 @@ impl BasicAuth {
         let mut try_cnt = 0;
         loop {
             let mut request = request_builder().await; // RequestBuilder can't be cloned
-            if let Some(auth) = AUTH.lock().expect("AUTH mutex poisoned").deref() {
+            // Poison-tolerant: the guarded data is a plain Option swap, so a
+            // panicked writer cannot leave it inconsistent — never crash the
+            // network hot path over a poisoned mutex.
+            let interactive = AUTH
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .deref()
+                .clone();
+            if let Some(auth) = interactive {
                 request = request.basic_auth(auth.username.clone(), Some(auth.password.clone()));
-            } // if no auth exists, try without auth (e.g. clone public)
-            res = request.send().await?;
+                res = request.send().await?;
+            } else {
+                // Stored-token attach (lore.md 1.6): split the builder so the
+                // request URL is known, then attach the host-scoped token —
+                // ONLY when the scope matches and no Authorization header is
+                // already present. Builder errors propagate exactly as
+                // .send() would have surfaced them.
+                let (client, built) = request.build_split();
+                let mut built = built?;
+                if built
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .is_none()
+                    && let Some(scope) =
+                        crate::internal::auth::HostScope::from_request_url(built.url())
+                {
+                    match crate::internal::auth::lookup(&scope).await {
+                        crate::internal::auth::Lookup::Valid { username, token } => {
+                            use base64::Engine;
+                            let value = format!(
+                                "Basic {}",
+                                base64::engine::general_purpose::STANDARD
+                                    .encode(format!("{username}:{token}"))
+                            );
+                            if let Ok(header) = reqwest::header::HeaderValue::from_str(&value) {
+                                let mut header = header;
+                                header.set_sensitive(true);
+                                built
+                                    .headers_mut()
+                                    .insert(reqwest::header::AUTHORIZATION, header);
+                            }
+                        }
+                        crate::internal::auth::Lookup::Expired { .. } => {
+                            emit_warning(format!(
+                                "stored token for {} is EXPIRED; run 'libra auth login --host {}'",
+                                scope.display(),
+                                scope.display()
+                            ));
+                        }
+                        crate::internal::auth::Lookup::Undecryptable => {
+                            emit_warning(format!(
+                                "stored token for {} cannot be decrypted (key changed?); \
+                                 run 'libra auth login --host {}'",
+                                scope.display(),
+                                scope.display()
+                            ));
+                        }
+                        crate::internal::auth::Lookup::Miss => {}
+                    }
+                }
+                res = client.execute(built).await?;
+            }
             if res.status() == StatusCode::FORBIDDEN {
                 // 403: no access, no need to retry. The caller receives the
                 // response and decides how to handle it — some callers (e.g.
@@ -90,7 +150,7 @@ impl BasicAuth {
             }
             emit_warning("authentication required, retrying...");
             AUTH.lock()
-                .expect("AUTH mutex poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .replace(ask_basic_auth());
             try_cnt += 1;
         }
@@ -324,12 +384,34 @@ fn normalize_url(url: &Url) -> Url {
     }
 }
 
+/// Redirect policy that refuses an https→http downgrade: reqwest strips
+/// Authorization only when the HOST or PORT changes — a same-host cleartext
+/// downgrade would re-send credentials over http (lore.md 1.6 review
+/// finding). Same-scheme redirects keep reqwest's default 10-hop limit.
+pub(crate) fn no_downgrade_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let downgraded = attempt.url().scheme() == "http"
+            && attempt
+                .previous()
+                .last()
+                .is_some_and(|previous| previous.scheme() == "https");
+        if downgraded {
+            attempt.error("refusing an https->http downgrade redirect")
+        } else if attempt.previous().len() > 10 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 fn build_client(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .http1_only()
+        .redirect(no_downgrade_redirect_policy())
         .connect_timeout(connect_timeout)
         .read_timeout(read_timeout)
         .build()

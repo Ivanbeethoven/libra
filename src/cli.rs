@@ -34,7 +34,7 @@ Command Groups:
   Working Tree            status, add, rm, mv, restore, clean, stash, dirty, lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
-  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle
+  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref
 
@@ -367,6 +367,11 @@ enum Commands {
         after_help = command::dirty::DIRTY_EXAMPLES
     )]
     Dirty(command::dirty::DirtyArgs),
+    #[command(
+        about = "Manage host-scoped HTTP tokens: login, status, logout (Libra extension)",
+        after_help = command::auth::AUTH_EXAMPLES
+    )]
+    Auth(command::auth::AuthArgs),
     #[command(
         about = "Look up revisions by ordinal on a branch's first-parent chain (Libra extension)",
         after_help = command::revision::REVISION_EXAMPLES
@@ -1169,6 +1174,9 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         | Commands::Completions(_)
         // `logfile` only inspects env-derived tracing configuration.
         | Commands::Logfile(_)
+        // `auth` manages host-global tokens in the GLOBAL store; it works
+        // outside a repository and touches no objects.
+        | Commands::Auth(_)
         // `cache info` only inspects env/config-derived storage tunables.
         | Commands::Cache(_)
         | Commands::Sandbox(_) => Ok(CommandPreflight::none()),
@@ -1468,6 +1476,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
         Commands::Metadata(cmd_args) => command::metadata::execute_safe(cmd_args, &output).await?,
         Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
+        Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,
         Commands::Revision(cmd_args) => command::revision::execute_safe(cmd_args, &output).await?,
         Commands::Service(cmd_args) => command::service::execute_safe(cmd_args, &output).await?,
         Commands::Shortlog(cmd_args) => command::shortlog::execute_safe(cmd_args, &output).await?,

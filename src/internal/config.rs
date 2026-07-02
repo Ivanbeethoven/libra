@@ -1418,6 +1418,11 @@ pub fn is_sensitive_key(key: &str) -> bool {
     if lower.starts_with("vault.env.") {
         return true;
     }
+    // Host-token records (lore.md 1.6): owned exclusively by `libra auth` —
+    // config get/set/list/unset must neither dump nor forge nor delete them.
+    if lower.starts_with("auth.token.") {
+        return true;
+    }
     if lower.ends_with(".privkey") {
         return true;
     }
@@ -1463,6 +1468,9 @@ pub fn is_vault_internal_key(key: &str) -> bool {
         || lower == "vault.unsealkey"
         || lower == "vault.roottoken"
         || lower == "vault.roottoken_enc"
+        // `libra auth` token records: unset via config would be an unaudited
+        // logout outside the owner API.
+        || lower.starts_with("auth.token.")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

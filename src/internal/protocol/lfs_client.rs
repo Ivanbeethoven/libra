@@ -108,8 +108,12 @@ impl ProtocolClient for LFSClient {
             "LFSClient::from_url: derived LFS server URL did not parse (use LFSClient::new for SCP-style)",
         );
         let client = Client::builder()
+            .redirect(super::https_client::no_downgrade_redirect_policy())
             .default_headers(lfs::LFS_HEADERS.clone()) //  will be overwritten by `json()`, careful!
             .build()
+            // INVARIANT (trait contract, see the impl doc above): the trait
+            // returns Self, so this must panic; LFSClient::new() is the
+            // fallible path.
             .expect(
                 "LFSClient::from_url: reqwest client builder failed (likely missing TLS backend)",
             );
@@ -144,6 +148,7 @@ impl LFSClient {
         let lfs_server = Url::parse(&lfs_server)
             .with_context(|| format!("failed to derive LFS server URL from remote '{url}'"))?;
         let client = Client::builder()
+            .redirect(super::https_client::no_downgrade_redirect_policy())
             .default_headers(lfs::LFS_HEADERS.clone())
             .build()?;
         Ok(Self {
