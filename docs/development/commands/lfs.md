@@ -51,6 +51,19 @@ flowchart TD
 - 公开参数/子命令包括：`track [<pattern>...]`、`untrack <path>...`、`locks`（`--id`/`-i <ID>`、`--path`/`-p <PATH>`、`--limit`/`-l <N>`）、`lock <path>`、`unlock <path>`（`--force`/`-f`、`--id`/`-i <ID>`）、`ls-files`（`--long`/`-l`、`--size`/`-s`、`--name-only`/`-n`）。
 
 
+
+### lfs.lockEnforce（lore.md 2.8，已落地）
+
+纯策略门（非锁管理器）：`add`/`commit` 两卡点在任何 blob/索引写入前调用
+`command::lfs::enforce_lock_policy`，服务器（`POST locks/verify` 的
+ours/theirs 划分）是唯一锁真源——Libra 不引入本地锁存储或缓存（读穿缓存为
+既名后续项，非 v1）。候选集=暂存 新+改+删（删除只有此门守卫）。响应矩阵与
+离线/无 remote/新分支回退语义钉在 COMPATIBILITY lfs 行。已知成本：同文件
+add→commit 走两次 verify 往返（opt-in 门无缓存的接受成本）。add --refresh
+不经此门（仅重写 stat 元数据，无内容变更可门）。`libra rm` 的暂存删除绕过
+add 门、由 commit 门兜底。401 交互提示沿用全局 BasicAuth 机制（TTY 上
+warn 模式也可能提示一次——文档化行为）。
+
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 当前处理 |

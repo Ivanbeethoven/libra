@@ -226,6 +226,10 @@ pub enum CleanupMode {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
+    /// The `lfs.lockEnforce` gate refused the commit (lore.md 2.8); the
+    /// carried [`CliError`] already has its stable code and hints.
+    #[error("{0}")]
+    LockPolicy(crate::utils::error::CliError),
     #[error("failed to load index: {0}")]
     IndexLoad(String),
 
@@ -299,6 +303,7 @@ pub enum CommitError {
 impl From<CommitError> for CliError {
     fn from(error: CommitError) -> Self {
         match &error {
+            CommitError::LockPolicy(inner) => inner.clone(),
             CommitError::IndexLoad(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("the index file may be corrupted; try 'libra status' to verify"),
@@ -584,6 +589,27 @@ pub async fn run_commit(
         .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
     if staged_changes.is_empty() && !args.allow_empty && !is_amend {
         return Err(CommitError::NothingToCommit);
+    }
+
+    // `lfs.lockEnforce` gate (lore.md 2.8): staged new+modified+DELETED
+    // paths (deletions never reach the push-time OID check — this is the
+    // only guard for them). Skipped on dry-run/--porcelain (previews never
+    // touch the network). Runs AFTER `-a` auto-staging, matching the
+    // existing pre-commit-hook-failure semantics (the auto-staged index
+    // mutation persists on abort).
+    if !dry_run {
+        let mut candidates: Vec<String> = Vec::new();
+        for path in staged_changes
+            .new
+            .iter()
+            .chain(staged_changes.modified.iter())
+            .chain(staged_changes.deleted.iter())
+        {
+            candidates.push(path.display().to_string());
+        }
+        crate::command::lfs::enforce_lock_policy(&candidates)
+            .await
+            .map_err(CommitError::LockPolicy)?;
     }
 
     // `--porcelain` snapshot of the would-be-committed state: taken AFTER `-a`

@@ -209,6 +209,26 @@ Listing LFS files:
 
 Lock operations include `path`, `id` when available, `refspec`, or a `locks` array for `lfs locks`.
 
+## Lock enforcement (`lfs.lockEnforce`, lore.md 2.8)
+
+An opt-in policy gate on `libra add` / `libra commit` against LFS locks held
+by **someone else** (your own locks never warn or block):
+
+```bash
+libra config lfs.lockEnforce warn    # warn and proceed
+libra config lfs.lockEnforce block   # refuse before anything is staged
+libra config lfs.lockEnforce off     # explicit off (overrides a broader setting)
+```
+
+The LFS server stays the single source of truth (`locks/verify`, the same
+check `push` performs); ownership is decided server-side from your
+authenticated user. Staged deletions are covered too — they never reach the
+push-time check. With `block`, an unreachable server fails closed (use
+`--offline` to skip deliberately, or downgrade to `warn`); explicit offline
+intent skips with a recorded warning in both modes. A server without a
+locking API (404) is a clean no-op. Previews (`add --dry-run`,
+`commit --porcelain`) never touch the network.
+
 ## Common Commands
 
 ```bash

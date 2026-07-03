@@ -143,6 +143,10 @@ pub enum AddError {
     /// [`StableErrorCode::RepoNotFound`].
     #[error("not a libra repository (or any of the parent directories): .libra")]
     NotInRepo,
+    /// The `lfs.lockEnforce` gate refused the operation (lore.md 2.8); the
+    /// carried [`CliError`] already has its stable code and hints.
+    #[error("{0}")]
+    LockPolicy(CliError),
     /// A user-supplied pathspec matched neither tracked files, working-tree
     /// changes, nor an ignored entry — typically a typo. Mapped to
     /// [`StableErrorCode::CliInvalidTarget`].
@@ -185,6 +189,7 @@ pub enum AddError {
 impl From<AddError> for CliError {
     fn from(error: AddError) -> Self {
         match &error {
+            AddError::LockPolicy(inner) => inner.clone(),
             AddError::NotInRepo => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoNotFound)
                 .with_hint("run 'libra init' to create a repository"),
@@ -575,6 +580,19 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     filter_out_current_executable(&mut files);
     files.sort();
     files.dedup();
+
+    // `lfs.lockEnforce` gate (lore.md 2.8): before ANY blob/index write, and
+    // never on --dry-run (previews must not touch the network). `--refresh`
+    // returned above (stat-only rewrite — no content change to gate).
+    if !args.dry_run {
+        let candidates: Vec<String> = files
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect();
+        crate::command::lfs::enforce_lock_policy(&candidates)
+            .await
+            .map_err(AddError::LockPolicy)?;
+    }
 
     if args.dry_run {
         // Classify files for dry-run preview.

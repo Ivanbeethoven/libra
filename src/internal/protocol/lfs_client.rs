@@ -160,6 +160,27 @@ impl LFSClient {
         })
     }
 
+    /// Build a client from an EXPLICIT remote URL (lore.md 2.8): the lock
+    /// gate must work on branches with no upstream yet (falling back to
+    /// `remote.origin.url`), where [`Self::new`]'s current-branch resolution
+    /// would refuse.
+    pub fn from_remote_url(url: &str) -> anyhow::Result<Self> {
+        let lfs_server = lfs::generate_lfs_server_url(url.to_string()) + "/";
+        let lfs_server = Url::parse(&lfs_server)
+            .with_context(|| format!("failed to derive LFS server URL from remote '{url}'"))?;
+        let client = Client::builder()
+            .redirect(super::https_client::no_downgrade_redirect_policy())
+            .default_headers(lfs::LFS_HEADERS.clone())
+            .build()?;
+        Ok(Self {
+            batch_url: lfs_server
+                .join("objects/batch")
+                .expect("'objects/batch' is a valid relative URL"),
+            lfs_url: lfs_server,
+            client,
+        })
+    }
+
     /// push LFS objects to remote server
     pub async fn push_objects<'a, I>(&self, objs: I) -> Result<usize, LfsPushError>
     where
@@ -879,14 +900,23 @@ impl LFSClient {
             .expect("'locks/verify' is a valid relative URL");
         let resp = BasicAuth::send(|| async { self.client.post(url.clone()).json(&query) }).await?;
         let code = resp.status();
-        // By default, an LFS server that doesn't implement any locking endpoints should return 404.
-        // This response will not halt any Git pushes.
-        if !code.is_success() && code != StatusCode::NOT_FOUND && code != StatusCode::FORBIDDEN {
-            eprintln!(
-                "fatal: LFS verify locks failed. Status: {}, Message: {}",
-                code,
-                resp.text().await.unwrap_or_default()
-            );
+        // Only a 2xx response carries a lock list. Any non-success status —
+        // 404 (server implements no locking endpoints; by default this must
+        // NOT halt pushes), 403 (no push access), 5xx — is returned WITHOUT
+        // decoding the body: a 404's body is typically empty or a plain
+        // error object, so `resp.json::<VerifiableLockList>()` would fail and
+        // (pre-fix) turn a benign no-locking-API 404 into a hard error,
+        // bypassing the caller's explicit 404/403 handling. A genuinely
+        // unexpected non-2xx (not 404/403) still prints a fatal note; the
+        // caller decides whether an empty list on that status is acceptable.
+        if !code.is_success() {
+            if code != StatusCode::NOT_FOUND && code != StatusCode::FORBIDDEN {
+                eprintln!(
+                    "fatal: LFS verify locks failed. Status: {}, Message: {}",
+                    code,
+                    resp.text().await.unwrap_or_default()
+                );
+            }
             return Ok((
                 code,
                 VerifiableLockList {

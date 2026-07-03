@@ -17,10 +17,11 @@ use crate::{
         status,
     },
     internal::{
+        config::ConfigKv,
         head::Head,
         protocol::lfs_client::{LFSClient, LockListError},
     },
-    lfs_structs::LockListQuery,
+    lfs_structs::{Lock, LockListQuery, Ref, VerifiableLockRequest},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         lfs,
@@ -467,6 +468,269 @@ fn render_lfs_output(result: &LfsOutput, output: &OutputConfig) -> CliResult<()>
     }
 
     Ok(())
+}
+
+/// `lfs.lockEnforce` policy (lore.md 2.8): an opt-in gate on `add`/`commit`
+/// against locks held by OTHERS on the LFS server. Never a lock manager —
+/// the server stays the single source of truth (`POST locks/verify`, the
+/// same ours/theirs split push already consumes) and the push-time check
+/// remains the authoritative backstop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockEnforcePolicy {
+    Off,
+    Warn,
+    Block,
+}
+
+impl LockEnforcePolicy {
+    /// Case-insensitive; `off` is accepted explicitly so a repo can
+    /// override a broader setting. Anything else is a hard usage error —
+    /// a typo must not silently disable enforcement.
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "off" => Ok(Self::Off),
+            "warn" => Ok(Self::Warn),
+            "block" => Ok(Self::Block),
+            other => Err(format!(
+                "invalid lfs.lockEnforce value '{other}' (expected off, warn, or block)"
+            )),
+        }
+    }
+}
+
+async fn load_lock_enforce_policy() -> CliResult<LockEnforcePolicy> {
+    // ConfigKv is what `libra config set` writes (keys stored VERBATIM) —
+    // the case-insensitive lookup accepts lfs.lockEnforce / lfs.lockenforce.
+    let entry = ConfigKv::get_var_case_insensitive("lfs.", "lockEnforce")
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to read lfs.lockEnforce: {error}"))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+        })?;
+    match entry {
+        None => Ok(LockEnforcePolicy::Off),
+        Some(entry) => LockEnforcePolicy::parse(&entry.value).map_err(|message| {
+            CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("set it with: libra config lfs.lockEnforce off|warn|block")
+        }),
+    }
+}
+
+/// Gate `candidates` (repo-relative slash paths of the operation's staged
+/// new/modified/DELETED set — deletions matter: they never reach the
+/// push-time OID check) against server locks. Behavior matrix is pinned in
+/// COMPATIBILITY.md; the notable calls: explicit offline intent skips with a
+/// recorded warning in BOTH modes (deletion residual documented); an
+/// unreachable server FAILS CLOSED under `block` (an opted-in hard
+/// guarantee must not silently degrade on a flaky network — the
+/// LIBRA_READ_POLICY discipline) and warns-and-proceeds under `warn`.
+/// Repo-root-relative, forward-slash form (the git-index / LFS-lock-path
+/// convention). Drops `.` and any leading components; joins `Normal` parts
+/// with `/` so a Windows `sub\\file.bin` candidate matches the server's
+/// `sub/file.bin` lock path.
+fn normalize_lock_path(path: &str) -> String {
+    use std::path::{Component, Path};
+    Path::new(path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub(crate) async fn enforce_lock_policy(candidates: &[String]) -> CliResult<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let workdir = util::working_dir();
+    // Normalize to the git-index / LFS-lock convention: repo-root-relative,
+    // forward-slash (candidates arrive repo-root-relative from `status`, but
+    // may carry platform separators — a byte-for-byte compare against
+    // slash-normalized server lock paths would else miss a lock on Windows).
+    let normalized: Vec<String> = candidates
+        .iter()
+        .map(|path| normalize_lock_path(path))
+        .collect();
+    let lfs_candidates: Vec<&String> = normalized
+        .iter()
+        .filter(|path| lfs::is_lfs_tracked(workdir.join(path.as_str())))
+        .collect();
+    if lfs_candidates.is_empty() {
+        return Ok(()); // zero overhead for non-LFS work
+    }
+    let policy = load_lock_enforce_policy().await?;
+    if policy == LockEnforcePolicy::Off {
+        return Ok(());
+    }
+    // Explicit offline intent: skip with a recorded warning (the operator
+    // asked for no network; push-time verify still guards uploads).
+    if crate::utils::read_policy::read_policy() == crate::utils::read_policy::ReadPolicy::LocalOnly
+    {
+        eprintln!(
+            "warning: lfs.lockEnforce skipped (offline read policy); locks were NOT verified"
+        );
+        crate::utils::output::record_warning();
+        return Ok(());
+    }
+    // Detached HEAD: refspec-scoped verification is undefined; push refuses
+    // detached LFS pushes, so the backstop holds.
+    let Some(refspec) = current_refspec().await else {
+        eprintln!("warning: lfs.lockEnforce skipped (detached HEAD); locks were NOT verified");
+        crate::utils::output::record_warning();
+        return Ok(());
+    };
+    // Remote resolution. A fresh `switch -c` branch has no upstream (Ok(None))
+    // — fall back to `remote.origin.url` so enforcement is NOT silently
+    // skipped in a repo with a configured remote. But a real config/storage
+    // ERROR must NOT be masked by the origin fallback (that would verify
+    // against the wrong remote and proceed unverified) — surface it per
+    // policy.
+    let remote_url = match ConfigKv::get_current_remote_url().await {
+        Ok(Some(url)) => Some(url),
+        Ok(None) => ConfigKv::get_remote_url("origin").await.ok(),
+        Err(error) => {
+            return match policy {
+                LockEnforcePolicy::Block => Err(CliError::fatal(format!(
+                    "lfs.lockEnforce=block: cannot resolve the remote for lock verification: \
+                     {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("use --offline to skip deliberately, or set lfs.lockEnforce warn")),
+                _ => {
+                    eprintln!("warning: lfs.lockEnforce: cannot resolve the remote: {error}");
+                    crate::utils::output::record_warning();
+                    Ok(())
+                }
+            };
+        }
+    };
+    let Some(remote_url) = remote_url else {
+        // Purely local repository: structural no-op.
+        tracing::debug!("lfs.lockEnforce: no remote configured; nothing to verify");
+        return Ok(());
+    };
+    let client = match LFSClient::from_remote_url(&remote_url) {
+        Ok(client) => client,
+        Err(error) => {
+            return match policy {
+                LockEnforcePolicy::Block => Err(CliError::fatal(format!(
+                    "lfs.lockEnforce=block: cannot reach the LFS server: {error}"
+                ))
+                .with_stable_code(StableErrorCode::NetworkUnavailable)
+                .with_hint("use --offline to skip deliberately, or set lfs.lockEnforce warn")),
+                _ => {
+                    eprintln!("warning: lfs.lockEnforce: cannot build the LFS client: {error}");
+                    crate::utils::output::record_warning();
+                    Ok(())
+                }
+            };
+        }
+    };
+    let request = VerifiableLockRequest {
+        refs: Ref { name: refspec },
+        cursor: None,
+        limit: None,
+    };
+    let (code, list) = match client.verify_locks(request).await {
+        Ok(result) => result,
+        Err(error) => {
+            // Transport failure.
+            return match policy {
+                LockEnforcePolicy::Block => Err(CliError::network(format!(
+                    "lfs.lockEnforce=block: lock verification failed: {error}"
+                ))
+                .with_hint("use --offline to skip deliberately, or set lfs.lockEnforce warn")),
+                _ => {
+                    eprintln!("warning: lfs.lockEnforce: lock verification failed: {error}");
+                    crate::utils::output::record_warning();
+                    Ok(())
+                }
+            };
+        }
+    };
+    if code == StatusCode::NOT_FOUND {
+        return Ok(()); // server has no locking API — mirror the push path
+    }
+    if code == StatusCode::FORBIDDEN {
+        return match policy {
+            LockEnforcePolicy::Block => Err(CliError::fatal(
+                "lfs.lockEnforce=block: you must have push access to verify locks",
+            )
+            .with_stable_code(StableErrorCode::AuthPermissionDenied)),
+            _ => {
+                eprintln!("warning: lfs.lockEnforce: no push access to verify locks");
+                crate::utils::output::record_warning();
+                Ok(())
+            }
+        };
+    }
+    if !code.is_success() {
+        // verify_locks already printed the server detail and returned an
+        // EMPTY list — an empty list on a 5xx is an unverified state, not a
+        // clean bill: apply the unreachable-server policy.
+        return match policy {
+            LockEnforcePolicy::Block => Err(CliError::network(format!(
+                "lfs.lockEnforce=block: lock verification returned HTTP {code}"
+            ))
+            .with_hint("use --offline to skip deliberately, or set lfs.lockEnforce warn")),
+            _ => {
+                crate::utils::output::record_warning();
+                Ok(())
+            }
+        };
+    }
+    // Only locks held by OTHERS gate the operation (ours = permission).
+    let offending: Vec<&Lock> = list
+        .theirs
+        .iter()
+        .filter(|lock| {
+            lfs_candidates
+                .iter()
+                .any(|candidate| candidate.as_str() == lock.path)
+        })
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    let describe = |lock: &Lock| {
+        let owner = lock
+            .owner
+            .as_ref()
+            .map(|user| user.name.clone())
+            .unwrap_or_else(|| "(unknown)".to_string());
+        format!(
+            "'{}' is locked by {} (lock id {})",
+            lock.path, owner, lock.id
+        )
+    };
+    match policy {
+        LockEnforcePolicy::Warn => {
+            for lock in &offending {
+                eprintln!("warning: {}", describe(lock));
+            }
+            crate::utils::output::record_warning();
+            Ok(())
+        }
+        LockEnforcePolicy::Block => {
+            let listing = offending
+                .iter()
+                .map(|lock| describe(lock))
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(CliError::fatal(format!(
+                "lfs.lockEnforce=block: {listing}"
+            ))
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("inspect with: libra lfs locks")
+            .with_hint(
+                "ask the owner to unlock, or set lfs.lockEnforce warn to proceed with a warning",
+            ))
+        }
+        LockEnforcePolicy::Off => Ok(()),
+    }
 }
 
 pub(crate) async fn current_refspec() -> Option<String> {

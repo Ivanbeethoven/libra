@@ -902,3 +902,354 @@ fn test_lfs_help_lists_examples_banner() {
         );
     }
 }
+
+// ── lore.md 2.8: lfs.lockEnforce warn|block gate ────────────────────────────
+
+/// Mock `POST /locks/verify` returning a canned ours/theirs split, with a
+/// hit counter so the zero-overhead default is assertable.
+fn locks_verify_router(
+    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    theirs_path: &str,
+) -> Router {
+    let theirs = theirs_path.to_string();
+    Router::new().route(
+        "/locks/verify",
+        axum::routing::post(move || {
+            hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = serde_json::json!({
+                "ours": [],
+                "theirs": [{
+                    "id": "lock-1",
+                    "path": theirs,
+                    "locked_at": "2026-01-01T00:00:00Z",
+                    "owner": { "name": "alice" }
+                }],
+                "next_cursor": ""
+            });
+            async move { axum::Json(body) }
+        }),
+    )
+}
+
+/// Scaffold: repo with a mock locks server, `*.bin` LFS-tracked, and one
+/// LFS-tracked file plus one plain file in the working tree.
+async fn lock_enforce_setup(
+    theirs_path: &str,
+) -> (TempDir, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let addr = spawn_mock_lfs_server(locks_verify_router(hits.clone(), theirs_path)).await;
+    let repo = init_repo_with_mock_remote(&format!("http://{addr}"));
+    let track = libra_command(repo.path())
+        .args(["lfs", "track", "*.bin"])
+        .output()
+        .expect("lfs track");
+    assert!(track.status.success());
+    std::fs::write(repo.path().join("asset.bin"), b"payload").expect("write asset");
+    std::fs::write(repo.path().join("plain.txt"), b"text").expect("write plain");
+    (repo, hits)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_enforce_off_by_default_zero_overhead() {
+    let (repo, hits) = lock_enforce_setup("asset.bin").await;
+    let add = libra_command(repo.path())
+        .args(["add", "asset.bin", "plain.txt"])
+        .output()
+        .expect("add");
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "unset policy must perform zero verify requests"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_enforce_warn_proceeds_with_warning() {
+    let (repo, hits) = lock_enforce_setup("asset.bin").await;
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "warn"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    let add = libra_command(repo.path())
+        .args(["add", "asset.bin"])
+        .output()
+        .expect("add");
+    assert!(add.status.success(), "warn must proceed");
+    let stderr = String::from_utf8_lossy(&add.stderr);
+    assert!(
+        stderr.contains("locked by alice") && stderr.contains("lock-1"),
+        "warning names owner and lock id: {stderr}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // Non-LFS files never trigger verification.
+    let add_plain = libra_command(repo.path())
+        .args(["add", "plain.txt"])
+        .output()
+        .expect("add plain");
+    assert!(add_plain.status.success());
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "plain file adds perform no verify request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_enforce_block_aborts_atomically_and_commit_gate_fires() {
+    let (repo, hits) = lock_enforce_setup("asset.bin").await;
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "block"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    let add = libra_command(repo.path())
+        .args(["add", "asset.bin"])
+        .output()
+        .expect("add");
+    assert!(!add.status.success(), "block must refuse");
+    let stderr = String::from_utf8_lossy(&add.stderr);
+    assert!(
+        stderr.contains("locked by alice") && stderr.contains("LBR-CONFLICT-002"),
+        "typed conflict with detail: {stderr}"
+    );
+    // Atomic: nothing staged.
+    let status = libra_command(repo.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("status");
+    assert!(
+        !String::from_utf8_lossy(&status.stdout)
+            .lines()
+            .any(|line| line.starts_with('A')),
+        "nothing staged after a blocked add"
+    );
+    // --dry-run never hits the network.
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let dry = libra_command(repo.path())
+        .args(["add", "--dry-run", "asset.bin"])
+        .output()
+        .expect("dry add");
+    assert!(dry.status.success(), "dry-run is a preview");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before);
+    // Commit gate: stage under warn, then block the commit itself.
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "warn"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    assert!(
+        libra_command(repo.path())
+            .args(["add", "asset.bin"])
+            .output()
+            .expect("add under warn")
+            .status
+            .success()
+    );
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "block"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    let commit = libra_command(repo.path())
+        .args(["commit", "-m", "blocked"])
+        .output()
+        .expect("commit");
+    assert!(!commit.status.success(), "commit gate fires");
+    assert!(
+        String::from_utf8_lossy(&commit.stderr).contains("locked by alice"),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    // Invalid value is a hard usage error (never silently off) — surfaced
+    // when an LFS-tracked path is actually staged (the gate reads config
+    // only after finding LFS candidates, preserving zero-overhead default).
+    // Modify the file so `add` has a real candidate to gate.
+    std::fs::write(repo.path().join("asset.bin"), b"changed payload").expect("modify asset");
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "blocc"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    let bad = libra_command(repo.path())
+        .args(["add", "asset.bin"])
+        .output()
+        .expect("add bad policy");
+    assert!(
+        !bad.status.success(),
+        "invalid config value must be a hard error"
+    );
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("invalid lfs.lockEnforce"),
+        "{}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_enforce_block_fails_closed_on_unreachable_server() {
+    // A realistic "no locking API" server returns 404 WITH a JSON error
+    // body (git-lfs spec). verify_locks returns Ok((404, empty)) without
+    // decoding, and both modes treat 404 as a clean no-op.
+    let addr = spawn_mock_lfs_server(Router::new().route(
+        "/locks/verify",
+        axum::routing::post(|| async {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({ "message": "not found" })),
+            )
+        }),
+    ))
+    .await;
+    let repo = init_repo_with_mock_remote(&format!("http://{addr}"));
+    assert!(
+        libra_command(repo.path())
+            .args(["lfs", "track", "*.bin"])
+            .output()
+            .expect("track")
+            .status
+            .success()
+    );
+    std::fs::write(repo.path().join("asset.bin"), b"payload").expect("write");
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "block"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    // 404 = server has no locking API → clean no-op (mirrors push).
+    let add = libra_command(repo.path())
+        .args(["add", "asset.bin"])
+        .output()
+        .expect("add");
+    assert!(
+        add.status.success(),
+        "404 no-locking-API is a documented no-op: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+}
+
+/// block + a 5xx server → FAIL CLOSED (an opted-in hard guarantee must not
+/// silently degrade); the same server under warn proceeds with a warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_enforce_block_fails_closed_on_server_error() {
+    let addr = spawn_mock_lfs_server(Router::new().route(
+        "/locks/verify",
+        axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+    ))
+    .await;
+    let repo = init_repo_with_mock_remote(&format!("http://{addr}"));
+    assert!(
+        libra_command(repo.path())
+            .args(["lfs", "track", "*.bin"])
+            .output()
+            .expect("track")
+            .status
+            .success()
+    );
+    std::fs::write(repo.path().join("asset.bin"), b"payload").expect("write");
+    // block: 5xx = unverified → fail closed.
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "block"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    let blocked = libra_command(repo.path())
+        .args(["add", "asset.bin"])
+        .output()
+        .expect("add block");
+    assert!(!blocked.status.success(), "block must fail closed on 5xx");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("LBR-NET-001"),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    // warn: advisory mode proceeds despite the 5xx.
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "warn"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    let warned = libra_command(repo.path())
+        .args(["add", "asset.bin"])
+        .output()
+        .expect("add warn");
+    assert!(
+        warned.status.success(),
+        "warn proceeds despite 5xx: {}",
+        String::from_utf8_lossy(&warned.stderr)
+    );
+}
+
+/// A lock on a file in a SUBDIRECTORY must be enforced even when `add` is
+/// invoked from that subdirectory (candidates are repo-root-relative and
+/// slash-normalized before matching the server's `sub/asset.bin` lock path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_enforce_matches_subdir_lock_from_subdir_cwd() {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let addr = spawn_mock_lfs_server(locks_verify_router(hits.clone(), "sub/asset.bin")).await;
+    let repo = init_repo_with_mock_remote(&format!("http://{addr}"));
+    assert!(
+        libra_command(repo.path())
+            .args(["lfs", "track", "*.bin"])
+            .output()
+            .expect("track")
+            .status
+            .success()
+    );
+    let subdir = repo.path().join("sub");
+    std::fs::create_dir_all(&subdir).expect("mkdir sub");
+    std::fs::write(subdir.join("asset.bin"), b"payload").expect("write");
+    assert!(
+        libra_command(repo.path())
+            .args(["config", "lfs.lockEnforce", "block"])
+            .output()
+            .expect("config")
+            .status
+            .success()
+    );
+    // Invoke `add asset.bin` FROM the subdirectory — the candidate must still
+    // resolve to the repo-root-relative `sub/asset.bin` lock path.
+    let add = libra_command(&subdir)
+        .args(["add", "asset.bin"])
+        .output()
+        .expect("add from subdir");
+    assert!(
+        !add.status.success(),
+        "subdir lock must be enforced: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&add.stderr).contains("sub/asset.bin"),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+}
