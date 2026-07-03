@@ -21,6 +21,7 @@
 //! on `src/command/*` — that direction is the CLI dispatch boundary.
 
 pub mod ai;
+pub mod alternates;
 pub mod auth;
 pub mod branch;
 pub mod config;

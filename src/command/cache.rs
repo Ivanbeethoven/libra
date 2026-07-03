@@ -73,6 +73,15 @@ async fn evict(
     use crate::utils::{error::StableErrorCode, storage::EvictRequest};
     crate::utils::util::require_repo()
         .map_err(|_| crate::utils::error::CliError::repo_not_found())?;
+    // lore.md 2.3 deletion safety: a shared base (repos borrow FROM it) must
+    // not evict a large object a borrower still needs — refuse while any live
+    // borrower exists (only for a real run; a dry run just previews).
+    if !dry_run && crate::internal::alternates::has_live_borrowers(&crate::utils::path::objects()) {
+        return Err(crate::utils::error::CliError::failure(
+            "cache eviction skipped: this store is shared (other repos borrow from it via              alternates); have borrowers run 'libra alternates remove' first",
+        )
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked));
+    }
     // Offline read policy forbids the durability probes the safety contract
     // requires — refuse rather than delete unverified.
     if crate::utils::read_policy::read_policy() == crate::utils::read_policy::ReadPolicy::LocalOnly

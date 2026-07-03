@@ -247,9 +247,13 @@ pub fn classify_presence(hash: &ObjectHash) -> ObjectPresence {
     if loose {
         return ObjectPresence::LooseOnly;
     }
-    // Packed presence: a storage `exist` that is true while the loose file is
-    // absent means it is inside a pack.
-    let storage = util::objects_storage();
+    // Packed presence: check the LOCAL store ONLY (no alternates — lore.md
+    // 2.3). Obliteration must never reach into a parent's borrowed store: an
+    // object resolvable only via an alternate is NOT ours to obliterate, so it
+    // classifies as Absent here and the driver refuses it. A local pack
+    // (present locally, not loose) is PackedOnly.
+    let storage =
+        crate::utils::client_storage::ClientStorage::init_local(crate::utils::path::objects());
     if storage.exist(hash) {
         ObjectPresence::PackedOnly
     } else {

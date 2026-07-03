@@ -128,6 +128,18 @@ async fn run_obliterate(
         return Ok(());
     }
 
+    // lore.md 2.3 deletion safety (Codex P1): if another repo borrows FROM
+    // this store, obliterating one of its objects could corrupt the borrower.
+    // Refuse while any live borrower exists.
+    if crate::internal::alternates::has_live_borrowers(&crate::utils::path::objects()) {
+        return Err(CliError::fatal(
+            "cannot obliterate: this store is shared (other repos borrow from it via \
+             alternates)",
+        )
+        .with_stable_code(StableErrorCode::ObliterateConfirm)
+        .with_hint("have borrowers run 'libra alternates remove' first, or dissociate them"));
+    }
+
     // Phase A — evaluate (read-only).
     let presence = obliteration::classify_presence(&hash);
     match presence {

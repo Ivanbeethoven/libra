@@ -357,6 +357,24 @@ async fn run_gc(
     output: &OutputConfig,
 ) -> CliResult<TaskResult> {
     let storage = ClientStorage::init(path::objects());
+    // lore.md 2.3 deletion safety: if another repo borrows FROM this store, a
+    // prune could delete an object it still needs (this store's reachability
+    // does not include the borrower's refs). Refuse to prune loose objects
+    // while any live borrower exists — the borrower must `alternates remove`
+    // (or dissociate) first. This makes the base's gc "never delete a
+    // borrowed object" AIRTIGHT.
+    if !dry_run && crate::internal::alternates::has_live_borrowers(&path::objects()) {
+        return Ok(TaskResult {
+            task: "gc".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: 0,
+            refs_packed: 0,
+            packs_repacked: 0,
+            message: "skipped loose-object prune: this store is shared (other repos borrow from                       it via alternates); have borrowers run 'libra alternates remove' first"
+                .to_string(),
+        });
+    }
     let reachable = collect_reachable_objects(&storage).await?;
     let all_loose = list_loose_objects(repo_path)
         .map_err(|e| CliError::fatal(format!("failed to list loose objects: {e}")))?;

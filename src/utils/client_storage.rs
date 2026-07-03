@@ -326,7 +326,7 @@ impl ClientStorage {
         let storage_type = match resolve_env_sync("LIBRA_STORAGE_TYPE") {
             Ok(Some(storage_type)) => storage_type,
             Ok(None) => {
-                return Arc::new(LocalStorage::new(base_path));
+                return Arc::new(LocalStorage::new_with_alternates(base_path));
             }
             Err(err) => {
                 return Self::storage_config_resolution_fallback(
@@ -352,7 +352,7 @@ impl ClientStorage {
             eprintln!(
                 "Warning: LIBRA_STORAGE_BUCKET cannot be empty. Falling back to local storage."
             );
-            return Arc::new(LocalStorage::new(base_path));
+            return Arc::new(LocalStorage::new_with_alternates(base_path));
         }
 
         // Build ObjectStore
@@ -392,7 +392,7 @@ impl ClientStorage {
                             "Warning: Invalid LIBRA_STORAGE_ENDPOINT URL: {}. Falling back to local storage.",
                             endpoint
                         );
-                        return Arc::new(LocalStorage::new(base_path));
+                        return Arc::new(LocalStorage::new_with_alternates(base_path));
                     }
                     builder = builder.with_endpoint(endpoint);
                 }
@@ -424,7 +424,7 @@ impl ClientStorage {
                         eprintln!(
                             "Warning: LIBRA_STORAGE_ACCESS_KEY cannot be empty. Falling back to local storage."
                         );
-                        return Arc::new(LocalStorage::new(base_path));
+                        return Arc::new(LocalStorage::new_with_alternates(base_path));
                     }
                     builder = builder.with_access_key_id(key);
                 }
@@ -443,7 +443,7 @@ impl ClientStorage {
                         eprintln!(
                             "Warning: LIBRA_STORAGE_SECRET_KEY cannot be empty. Falling back to local storage."
                         );
-                        return Arc::new(LocalStorage::new(base_path));
+                        return Arc::new(LocalStorage::new_with_alternates(base_path));
                     }
                     builder = builder.with_secret_access_key(secret);
                 }
@@ -474,7 +474,7 @@ impl ClientStorage {
                     "Warning: Unsupported storage type: {}. Falling back to local storage.",
                     storage_type
                 );
-                return Arc::new(LocalStorage::new(base_path));
+                return Arc::new(LocalStorage::new_with_alternates(base_path));
             }
         };
 
@@ -482,7 +482,7 @@ impl ClientStorage {
             Some(repo_id) => RemoteStorage::new_with_prefix(object_store, repo_id),
             None => RemoteStorage::new(object_store),
         };
-        let local = LocalStorage::new(base_path.clone());
+        let local = LocalStorage::new_with_alternates(base_path.clone());
 
         let threshold = match resolve_env_sync("LIBRA_STORAGE_THRESHOLD") {
             Ok(Some(raw_threshold)) => raw_threshold
@@ -537,7 +537,7 @@ impl ClientStorage {
             "Warning: failed to resolve {}: {}. Falling back to local storage.",
             name, error
         );
-        Arc::new(LocalStorage::new(base_path.to_path_buf()))
+        Arc::new(LocalStorage::new_with_alternates(base_path.to_path_buf()))
     }
 
     /// Helper to execute async task on dedicated runtime and block waiting for result.

@@ -36,7 +36,7 @@ Command Groups:
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, service
-  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file
+  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates
 
 Help Topics:
   error-codes  Print the stable CLI error code table (`libra help error-codes`)
@@ -367,6 +367,11 @@ enum Commands {
         after_help = command::file::FILE_EXAMPLES
     )]
     File(command::file::FileArgs),
+    #[command(
+        about = "Manage object alternates — borrow objects from a shared store (Libra extension)",
+        after_help = command::alternates::ALTERNATES_EXAMPLES
+    )]
+    Alternates(command::alternates::AlternatesArgs),
     #[command(
         name = "sparse-view",
         about = "Manage the read-only sparse view filter over ls-files/diff (Libra extension)",
@@ -1545,6 +1550,9 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
         Commands::Layer(cmd_args) => command::layer::execute_safe(cmd_args, &output).await?,
         Commands::File(cmd_args) => command::file::execute_safe(cmd_args, &output).await?,
+        Commands::Alternates(cmd_args) => {
+            command::alternates::execute_safe(cmd_args, &output).await?
+        }
         Commands::SparseView(cmd_args) => {
             command::sparse_view::execute_safe(cmd_args, &output).await?
         }

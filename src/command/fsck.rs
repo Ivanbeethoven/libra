@@ -467,6 +467,23 @@ async fn run_fsck(args: &FsckArgs) -> CliResult<FsckResult> {
     // snapshot so every seam below distinguishes obliterated objects from
     // corruption and does NOT flip the exit code (empty set = no-op).
     crate::internal::obliteration::refresh_snapshot().await;
+    // lore.md 2.3: a DANGLING alternate (a registered object dir that no longer
+    // exists / is not a readable object store) is an actionable ERROR — a
+    // borrowed read would fail — and MUST flip the exit code (Codex P1).
+    let mut dangling_alternate = false;
+    {
+        let objects_dir = path::objects();
+        for alt in crate::internal::alternates::list(&objects_dir) {
+            let readable = alt.is_dir()
+                && (alt.join("info").is_dir()
+                    || alt.join("pack").is_dir()
+                    || std::fs::read_dir(&alt).is_ok());
+            if !readable {
+                eprintln!("error: dangling object alternate: {}", alt.display());
+                dangling_alternate = true;
+            }
+        }
+    }
     // `--heal` repairs FIRST, so the checks below (and therefore the exit code)
     // observe the post-repair state. The repair itself is reported separately.
     let heal_report = if args.heal {
@@ -498,6 +515,13 @@ async fn run_fsck(args: &FsckArgs) -> CliResult<FsckResult> {
         check_all_objects(args, &storage).await?
     };
     result.heal = heal_report;
+    // lore.md 2.3: a dangling alternate is an integrity error (fails fsck).
+    if dangling_alternate {
+        result.has_errors = true;
+        if result.overall_status == CheckStatus::Ok {
+            result.overall_status = CheckStatus::Missing;
+        }
+    }
     Ok(result)
 }
 

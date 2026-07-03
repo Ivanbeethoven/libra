@@ -46,6 +46,11 @@ enum IdxVersion {
 pub struct LocalStorage {
     base_path: PathBuf,
     hash_kind: Option<HashKind>, // Capture hash kind from creation thread
+    /// lore.md 2.3: flattened, transitive alternate object stores this store
+    /// borrows FROM. Each is a plain (alternate-free) store, so a borrowed read
+    /// probes them without recursion. `Arc` keeps `LocalStorage` cheaply
+    /// cloneable and finitely-sized.
+    alternates: Vec<std::sync::Arc<LocalStorage>>,
 }
 
 impl LocalStorage {
@@ -59,6 +64,43 @@ impl LocalStorage {
         Self {
             base_path,
             hash_kind: Some(get_hash_kind()),
+            alternates: Vec::new(),
+        }
+    }
+
+    /// Open an existing object dir WITHOUT creating it (lore.md 2.3): an
+    /// alternate base may be missing or read-only, and auto-creating it would
+    /// mask a dangling alternate. No alternates of its own (the chain is
+    /// pre-flattened by the caller).
+    fn open_no_create(base_path: PathBuf) -> Self {
+        Self {
+            base_path,
+            hash_kind: Some(get_hash_kind()),
+            alternates: Vec::new(),
+        }
+    }
+
+    /// Build a store whose read path also consults the repo's alternate chain
+    /// (`objects/info/alternates`, transitive). Used by `ClientStorage::init`.
+    pub fn new_with_alternates(base_path: PathBuf) -> Self {
+        let mut store = Self::new(base_path.clone());
+        store.alternates = crate::internal::alternates::resolve_chain(&base_path)
+            .into_iter()
+            .map(|dir| std::sync::Arc::new(Self::open_no_create(dir)))
+            .collect();
+        store
+    }
+
+    /// Read an object's bytes from THIS store only (loose→pack), no alternates.
+    fn get_here(&self, hash: &ObjectHash) -> Result<Option<(Vec<u8>, ObjectType)>, GitError> {
+        if self.exist_loosely(hash) {
+            let raw_data = self.read_raw_data(hash)?;
+            let data = Self::decompress_zlib(&raw_data)?;
+            let (type_str, _, end_of_header) = Self::parse_header(&data)?;
+            let obj_type = ObjectType::from_string(&type_str)?;
+            Ok(Some((data[end_of_header + 1..].to_vec(), obj_type)))
+        } else {
+            Ok(self.get_from_pack(hash)?.map(|x| (x.0, x.1)))
         }
     }
 
@@ -526,18 +568,21 @@ impl Storage for LocalStorage {
             if let Some(kind) = self_clone.hash_kind {
                 set_hash_kind(kind);
             }
-            if self_clone.exist_loosely(&hash) {
-                let raw_data = self_clone.read_raw_data(&hash)?;
-                let data = Self::decompress_zlib(&raw_data)?;
-                let (type_str, _, end_of_header) = Self::parse_header(&data)?;
-                let obj_type = ObjectType::from_string(&type_str)?;
-                Ok((data[end_of_header + 1..].to_vec(), obj_type))
-            } else {
-                self_clone
-                    .get_from_pack(&hash)?
-                    .map(|x| (x.0, x.1))
-                    .ok_or(GitError::ObjectNotFound(hash.to_string()))
+            // Self first (loose -> pack).
+            if let Some(found) = self_clone.get_here(&hash)? {
+                return Ok(found);
             }
+            // lore.md 2.3: borrow from the alternate chain on a local miss.
+            // Every borrowed hit is FULL-BYTE OID-verified before it is
+            // returned, so a tampered/mismatched alternate can never poison a
+            // read (§7.6 read-verify).
+            for alt in &self_clone.alternates {
+                if let Some((payload, obj_type)) = alt.get_here(&hash)? {
+                    super::tiered::verify_fetched_object(&hash, obj_type, &payload)?;
+                    return Ok((payload, obj_type));
+                }
+            }
+            Err(GitError::ObjectNotFound(hash.to_string()))
         })
         .await
         .map_err(|e| GitError::IOError(io::Error::other(e)))?
@@ -596,8 +641,8 @@ impl Storage for LocalStorage {
                 return true;
             }
             match self_clone.get_from_pack(&hash) {
-                Ok(Some(_)) => true,
-                Ok(None) => false,
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
                 Err(err) => {
                     // exist() returns bool, so any pack-read failure is treated as "not present".
                     // Log so a corrupt pack doesn't silently cause re-fetch loops.
@@ -606,9 +651,19 @@ impl Storage for LocalStorage {
                         error = %err,
                         "failed to consult pack while checking object existence; assuming missing"
                     );
-                    false
                 }
             }
+            // lore.md 2.3: a borrowed-but-present object is NOT missing. VERIFY
+            // the borrowed bytes (Codex P2): a corrupt/tampered alternate must
+            // not make `exist` claim presence and cause fetch/connectivity code
+            // to skip a valid object. Only a byte-verified alternate hit counts.
+            self_clone.alternates.iter().any(|alt| {
+                matches!(
+                    alt.get_here(&hash),
+                    Ok(Some((ref payload, obj_type)))
+                        if super::tiered::verify_fetched_object(&hash, obj_type, payload).is_ok()
+                )
+            })
         })
         .await
         .unwrap_or(false)
