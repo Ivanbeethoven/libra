@@ -37,6 +37,7 @@ pub mod revision_ordinal;
 pub mod revision_ordinal_meta;
 pub mod schema_version;
 pub mod source_call_log;
+pub mod sparse_view;
 pub mod working_dirty;
 pub mod working_dirty_meta;
 

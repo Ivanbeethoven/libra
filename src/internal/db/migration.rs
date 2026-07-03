@@ -712,6 +712,14 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070601_object_obliteration.sql"),
             include_str!("../../../sql/migrations/2026070601_object_obliteration_down.sql"),
         ),
+        // lore.md 2.2: read-only sparse view include patterns. Owner:
+        // `internal::sparse::SparseViewStore`.
+        sql_migration(
+            2026070701,
+            "sparse_view",
+            include_str!("../../../sql/migrations/2026070701_sparse_view.sql"),
+            include_str!("../../../sql/migrations/2026070701_sparse_view_down.sql"),
+        ),
     ]
 }
 
@@ -840,9 +848,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 19);
+        assert_eq!(runner.len(), 20);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070601));
+        assert_eq!(runner.max_registered_version(), Some(2026070701));
     }
 
     #[test]

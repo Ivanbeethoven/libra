@@ -349,6 +349,12 @@ struct StatusData {
     /// as a one-line human advisory (lore.md 2.6). Merge has its own richer
     /// rendering; porcelain/JSON are unchanged.
     sequence_notice: Option<String>,
+    /// lore.md 2.2: a read-only sparse view is ACTIVELY filtering (enabled AND
+    /// non-empty AND compiled — matches SparseView::is_active). status itself
+    /// is NEVER filtered (it must stay honest about what commit will record);
+    /// this is only an advisory that ls-files/diff are scoped. An
+    /// enabled-but-empty view is a no-op, so no advisory.
+    sparse_view_active: bool,
     porcelain_v2: Option<PorcelainV2Data>,
 }
 
@@ -501,6 +507,9 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         upstream,
         merge_state,
         sequence_notice: sequence_notice().await,
+        sparse_view_active: crate::internal::sparse::SparseView::load()
+            .await
+            .is_active(),
         porcelain_v2,
     })
 }
@@ -1122,6 +1131,9 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         upstream,
         merge_state,
         sequence_notice: sequence_notice().await,
+        sparse_view_active: crate::internal::sparse::SparseView::load()
+            .await
+            .is_active(),
         porcelain_v2: None,
     };
 
@@ -1307,6 +1319,13 @@ fn render_human_status(
 
     if let Some(notice) = &data.sequence_notice {
         writeln!(buffer, "{notice}").map_err(write_error)?;
+    }
+    if data.sparse_view_active {
+        writeln!(
+            buffer,
+            "note: a sparse view is active (scopes 'ls-files'/'diff' output; status is not filtered)"
+        )
+        .map_err(write_error)?;
     }
     if let Some(merge_state) = &data.merge_state {
         render_merge_state_human(merge_state, buffer)?;

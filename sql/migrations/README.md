@@ -123,6 +123,7 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026070401`  | `sequence_state` | `2026070401_sequence_state{,_down}.sql` (lore.md 2.6: unified sequencer store; folds cherry-pick forward, drops the `cherry_pick_state`/`revert_sequence` legacy tables) |
 | `2026070501`  | `layer` | `2026070501_layer{,_down}.sql` (lore.md 2.4: `layer`+`layer_path` local-overlay side-tables; owner `internal::layer`) |
 | `2026070601`  | `object_obliteration` | `2026070601_object_obliteration{,_down}.sql` (lore.md 2.5: intentional-absence tombstone registry; owner `internal::obliteration`) |
+| `2026070701`  | `sparse_view` | `2026070701_sparse_view{,_down}.sql` (lore.md 2.2: read-only sparse view include patterns; owner `internal::sparse`) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no

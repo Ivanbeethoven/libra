@@ -531,6 +531,15 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     validate_diff_algorithm(&args).map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
     let mut result = run_diff(&args, output).await.map_err(CliError::from)?;
+    // lore.md 2.2: read-only sparse view — scope ONLY the working-tree diff
+    // (unstaged: new side is the worktree, not `--staged`, not rev-vs-rev), the
+    // one that is pure browsing. `--staged` (index-vs-HEAD, commit-authoritative)
+    // and `A..B` (rev-vs-rev) are NEVER filtered, so diff never hides what a
+    // commit will record. Applied on repo-root-relative paths BEFORE the
+    // `--relative` prefix strip.
+    if !result.external_diff_applied && !args.staged && args.new.is_none() {
+        apply_sparse_view_filter(&mut result).await;
+    }
     // External-driver output is verbatim: skip the internal relative-path rewrite
     // and word-diff transforms (they would mangle the driver's own format).
     if !result.external_diff_applied {
@@ -573,6 +582,26 @@ fn relative_prefix(args: &DiffArgs) -> Option<String> {
 /// root are no-ops. The file-set restriction is also applied (without path
 /// rewriting) inside `run_diff` before an external driver runs, so this rewrite
 /// pass is skipped for external output.
+/// lore.md 2.2: retain only in-view files in a working-tree diff and recompute
+/// the stat totals. A no-op when the view is inactive.
+async fn apply_sparse_view_filter(result: &mut DiffOutput) {
+    let view = crate::internal::sparse::SparseView::load().await;
+    if !view.is_active() {
+        return;
+    }
+    result.files.retain(|file| {
+        // A rename's old path counts as in-view too (either side visible).
+        view.contains_str(&file.path)
+            || file
+                .rename_from
+                .as_deref()
+                .is_some_and(|from| view.contains_str(from))
+    });
+    result.files_changed = result.files.len();
+    result.total_insertions = result.files.iter().map(|file| file.insertions).sum();
+    result.total_deletions = result.files.iter().map(|file| file.deletions).sum();
+}
+
 fn apply_relative_filter(args: &DiffArgs, result: &mut DiffOutput) {
     let Some(strip) = relative_prefix(args) else {
         return;

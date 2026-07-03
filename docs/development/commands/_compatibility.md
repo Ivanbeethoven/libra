@@ -113,6 +113,8 @@ flowchart TD
 - 状态：延后。Sparse checkout 依赖工作树配置和 skip-worktree 语义；Libra 已将 config/HEAD/refs 放入 SQLite，桥接成本高。
 - 重启条件：出现大型 monorepo 子树检出需求，并完成对象存储 + 部分检出的工程 RFC。
 
+- lore.md 2.2 landed the NON-declined complement: `libra sparse-view`, a strictly READ-ONLY view filter over `ls-files`/`diff` (working-tree) output that NEVER materializes or prunes the working tree, never writes skip-worktree bits, and never filters the to-be-committed set (status stays honest). The materializing `sparse-checkout` command and `clone --sparse` remain declined here.
+
 ### D15：跨命令 patch mode
 
 - 状态：拒绝。`add -p`、`commit -p`、`checkout -p`、`restore -p`、`reset -p`、`stash -p` 等交互式 patch mode 暂不进入当前兼容面。

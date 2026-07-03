@@ -152,18 +152,23 @@ struct ResolvedPathspec {
 
 pub async fn execute(args: LsFilesArgs) -> CliResult<()> {
     let output = OutputConfig::default();
-    let result = run_ls_files(&args)?;
+    let view = crate::internal::sparse::SparseView::load().await;
+    let result = run_ls_files(&args, &view)?;
     render_output(&result, &args, &output)?;
     Ok(())
 }
 
 pub async fn execute_safe(args: LsFilesArgs, output: &OutputConfig) -> CliResult<()> {
-    let result = run_ls_files(&args)?;
+    let view = crate::internal::sparse::SparseView::load().await;
+    let result = run_ls_files(&args, &view)?;
     render_output(&result, &args, output)?;
     Ok(())
 }
 
-fn run_ls_files(_args: &LsFilesArgs) -> CliResult<Vec<FileEntry>> {
+fn run_ls_files(
+    _args: &LsFilesArgs,
+    view: &crate::internal::sparse::SparseView,
+) -> CliResult<Vec<FileEntry>> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
     let workdir = util::working_dir();
     let current_dir = util::cur_dir();
@@ -332,6 +337,14 @@ fn run_ls_files(_args: &LsFilesArgs) -> CliResult<Vec<FileEntry>> {
                 status: "other".to_string(),
             });
         }
+    }
+
+    // lore.md 2.2: read-only sparse view — scope the listing to in-view paths.
+    // An UNMERGED entry (stage > 0) is ALWAYS shown so the view never hides an
+    // unresolved conflict. Applied before pathspec/error-unmatch so an
+    // out-of-view pathspec is treated as unmatched.
+    if view.is_active() {
+        entries.retain(|entry| entry.stage.unwrap_or(0) > 0 || view.contains_str(&entry.path));
     }
 
     entries = filter_entries_by_pathspec(entries, &pathspecs, &workdir);

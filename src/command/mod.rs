@@ -102,6 +102,7 @@ mod show_ref_check;
 mod show_ref_deref;
 mod show_ref_exclude_existing;
 mod show_ref_render;
+pub mod sparse_view;
 pub mod symbolic_ref;
 pub mod tag;
 pub mod update_index;
