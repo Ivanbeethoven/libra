@@ -54,6 +54,7 @@ pub mod graph;
 pub mod grep;
 pub mod hash_object;
 pub mod hooks;
+pub mod hydrate;
 pub mod index_pack;
 mod index_pack_support;
 mod index_pack_v1;

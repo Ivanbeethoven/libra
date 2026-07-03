@@ -31,7 +31,7 @@ use crate::{
 const ROOT_AFTER_HELP: &str = "\
 Command Groups:
   Repository Setup        init, clone, config, completions
-  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, layer, sparse-view, lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
+  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, layer, sparse-view, hydrate, lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
@@ -377,6 +377,11 @@ enum Commands {
         after_help = command::deps::DEPS_EXAMPLES
     )]
     Deps(command::deps::DepsArgs),
+    #[command(
+        about = "Hydrate working-tree content on demand (Libra extension)",
+        after_help = command::hydrate::HYDRATE_EXAMPLES
+    )]
+    Hydrate(command::hydrate::HydrateArgs),
     #[command(
         name = "sparse-view",
         about = "Manage the read-only sparse view filter over ls-files/diff (Libra extension)",
@@ -1559,6 +1564,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
             command::alternates::execute_safe(cmd_args, &output).await?
         }
         Commands::Deps(cmd_args) => command::deps::execute_safe(cmd_args, &output).await?,
+        Commands::Hydrate(cmd_args) => command::hydrate::execute_safe(cmd_args, &output).await?,
         Commands::SparseView(cmd_args) => {
             command::sparse_view::execute_safe(cmd_args, &output).await?
         }

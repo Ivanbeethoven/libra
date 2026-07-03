@@ -325,6 +325,7 @@ mod graph_test;
 mod grep_test;
 mod hash_object_test;
 mod hooks_help_test;
+mod hydrate_test;
 mod index_pack_keep_test;
 mod index_pack_progress_test;
 mod index_pack_stdin_test;
