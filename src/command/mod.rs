@@ -69,6 +69,8 @@ pub mod ls_files;
 pub mod ls_remote;
 pub mod ls_tree;
 pub mod maintenance;
+#[cfg(feature = "fastcdc")]
+pub mod media;
 pub mod merge;
 pub mod merge_base;
 pub mod merge_file;

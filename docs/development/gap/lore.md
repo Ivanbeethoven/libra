@@ -356,6 +356,27 @@ Libra 不应复制这些 Lore 机制：
 
 ## 6. 最后支持的特性：LFS FastCDC chunking
 
+> **实施状态（客户端 v1 ✅ 已落地；服务端协议冻结）**：诚实 v1 交付**严格 feature-gated
+> （`fastcdc`，默认关闭，`fastcdc = []` 纯 in-tree 无新依赖，对默认二进制/CI 零影响）的
+> 客户端底座**——`libra media chunk/inspect/verify/probe`（`src/utils/media/` +
+> `src/command/media.rs`）：in-tree 确定性 gear-hash FastCDC chunker（冻结 `fastcdc-v1` 参数
+> MIN 512K/AVG 2M/MAX 8M + splitmix64 GEAR 表）、版本化 manifest（`media_oid` 恒 SHA-256、
+> 独立于 `core.objectformat`、与标准 LFS pointer 逐字节一致；`crc32c` 字段 v1 留空避免把
+> IEEE crc32 烙进 frozen schema）、私有 `.libra/media/` 内容寻址 chunk store（`objects/` 兄弟、
+> chunk **绝不**成 Git object ID、读时 sha256 重校验）、verify-then-rename 重组（绝无坏文件）、
+> 以及 §6.4 **安全回退协商**（能力探测经 `retry_idempotent` §0.2 退避；`negotiate()` 纯函数：
+> 全绿默认 Chunked、任一疑点回退标准 LFS、服务端拒 fallback + 本地无 fallback → **Block** 绝不
+> chunk-only 半写；`ProbeOutcome` 区分 NoEndpoint/ServerErrorAfterBackoff/Ok）。**冻结/延后**：
+> §6.5–6.8 全部服务端协议（真实跨机 chunked 上传/下载、finalize 生命周期、GC/fsck/heal、
+> **每条 §6.7 反侧信道保证均为服务端义务**）+ chunk-only 策略 + 接进 live LFS 热路径 + 纯 git
+> 客户端 bridge——故对今天任何可达远端，探测都回退标准 Git LFS。测试：media 单测（chunker
+> 确定性+退化契约、manifest 往返+校验、negotiate 全矩阵含 all-green→Chunked 正例、chunk-store
+> 原始字节+重校验、capability 分类）+ 集成 `tests/media_fastcdc_test.rs`（chunk--store/verify
+> 往返、坏 chunk 干净失败、probe 不可达回退）+ `compat_fastcdc_feature_gate_guard` 常驻钉门控。
+> 规划经多智能体工作流（Understand→Design→三面对抗审阅：安全/门控 NEEDS_REVISION→已修
+> negotiate 优先级+正例、可行性 SOUND、诚实/侧信道 SOUND）+ Codex 两轮（backoff 非 §0.2 +
+> banner guard cfg → 已修 → APPROVE）。以下 §6.1–6.10 为完整设计规范（客户端 + 冻结的服务端）。
+
 ### 6.1 为什么必须最后做
 
 LFS FastCDC chunking 的目标是把大文件按内容定义边界切成 chunk，在多个版本、多个 clone、多个客户端之间复用相同 chunk，从而降低传输、存储和水合成本。这个能力接近 Lore 的 binary-first 优势，但它不能早做，原因是：

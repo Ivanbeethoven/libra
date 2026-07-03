@@ -152,4 +152,24 @@ fn every_visible_command_help_renders_examples_section() {
          (or wiring after_help on the subcommand binding in src/cli.rs \
          for subcommand-style commands; see e.g. Stash / Remote / Lfs)."
     );
+
+    // The `media` command (lore.md §6) is a cfg-gated `Commands` variant absent
+    // from the static `VISIBLE_COMMANDS` list, so it is only checkable when the
+    // `fastcdc` feature is on. Under `--features fastcdc` the compiled `libra`
+    // binary exposes it, so assert its EXAMPLES banner here (feature-off, this
+    // block compiles out and `media` does not exist).
+    #[cfg(feature = "fastcdc")]
+    {
+        let output = run(&["media", "--help"]);
+        assert!(
+            output.status.success(),
+            "`libra media --help` should succeed; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("EXAMPLES:") || stdout.contains("Examples:"),
+            "`libra media --help` must render an EXAMPLES section (feature fastcdc)"
+        );
+    }
 }

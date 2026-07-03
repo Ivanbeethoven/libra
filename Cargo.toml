@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.17.1831"
+version = "0.17.1832"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -18,6 +18,7 @@ test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
 test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
 test-provider  = []   # deterministic hidden provider for local TUI automation tests
+fastcdc        = []   # lore.md §6: default-OFF FastCDC LFS media chunking client substrate (no new deps; reuses ring sha256; server protocol frozen)
 subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/commands/agent.md "Step 2 audit closure")
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]  # lore.md 1.7: OTLP trace export (default binary unaffected)
 keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release builds enable it; default dev builds unaffected)
@@ -276,6 +277,10 @@ path = "tests/compat/format_patch_flag_surface.rs"
 [[test]]
 name = "compat_otlp_feature_gate_guard"
 path = "tests/compat/otlp_feature_gate_guard.rs"
+
+[[test]]
+name = "compat_fastcdc_feature_gate_guard"
+path = "tests/compat/fastcdc_feature_gate_guard.rs"
 
 [[test]]
 name = "compat_keyring_feature_gate_guard"

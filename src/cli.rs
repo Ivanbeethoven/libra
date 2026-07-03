@@ -28,10 +28,31 @@ use crate::{
     },
 };
 
-const ROOT_AFTER_HELP: &str = "\
+// The `media` command (lore.md §6) is a cfg-gated `Commands` variant, so its
+// Command-Groups entry must appear ONLY under `--features fastcdc` — otherwise
+// the default-features compat matrix (which cross-checks every listed command
+// against the real CLI surface) would see a command that does not exist. A
+// cfg-selected macro fragment splices it into the Working Tree row.
+#[cfg(feature = "fastcdc")]
+macro_rules! media_group_entry {
+    () => {
+        ", media"
+    };
+}
+#[cfg(not(feature = "fastcdc"))]
+macro_rules! media_group_entry {
+    () => {
+        ""
+    };
+}
+
+const ROOT_AFTER_HELP: &str = concat!(
+    "\
 Command Groups:
   Repository Setup        init, clone, config, completions
-  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, layer, sparse-view, hydrate, lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
+  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, layer, sparse-view, hydrate",
+    media_group_entry!(),
+    ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
@@ -49,7 +70,8 @@ Output Examples:
   libra --color=never log              Force-disable colors (also via NO_COLOR=1)
 
 For per-command flags, see `libra <cmd> --help`.
-";
+"
+);
 
 const ERROR_CODES_HELP: &str = include_str!("../docs/error-codes.md");
 
@@ -382,6 +404,12 @@ enum Commands {
         after_help = command::hydrate::HYDRATE_EXAMPLES
     )]
     Hydrate(command::hydrate::HydrateArgs),
+    #[cfg(feature = "fastcdc")]
+    #[command(
+        about = "FastCDC LFS media chunking client (Libra extension, lore.md §6)",
+        after_help = command::media::MEDIA_EXAMPLES
+    )]
+    Media(command::media::MediaArgs),
     #[command(
         name = "sparse-view",
         about = "Manage the read-only sparse view filter over ls-files/diff (Libra extension)",
@@ -1565,6 +1593,8 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         }
         Commands::Deps(cmd_args) => command::deps::execute_safe(cmd_args, &output).await?,
         Commands::Hydrate(cmd_args) => command::hydrate::execute_safe(cmd_args, &output).await?,
+        #[cfg(feature = "fastcdc")]
+        Commands::Media(cmd_args) => command::media::execute_safe(cmd_args, &output).await?,
         Commands::SparseView(cmd_args) => {
             command::sparse_view::execute_safe(cmd_args, &output).await?
         }

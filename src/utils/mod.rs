@@ -13,6 +13,8 @@ pub mod d1_client;
 pub mod ignore;
 pub mod lfs;
 pub mod log_config;
+#[cfg(feature = "fastcdc")]
+pub mod media;
 pub mod object;
 pub mod object_ext;
 pub mod pager;

@@ -22,6 +22,23 @@ pub fn try_objects() -> io::Result<PathBuf> {
     Ok(util::try_get_storage_path(None)?.join("objects"))
 }
 
+/// FastCDC media chunk store root (lore.md §6): a physical SIBLING of
+/// `objects/`, wholly outside the Git object graph. Content-addressed chunk
+/// files live under `media/chunks/<ab>/<chunk_hash>`; it is NEVER walked as a
+/// loose-object store. Gated behind the `fastcdc` feature at the call sites.
+#[cfg(feature = "fastcdc")]
+pub fn media_chunks() -> PathBuf {
+    util::storage_path().join("media").join("chunks")
+}
+
+/// FastCDC media manifest store root (lore.md §6): content-addressed manifest
+/// JSON files under `media/manifests/<media_oid>.json`. Sibling of `objects/`,
+/// outside the Git object graph.
+#[cfg(feature = "fastcdc")]
+pub fn media_manifests() -> PathBuf {
+    util::storage_path().join("media").join("manifests")
+}
+
 pub fn database() -> PathBuf {
     util::storage_path().join(util::DATABASE)
 }
