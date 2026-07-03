@@ -152,64 +152,71 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
     Ok(Some((objectformat, tiered)))
 }
 
+/// Register `base_objects` as an alternate of `clone_objects` (lore.md 2.3),
+/// applying the full guard set (self-reference, fail-closed objectformat, and
+/// tiered-base refusal) and the dual alternates/borrowers write. Shared by the
+/// `alternates add` command and the 2.11 clone auto-register hook.
+pub(crate) async fn guarded_add(
+    clone_objects: &Path,
+    base_objects: &Path,
+    this_object_format: &str,
+) -> CliResult<()> {
+    // Refuse a self-reference.
+    let me = std::fs::canonicalize(clone_objects).unwrap_or_else(|_| clone_objects.to_path_buf());
+    if std::fs::canonicalize(base_objects).unwrap_or_else(|_| base_objects.to_path_buf()) == me {
+        return Err(CliError::fatal("a repository cannot borrow from itself")
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+    // Fail-CLOSED objectformat + tiered guards: an unreadable base config
+    // REFUSES the borrow rather than allowing a cross-hash / tiered base.
+    match read_foreign_config(base_objects).await {
+        Ok(Some((base_fmt, tiered))) => {
+            if base_fmt != this_object_format {
+                return Err(CliError::fatal(format!(
+                    "cannot borrow from an object store with core.objectformat '{base_fmt}' \
+                     (this repo is '{this_object_format}')"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+            if tiered {
+                return Err(CliError::fatal(
+                    "cannot borrow from a tiered (s3/r2) object store — a local alternate \
+                     cannot reach its remote tier",
+                )
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("clone/copy the base locally, or use a non-tiered base"));
+            }
+        }
+        // No DB → a plain-git base, implicitly sha1, non-tiered.
+        Ok(None) => {
+            if this_object_format != "sha1" {
+                return Err(CliError::fatal(format!(
+                    "cannot borrow from a base with no Libra config (assumed sha1) while this \
+                     repo is '{this_object_format}'"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+        }
+        Err(e) => {
+            return Err(CliError::fatal(format!(
+                "cannot verify the base repository's config; refusing to borrow: {e}"
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid));
+        }
+    }
+    alternates::add(clone_objects, base_objects).map_err(|e| {
+        CliError::fatal(format!("failed to register the alternate: {e}"))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })
+}
+
 pub async fn execute_safe(args: AlternatesArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
     let objects_dir = path::objects();
     match args.command {
         AlternatesCommand::Add { path: input } => {
             let alt = resolve_objects_dir(&input)?;
-            // Refuse a self-reference.
-            let me = std::fs::canonicalize(&objects_dir).unwrap_or_else(|_| objects_dir.clone());
-            if std::fs::canonicalize(&alt).unwrap_or_else(|_| alt.clone()) == me {
-                return Err(CliError::fatal("a repository cannot borrow from itself")
-                    .with_stable_code(StableErrorCode::CliInvalidArguments));
-            }
-            // Fail-CLOSED objectformat + tiered guards (Codex P1): an
-            // unreadable base config REFUSES the borrow rather than allowing a
-            // possibly cross-hash / tiered base.
-            match read_foreign_config(&alt).await {
-                Ok(Some((base_fmt, tiered))) => {
-                    let mine = this_object_format();
-                    if base_fmt != mine {
-                        return Err(CliError::fatal(format!(
-                            "cannot borrow from an object store with core.objectformat \
-                             '{base_fmt}' (this repo is '{mine}')"
-                        ))
-                        .with_stable_code(StableErrorCode::CliInvalidArguments));
-                    }
-                    if tiered {
-                        return Err(CliError::fatal(
-                            "cannot borrow from a tiered (s3/r2) object store — a local \
-                             alternate cannot reach its remote tier",
-                        )
-                        .with_stable_code(StableErrorCode::CliInvalidArguments)
-                        .with_hint("clone/copy the base locally, or use a non-tiered base"));
-                    }
-                }
-                // No DB → a plain-git base, implicitly sha1, non-tiered. Still
-                // apply the objectformat guard (Codex: a sha256 repo must NOT
-                // borrow an implicit-sha1 store).
-                Ok(None) => {
-                    let mine = this_object_format();
-                    if mine != "sha1" {
-                        return Err(CliError::fatal(format!(
-                            "cannot borrow from a base with no Libra config (assumed sha1) \
-                             while this repo is '{mine}'"
-                        ))
-                        .with_stable_code(StableErrorCode::CliInvalidArguments));
-                    }
-                }
-                Err(e) => {
-                    return Err(CliError::fatal(format!(
-                        "cannot verify the base repository's config; refusing to borrow: {e}"
-                    ))
-                    .with_stable_code(StableErrorCode::RepoStateInvalid));
-                }
-            }
-            alternates::add(&objects_dir, &alt).map_err(|e| {
-                CliError::fatal(format!("failed to register the alternate: {e}"))
-                    .with_stable_code(StableErrorCode::IoWriteFailed)
-            })?;
+            guarded_add(&objects_dir, &alt, &this_object_format()).await?;
             if !output.quiet && !output.is_json() {
                 println!("registered alternate {}", alt.display());
             }

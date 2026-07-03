@@ -190,12 +190,20 @@ pub struct CloneArgs {
     #[clap(long = "reference-if-able", value_name = "repo")]
     pub reference_if_able: Vec<String>,
 
-    /// Share objects with a local source via alternates instead of copying
-    /// (Git's `--shared`/`-s`). Accepted for compatibility but a no-op with a
-    /// warning: Libra always copies objects (no alternates), so the clone is
-    /// self-contained rather than sharing the source's object store.
+    /// Share objects with a local source via alternates (Git's `--shared`/`-s`,
+    /// lore.md 2.11). For a LOCAL Libra source, registers the source's object
+    /// store as an alternate of the clone (borrowed reads + base gc/evict
+    /// protection). NOTE: v1 still COPIES every object — the register only adds
+    /// the borrow link and base protection; disk copy-avoidance is deferred.
+    /// A no-op (warning) for a remote or local-Git source. Can also default via
+    /// `clone.shared` config; override with `--no-shared`.
     #[clap(long = "shared", short = 's')]
     pub shared: bool,
+
+    /// Countermand `--shared` / a `clone.shared=true` default: do NOT register
+    /// the source as an alternate (lore.md 2.11). Last one wins with `--shared`.
+    #[clap(long = "no-shared", overrides_with = "shared")]
+    pub no_shared: bool,
 
     /// Copy borrowed objects in so the clone does not depend on `--reference`
     /// (Git's `--dissociate`). Accepted for compatibility and a no-op: Libra
@@ -259,12 +267,15 @@ pub struct CloneArgs {
 /// and `--dissociate` are intentionally silent (Git's `-if-able` silently
 /// ignores an unusable reference, and a copy-only clone is already dissociated).
 fn object_alternates_warning(args: &CloneArgs) -> Option<String> {
-    if args.reference.is_empty() && !args.shared {
+    // `--reference` is still a genuine no-op (copy-avoidance deferred).
+    // `--shared` messaging is handled at the clone hook (took-effect vs
+    // can't-share), so it is NOT warned here.
+    if args.reference.is_empty() {
         return None;
     }
     Some(
-        "--reference/--shared have no effect: Libra has no object alternates and \
-         always copies every object into the clone, so it is already self-contained"
+        "--reference has no effect: Libra has no fetch-side alternate negotiation yet and \
+         always copies every object into the clone (use 'libra alternates add' to borrow)"
             .to_string(),
     )
 }
@@ -3107,12 +3118,27 @@ fn validate_cloud_revision_selector(input: &str, value: &str) -> Result<(), Clon
 async fn clone_into_destination(
     args: &CloneArgs,
     remote_url: &str,
-    _remote_client: &fetch::RemoteClient,
+    remote_client: &fetch::RemoteClient,
     discovery: &DiscoveryResult,
     local_path: &Path,
     original_dir: &Path,
     output: &OutputConfig,
 ) -> Result<CloneOutput, CloneError> {
+    // lore.md 2.11: resolve the effective `--shared` decision BEFORE cwd
+    // changes into the new (empty) clone — a per-repo `clone.shared` in the
+    // directory being cloned FROM should count, and the fresh clone has no
+    // config yet.
+    let config_shared = crate::internal::config::read_cascaded_config_value(
+        clone_config_local_target(),
+        "clone.shared",
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|v| matches!(v.trim(), "true" | "1" | "yes" | "on"))
+    .unwrap_or(false);
+    let effective_shared = !args.dissociate && !args.no_shared && (args.shared || config_shared);
+
     #[cfg(test)]
     let _cwd_lock = crate::utils::test::cwd_lock_guard();
     env::set_current_dir(local_path).map_err(|source| CloneError::ChangeDirectory {
@@ -3205,6 +3231,50 @@ async fn clone_into_destination(
     )
     .await?;
 
+    // lore.md 2.11: auto-register the source as an object alternate for a LOCAL
+    // LIBRA source (a Git source's `git gc` does not consult Libra's borrowers
+    // file, so it is never safe). NON-FATAL: any failure (a guard refusal OR an
+    // io write, e.g. a read-only source) warns and continues — the clone
+    // already copied everything and must not fail over a shared-store link.
+    let mut shared_warnings: Vec<String> = Vec::new();
+    if effective_shared {
+        if let fetch::RemoteClient::Local(client) = remote_client {
+            if client.is_libra_source() {
+                let base_objects = client.repo_path().join("objects");
+                let clone_objects = path::objects();
+                match command::alternates::guarded_add(
+                    &clone_objects,
+                    &base_objects,
+                    &object_format,
+                )
+                .await
+                {
+                    Ok(()) if !output.quiet => shared_warnings.push(format!(
+                        "shared: registered {} as an object alternate (reads borrow from it; \
+                         v1 still copied every object)",
+                        base_objects.display()
+                    )),
+                    Ok(()) => {}
+                    Err(e) => shared_warnings.push(format!(
+                        "--shared: could not register the source as an alternate (continuing \
+                         — the clone is self-contained): {e}"
+                    )),
+                }
+            } else if args.shared {
+                shared_warnings.push(
+                    "--shared has no effect: the source is a local Git repo, not a Libra repo"
+                        .to_string(),
+                );
+            }
+        } else if args.shared {
+            shared_warnings.push(
+                "--shared has no effect: sharing an object store is only possible for a LOCAL \
+                 Libra source"
+                    .to_string(),
+            );
+        }
+    }
+
     // `--mirror`: turn the standard tracking-ref layout into a mirror — every
     // fetched branch becomes a local `refs/heads/*` ref and the
     // `refs/remotes/<name>/*` tracking refs are dropped — and record the
@@ -3229,6 +3299,7 @@ async fn clone_into_destination(
     }
 
     let mut warnings = init_output.warnings.clone();
+    warnings.extend(shared_warnings);
     warnings.extend(object_alternates_warning(args));
     warnings.extend(unsupported_fetch_optimization_warnings(args));
     let mut gitignore_converted = Vec::new();
@@ -3862,6 +3933,7 @@ mod tests {
             reference: vec![],
             reference_if_able: vec![],
             shared: false,
+            no_shared: false,
             dissociate: false,
             mirror: false,
             filter: None,
@@ -4230,6 +4302,7 @@ mod tests {
             reference: vec![],
             reference_if_able: vec![],
             shared: false,
+            no_shared: false,
             dissociate: false,
             mirror: false,
             filter: None,
@@ -4332,6 +4405,7 @@ mod tests {
             reference: vec![],
             reference_if_able: vec![],
             shared: false,
+            no_shared: false,
             dissociate: false,
             mirror: false,
             filter: None,
@@ -4422,6 +4496,7 @@ mod tests {
             reference: vec![],
             reference_if_able: vec![],
             shared: false,
+            no_shared: false,
             dissociate: false,
             mirror: false,
             filter: None,
@@ -4502,6 +4577,7 @@ mod tests {
             reference: vec![],
             reference_if_able: vec![],
             shared: false,
+            no_shared: false,
             dissociate: false,
             mirror: false,
             filter: None,
@@ -4579,6 +4655,7 @@ mod tests {
             reference: vec![],
             reference_if_able: vec![],
             shared: false,
+            no_shared: false,
             dissociate: false,
             mirror: false,
             filter: None,

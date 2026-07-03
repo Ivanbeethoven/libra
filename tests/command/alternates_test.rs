@@ -169,3 +169,82 @@ fn shared_base_refuses_obliterate() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+// ── lore.md 2.11: default shared-store (clone --shared / clone.shared) ──────
+
+#[test]
+fn clone_shared_registers_alternate_for_local_libra_source() {
+    let (base, _oid) = committed_repo("base");
+    let dest = tempfile::tempdir().expect("dest parent");
+    let clone_path = dest.path().join("clone");
+
+    // `clone --shared <local libra src>` registers the source as an alternate
+    // (v1 still copies, but the borrow link + base protection are established).
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--shared",
+            base.path().to_str().unwrap(),
+            clone_path.to_str().unwrap(),
+        ],
+        dest.path(),
+    );
+    assert_cli_success(&out, "clone --shared");
+    let alts = run_libra_command(&["alternates", "list"], &clone_path);
+    assert!(
+        String::from_utf8_lossy(&alts.stdout).contains(".libra/objects"),
+        "alternate registered: {}",
+        String::from_utf8_lossy(&alts.stdout)
+    );
+    // The base is now a protected shared store.
+    let borrowers = base.path().join(".libra/objects/info/borrowers");
+    assert!(borrowers.exists(), "base has a borrowers file");
+}
+
+#[test]
+fn plain_clone_registers_no_alternate_by_default() {
+    let (base, _oid) = committed_repo("base");
+    let dest = tempfile::tempdir().expect("dest parent");
+    let clone_path = dest.path().join("clone");
+    // Default OFF: a plain clone (no --shared, no config) registers nothing.
+    let out = run_libra_command(
+        &[
+            "clone",
+            base.path().to_str().unwrap(),
+            clone_path.to_str().unwrap(),
+        ],
+        dest.path(),
+    );
+    assert_cli_success(&out, "plain clone");
+    let alts = run_libra_command(&["alternates", "list"], &clone_path);
+    assert!(
+        String::from_utf8_lossy(&alts.stdout).contains("no alternates"),
+        "no alternate by default: {}",
+        String::from_utf8_lossy(&alts.stdout)
+    );
+}
+
+#[test]
+fn clone_no_shared_overrides_shared() {
+    let (base, _oid) = committed_repo("base");
+    let dest = tempfile::tempdir().expect("dest parent");
+    let clone_path = dest.path().join("clone");
+    // --no-shared wins over --shared.
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--shared",
+            "--no-shared",
+            base.path().to_str().unwrap(),
+            clone_path.to_str().unwrap(),
+        ],
+        dest.path(),
+    );
+    assert_cli_success(&out, "clone --shared --no-shared");
+    let alts = run_libra_command(&["alternates", "list"], &clone_path);
+    assert!(
+        String::from_utf8_lossy(&alts.stdout).contains("no alternates"),
+        "--no-shared overrides: {}",
+        String::from_utf8_lossy(&alts.stdout)
+    );
+}

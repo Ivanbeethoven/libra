@@ -163,6 +163,13 @@ impl ProtocolClient for LocalClient {
 }
 
 impl LocalClient {
+    /// Whether the source is a Libra repository (vs a plain Git repo). Object
+    /// alternates auto-registration (lore.md 2.11) is gated on this — a Git
+    /// source's `git gc` does not consult Libra's borrowers file.
+    pub fn is_libra_source(&self) -> bool {
+        matches!(self.source_type, RepoType::LibraRepo)
+    }
+
     async fn with_repo_current_dir<T, E, F, Fut>(&self, operation: F) -> Result<T, E>
     where
         E: From<IoError>,
