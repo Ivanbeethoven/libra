@@ -671,21 +671,21 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **验收标准**：
 
-- [ ] `libra agent list` 输出 focused capability matrix，`--json` 带 schema/version 字段。
-- [ ] `libra agent add <name>` 与 `enable --agent <name>` 同语义、同退出码、同 JSON shape。
-- [ ] `libra agent remove <name>` 与 `disable --agent <name>` 同语义、同退出码、同 JSON shape。
-- [ ] 无参 `add/remove` 的行为与无参 `enable/disable` 一致，并只作用于 supported/installable roster。
-- [ ] 非首批 agent 返回 actionable unsupported，不写 hook、不创建 session/checkpoint、不把 `installed` 标为 true。
-- [ ] 曾 supported 的非首批 agent（如 `gemini`，现为 `STABLE_AGENT_SLUGS` 成员且 hooks 可安装）保留 **uninstall-only 通道**：`remove <name>` / `disable --agent <name>` 可卸载已安装的 Libra-managed hooks、幂等、卸载后不允许再 add/enable；仅 add/enable 返回 actionable unsupported。
-- [ ] remove/disable 卸载语义按 `agent.md` 既有锚点验收：provider 配置文件中仅 Libra-managed entry 被移除（codex 另按 `agent.md` 处理 Libra 写入的 features/`[hooks.state]` 项）、用户条目语义等价保留、已捕获的 agent_session/agent_checkpoint/refs/libra/traces 数据不删除；卸载后 `agent list --json` 显示 `installed=false` 且 `hook_installable=true`；对未安装状态重复 remove 幂等（exit 0 或明确提示，不报错误栈）。
+- [x] `libra agent list` 输出 focused capability matrix，`--json` 带 schema/version 字段。
+- [x] `libra agent add <name>` 与 `enable --agent <name>` 同语义、同退出码、同 JSON shape。
+- [x] `libra agent remove <name>` 与 `disable --agent <name>` 同语义、同退出码、同 JSON shape。
+- [x] 无参 `add/remove` 的行为与无参 `enable/disable` 一致，并只作用于 supported/installable roster。
+- [x] 非首批 agent 返回 actionable unsupported，不写 hook、不创建 session/checkpoint、不把 `installed` 标为 true。
+- [x] 曾 supported 的非首批 agent（如 `gemini`，现为 `STABLE_AGENT_SLUGS` 成员且 hooks 可安装）保留 **uninstall-only 通道**：`remove <name>` / `disable --agent <name>` 可卸载已安装的 Libra-managed hooks、幂等、卸载后不允许再 add/enable；仅 add/enable 返回 actionable unsupported。
+- [x] remove/disable 卸载语义按 `agent.md` 既有锚点验收：provider 配置文件中仅 Libra-managed entry 被移除（codex 另按 `agent.md` 处理 Libra 写入的 features/`[hooks.state]` 项）、用户条目语义等价保留、已捕获的 agent_session/agent_checkpoint/refs/libra/traces 数据不删除；卸载后 `agent list --json` 显示 `installed=false` 且 `hook_installable=true`；对未安装状态重复 remove 幂等（exit 0 或明确提示，不报错误栈）。
 
 **验证**：
 
-- [ ] `cargo test --test command_test agent_list_add_remove_aliases_parse`
-- [ ] `cargo test --test command_test agent_list_json_contains_capability_fields`
-- [ ] `cargo test --test command_test agent_add_non_hook_installable_returns_actionable_unsupported`
-- [ ] `cargo test --test command_test agent_remove_gemini_uninstalls_legacy_hooks_idempotent`
-- [ ] `cargo test --test command_test agent_remove_preserves_user_hook_entries`
+- [x] `cargo test --test command_test agent_list_add_remove_aliases_parse`
+- [x] `cargo test --test command_test agent_list_json_contains_capability_fields`
+- [x] `cargo test --test command_test agent_add_non_hook_installable_returns_actionable_unsupported`
+- [x] `cargo test --test command_test agent_remove_gemini_uninstalls_legacy_hooks_idempotent`
+- [x] `cargo test --test command_test agent_remove_preserves_user_hook_entries`
 
 **依赖**：Task A1。
 
@@ -1585,3 +1585,4 @@ cargo test --lib cli::tests::root_after_help_lists_every_visible_command
 | 2026-07-04 | Task 0.4 事实源文档自洽清理 | 完成 | 0.18.2 | 本行所在提交 | `docs/development/internal/code-agent-runtime.md` 共 45 处编辑：11 处 `](commands/agent.md)` 链接（含 :2971 短形态）重指 `../tracing/agent.md` 并同步链接文字、4 处 `](commands/_general.md)` href 修正相对深度 `../commands/_general.md`、13 处 `](mcp.md)` 链接全部转为不可点击历史标注（涉当前边界的句子重定向 `docs/development/tracing/code.md` C6，已核实 code.md 确有 C6 承接该边界）、:2678 自链接改纯文本、15 处 prose/验证命令旧根路径重指（含 :958/:2675/:2788/:2793 四条 drift rg 命令的路径实参）。四条验证命令全部 PASS（test ! -e 五文件、两条否定 rg 断言零命中、正面断言 4 文件均有新路径命中）。codex review 第一轮 FAIL（bare `commands/agent.md` 裸述 5 行 + bare `mcp.md` 裸述 3 行——链接形态正则扫不到的残留）→ 修复 10 处 → 第二轮 VERDICT: PASS（全文件扫描确认 `docs/commands/agent.md` 公共文档路径正确保留）。fmt 全绿；本卡纯文档改动零 Rust 变更，clippy 沿用 Task 0.3 最终树结论；`cargo test --all` 与 Task 0.3 同口径（10 个既有失败按 §0.4 豁免，另见 Task 0.3 行）。推送仍待 ruleset bypass |
 | 2026-07-04 | Task 0.2 固定公共命令开发规则 | 完成（只读，豁免版本递增/构建/部署） | 0.18.2（未变） | 本行所在提交 | 规则本体已固化于 §0.2/§0.4/§0.5 checklist，无独立代码变更；验收两守卫在 0.3/0.4 落地后的树上跑绿：`compat_matrix_alignment` 7/7、`compat_error_codes_doc_sync` 1/1。0.x 前置任务（0.1→0.3→0.4→0.2）全部完成，Agent 阶段 A1 就绪 |
 | 2026-07-04 | Task A1（AG-16 capability contract） | 完成 | 0.18.3 | 本行所在提交 | 新增 `observed_agents/capability.rs`（`DeclaredAgentCaps` 8-bool E1 契约 + `CapabilityDeclarer` + 10 个可选能力 trait + E7 `SkillEvent` wire 形态）与 `observed_agents/registry.rs`（`AgentRegistration` 14 字段静态 matrix、7 行按注册序、首批 supported=claude-code/codex/opencode@first_batch、gemini/cursor/copilot/factory-ai unsupported、`lookup_cli_slug` 未知 slug quarantine fail-closed）；`ObservedAgent` 加 13 个 `as_*` 能力访问器（默认 None）+ `declared_capabilities()` 自省默认实现；删除 dead trait `ObservedAgentHooks`（0 impl）及其 re-export/文档引用。测试：`compat_agent_capability_matrix_pin` 3/3、`compat_agent_architecture_guard` 4/4（含 observed_agents 不 import runtime/checkpoint 层守卫——放行 doc 注释与既存 `derived.rs:70` `orchestrator::types` 数据 seam、SQL CHECK↔enum↔doc roster 三方同步断言）、`cargo test --lib observed_agents` 109/109；两 target 已注册 `Cargo.toml [[test]]` + `tests/INDEX.md` + `tests/compat/README.md`；agent.md 测试矩阵两行同步为已注册。范围守恒：未动 `STABLE_AGENT_SLUGS`（AG-17 承接）、未动 writer/storage；E1 pin 的 external methods[] 解锁断言待 AG-18 shim 落地后补入（守卫注释已注明）。codex review 六轮（codex exec 0.142.4 read-only sandbox）：R1 FAIL（注释残留符号名 + 分组 import 绕过）→ R2 FAIL（嵌套分组 `internal::{ai::{…}}` + cfg(test) 文本截断）→ 架构守卫改为 **syn AST 实现**（新增 syn dev-dep；use-tree 展平、`#[cfg(test)]` item 级剪枝、内联路径 visit）→ R3 FAIL（`cfg(not(test))` 误剪枝 + `use … as` 别名绕过）→ 修复（精确 test 谓词、禁 internal/ai 根别名与根 glob、按文件深度校准 super 链）→ R4 FAIL（`{self as x}` 形态 + mod.rs 深度差一）→ 修复 → R5 FAIL（registry 声明 claude hooks=true 但 adapter 自省 false——契约不自洽）→ `ClaudeCodeObservedAgent::as_hooks()` 接线现有 `ClaudeProvider` + pin 测试加双向一致性断言（`row.capabilities == declared_capabilities()`、`hook_installable == supported && as_hooks().is_some()`；gemini 有意不接线，E9 禁止其能力暴露）→ **R6 VERDICT: PASS 零缺陷**。每轮修复均带绕过探针实证（注入违规文件守卫必 FAIL、移除复绿）。质量门禁：fmt/clippy 全绿；`cargo test --all` 同口径 10 个既有失败（§0.4 豁免，见 Task 0.3 行） |
+| 2026-07-04 | Task A2（AG-17 CLI alias parity） | 完成 | 0.18.4 | 本行所在提交 | 删除 `STABLE_AGENT_SLUGS` 常量（CLI roster 改由 AG-16 registry `supported_slugs()` 派生，`rg STABLE_AGENT_SLUGS src` 零命中）；新增 `agent list`（capability matrix，`--json` 带 `schema_version=1` + AG-17 冻结行键，`support_wave` 对 unsupported 行序列化 null、`installed` 运行时叠加仅限 hook_installable 行且检查失败硬报错）；`add`/`remove` 为 `enable --agent`/`disable --agent` 严格别名（同 execute 路径、同退出码、同诊断，位置参数，空参=支持 roster）；安装/卸载语义收敛：批量预校验 fail-closed（任一 unsupported 即整批拒绝、零副作用）、supported-未落地 HookProvider（codex/opencode）为提示性跳过 exit 0、gemini 专属 uninstall-only 通道（幂等、`hooks_are_installed` 预检、错误带上下文传播、非 gemini 的非 roster remove 一律 actionable unsupported）、enable gemini 指向 remove 通道。测试：`tests/command/agent_roster_test.rs` 6 个用例（规格 5 个 + list 检查失败回归；两个 gemini 用例 `#[serial]` 真 provider 安装/卸载/用户条目保留断言）全绿；`command::agent` lib 单测 21/21。文档：`docs/commands/agent.md` + zh-CN 同步（synopsis/子命令表/选项/JSON 契约/示例/roster 说明）；tracing/agent.md `STABLE_AGENT_SLUGS` 两处锚点标历史 + AG-17 测试矩阵行更新；COMPATIBILITY.md 泛化行无需变更。codex review 三轮：R1 FAIL（uninstall 吞错、support_wave 缺席、registry 注释残留常量名、help 措辞陈旧）→ 修 4 处 → R2 FAIL（list `.ok()` 吞错、remove cursor 静默成功违反 gemini-only 通道语义）→ 修 2 处 + 2 个回归测试 → **R3 VERDICT: PASS**。质量门禁：fmt/clippy 全绿；`cargo test --all` 同口径 10 个既有失败（§0.4 豁免） |

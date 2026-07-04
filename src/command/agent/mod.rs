@@ -14,7 +14,7 @@ use crate::{
             provider::{HookProvider, ProviderInstallOptions},
             providers::find_provider,
         },
-        observed_agents::{AgentKind, is_preview},
+        observed_agents::{AgentKind, agent_for, registration_for, supported_slugs},
     },
     utils::{
         error::{CliError, CliResult},
@@ -26,6 +26,7 @@ mod checkpoint;
 mod clean;
 mod doctor;
 mod hooks;
+mod list;
 mod push;
 mod rpc;
 mod session;
@@ -45,8 +46,12 @@ mod status;
 pub const AGENT_EXAMPLES: &str = "\
 EXAMPLES:
     libra agent status                              Show captured-session counts and recent checkpoint summary
+    libra agent list                                Show the agent capability matrix (supported roster, hooks, install state)
+    libra agent list --json                         Capability matrix as JSON (stable schema for automation)
+    libra agent add claude-code                     Enable Claude Code capture and install its hooks (alias of enable)
+    libra agent add                                 Enable every supported agent
+    libra agent remove claude-code                  Disable Claude Code capture and uninstall its hooks (alias of disable)
     libra agent enable --agent claude               Enable Claude Code capture and install its hooks
-    libra agent enable                              Enable every stable external agent
     libra agent disable --agent claude              Disable Claude Code capture and uninstall its hooks
     libra agent session list                        List captured sessions
     libra agent checkpoint list                     List captured checkpoints
@@ -74,13 +79,27 @@ pub enum AgentSubcommand {
     #[command(about = "Report captured external-agent session status")]
     Status(status::StatusArgs),
 
+    /// List known agents with their capability matrix (AG-17).
+    #[command(about = "List agents with their capability matrix")]
+    List(list::ListArgs),
+
     /// Enable an external Agent and install its hooks.
     #[command(about = "Enable an external agent and install its hooks")]
     Enable(EnableArgs),
 
+    /// Alias of `enable`: `add <name>` ≡ `enable --agent <name>`; no name
+    /// means every supported agent.
+    #[command(about = "Enable an external agent and install its hooks (alias of enable)")]
+    Add(AddRemoveArgs),
+
     /// Disable an external Agent and uninstall its hooks.
     #[command(about = "Disable an external agent and uninstall its hooks")]
     Disable(DisableArgs),
+
+    /// Alias of `disable`: `remove <name>` ≡ `disable --agent <name>`; no
+    /// name means every supported agent.
+    #[command(about = "Disable an external agent and uninstall its hooks (alias of disable)")]
+    Remove(AddRemoveArgs),
 
     /// Inspect captured sessions.
     #[command(subcommand, about = "Inspect captured sessions")]
@@ -114,15 +133,24 @@ pub enum AgentSubcommand {
 
 #[derive(Args, Debug)]
 pub struct EnableArgs {
-    /// One or more agent names. Empty means "all stable agents".
+    /// One or more agent names. Empty means "every supported agent".
     #[arg(long = "agent", value_name = "NAME")]
     pub agents: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct DisableArgs {
-    /// One or more agent names to disable. Empty means "all stable agents"
+    /// One or more agent names to disable. Empty means "every supported agent".
     #[arg(long = "agent", value_name = "NAME")]
+    pub agents: Vec<String>,
+}
+
+/// Positional-name form shared by the `add` / `remove` aliases
+/// (`libra agent add claude-code` ≡ `libra agent enable --agent claude-code`).
+#[derive(Args, Debug)]
+pub struct AddRemoveArgs {
+    /// Agent names. Empty means "every supported agent".
+    #[arg(value_name = "NAME")]
     pub agents: Vec<String>,
 }
 
@@ -198,8 +226,11 @@ pub struct CheckpointRewindArgs {
 pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<()> {
     match args.command {
         AgentSubcommand::Status(args) => status::execute_safe(args, output).await,
+        AgentSubcommand::List(args) => list::execute_safe(args, output).await,
         AgentSubcommand::Enable(args) => enable_agents(&args.agents, output),
+        AgentSubcommand::Add(args) => enable_agents(&args.agents, output),
         AgentSubcommand::Disable(args) => disable_agents(&args.agents, output),
+        AgentSubcommand::Remove(args) => disable_agents(&args.agents, output),
         AgentSubcommand::Session(cmd) => session::execute_safe(cmd, output).await,
         AgentSubcommand::Checkpoint(cmd) => checkpoint::execute_safe(cmd, output).await,
         AgentSubcommand::Clean(cmd) => clean::execute_safe(cmd, output).await,
@@ -209,11 +240,6 @@ pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<(
         AgentSubcommand::Rpc(cmd) => rpc::execute_safe(cmd, output).await,
     }
 }
-
-/// Set of stable agent slugs whose `HookProvider` is fully installable today.
-/// Phase 1 only ships Claude Code and Gemini stable; everything else is
-/// preview and surfaces as a clear "not yet" rather than a silent no-op.
-const STABLE_AGENT_SLUGS: &[&str] = &["claude-code", "gemini"];
 
 fn enable_agents(agents: &[String], output: &OutputConfig) -> CliResult<()> {
     install_or_uninstall(agents, output, true)
@@ -225,61 +251,118 @@ fn disable_agents(agents: &[String], output: &OutputConfig) -> CliResult<()> {
 
 fn install_or_uninstall(agents: &[String], output: &OutputConfig, install: bool) -> CliResult<()> {
     let verb_present = if install { "enable" } else { "disable" };
-    let verb_past = if install { "enabled" } else { "disabled" };
 
-    let resolved = resolve_agent_slugs(agents)?;
+    let resolved = resolve_agent_kinds(agents)?;
     if resolved.is_empty() {
         return Err(CliError::fatal(format!(
             "no installable agents to {verb_present}"
         )));
     }
 
-    for slug in resolved {
-        let kind = AgentKind::from_cli_slug(&slug).ok_or_else(|| {
-            CliError::fatal(format!(
-                "unknown agent '{slug}'; supported: {}",
-                STABLE_AGENT_SLUGS.join(", "),
-            ))
-        })?;
-        let provider_name = provider_name_for(kind);
-        let Some(provider) = find_provider(provider_name) else {
-            // Preview-only adapter: surface a friendly diagnostic on stderr
-            // (not stdout — this is informational, not program output) and
-            // don't fail the whole batch. Phase 3.1 added the preview
-            // registry in `observed_agents::preview`; phase 4 will flesh
-            // out the install path for each one.
-            if !output.quiet {
-                if is_preview(kind) {
+    // Fail-closed before any side effect: anything outside the supported
+    // roster is an actionable error (so an `add a b` batch never
+    // half-installs). The one exception is `remove gemini` — the
+    // uninstall-only channel for the demoted agent (E9 / AG-17).
+    for kind in &resolved {
+        let row = registration_for(*kind);
+        if row.supported {
+            continue;
+        }
+        if install {
+            return Err(unsupported_for_install(row.slug));
+        }
+        if *kind != AgentKind::Gemini {
+            return Err(CliError::fatal(format!(
+                "agent '{}' is not in the supported roster ({}) and has no hooks to remove; \
+                 only gemini retains an uninstall-only channel",
+                row.slug,
+                supported_slugs().join(", ")
+            )));
+        }
+    }
+
+    for kind in resolved {
+        let row = registration_for(kind);
+        let slug = row.slug;
+        if install {
+            if !row.hook_installable {
+                // Supported (first-batch) but its HookProvider has not
+                // landed yet — transcript capture still works, so this is
+                // an informational skip, not an error (AG-19 wires it).
+                if !output.quiet {
                     eprintln!(
                         "libra agent {verb_present}: skipping '{slug}' \
-                         (preview adapter — hook installation lands in phase 4; \
-                         see observed_agents::preview)"
-                    );
-                } else {
-                    eprintln!(
-                        "libra agent {verb_present}: skipping '{slug}' \
-                         (no HookProvider registered for this agent)"
+                         (HookProvider not landed yet — transcript-readable only; \
+                         hook install arrives with AG-19)"
                     );
                 }
+                continue;
             }
-            continue;
-        };
-        if install {
+            let provider = agent_for(kind).as_hooks().ok_or_else(|| {
+                CliError::fatal(format!(
+                    "internal error: '{slug}' is marked hook-installable but exposes no \
+                     HookProvider; run libra agent doctor and report this"
+                ))
+            })?;
             install_provider_hooks(provider)
                 .map_err(|err| CliError::fatal(format!("failed to enable '{slug}': {err}")))?;
             if !output.quiet {
-                println!("libra agent enable: {verb_past} '{slug}' (provider hooks installed)");
+                println!("libra agent enable: enabled '{slug}' (provider hooks installed)");
             }
         } else {
+            // Uninstall side: supported agents plus the uninstall-only
+            // channel for formerly-supported agents (gemini). Agents that
+            // never had a HookProvider have nothing to remove — that is a
+            // no-op, not an error, so repeated removes stay idempotent.
+            let provider = agent_for(kind)
+                .as_hooks()
+                .or_else(|| find_provider(provider_name_for(kind)));
+            let Some(provider) = provider else {
+                if !output.quiet {
+                    println!(
+                        "libra agent disable: '{slug}' has no hook provider; nothing to remove"
+                    );
+                }
+                continue;
+            };
+            let installed = provider.hooks_are_installed().map_err(|err| {
+                CliError::fatal(format!(
+                    "failed to inspect '{slug}' hook installation state: {err}"
+                ))
+            })?;
+            if !installed {
+                if !output.quiet {
+                    println!("libra agent disable: '{slug}' hooks not installed; nothing to do");
+                }
+                continue;
+            }
             provider
                 .uninstall_hooks()
                 .map_err(|err| CliError::fatal(format!("failed to disable '{slug}': {err}")))?;
             if !output.quiet {
-                println!("libra agent disable: {verb_past} '{slug}' (provider hooks removed)");
+                println!("libra agent disable: disabled '{slug}' (provider hooks removed)");
             }
         }
     }
     Ok(())
+}
+
+/// Actionable unsupported-roster error for `enable`/`add` (E9). The gemini
+/// wording points at its uninstall-only channel.
+fn unsupported_for_install(slug: &str) -> CliError {
+    let roster = supported_slugs().join(", ");
+    if slug == "gemini" {
+        CliError::fatal(format!(
+            "agent 'gemini' is no longer in the supported roster ({roster}); \
+             it is uninstall-only — existing hooks can be removed with \
+             'libra agent remove gemini', and previously captured sessions stay readable"
+        ))
+    } else {
+        CliError::fatal(format!(
+            "agent '{slug}' is not in the supported roster ({roster}); \
+             it cannot be enabled or install hooks"
+        ))
+    }
 }
 
 /// `agent.as_cli_slug()` returns hyphens (`claude-code`); the existing
@@ -312,24 +395,27 @@ fn install_provider_hooks(provider: &dyn HookProvider) -> anyhow::Result<()> {
     provider.install_hooks(&opts)
 }
 
-/// Validate `agents`. Empty input expands to every stable slug; non-empty
-/// passes through unchanged after a known-slug check.
-fn resolve_agent_slugs(agents: &[String]) -> CliResult<Vec<String>> {
+/// Validate `agents` and canonicalize to [`AgentKind`]s. Empty input expands
+/// to the supported roster (derived from the AG-16 registry — the CLI keeps
+/// no roster constant of its own); non-empty input accepts any known slug so
+/// the uninstall-only channel stays reachable, with unknown slugs rejected
+/// against the supported roster.
+fn resolve_agent_kinds(agents: &[String]) -> CliResult<Vec<AgentKind>> {
     if agents.is_empty() {
-        return Ok(STABLE_AGENT_SLUGS
+        return Ok(supported_slugs()
             .iter()
-            .map(|s| (*s).to_string())
+            .filter_map(|slug| AgentKind::from_cli_slug(slug))
             .collect());
     }
     let mut out = Vec::with_capacity(agents.len());
     for slug in agents {
-        if AgentKind::from_cli_slug(slug).is_none() {
+        let Some(kind) = AgentKind::from_cli_slug(slug) else {
             return Err(CliError::fatal(format!(
                 "unknown agent '{slug}'; supported: {}",
-                STABLE_AGENT_SLUGS.join(", ")
+                supported_slugs().join(", ")
             )));
-        }
-        out.push(slug.clone());
+        };
+        out.push(kind);
     }
     Ok(out)
 }
@@ -347,22 +433,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_agent_slugs_expands_empty_to_stable() {
-        let resolved = resolve_agent_slugs(&[]).expect("empty resolves cleanly");
-        assert_eq!(resolved, vec!["claude-code", "gemini"]);
+    fn resolve_agent_kinds_expands_empty_to_supported_roster() {
+        let resolved = resolve_agent_kinds(&[]).expect("empty resolves cleanly");
+        assert_eq!(
+            resolved,
+            vec![AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenCode]
+        );
     }
 
     #[test]
-    fn resolve_agent_slugs_passes_known() {
+    fn resolve_agent_kinds_passes_known() {
         let resolved =
-            resolve_agent_slugs(&["claude-code".to_string()]).expect("known slug resolves");
-        assert_eq!(resolved, vec!["claude-code"]);
+            resolve_agent_kinds(&["claude-code".to_string()]).expect("known slug resolves");
+        assert_eq!(resolved, vec![AgentKind::ClaudeCode]);
     }
 
     #[test]
-    fn resolve_agent_slugs_rejects_unknown() {
-        let err = resolve_agent_slugs(&["bogus".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("unknown agent 'bogus'"));
+    fn resolve_agent_kinds_accepts_uninstall_only_gemini() {
+        let resolved = resolve_agent_kinds(&["gemini".to_string()])
+            .expect("gemini stays resolvable for the uninstall-only channel");
+        assert_eq!(resolved, vec![AgentKind::Gemini]);
+    }
+
+    #[test]
+    fn resolve_agent_kinds_rejects_unknown() {
+        let err = resolve_agent_kinds(&["bogus".to_string()]).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("unknown agent 'bogus'"));
+        assert!(message.contains("claude-code, codex, opencode"));
+    }
+
+    #[test]
+    fn unsupported_for_install_points_gemini_at_uninstall_channel() {
+        assert!(
+            unsupported_for_install("gemini")
+                .to_string()
+                .contains("libra agent remove gemini")
+        );
+        assert!(
+            unsupported_for_install("cursor")
+                .to_string()
+                .contains("not in the supported roster")
+        );
     }
 
     #[test]

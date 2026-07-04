@@ -952,7 +952,7 @@ Schema pin test 必须断言序列化后的 8 个 snake_case key 精确匹配 E1
 | CLI slug（`--agent`, `status` 输出, JSON `slug`） | kebab-case | `claude-code`, `factory-ai` | `AgentKind::as_cli_slug()`（`adapter.rs:81`） |
 | CLI slug 反向解析 | kebab + snake + short form aliases | `claude-code` / `claude_code` / `claude` → `Some(ClaudeCode)` | `AgentKind::from_cli_slug()`（`adapter.rs:96`，**permissive mode**） |
 | SQL CHECK constraint | snake_case | `'claude_code'`, `'factory_ai'` | migration `2026050303:17` |
-| 当前代码 `STABLE_AGENT_SLUGS` | kebab-case | `"claude-code"`, `"gemini"` | `mod.rs:216`；这是现状锚点，不是本文第一批目标 |
+| ~~当前代码 `STABLE_AGENT_SLUGS`~~（历史锚点，2026-07-04 AG-17 落地时删除） | kebab-case | 曾为 `"claude-code"`, `"gemini"`（旧 `mod.rs:216`） | CLI roster 现从 AG-16 registry（`observed_agents/registry.rs` `supported_slugs()`）派生，无独立常量 |
 | 第一批 supported roster | kebab-case | `"claude-code"`, `"codex"`, `"opencode"` | 本文“第一批支持项目”；实现时应作为 capability matrix 的 supported 事实源 |
 | external binary 命名 | kebab-case | `libra-agent-claude-code` | `RPC_BINARY_PREFIX = "libra-agent-"`（`rpc.rs:50`） |
 
@@ -1749,7 +1749,7 @@ Special cases：
 | AG-24 partial（已交付） | `compat_agent_docs_contract`：已注册 | `compat_agent_docs_contract::agent_doc_keeps_claudecode_marked_removed_not_active` | 当前唯一已落地的 public-agent doc 守卫；守卫 `claudecode` 不得复活 + 文档事实一致性 |
 | AG-24a/AG-24 docs/schema/compliance/source-of-truth | `compat_agent_docs_contract`：规划测试（函数未实现） | `compat_agent_docs_contract::agent_doc_tracks_schema_versioning_and_retention_policy`; `compat_agent_docs_contract::agent_doc_tracks_code_agent_runtime_source_of_truth` | 这些函数当前不存在；新增 public schema/retention/raw export 约束或跨文档事实源变更时补入同一 target，并更新 `tests/compat/agent_docs_contract.rs`、`tests/INDEX.md` 说明 |
 | AG-24 partial（已交付） | `compat_agent_run_non_exhaustive_guard`：已注册 | （见 `agent_run/` 下 `#[non_exhaustive]` 各 enum） | Wave 1；守卫内部 agent run 类型演进 |
-| AG-17 | `command_test`：已注册 target，可复用；AG-17 具体测试未实现 | `command_test::agent_list_add_remove_aliases_parse`; `command_test::agent_list_json_contains_capability_fields`; `command_test::agent_add_non_hook_installable_returns_actionable_unsupported`; `command_test::agent_remove_gemini_uninstalls_legacy_hooks_idempotent`; `command_test::agent_remove_preserves_user_hook_entries` | `list` / `add` / `remove` alias 落地时补测试；未补前不得声称 AG-17 有 command coverage |
+| AG-17 | `command_test`：已注册 target；AG-17 五个测试已实现（2026-07-04，`tests/command/agent_roster_test.rs`） | `command_test::agent_list_add_remove_aliases_parse`; `command_test::agent_list_json_contains_capability_fields`; `command_test::agent_add_non_hook_installable_returns_actionable_unsupported`; `command_test::agent_remove_gemini_uninstalls_legacy_hooks_idempotent`; `command_test::agent_remove_preserves_user_hook_entries` | `list` / `add` / `remove` alias 落地时补测试；未补前不得声称 AG-17 有 command coverage |
 | AG-18 / E2 | `agent_rpc_external_test`：规划 target（未注册） | `agent_rpc_external_test::info_success_registers_binary`; `agent_rpc_external_test::version_mismatch_is_skipped_with_reason`; `agent_rpc_external_test::timeout_and_oversize_are_fail_closed`; `agent_rpc_external_test::undeclared_capability_method_is_rejected`; `agent_rpc_external_test::stderr_is_capped_redacted_and_not_inherited` | Wave 1/2；原场景名 `agent_external_protocol_v2_matrix` 只作为目的说明，不再作为命令名 |
 | AG-19 / E3 | `agent_lifecycle_event_test`：规划 target（未注册） | `agent_lifecycle_event_test::invalid_hook_envelopes_are_rejected_before_checkpoint`; `agent_lifecycle_event_test::owner_claim_prevents_duplicate_checkpoint`; `agent_lifecycle_event_test::subagent_start_end_write_subagent_checkpoint`; `agent_lifecycle_event_test::codex_trust_gap_banner_only_for_unapproved_hooks` | Wave 2；覆盖 owner claim、SubagentStart/End、trust-gap |
 | AG-19 redaction | `agent_checkpoint_redaction_test`：规划 target（未注册） | `agent_checkpoint_redaction_test::raw_hook_input_is_redacted_before_persist`; `agent_checkpoint_redaction_test::extractor_warning_does_not_include_secret_owner_or_prompt` | Wave 2；与 lifecycle/checkpoint writer 同 PR 更新 |
@@ -1954,6 +1954,6 @@ rg -n "claudecode|claude-code|libra-agent-|agent list|agent add|agent remove|Lif
 | manual attach | 用户手动把外部 transcript、findings 或上下文附加到 Libra 捕获/审计链上的路径。它提供 provenance，但不代表 Libra 控制了该外部 Agent。 |
 | 第一批 supported roster | 执行本文档时唯一允许标为 supported/installable/launchable 的首批 agent 集合：`claude-code`、`codex`、`opencode`。首批之外的 agent 必须 quarantine/unsupported，除非另开 PR 同步文档、schema 和测试。 |
 | `AgentKind` | 当前源码内置 observed external agent 枚举；不等于第一批 supported roster。历史 enum 或 SQL CHECK 中存在某 agent，不代表它可被公开标记为 supported。 |
-| `STABLE_AGENT_SLUGS` | 当前代码可安装 hook 的历史 stable slug 集合（`claude-code`、`gemini`）；不是本文第一批支持目标，也不能作为未来 capability matrix 的唯一事实源。 |
+| `STABLE_AGENT_SLUGS` | （历史）旧 CLI roster 常量（曾为 `claude-code`、`gemini`）；2026-07-04 AG-17 落地时删除，CLI roster 从 AG-16 registry `supported_slugs()` 派生。 |
 | AG-16 ~ AG-24a | Gate 8 任务卡编号，覆盖 capability、CLI alias、RPC、安全、lifecycle、checkpoint/export、transcript intelligence、review/investigate、合规实现和 docs/compat closeout；AG-24a 是实现卡，AG-24 是收口卡。 |
 | E1 ~ E10 | 与 entireio/cli 对齐的 wire 契约编号，覆盖 capability、external protocol、lifecycle、checkpoint/export、chunking、usage、skill event、review/investigate、roster 和稳定错误码。 |

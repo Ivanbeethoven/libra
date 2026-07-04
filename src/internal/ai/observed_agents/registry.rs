@@ -1,11 +1,10 @@
 //! Static capability matrix for observed external agents (AG-16 / E9).
 //!
 //! This is the single fact source for which agents Libra supports, at what
-//! wave, and with which frozen capability rows. The CLI roster
-//! (`STABLE_AGENT_SLUGS`) converges onto this registry in AG-17; hook
-//! providers converge in AG-19. Until then the matrix is authoritative for
-//! *target* state and the compat pin (`compat_agent_capability_matrix_pin`)
-//! guards it against drift.
+//! wave, and with which frozen capability rows. The CLI roster derives from
+//! [`supported_slugs`] (the old CLI roster constant was deleted in AG-17);
+//! hook providers converge in AG-19. The compat pin
+//! (`compat_agent_capability_matrix_pin`) guards the matrix against drift.
 //!
 //! Roster rules (E9 / "第一批支持项目"):
 //!

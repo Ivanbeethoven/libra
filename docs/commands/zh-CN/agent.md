@@ -6,8 +6,11 @@
 
 ```bash
 libra agent status
+libra agent list [--json]
 libra agent enable [--agent <name>]...
+libra agent add [<name>...]
 libra agent disable [--agent <name>]...
+libra agent remove [<name>...]
 libra agent session <subcommand>
 libra agent checkpoint <subcommand>
 libra agent clean [--all]
@@ -20,15 +23,18 @@ libra agent rpc <subcommand>
 
 `libra agent` 管理 Libra 的外部代理捕获表面。它安装和移除提供商 hook，报告已捕获的 session/checkpoint 状态，暴露只读诊断，并可将 `refs/libra/traces` 推送到远程。
 
-当前稳定可安装代理包括 `claude-code` 和 `gemini`。预览适配器可在代码中发现，但在其 hook 安装路径实现之前，会被安装/卸载流程跳过。
+支持的 roster 为 `claude-code`、`codex`、`opencode`（首批）。`claude-code` 当前可安装 hook；`codex` 与 `opencode` 目前只支持 transcript 读取，其 HookProvider 落地后才可安装。`gemini` 已从支持 roster 降级为仅卸载通道：`libra agent remove gemini` 可移除历史安装的 Libra 托管 hook（幂等），已捕获会话保持可读；对它或其它非 roster 代理执行 `add`/`enable` 会返回可操作的 unsupported 错误。
 
 ## 子命令
 
 | 子命令 | 说明 |
 |------------|-------------|
 | `status` | 报告已捕获的外部代理会话状态 |
+| `list` | 列出代理能力矩阵（roster、hook、安装状态） |
 | `enable` | 启用一个或多个外部代理并安装 hook |
+| `add` | `enable` 的别名：`add <name>` ≡ `enable --agent <name>` |
 | `disable` | 禁用一个或多个外部代理并卸载 hook |
+| `remove` | `disable` 的别名：`remove <name>` ≡ `disable --agent <name>` |
 | `session list` | 列出已捕获会话 |
 | `session show <id>` | 显示一个已捕获会话 |
 | `session stop <id>` | 将已捕获会话标记为 stopped |
@@ -48,7 +54,7 @@ libra agent rpc <subcommand>
 
 | 标志 | 子命令 | 说明 |
 |------|------------|-------------|
-| `--agent <name>` | `enable`, `disable` | 选择代理名称；省略时针对所有稳定代理 |
+| `--agent <name>` | `enable`, `disable` | 选择代理名称；省略时针对支持 roster（`add`/`remove` 以位置参数接收名称） |
 | `--extract-transcript <path>` | `session show` | 将会话元数据中的已捕获 transcript 路径复制到本地文件 |
 | `--all` | `clean` | 清理所有已停止会话的 checkpoint，而不只是最近一个 |
 | `--remote <name>` | `push` | 选择用于推送代理 trace 引用的远程 |
@@ -61,9 +67,12 @@ libra agent rpc <subcommand>
 
 ```bash
 libra --json agent status
+libra --json agent list
 libra --json agent checkpoint list
 libra --json agent rpc list
 ```
+
+`agent list --json` 携带稳定的 `schema_version` 与每个已知代理一行（`slug`、`agent_kind`、`stability`、`supported`、`support_wave`、`registered`、`transcript_readable`、`hook_installable`、`installed`、`launchable_review`、`launchable_investigate`、`external_binary`、`config_paths`、`protected_dirs`、`capabilities`）。行结构是面向自动化的冻结契约。
 
 ## 示例
 
@@ -71,11 +80,23 @@ libra --json agent rpc list
 # 显示已捕获会话数量和最近 checkpoint 摘要
 libra agent status
 
+# 显示代理能力矩阵（支持 roster、hook、安装状态）
+libra agent list
+
+# 启用 Claude Code 捕获并安装它的 hook（enable 的别名）
+libra agent add claude-code
+
 # 启用 Claude Code 捕获并安装它的 hook
 libra agent enable --agent claude
 
-# 一次启用所有稳定外部代理
+# 一次启用所有支持的代理
 libra agent enable
+
+# 禁用 Claude Code 捕获并卸载它的 hook（disable 的别名）
+libra agent remove claude-code
+
+# 移除历史 gemini hook（仅卸载通道；幂等）
+libra agent remove gemini
 
 # 禁用 Claude Code 捕获并卸载它的 hook
 libra agent disable --agent claude
