@@ -1,0 +1,328 @@
+//! Architecture guard for the external-agent capture subsystem (AG-16/AG-24).
+//!
+//! Pins the boundary rules from `docs/development/tracing/agent.md`:
+//! observed_agents (capture) stays decoupled from the internal AgentRuntime
+//! and checkpoint layers, every known `AgentKind` resolves to a live
+//! adapter, external agents cannot enter the static roster, and the SQL
+//! CHECK constraint / doc roster / Rust enum stay in sync.
+
+use std::{collections::BTreeSet, fs, path::Path};
+
+use libra::internal::ai::observed_agents::{
+    AgentKind, SlugLookup, agent_for, lookup_cli_slug, registration_for, registry,
+};
+
+fn repo_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Capture modules must not import the internal AgentRuntime or the
+/// checkpoint-writer layers. Allowed seams: `hooks::{lifecycle,provider}`
+/// (hook contracts), `completion` (shared usage model), `session` (session
+/// context types) and — documented exception — `orchestrator::types` for
+/// the derived `ToolCallRecord` projection (`derived.rs`). Anything else
+/// from the runtime side is a boundary violation.
+///
+/// The check is AST-based (`syn`): use-trees are flattened (so grouped and
+/// nested-grouped imports cannot slip through), inline fully-qualified
+/// paths are visited, and items annotated `#[cfg(test)]` are pruned —
+/// schema-lockstep tests may deliberately drive runtime writers (e.g.
+/// derived.rs's normalized-event integration test).
+#[test]
+fn observed_agent_modules_do_not_import_runtime_or_checkpoint_layers() {
+    use syn::visit::Visit;
+
+    /// Why a resolved path is out of bounds, or `None` when it is fine.
+    ///
+    /// `original` is a `::`-joined path as written. Leading `crate::` /
+    /// `super::` chains are normalized away; the remainder is judged
+    /// ai-relative when it came through `internal::ai::` explicitly or
+    /// through enough `super::` hops to escape the capture module
+    /// (`ai_root_supers` = 2 for files directly under `observed_agents/`,
+    /// 3 for `builtin/`, …). Bare paths (`runtime::Handle` from a `use
+    /// tokio::runtime` import) are not judged — their `use` item is.
+    /// Module-root imports/renames of `crate::internal` / the ai root and
+    /// root-level globs are forbidden outright: they would let an alias
+    /// (`use crate::internal::ai as x; x::runtime::…`) evade the check.
+    fn forbidden_reason(original: &str, ai_root_supers: usize) -> Option<String> {
+        let had_crate = original.starts_with("crate::");
+        let mut path = original.strip_prefix("crate::").unwrap_or(original);
+        let mut supers = 0usize;
+        while let Some(rest) = path.strip_prefix("super::") {
+            path = rest;
+            supers += 1;
+        }
+        if had_crate && (path == "internal" || path == "internal::ai") {
+            return Some(
+                "module-root import/rename of crate::internal(::ai) — alias bypass".to_string(),
+            );
+        }
+        let candidate = if let Some(rest) = path
+            .strip_prefix("internal::ai::")
+            .or_else(|| path.strip_prefix("ai::"))
+        {
+            rest
+        } else if !had_crate && supers >= ai_root_supers {
+            path
+        } else {
+            return None;
+        };
+        if candidate.is_empty() {
+            return Some("aliasing the internal::ai root — alias bypass".to_string());
+        }
+        if candidate == "*" {
+            return Some("glob import from the internal::ai root".to_string());
+        }
+        if candidate == "hooks" || candidate == "hooks::*" {
+            return Some(
+                "module-root/glob import of internal::ai::hooks (surfaces hooks::runtime)"
+                    .to_string(),
+            );
+        }
+        for module in ["agent", "runtime", "agent_run", "history"] {
+            if candidate == module || candidate.starts_with(&format!("{module}::")) {
+                return Some(format!("internal::ai::{module}"));
+            }
+        }
+        if candidate == "hooks::runtime" || candidate.starts_with("hooks::runtime::") {
+            return Some("internal::ai::hooks::runtime".to_string());
+        }
+        if (candidate == "orchestrator" || candidate.starts_with("orchestrator::"))
+            && !candidate.starts_with("orchestrator::types")
+        {
+            return Some("internal::ai::orchestrator (outside the ::types seam)".to_string());
+        }
+        None
+    }
+
+    /// Flatten a use-tree into fully-qualified `::`-joined paths.
+    fn flatten_use(tree: &syn::UseTree, prefix: &str, out: &mut Vec<String>) {
+        let join = |prefix: &str, ident: &dyn std::fmt::Display| {
+            if prefix.is_empty() {
+                ident.to_string()
+            } else {
+                format!("{prefix}::{ident}")
+            }
+        };
+        match tree {
+            syn::UseTree::Path(path) => {
+                flatten_use(&path.tree, &join(prefix, &path.ident), out);
+            }
+            // `{self}` / `{self as x}` denote the prefix module itself —
+            // normalize so root-alias checks fire on the real path.
+            syn::UseTree::Name(name) if name.ident == "self" => out.push(prefix.to_string()),
+            syn::UseTree::Rename(rename) if rename.ident == "self" => out.push(prefix.to_string()),
+            syn::UseTree::Name(name) => out.push(join(prefix, &name.ident)),
+            syn::UseTree::Rename(rename) => out.push(join(prefix, &rename.ident)),
+            syn::UseTree::Glob(_) => out.push(join(prefix, &"*")),
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    flatten_use(item, prefix, out);
+                }
+            }
+        }
+    }
+
+    /// Only the exact `#[cfg(test)]` predicate prunes — `cfg(not(test))`
+    /// (and any compound predicate) is production code and stays guarded.
+    fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && matches!(&attr.meta, syn::Meta::List(list) if list.tokens.to_string().trim() == "test")
+        })
+    }
+
+    fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+        match item {
+            syn::Item::Const(i) => &i.attrs,
+            syn::Item::Enum(i) => &i.attrs,
+            syn::Item::ExternCrate(i) => &i.attrs,
+            syn::Item::Fn(i) => &i.attrs,
+            syn::Item::ForeignMod(i) => &i.attrs,
+            syn::Item::Impl(i) => &i.attrs,
+            syn::Item::Macro(i) => &i.attrs,
+            syn::Item::Mod(i) => &i.attrs,
+            syn::Item::Static(i) => &i.attrs,
+            syn::Item::Struct(i) => &i.attrs,
+            syn::Item::Trait(i) => &i.attrs,
+            syn::Item::TraitAlias(i) => &i.attrs,
+            syn::Item::Type(i) => &i.attrs,
+            syn::Item::Union(i) => &i.attrs,
+            syn::Item::Use(i) => &i.attrs,
+            _ => &[],
+        }
+    }
+
+    struct BoundaryGuard {
+        violations: Vec<String>,
+        /// `super::` hops from this file's module to the `internal::ai`
+        /// root: 2 for files directly under `observed_agents/`, 3 for
+        /// `builtin/`, … Used to judge super-relative paths correctly.
+        ai_root_supers: usize,
+    }
+
+    impl<'ast> Visit<'ast> for BoundaryGuard {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            // Prune #[cfg(test)] subtrees — test-only seams are allowed.
+            if has_cfg_test(item_attrs(item)) {
+                return;
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            let mut paths = Vec::new();
+            flatten_use(&item.tree, "", &mut paths);
+            for path in paths {
+                if let Some(reason) = forbidden_reason(&path, self.ai_root_supers) {
+                    self.violations.push(format!("use {path} → {reason}"));
+                }
+            }
+        }
+
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            let joined = path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            if let Some(reason) = forbidden_reason(&joined, self.ai_root_supers) {
+                self.violations.push(format!("path {joined} → {reason}"));
+            }
+            syn::visit::visit_path(self, path);
+        }
+    }
+
+    let dir = repo_root().join("src/internal/ai/observed_agents");
+    let mut checked = 0usize;
+    let mut stack = vec![dir];
+    let mut violations = Vec::new();
+    while let Some(current) = stack.pop() {
+        for entry in fs::read_dir(&current).expect("read observed_agents dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
+            let source = fs::read_to_string(&path).expect("read source file");
+            let file = syn::parse_file(&source)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            checked += 1;
+            let relative = path
+                .strip_prefix(repo_root().join("src/internal/ai/observed_agents"))
+                .expect("scanned file lives under observed_agents");
+            let depth = relative.components().count().saturating_sub(1);
+            // `mod.rs` IS its directory's module — one super fewer than a
+            // leaf file at the same directory level.
+            let is_mod_rs = relative.file_name().is_some_and(|name| name == "mod.rs");
+            let mut guard = BoundaryGuard {
+                violations: Vec::new(),
+                ai_root_supers: 2 + depth - usize::from(is_mod_rs),
+            };
+            guard.visit_file(&file);
+            for violation in guard.violations {
+                violations.push(format!("{}: {violation}", path.display()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "observed_agents must stay decoupled from the internal AgentRuntime/checkpoint \
+         layers:\n{}",
+        violations.join("\n")
+    );
+    assert!(
+        checked >= 8,
+        "expected to scan the observed_agents sources, got {checked}"
+    );
+}
+
+/// `agent_for` is total over `AgentKind` and each adapter reports the kind
+/// it was registered under; the registry row exists for every kind.
+#[test]
+fn all_known_agent_kinds_resolve_non_null_adapter() {
+    for kind in AgentKind::all() {
+        let agent = agent_for(*kind);
+        assert_eq!(agent.provider_kind(), *kind);
+        let row = registration_for(*kind);
+        assert_eq!(row.db_value, kind.as_db_str());
+        // The capability introspection default must not panic for any kind.
+        let _ = agent.declared_capabilities();
+    }
+}
+
+/// External `libra-agent-*` binaries never appear in the static roster —
+/// registration requires the AG-18 `info`/trust flow, so the static matrix
+/// only carries built-in rows and unknown slugs stay quarantined.
+#[test]
+fn external_agent_info_is_required_for_registration() {
+    for row in registry() {
+        assert!(
+            !row.external_binary,
+            "{}: static registry rows must be built-in adapters; external agents \
+             register through the AG-18 info/trust flow only",
+            row.slug
+        );
+    }
+    assert_eq!(
+        lookup_cli_slug("libra-agent-anything"),
+        SlugLookup::UnknownQuarantined
+    );
+}
+
+/// The `agent_session.agent_kind` SQL CHECK constraint, the Rust enum and
+/// the tracing/agent.md roster stay in sync.
+#[test]
+fn agent_kind_enum_sql_check_and_doc_roster_stay_in_sync() {
+    // Rust enum → db values.
+    let enum_values: BTreeSet<String> = AgentKind::all()
+        .iter()
+        .map(|kind| kind.as_db_str().to_string())
+        .collect();
+
+    // SQL CHECK constraint values from the capture migration.
+    let migration =
+        fs::read_to_string(repo_root().join("sql/migrations/2026050303_agent_capture.sql"))
+            .expect("read agent capture migration");
+    let check_block = migration
+        .split("`agent_kind`           TEXT NOT NULL CHECK(`agent_kind` IN (")
+        .nth(1)
+        .and_then(|rest| rest.split("))").next())
+        .expect("agent_kind CHECK block present in migration");
+    let sql_values: BTreeSet<String> = check_block
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        sql_values, enum_values,
+        "agent_session.agent_kind CHECK constraint drifted from AgentKind::as_db_str"
+    );
+
+    // Doc roster (docs/development/tracing/agent.md 第一批支持项目) matches
+    // the registry's supported set.
+    let agent_doc = fs::read_to_string(repo_root().join("docs/development/tracing/agent.md"))
+        .expect("read tracing/agent.md");
+    let supported: Vec<&str> = registry()
+        .iter()
+        .filter(|row| row.supported)
+        .map(|row| row.slug)
+        .collect();
+    assert_eq!(supported, ["claude-code", "codex", "opencode"]);
+    for slug in &supported {
+        assert!(
+            agent_doc.contains(&format!("| `{slug}` |")),
+            "tracing/agent.md first-batch roster table must list {slug}"
+        );
+    }
+    // The doc must keep declaring the frozen first-batch roster line.
+    assert!(
+        agent_doc.contains("`claude-code` / `codex` / `opencode`"),
+        "tracing/agent.md must keep the frozen first-batch roster statement"
+    );
+}

@@ -12,10 +12,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::internal::ai::hooks::{
-    lifecycle::{LifecycleEvent, SessionHookEnvelope},
-    provider::{ProviderHookCommand, ProviderInstallOptions},
+use super::capability::{
+    DeclaredAgentCaps, HookResponseWriter, ModelExtractor, PromptExtractor, SkillEventExtractor,
+    SubagentAwareExtractor, TextGenerator, TokenCalculator, TranscriptAnalyzer,
+    TranscriptCompactor, TranscriptPreparer,
 };
+use crate::internal::ai::hooks::provider::HookProvider;
 
 /// Identity for one of the externally-hosted agents Libra knows how to capture.
 ///
@@ -211,26 +213,83 @@ pub trait ObservedAgent: Send + Sync {
     /// alone (`.claude`, `.gemini`, …). Path elements are matched
     /// case-sensitively against the workspace tree walker.
     fn protected_dirs(&self) -> &'static [&'static str];
-}
 
-/// Optional capability: full hook lifecycle support.
-///
-/// An agent that implements this trait participates in `libra agent enable`
-/// (hook installation), the hook ingestion pipeline (`libra agent hooks <name>
-/// session-start` etc.), and the dedup machinery. It is purely additive —
-/// adapters that don't implement it just don't show up in `libra agent
-/// enable`'s listing.
-pub trait ObservedAgentHooks: ObservedAgent {
-    fn supported_commands(&self) -> &'static [ProviderHookCommand];
-    fn parse_hook_event(
-        &self,
-        hook_event_name: &str,
-        envelope: &SessionHookEnvelope,
-    ) -> Result<LifecycleEvent>;
-    fn dedup_identity_keys(&self) -> &'static [&'static str];
-    fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()>;
-    fn uninstall_hooks(&self) -> Result<()>;
-    fn hooks_are_installed(&self) -> Result<bool>;
+    // Capability accessors (AG-16). Rust's answer to entire's runtime
+    // `As*(agent)` probes: every accessor defaults to `None`, and an adapter
+    // that implements a capability overrides the accessor to `Some(self)`.
+    // Hook support is expressed through `as_hooks()`; the zero-impl
+    // hooks dup trait that used to live here was deleted in favour of the
+    // shared `hooks::provider::HookProvider` contract (AG-16).
+
+    /// Hook lifecycle support (E1 `hooks`). Adapters converge in AG-19.
+    fn as_hooks(&self) -> Option<&dyn HookProvider> {
+        None
+    }
+    /// E1 `transcript_analyzer`.
+    fn as_transcript_analyzer(&self) -> Option<&dyn TranscriptAnalyzer> {
+        None
+    }
+    /// Prompt extraction — no 8-bool key; gated by `transcript_analyzer`.
+    fn as_prompt_extractor(&self) -> Option<&dyn PromptExtractor> {
+        None
+    }
+    /// E1 `transcript_preparer`.
+    fn as_transcript_preparer(&self) -> Option<&dyn TranscriptPreparer> {
+        None
+    }
+    /// E1 `token_calculator`.
+    fn as_token_calculator(&self) -> Option<&dyn TokenCalculator> {
+        None
+    }
+    /// Model extraction — deliberately outside the 8-bool set (E1).
+    fn as_model_extractor(&self) -> Option<&dyn ModelExtractor> {
+        None
+    }
+    /// E1 `text_generator`.
+    fn as_text_generator(&self) -> Option<&dyn TextGenerator> {
+        None
+    }
+    /// E1 `compact_transcript`.
+    fn as_transcript_compactor(&self) -> Option<&dyn TranscriptCompactor> {
+        None
+    }
+    /// E1 `hook_response_writer`.
+    fn as_hook_response_writer(&self) -> Option<&dyn HookResponseWriter> {
+        None
+    }
+    /// E1 `subagent_aware_extractor`.
+    fn as_subagent_aware_extractor(&self) -> Option<&dyn SubagentAwareExtractor> {
+        None
+    }
+    /// Skill-event projection — deliberately outside the 8-bool set (E1/E7).
+    fn as_skill_event_extractor(&self) -> Option<&dyn SkillEventExtractor> {
+        None
+    }
+    /// Transcript truncation (pre-AG-16 capability, kept as-is).
+    fn as_transcript_truncator(&self) -> Option<&dyn TranscriptTruncator> {
+        None
+    }
+    /// Transcript chunking (pre-AG-16 capability, kept as-is).
+    fn as_transcript_chunker(&self) -> Option<&dyn TranscriptChunker> {
+        None
+    }
+
+    /// Introspect the E1 8-bool capability declaration from the `as_*`
+    /// accessors. Built-in adapters rely on this default; external RPC
+    /// shims (AG-18) override it from their negotiated
+    /// `CapabilityDeclarer` payload instead.
+    fn declared_capabilities(&self) -> DeclaredAgentCaps {
+        DeclaredAgentCaps {
+            hooks: self.as_hooks().is_some(),
+            transcript_analyzer: self.as_transcript_analyzer().is_some(),
+            transcript_preparer: self.as_transcript_preparer().is_some(),
+            token_calculator: self.as_token_calculator().is_some(),
+            compact_transcript: self.as_transcript_compactor().is_some(),
+            text_generator: self.as_text_generator().is_some(),
+            hook_response_writer: self.as_hook_response_writer().is_some(),
+            subagent_aware_extractor: self.as_subagent_aware_extractor().is_some(),
+        }
+    }
 }
 
 /// Optional capability: transcript truncation at a checkpoint boundary.

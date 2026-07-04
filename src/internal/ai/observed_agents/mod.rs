@@ -9,9 +9,15 @@
 //! Sub-modules:
 //!
 //! - [`adapter`]: the small core trait [`adapter::ObservedAgent`] every captured
-//!   agent must implement, plus the optional capability traits
-//!   ([`adapter::ObservedAgentHooks`], [`adapter::TranscriptTruncator`],
+//!   agent must implement (with `as_*` capability accessors), plus the
+//!   optional capability traits ([`adapter::TranscriptTruncator`],
 //!   [`adapter::TranscriptChunker`]).
+//! - [`capability`]: the frozen E1 8-bool wire contract
+//!   ([`capability::DeclaredAgentCaps`]) and the optional capability traits
+//!   (AG-16; implementations land in AG-19/AG-21).
+//! - [`registry`]: the static capability matrix and roster fact source
+//!   ([`registry::AgentRegistration`], first-batch supported roster,
+//!   unknown-slug quarantine).
 //! - [`redaction`]: the [`redaction::Redactor`] engine and the
 //!   [`redaction::RedactedBytes`] compile-time contract — only redacted bytes
 //!   may flow into checkpoint storage.
@@ -22,14 +28,16 @@
 
 pub mod adapter;
 pub mod builtin;
+pub mod capability;
 pub mod derived;
 pub mod preview;
 pub mod redaction;
+pub mod registry;
 pub mod rpc;
 
 pub use adapter::{
-    AgentKind, AgentSessionCtx, AgentStability, ObservedAgent, ObservedAgentHooks,
-    TranscriptChunker, TranscriptTruncator,
+    AgentKind, AgentSessionCtx, AgentStability, ObservedAgent, TranscriptChunker,
+    TranscriptTruncator,
 };
 use builtin::stable_promoted::{
     CODEX_STABLE_PROMOTED_SPEC, COPILOT_STABLE_PROMOTED_SPEC, CURSOR_STABLE_PROMOTED_SPEC,
@@ -39,10 +47,20 @@ pub use builtin::{
     ClaudeCodeObservedAgent, GeminiObservedAgent, STABLE_PROMOTED_SPECS, StablePromotedAgent,
     rfc3339_boundary_for_unix_seconds, stable_promoted_spec_for, write_truncated_transcript,
 };
+pub use capability::{
+    CapabilityDeclarer, DeclaredAgentCaps, HookResponseWriter, ModelExtractor, PromptExtractor,
+    SkillEvent, SkillEventExtractor, SkillEventSignal, SkillEventSource, SkillEventType, SkillRef,
+    SubagentAwareExtractor, TextGenerator, TokenCalculator, TranscriptAnalyzer,
+    TranscriptCompactor, TranscriptPreparer,
+};
 pub use derived::derive_tool_call_records;
 pub use preview::{PREVIEW_SPECS, PreviewAgent, PreviewSpec, is_preview, preview_spec_for};
 pub use redaction::{
     RedactedBytes, RedactedSink, RedactionMatch, RedactionReport, RedactionRule, Redactor,
+};
+pub use registry::{
+    AgentRegistration, FIRST_BATCH_WAVE, SlugLookup, lookup_cli_slug, registration_for, registry,
+    supported_slugs,
 };
 pub use rpc::{
     RPC_BINARY_PREFIX, RPC_DEFAULT_TIMEOUT, RpcAgent, RpcAgentBinary, RpcError, RpcRequest,

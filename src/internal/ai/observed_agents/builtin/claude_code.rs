@@ -20,6 +20,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 
 use super::super::adapter::{AgentKind, AgentSessionCtx, ObservedAgent, TranscriptTruncator};
+use crate::internal::ai::hooks::{provider::HookProvider, providers::claude::ClaudeProvider};
 
 /// Hard cap on how many bytes the transcript reader will pull off disk.
 /// Claude Code transcripts grow with conversation length; in practice
@@ -74,6 +75,16 @@ impl ObservedAgent for ClaudeCodeObservedAgent {
 
     fn protected_dirs(&self) -> &'static [&'static str] {
         &[".claude"]
+    }
+
+    /// Claude Code is the one first-batch agent whose `HookProvider`
+    /// already exists; expose it so `declared_capabilities()` matches the
+    /// static registry row (AG-16 coherence). Runtime hook dispatch still
+    /// goes through the provider registry until AG-19 removes the string
+    /// bridge.
+    fn as_hooks(&self) -> Option<&dyn HookProvider> {
+        static CLAUDE_HOOKS: ClaudeProvider = ClaudeProvider;
+        Some(&CLAUDE_HOOKS)
     }
 }
 

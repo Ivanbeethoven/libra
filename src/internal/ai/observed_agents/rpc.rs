@@ -25,7 +25,7 @@
 //!   The runtime ONLY invokes methods listed there.
 //!
 //! Out of scope for v1: streaming responses, hooks/lifecycle events
-//! (these go through the existing in-process `ObservedAgentHooks`),
+//! (these go through the in-process `HookProvider` via `ObservedAgent::as_hooks()`),
 //! truncation. Future work in `entire.md` §14 phase 5 picks up
 //! capability v2 (events stream, hook installation by binary).
 
