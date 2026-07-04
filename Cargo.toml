@@ -4,9 +4,9 @@ version = "0.18.4"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
-repository = "https://github.com/web3infra-foundation/libra"
-homepage = "https://github.com/web3infra-foundation/libra"
-authors = ["Web3 Infrastructure Foundation"]
+repository = "https://github.com/libra-tools/libra"
+homepage = "https://github.com/libra-tools/libra"
+authors = ["Libra Tools"]
 keywords = ["git", "version-control", "ai", "agent", "vcs"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
@@ -25,7 +25,7 @@ keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release build
 
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
-git-internal = "0.7.6"
+git-internal = "0.8.1"
 anyhow = "1.0.102"
 byte-unit = "5.2.0"
 byteorder = "1.5.0"
