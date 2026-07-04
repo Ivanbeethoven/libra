@@ -21,7 +21,7 @@
 - 已知冲突处一律以本计划 + `agent.md` / `code.md` 为事实源：
   - `memory.md` 断言 LifecycleEventKind 共 11 个变体、"无需新增任何 hook 事件"，与 A4 新增 `SubagentStart`/`SubagentEnd`（13 变体）冲突；A4 落地后该枚举描述需由文档 owner 更新。
   - `memory.md` 以 `libra mcp --stdio`（其链接的 docs/development/mcp.md 当前不存在）为前提，与 C6 固定的 `libra code --stdio` 现实冲突；C6 落地后需对齐。
-  - `web-api.md` 的 `/api/v1` 变更型契约与 C4 的 `/api/code/*` observe-only 契约冲突；本计划执行期间 web 契约唯一事实源是 C4（与现行 `src/internal/ai/web/code_ui.rs` 一致），`/api/v1` 提案留待独立仲裁。
+  - `web-api.md` 的 `/api/v1` 变更型契约与 C4 的 `/api/code/*` observe-only 契约冲突；本计划执行期间 web 契约唯一事实源是 C4（与现行 `src/internal/ai/web/{mod,code_ui}.rs` 一致：路由注册在 `web/mod.rs` 的 code_router，状态/读模型在 `code_ui.rs`），`/api/v1` 提案留待独立仲裁。
   - `sandbox.md` 的 VM/AppleContainer 后端是净新增功能，不并入 C7（违反 §6 "不发明额外功能"口径），作为独立后续工作另行排期。
 - A9/C8 closeout 时在三份文档头部补 "out-of-scope of tracing/plan.md" banner 并注明上述冲突条目；修订其设计断言由各文档 owner 负责，不在本计划内。
 
@@ -108,7 +108,7 @@ Agent 第一期本地采集验收规则：
 5. agent.md 把 hook entry 写成裸 `libra` 且允许 "fallback 为 `libra`"，与 §0.3.3 pinned 绝对路径强制断言及源码（`resolve_hook_binary_path` 无裸名 fallback）冲突 → agent.md 安装契约改为 canonicalize 绝对路径必须形态；A4 补安装断言。
 6. `list --json` wire key 在 agent.md 内部冻结成两套（`hooks_installed` vs `installed`）→ 统一为 `installed`（以「第一批支持项目」capability matrix 为唯一事实源）。
 7. agent.md 强制补强项 #9（可观测性 span/metric）与 #10（hook 崩溃行为回归）在 plan 零承接 → A3/A4/A5/A7/A8 验收各补对应 span/metric 断言；A4 补 hook handler 崩溃回归。
-8. Code 阶段验证命令缺 `--features test-provider -- --test-threads=1`：`code_ui_remote_*` matrices、`code_mcp_dual_entry_test`、`code_resume_test` 整文件被 feature 门控，裸跑编译为 0 个测试空跑假通过 → C4/C5/C6/C7/C8 与 §9 已补 feature 与空跑警示。
+8. Code 阶段验证命令缺 `--features test-provider -- --test-threads=1`：`code_ui_remote_*` matrices、`code_mcp_dual_entry_test`、`code_resume_test` 整文件被 feature 门控，裸跑编译为 0 个测试空跑假通过 → C4/C5/C6/C7/C8 与 §9 已补 feature 与空跑警示。（历史表述；实际门控形态于 §0.1.5 第 5 条修正为"逐项门控 + 1 个跳过占位测试"，空跑假通过结论不变。）
 9. 保留期不闭合：agent.md 承诺 findings 90 天 "settings 可覆盖" 但无 settings 键、无任务承接 → agent.md 补 `agent.retention.findings_days`，A8.5 补 findings/run-state GC 验收；audit 1 年到期处理交叉引用 Audit log 规格的合规审批流程。
 10. `--allow-raw` 覆盖面矛盾：A8.5 把 redacted 的 detail/transcript 也锁进授权门，与 agent.md 读取 pipeline 及 A5/A6.5 metadata-first 断言自相矛盾 → 统一为 "detail/transcript：显式 flag + cap/streaming/redaction；raw（未脱敏）：`--allow-raw` + audit"；agent.md 三处混写句同步拆开。
 11. 分页契约挂在不存在的 `review/investigate run list` 子命令上，且 run_id 无枚举入口 → A7/A8 与 agent.md 补充规格 §5 统一新增 `review list` / `investigate list`（沿用 `--limit 50`/cap 500/keyset cursor）。
@@ -120,6 +120,32 @@ Agent 第一期本地采集验收规则：
 17. A9/C6 的 rg 验证命令不可机械判定（未转义正则、无否定断言/判定口径）→ A9 改用转义否定式，C6 补人工复核口径。
 18. agent.md 术语表指引用户运行已删除的 `libra db upgrade` → 改为 DB open 时自动迁移口径。
 19. A5 push 方案 (b) 需要稳定错误码但 E10 无对应语义键 → 命名 `ERR_AGENT_TRACES_PUSH_DIVERGED`，agent.md E10 表补条件行。
+
+#### 0.1.4 落地性复核补充（2026-07-04）
+
+本轮按“能否交给下一个执行 Agent 直接落地”的标准复核 `plan.md` 与它声明的事实源。结论：本文已经具备任务卡、依赖、验收命令、发布闭环和 blocked 处理规则，可以作为执行入口；但它**不是功能完成证明**，当前 §10 仍只有基线行，AG/C 任务均未落地。执行者必须从 0.x 前置任务开始，不得把计划完成视为实现完成。
+
+复核发现的剩余落地阻断与处理：
+
+1. `docs/development/internal/code-agent-runtime.md` 仍包含旧 `docs/development/commands/agent.md`、旧 `docs/development/code-agent-runtime.md`、失效 `commands/_general.md` / `mcp.md` 相对链接和旧 drift 命令。由于本文把该文件声明为 Code 阶段事实源，若不先清理，会在 A1/C1 前继续污染执行者判断。新增 Task 0.4 承接该 source-of-truth drift 清理。
+2. 当前可执行起点不是 A1，而是 `0.1 -> 0.3 -> 0.4 -> 0.2 -> A1`。0.3 修测试/索引断链；0.4 修事实源文档断链；0.2 才能把跨命令规则作为可运行守卫。
+3. “落地完成”的唯一判据是 §10 进度表 + `libra log` + 对应源码/测试证据。任务卡 checkbox 只能表示覆盖项，不表示功能已完成；任何 checklist 勾选都必须附带 commit、验证命令和 blocked/deferred 说明。
+4. 所有历史路径文字必须分为两类：可点击/可执行事实源必须指向当前存在路径；历史说明允许保留旧路径，但必须明确标注“旧/已删除/不得恢复/历史提交”，不能作为任务依赖或验证命令输入。
+
+#### 0.1.5 第五轮落地核查补充（2026-07-04）
+
+本轮以「验证命令能否机械跑绿、引用锚点今天是否仍真」为标准，对照当前树（Cargo.toml `0.17.1832`、HEAD `6aa0c08`）做了七维并行核查（测试 target 命名、Task 0.3/0.4 事实基础、Agent/Code 源码锚点、agent.md/code.md 回写、验证命令实跑、本机环境）。确认的问题已直接改进到对应章节，此处仅记录索引：
+
+1. 绝大多数断言成立：46 个 `cargo test` target 命名零错（35 个现存 + 11 个计划新增各有归属卡）；Agent 侧 19 项、Code 侧 11 项源码锚点全部命中（含 `reject_non_tui_flags` 拒一切非 Gemini provider、`STABLE_AGENT_SLUGS=["claude-code","gemini"]`、`materialize_isolated_workspace` 私有、`PushArgs` 仅 `--remote`、`LifecycleEventKind` 现 11 变体等）；§0.1.2/§0.1.3 声称的 agent.md/code.md 回写 18 项全部在文；两处守卫断链（`agent_docs_contract.rs:8`、`matrix_alignment.rs:104`/`:171`）行号仍精确成立。
+2. 三条验证命令按原文**永不可能跑绿**（blocker，均已实跑确认）→ 已改写为可判定形态：Task 0.3 否定 rg 扫描（原 `docs` 全域范围含 plan.md 自身任务文本 8 行、Task 0.4 所辖 internal 文档 24 行、§0 范围外 memory.md 4 行，且全路径正则测不到 `commands/README.md:27/:50` 的相对链接断链）；Task 0.4 第三条否定断言（Task 0.3/0.4 验收文本的「…改指…」句、`test ! -e` 验证命令行与 code-agent-runtime.md 的 `test ! -e` 断言行均不含任何原白名单词）；A9 的 claudecode 路径扫描（8 处命中全是计划要求保留的移除性表述，含 `agent_docs_contract.rs:33` 反而断言文档必须包含该字符串）。
+3. Task 0.3 预计触达文件原漏 15 处 `src`/`tests` 命中（`db/migration.rs`、`skills/embedded/libra.md`、capability_package 3 处、agent_run 4 处、runtime 4 处——其中 `runtime/{revision,phase0}.rs` 为失效 rustdoc 相对链接——及 tests 2 个文件头注释）与 `template/skills/libra.md`；`sql/migrations/2026053101_ai_final_decision.sql:4` 属已发布迁移文件，豁免改写。规模由 XS/S 调整为 S。
+4. `tests/command/agent_checkpoint_test.rs` 是孤儿模块（`tests/command/mod.rs` 未声明 `mod agent_checkpoint_test;`，整文件未编译）；当前 `cargo test --test command_test agent_checkpoint_rewind` "通过"只是 `agent_help_test.rs:54` 的名称碰撞假阳性 → A5 已补接线验收项。
+5. feature 门控口径修正：`code_ui_remote_*`、`code_mcp_dual_entry_test`、`code_resume_test` 实为**逐项** `#[cfg(feature = "test-provider")]` 门控 + 1 个 `#[cfg(not(...))]` 的 `*_requires_test_provider_feature` 跳过占位测试；裸跑编译并通过 1 个占位测试（并非 0 个），假通过警示不变——C4/C5/C6/C7/§9 与 code.md 注记已同步改写。
+6. 措辞精确化：`docs/commands/zh-CN/agent.md` 现存（A2/A9 的"若存在"改为必须同步）；C4 的 `/api/code/*` 路由注册在 `src/internal/ai/web/mod.rs`（code_router），`code_ui.rs` 承载状态/读模型（§0 已同步）；C2 两个 lib 测试 fn 已存在于 `src/command/code.rs:4342`/`:4712`（hedge 收紧）；`COMPATIBILITY.md` 旧路径链接仅 agent.md 一处（:138，无 code.md 链接）。
+7. 环境核查（本机 darwin arm64）：三个真实 agent CLI 均在位且登录态通过 §0.3.2 只读检查（codex 0.142.5 已登录；claude 2.1.200 已认证且 `claude auth status` 确需 redact；opencode 1.17.11 命中 `~/.opencode/bin` 且存在凭证——Homebrew 1.17.10 被影子，印证 §0 记录 PATH 的要求）；§0.3.4 全部 smoke flag 均存在于已装版本 `--help`；`origin` remote、`.env.test`、nightly rustfmt、pnpm 就绪。**A6.5 的环境前置当前不构成 blocked**。web/worker package.json 仍为 0.17.1758（滞后口径不变）。
+8. codex review 第一轮（2026-07-04，实跑 `cargo test`）补充两项，已修入：`compat_matrix_alignment` 除 agent.md 外还在运行时读取已迁移的 `docs/development/integration-test-plan.md`（现 `docs/development/integration/integration-test-plan.md`，同属 `932c3a0` 重组提交；仅重指 agent.md 该守卫仍失败）→ Task 0.3 已并入该第三处断链重指与 15 处/9 文件旧引用清理；§9 的 `ai_code_ui_headless_test` 为**整文件** `#![cfg(feature = "test-provider")]` 门控（`tests/ai_code_ui_headless_test.rs:10` 内部属性，裸跑编译 0 个测试、无占位测试，与第 5 条的逐项门控模式不同）→ §9 命令已改为带 `--features test-provider -- --test-threads=1`（带 feature 实跑 13 个用例）。
+9. codex review 第二轮（2026-07-04）补充，已修入：同源 `integration-scenarios` 家族（`integration-scenarios.yaml` + `integration-scenarios/<id>.md` 场景文档目录）迁移在 Task 0.3 原只覆盖 `_general.md` 同行引用一处且无守卫断言，而 `tools/integration-runner` 有 4 处功能性路径拼接（`manifest.rs:24`、`plan.rs:53/:118/:177`）按旧路径必失败，两个已迁移文件自身（`integration/integration-test-plan.md:84`、`integration/integration-scenarios/integration-scenarios.yaml:6/:13`）也残留旧根路径 → Task 0.3 补全 21 处/10 文件清单并新增家族否定断言（模式 `docs/development/integration-scenarios` 同时覆盖两种旧形态，不误伤新路径）。
+10. codex review 第三轮（2026-07-04）补充，已修入：全路径家族模式测不到的 **bare/相对简写**残留——`integration/integration-scenarios/README.md:3` 的 `../integration-scenarios.yaml` 父级相对链接（yaml 迁移后已并入目录内，该链接必然断链）、`account.md:924/:968`、`_general.md:29`（mermaid 标签）、`tools/integration-runner/README.md:14` 的 bare 简写 → Task 0.3 新增简写规范化验收（13 行/4 文件 + README 断链 1 处）与两条配套否定断言（README 断链断言 + prose 文档行级"必须携带完整新路径"断言，后者已注明 `-v` 同行混写局限、以逐点位核对为准）。
 
 ### 0.2 执行粒度与 PR 切分规则
 
@@ -422,7 +448,7 @@ harness 硬性要求：
 本计划可由 Claude（或其他 agent 执行者）自主逐任务执行。每个任务的执行循环：
 
 1. **定位状态**：读 §10 执行进度表 + `libra log`（用 `--oneline` 类简洁输出确认已发布版本与已完成任务）；重读 `Cargo.toml` 当前 version。
-2. **选任务**：按 §1/§2/§5 依赖关系选下一个所有依赖已完成的任务。顺序基线：Task 0.1 → **0.3**（先修守卫断链，否则一切验证命令不可用）→ 0.2 → A1 → A2/A3（可并行）→ A4 → A5 → A6 → A6.5 → A7/A8 → A8.5 → A9 →（§5 进入条件）→ C1 → C2 → C3/C4 → C5/C6 → C7 → C8。同一时间只推进一个任务到发布。
+2. **选任务**：按 §1/§2/§5 依赖关系选下一个所有依赖已完成的任务。顺序基线：Task 0.1 → **0.3**（先修守卫断链，否则一切验证命令不可用）→ **0.4**（清理 internal/tracing 事实源 drift）→ 0.2 → A1 → A2/A3（可并行）→ A4 → A5 → A6 → A6.5 → A7/A8 → A8.5 → A9 →（§5 进入条件）→ C1 → C2 → C3/C4 → C5/C6 → C7 → C8。同一时间只推进一个任务到发布。
 3. **开工前 source-audit**：逐条核对该卡验收标准当前代码是否已满足（不以任何文档断言为准，含本计划自身——以 `rg`/Read 源码与测试为准）；已满足项记录证据（文件+行号/测试名）后视为完成，不重复实现。
 4. **实施**：按 §0.2 切分 slice；遵循 CLAUDE.md 编码规范（错误处理不 `unwrap()`、`_with_conn` 事务变体、测试隔离、hash-kind preflight 等）。
 5. **验证**：运行该卡「验证」清单全部命令，注意 feature 门控（`--features test-provider -- --test-threads=1`）与 env-gate（`LIBRA_RUN_LOCAL_AGENTS=1` 等）标注。测试 target 注册规则：`tests/compat/*` 文件必须注册 `Cargo.toml [[test]]`（Cargo 默认不发现子目录）并加 `tests/compat/README.md` 行；顶层 `tests/*.rs` 自动发现、无需注册 `[[test]]`；两类都必须同步 `tests/INDEX.md`。
@@ -484,7 +510,7 @@ harness 硬性要求：
 - [ ] `cargo test --test compat_matrix_alignment`（Task 0.3 完成前预期失败，不得据此标记本卡完成）
 - [ ] `cargo test --test compat_error_codes_doc_sync`
 
-**依赖**：Task 0.1、0.3（0.3 未完成时本卡验证命令必失败）。
+**依赖**：Task 0.1、0.3、0.4（0.3 未完成时本卡验证命令必失败；0.4 未完成时跨文档事实源仍不干净）。
 
 **预计触达文件**：按后续任务决定。
 
@@ -492,7 +518,7 @@ harness 硬性要求：
 
 ### Task 0.3：文档搬迁接线（tracing/ 新路径守卫与索引重指）
 
-**描述**：`docs/development/commands/{agent,code}.md` 已迁移为 `docs/development/tracing/{agent,code}.md`，但守卫与索引仍指旧路径，导致 `cargo test --all` 在当前树上直接编译失败（`include_str!` 指向不存在的文件）。本卡必须在任何 Agent/Code 实现任务开工前完成，否则 §9 与各任务卡引用的 `compat_agent_docs_contract`、`cargo test --all` 均不可执行。
+**描述**：`docs/development/commands/{agent,code}.md` 已迁移为 `docs/development/tracing/{agent,code}.md`，但守卫与索引仍指旧路径，导致 `cargo test --all` 在当前树上直接编译失败（`include_str!` 指向不存在的文件）。同一次重组提交（`932c3a0` docs(development): reorganize planning docs）还把 `docs/development/integration-test-plan.md` 迁至 `docs/development/integration/integration-test-plan.md`，而 `compat_matrix_alignment` 在运行时同样读取该旧路径——仅重指 agent.md 无法让该守卫跑绿（2026-07-04 codex review 实跑 `cargo test` 确认），本卡一并重指。本卡必须在任何 Agent/Code 实现任务开工前完成，否则 §9 与各任务卡引用的 `compat_agent_docs_contract`、`cargo test --all` 均不可执行。
 
 **关联设计文档**：[`agent.md`](agent.md)、[`code.md`](code.md)。只做路径重指与索引同步，不改变守卫断言语义。
 
@@ -500,19 +526,27 @@ harness 硬性要求：
 
 - [ ] `tests/compat/agent_docs_contract.rs` 的 `include_str!("../../docs/development/commands/agent.md")` 重指 `../../docs/development/tracing/agent.md`；守卫内其它路径引用同步核对。
 - [ ] `tests/compat/matrix_alignment.rs` 的**运行时**旧路径读取同步重指：`read_repo_file("docs/development/commands/agent.md")`（约 :104）与相关 context 字符串（约 :171）——该守卫对缺失文件直接 panic，是 `include_str!` 之外的第二处断链，`cargo check` 抓不到。
+- [ ] `compat_matrix_alignment` 的**第三处**断链（旧 `docs/development/integration-test-plan.md`，已迁至 `docs/development/integration/integration-test-plan.md`）同步重指：`tests/compat/matrix_alignment.rs`（:103 运行时读取、:161/:166 context 字符串）、`tests/compat/matrix_alignment_support.rs`（:174/:181 运行时读取）、`tools/integration-runner/src/plan.rs:101`（功能性路径常量）以及 `tests/INDEX.md`、`tools/integration-runner/README.md`、`AGENTS.md`、`docs/development/commands/_general.md`、`docs/development/account.md`、`docs/development/gap/grit-gap.md` 的 live 引用——2026-07-04 实测旧路径共 15 处/9 文件（与下一条的命中行有重叠）。
+- [ ] 同源场景清单/场景文档迁移一并重指：旧 `docs/development/integration-scenarios.yaml` 与旧 `docs/development/integration-scenarios/<id>.md` 目录形态（均已迁至 `docs/development/integration/integration-scenarios/`）——**功能性路径拼接** `tools/integration-runner/src/manifest.rs:24`、`tools/integration-runner/src/plan.rs`（:53 目录 join、:118/:177 场景文档拼接；:51/:121 为注释与错误消息），按旧路径 runner 必失败；doc 注释 `tools/integration-runner/src/cli.rs:14`、`tools/integration-runner/src/registry.rs:11`、`tools/integration-runner/README.md:14`；文档引用 `docs/development/commands/_general.md`（:9/:20/:68）、`docs/development/account.md`（:1039/:1040/:1042）、`docs/development/gap/grit-gap.md`（:612/:613/:691）；以及两个已迁移文件自身残留的旧根路径：`docs/development/integration/integration-test-plan.md:84`、`docs/development/integration/integration-scenarios/integration-scenarios.yaml`（:6/:13 头部注释）——2026-07-04 实测全路径旧形态共 21 处/10 文件。
+- [ ] 同族 **bare/相对简写**引用一并规范化（全路径 rg 测不到，须单列）：`docs/development/integration/integration-scenarios/README.md:3` 的 `../integration-scenarios.yaml` 父级相对链接（迁移前 yaml 在目录外、现已并入目录内，链接必然断链——改为同目录 `integration-scenarios.yaml`；同文件 :4 的 `../integration-test-plan.md` 现可解析、无需改）；`docs/development/account.md:924/:968` 与 `docs/development/commands/_general.md:29`（mermaid 标签）、`tools/integration-runner/README.md:14` 的 bare `integration-scenarios.yaml` / `integration-scenarios/<file>` 简写——上述 prose 文档中所有 `integration-scenarios` 提及统一规范化为完整新路径 `docs/development/integration/integration-scenarios/…`（目录内相对链接仅允许 integration-scenarios/ 目录内部文件互引）。2026-07-04 实测规范化缺口 13 行/4 文件 + README 断链 1 处。
 - [ ] `tests/INDEX.md` 与 `tests/compat/README.md` 中上述守卫的 source mapping 更新为 tracing/ 新路径。
-- [ ] `COMPATIBILITY.md` 中指向 `docs/development/commands/agent.md` / `code.md` 的链接改指 tracing/ 新路径。
-- [ ] `docs/development/commands/README.md` 的 agent/code 表行改指 tracing/ 新路径或注明已迁移（不留断链）。
-- [ ] 全库 `rg -n "docs/development/commands/(agent|code)\.md"` 余量**一律改指 tracing/ 新路径**（含 `Cargo.toml`、`AGENTS.md`、源码注释等处的引用；统一改指以便 rg 可断言零残留，不采用"注明历史引用"的模糊出口）。
+- [ ] `COMPATIBILITY.md` 中指向 `docs/development/commands/agent.md` 的链接改指 tracing/ 新路径（2026-07-04 实测仅 :138 一处 agent.md 链接，无 code.md 链接）。
+- [ ] `docs/development/commands/README.md` 的 agent/code 表行改指 tracing/ 新路径或注明已迁移（不留断链）。注意 :27/:50 是相对链接 `](agent.md)` / `](code.md)`，全路径 rg 测不到，须用下方专项否定断言验证。
+- [ ] 本卡负责范围内的旧路径余量**一律改指 tracing/ 新路径**，范围为 `src`、`tests`、`Cargo.toml`、`COMPATIBILITY.md`、`AGENTS.md`、`docs/commands/`、`docs/development/commands/`、`template/`（含源码注释、rustdoc 链接、embedded/template 技能文档）。四类明确豁免（不由本卡触碰，避免验收与验证自相矛盾）：`docs/development/tracing/plan.md`（任务文本必须引用旧路径字符串）、`docs/development/tracing/memory.md`（§0 范围外文档，其旧路径引用随 A9 banner 处理）、`docs/development/internal/code-agent-runtime.md`（Task 0.4 承接）、`sql/migrations/*`（已发布迁移文件不得改写，`2026053101_ai_final_decision.sql:4` 注释保留为历史引用）。
 
 **验证**：
 
 - [ ] `cargo test --test compat_agent_docs_contract`
-- [ ] `cargo test --test compat_matrix_alignment`
+- [ ] `cargo test --test compat_matrix_alignment`（须 agent.md 与 integration-test-plan.md 两类断链都重指后才可跑绿）
 - [ ] `LIBRA_SKIP_WEB_BUILD=1 cargo check --all-targets`（确认无 `include_str!` 断链）
-- [ ] `! rg -n "docs/development/commands/(agent|code)\.md" src tests docs Cargo.toml COMPATIBILITY.md AGENTS.md`（否定断言，期望零命中）
+- [ ] `! rg -n "docs/development/commands/(agent|code)\.md" src tests Cargo.toml COMPATIBILITY.md AGENTS.md docs/commands docs/development/commands template`（否定断言，期望零命中；本卡完成前预期失败——2026-07-04 实测该范围 29 处命中/约 25 个文件。豁免的 plan.md、memory.md、internal 文档与 sql 迁移不在扫描范围，分别由本卡豁免声明、A9、Task 0.4 承接；原 `docs` 全域扫描因命中上述豁免文件永不可跑绿，已废弃）
+- [ ] `! rg -n "\]\((agent|code)\.md\)" docs/development/commands/README.md`（否定断言：README 相对链接断链已清理，期望零命中）
+- [ ] `! rg -n "docs/development/integration-test-plan\.md" src tests tools docs AGENTS.md -g '!docs/development/tracing/plan.md'`（否定断言，期望零命中；本卡完成前预期失败——2026-07-04 实测 15 处命中/9 文件。plan.md 经 `-g` 排除：本卡任务文本必须引用旧路径字符串）
+- [ ] `! rg -n "docs/development/integration-scenarios" src tests tools docs AGENTS.md -g '!docs/development/tracing/plan.md'`（否定断言，期望零命中；一个模式同时覆盖 `.yaml` 与 `/<id>.md` 两种旧形态；新路径 `docs/development/integration/integration-scenarios/…` 因中间多一级 `integration/` 不会被命中；本卡完成前预期失败——2026-07-04 实测 21 处/10 文件）
+- [ ] `! rg -n "\]\(\.\./integration-scenarios\.yaml\)" docs/development/integration/integration-scenarios/README.md`（否定断言：README 迁移后失效的父级相对链接已修复；本卡完成前预期失败——1 处命中）
+- [ ] `! rg -n "integration-scenarios" docs/development/account.md docs/development/gap/grit-gap.md docs/development/commands/_general.md tools/integration-runner/README.md | rg -v "docs/development/integration/integration-scenarios"`（bare/相对简写规范化断言：这四个 prose 文档中每一行 `integration-scenarios` 提及都必须携带完整新路径；本卡完成前预期失败——2026-07-04 实测 13 行缺口。已知局限：同一行同时含新全路径与残留 bare 简写时会被 `-v` 放过，故以上一条验收清单的逐点位核对为准）
 
-**依赖**：Task 0.1。本卡必须先于 Task 0.2 验证与一切 A/C 任务完成（0.3 未完成时 `compat_matrix_alignment`、`compat_agent_docs_contract` 乃至 `cargo test --all` 必失败）。
+**依赖**：Task 0.1。本卡必须先于 Task 0.4、Task 0.2 验证与一切 A/C 任务完成（0.3 未完成时 `compat_matrix_alignment`、`compat_agent_docs_contract` 乃至 `cargo test --all` 必失败）。
 
 **预计触达文件**：
 
@@ -522,13 +556,58 @@ harness 硬性要求：
 - `tests/INDEX.md`
 - `COMPATIBILITY.md`
 - `docs/development/commands/README.md`
-- 其余 rg 命中的零散引用（`Cargo.toml` 注释、`AGENTS.md`、`docs/commands/package.md`、`src/internal/db.rs` 注释等）
+- `docs/commands/package.md`、`Cargo.toml` 注释、`AGENTS.md`、`src/internal/db.rs` 注释
+- `src/internal/db/migration.rs`（:610/:651 注释）
+- `src/internal/ai/skills/embedded/libra.md`、`template/skills/libra.md`（嵌入/模板技能文档）
+- `src/internal/ai/capability_package/{diff,mod,manifest}.rs`、`src/internal/ai/agent_run/{event_store,mod,workspace_strategy,event}.rs`、`src/internal/ai/runtime/{revision,phase0,phase4,event}.rs`（其中 `runtime/revision.rs:28`、`runtime/phase0.rs:10` 是失效 rustdoc 相对链接，重指时注意新相对深度 `../../../../../docs/development/tracing/agent.md`）
+- `tests/code_codex_default_tui_test.rs:1`、`tests/ai_subagent_flag_off_regression_test.rs:3`（文件头注释）
+- `tests/compat/matrix_alignment_support.rs`（integration-test-plan 运行时读取）
+- `tools/integration-runner/src/{plan,manifest,cli,registry}.rs`、`tools/integration-runner/README.md`
+- `docs/development/commands/_general.md`、`docs/development/account.md`、`docs/development/gap/grit-gap.md`（integration-test-plan / integration-scenarios live 引用）
+- `docs/development/integration/integration-test-plan.md`、`docs/development/integration/integration-scenarios/integration-scenarios.yaml`（已迁移文件自身残留的旧根路径）
+- `docs/development/integration/integration-scenarios/README.md`（:3 父级相对链接断链）
 
-**规模**：XS/S。
+**规模**：S（2026-07-04 实测：agent/code 旧路径 29 处/约 25 文件 + integration-test-plan 旧路径 15 处/9 文件 + integration-scenarios 家族旧路径 21 处/10 文件，命中行与文件有重叠，全部为机械重指）。
+
+### Task 0.4：事实源文档自洽清理（internal runtime / tracing drift guard）
+
+**描述**：`docs/development/internal/code-agent-runtime.md` 是本文声明的内部 AgentRuntime / Web-only 事实源，但当前仍保留旧迁移前路径和失效相对链接。该文档在 A9/C1/C8 会被执行者读取；若它继续把 `docs/development/commands/agent.md`、`docs/development/code-agent-runtime.md` 或本目录外已删除的 `mcp.md` 当作 live 输入，后续实现会重新引入已修正的旧事实源。本卡只做 source-of-truth 链接、命令和漂移守卫清理，不改变 Agent/Code 设计目标。
+
+**关联设计文档**：[`agent.md`](agent.md)、[`code.md`](code.md)、[`../internal/code-agent-runtime.md`](../internal/code-agent-runtime.md)。执行时以当前存在路径为事实源：外部 Agent 捕获公共契约在 `docs/development/tracing/agent.md`，Code 命令公共契约在 `docs/development/tracing/code.md`，跨命令规则在 `docs/development/commands/_general.md`。
+
+**验收标准**：
+
+- [ ] `docs/development/internal/code-agent-runtime.md` 中所有 live Markdown 链接从 `commands/agent.md` / `docs/development/commands/agent.md` 改指 `../tracing/agent.md` 或 `docs/development/tracing/agent.md`；描述 `libra code` public surface 的 live 链接改指 `../tracing/code.md` 或 `docs/development/tracing/code.md`。（2026-07-04 实测：失效 href 均为相对形态——指向 `commands/agent.md` 的 11 处、`commands/_general.md` 4 处、`mcp.md` 13 处；全路径字符串只出现在链接文字/正文。另有 :2678 指向自身文件名的自链接虽可解析，但其链接文字声称已删除的根路径，须一并改写。）
+- [ ] `docs/development/internal/code-agent-runtime.md` 中所有 live Markdown 链接从 `commands/_general.md` 改指 `../commands/_general.md`；不得留下从 `internal/` 目录解析到不存在路径的相对链接。
+- [ ] `docs/development/internal/code-agent-runtime.md` 中的 `mcp.md` live 链接全部处理：若仅引用历史 MCP 拆分计划，改为不可点击历史说明；若引用当前可执行验证，改指 `docs/development/tracing/code.md` 的 C6 或现存的 `docs/development/integration/integration-scenarios/mcp.md`，并说明其只是 integration scenario，不是 MCP 事实源。
+- [ ] drift / rg / 验收命令里的旧路径同步改为当前路径，尤其是 `docs/development/code-agent-runtime.md`、`docs/development/commands/agent.md`、`commands/agent.md`、`mcp.md`。
+- [ ] 历史说明允许保留旧路径字符串，但必须在同句或相邻句标注 `旧`、`历史`、`已删除`、`不得恢复` 或 `d0a714` 等语境；不得作为可执行命令、依赖、链接或“source-of-truth”出现。
+- [ ] `docs/development/tracing/agent.md`、`docs/development/tracing/code.md`、本文的 cross-doc 描述与清理后的 internal 文档一致；若发现它们仍把旧路径当 live 输入，同 PR 修正。
+
+**验证**：
+
+- [ ] `test ! -e docs/development/commands/agent.md && test ! -e docs/development/commands/code.md && test ! -e docs/development/code-agent-runtime.md && test ! -e docs/development/agent.md && test ! -e docs/development/web-only.md`
+- [ ] `! rg -n "\\]\\((commands/(agent|_general)\\.md|mcp\\.md|code-agent-runtime\\.md|\\.\\./agent\\.md|\\.\\./web-only\\.md|\\.\\./code-agent-runtime\\.md)\\)" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`（Task 0.4 完成前预期失败——2026-07-04 实测 29 处命中，全部位于 code-agent-runtime.md，含 :2678 自链接）
+- [ ] `! rg -n "docs/development/commands/(agent|code)\\.md|docs/development/code-agent-runtime\\.md|docs/development/agent\\.md|docs/development/web-only\\.md" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md | rg -v "旧|历史|已删除|不得|d0a714|include_str|read_repo_file|Task 0\\.3|Task 0\\.4|改指|test ! -e"`（白名单含 `改指` / `test ! -e`：本计划 Task 0.3/0.4 验收文本中的「…改指…」句与上一条 `test ! -e` 验证命令、code-agent-runtime.md 内的 `test ! -e` 断言行都合法保留旧路径字符串；2026-07-04 实测原白名单下该断言永不可跑绿）
+- [ ] `rg -n "docs/development/tracing/(agent|code)\\.md|docs/development/internal/code-agent-runtime\\.md|docs/development/commands/_general\\.md" docs/development/internal/code-agent-runtime.md docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/tracing/plan.md`
+
+**依赖**：Task 0.1、0.3。本卡必须先于 Task 0.2 验证与 A1/C1 开工；0.4 未完成时，不得把 `docs/development/internal/code-agent-runtime.md` 当作干净事实源。
+
+**预计触达文件**：
+
+- `docs/development/internal/code-agent-runtime.md`
+- `docs/development/tracing/agent.md`
+- `docs/development/tracing/code.md`
+- `docs/development/tracing/plan.md`
+
+**规模**：S。
 
 ## 2. Agent 阶段总依赖图
 
 ```text
+Global preflight:
+Task 0.1 -> Task 0.3 -> Task 0.4 -> Task 0.2 -> AG-16
+
 AG-16 capability/registry
   ├─ AG-17 CLI alias/list/add/remove
   ├─ AG-18 external RPC v2/security
@@ -567,7 +646,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - [ ] `cargo test --test compat_agent_architecture_guard`
 - [ ] `cargo test --lib observed_agents`
 
-**依赖**：Task 0.1、0.2、0.3（0.3 未完成时 `cargo test --all` 编译失败，任何任务的验收命令均不可执行）。
+**依赖**：Task 0.1、0.2、0.3、0.4（0.3 未完成时 `cargo test --all` 编译失败，任何任务的验收命令均不可执行；0.4 未完成时 source-of-truth 文档仍可能指向旧路径）。
 
 **预计触达文件**：
 
@@ -614,7 +693,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - `src/command/agent/status.rs`
 - `src/command/agent/doctor.rs`
 - `docs/commands/agent.md`
-- `docs/commands/zh-CN/agent.md`（若存在）
+- `docs/commands/zh-CN/agent.md`（现存，必须同步）
 - `COMPATIBILITY.md`
 - `tests/command/*`
 
@@ -729,17 +808,18 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - [ ] doctor 检测并修复三类不一致：DB 指向缺失对象、ref 可达但无 catalog 行、`object_index` 缺失。
 - [ ] prune 窗口 A/B 关闭：writer lease、临时保护 ref 或 ref-vs-catalog fail-closed 必须覆盖到 DB INSERT/UPSERT 完成。
 - [ ] `CheckpointCommit.commit_hash` 与 DB 列 `traces_commit` 命名不混用。
-- [ ] reader（metadata-first list/show/detail/transcript）与 doctor 兼容识别**升级前 Libra v1 布局的存量 checkpoint**（无 manifest.json/redaction_report.json/content_hash.txt，事件文件为 `events/<provider>.jsonl`、transcript 为 `transcript/<provider>`）：doctor 将其归类为 legacy-v1 而非三类不一致，不得误报缺 manifest 或触发 repair 改写；v1 checkpoint 的 show/transcript 走无 manifest 的 fallback 解析。`tests/fixtures/agent_checkpoints/` 必须包含一个由当前（改造前）writer 生成的 v1 布局 fixture 供回归。`agent_kind=gemini` 的存量 session/checkpoint 行继续可读（read-only），doctor 对残留 gemini hooks 配置给出指向卸载通道的 actionable 提示。
+- [ ] reader（metadata-first list/show/detail/transcript）与 doctor 兼容识别**升级前 Libra v1 布局的存量 checkpoint**（无 manifest.json/redaction_report.json/content_hash.txt，事件文件为 `events/<provider>.jsonl`、transcript 为 `transcript/<provider>`）：doctor 将其归类为 legacy-v1 而非三类不一致，不得误报缺 manifest 或触发 repair 改写；v1 checkpoint 的 show/transcript 走无 manifest 的 fallback 解析。`tests/fixtures/agent_checkpoints/` 必须包含一个由当前（改造前）writer 生成的 v1 布局 fixture 供回归——本卡第一步须在改动任何 writer 代码前先生成并提交该 fixture。`agent_kind=gemini` 的存量 session/checkpoint 行继续可读（read-only），doctor 对残留 gemini hooks 配置给出指向卸载通道的 actionable 提示。
 - [ ] 提供 v1→E4-libra 的 migration notes 与 schema pin test；reader fallback 为主路径，是否对 `refs/libra/traces` 做一次性 backfill/重写为可选项，不做则在 release notes 说明 v1 checkpoint 长期以 legacy 形态可读。
 - [ ] 定义并测试 prune/rewrite 之后 `libra agent push` 的行为：`refs/libra/traces` 是 Libra 托管、prune 即整链重写的 ref，二选一——(a) agent push 对该 ref 采用 force-with-lease 等价语义（lease 基于 tracking ref，复用 push 既有机制，无需新错误码）；或 (b) 非快进时报 `ERR_AGENT_TRACES_PUSH_DIVERGED` 对应的稳定错误码（语义键须同 PR 补入/对齐 `agent.md` E10 表已预留的条件行；真实 `LBR-*` 编号沿用 A3 建立的分配规则，在本卡自己的 slice 内于 `docs/error-codes.md` 分配，无需回到 A3）+ actionable 指引，并提供重推出口（当前 `PushArgs` 仅有 `--remote`，需新增 force 类参数）；配套回归测试覆盖 clean/prune 重写后 push 到本地 file remote 的场景。
 - [ ] 新增迁移遵循 `sql/migrations/README.md` 规范：`YYYYMMDDNN` 命名（版本号严格递增）、forward DDL 幂等（`IF NOT EXISTS`）、配套 `_down.sql`（仓库现存迁移全部成对）、在 `builtin_migrations()` 注册，并补 run_pending 幂等 + 升级→回滚→再升级 round-trip 测试。
 - [ ] 按 `agent.md` 补充规格 §6 落地 `agent.checkpoint.write`、`agent.clean.prune`、`agent.doctor.repair` span/metric，tracing fake sink 断言必带/禁止字段。
+- [ ] 接线孤儿测试模块：`tests/command/agent_checkpoint_test.rs` 现存但未在 `tests/command/mod.rs` 声明（整文件未编译，2026-07-04 实测）；本卡必须补 `mod agent_checkpoint_test;` 并确认其中用例真实运行。在接线前，`cargo test --test command_test agent_checkpoint_rewind` "通过"只是 `agent_help_test.rs:54` 的名称碰撞假阳性，不得计为验收证据。
 
 **验证**：
 
 - [ ] `cargo test --test agent_checkpoint_export_test`
 - [ ] `cargo test --test command_test agent_checkpoint_rewind`
-- [ ] `cargo test --test command_test agent_checkpoint_rewind -- --list` 列出接入后的 rewind guard。
+- [ ] `cargo test --test command_test agent_checkpoint_rewind -- --list` 列出接入后的 rewind guard（列表必须包含 `agent_checkpoint_test.rs` 内的行为用例，而不只是 help 措辞测试）。
 - [ ] `EXPLAIN QUERY PLAN` 或测试断言命中 `agent_session` / `agent_checkpoint` 分页索引。
 - [ ] `cargo test --test db_migration_test`（round-trip 用例落点按现有 target 组织）
 
@@ -1010,7 +1090,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - [ ] `cargo test --test compat_matrix_alignment`
 - [ ] `cargo test --test compat_error_codes_doc_sync`
 - [ ] `! rg -n "\]\(\.\./agent\.md\)|\]\(\.\./web-only\.md\)|\]\(\.\./code-agent-runtime\.md\)" docs/development/tracing/agent.md docs/development/tracing/code.md docs/development/internal/code-agent-runtime.md`（否定断言，期望零命中；与 `agent.md` 验收命令同式）
-- [ ] `! rg -n "src/internal/ai/claudecode" src docs tests`（否定断言，期望零命中；`claudecode` 一词在移除性表述中允许出现，不作为守卫模式）
+- [ ] `test ! -d src/internal/ai/claudecode && ! rg -n "src/internal/ai/claudecode" src`（代码树否定断言，期望零命中。docs/tests 不纳入扫描：2026-07-04 实测 docs/tests 中全部 8 处命中均为计划要求保留的移除性表述——含 `tests/compat/agent_docs_contract.rs:33` 反而断言 agent.md 必须包含该路径字符串——原全范围扫描永不可跑绿）
 - [ ] `cargo +nightly fmt --all --check`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo test --all`
@@ -1021,7 +1101,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 - `docs/development/tracing/agent.md`
 - `docs/commands/agent.md`
-- `docs/commands/zh-CN/agent.md`（若存在）
+- `docs/commands/zh-CN/agent.md`（现存，必须同步）
 - `COMPATIBILITY.md`
 - `docs/error-codes.md`
 - `tests/INDEX.md`
@@ -1123,8 +1203,8 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 **验证**：
 
 - [ ] `cargo test --test code_cli_dispatch_test`
-- [ ] `cargo test --lib code::tests::rejects_web_flags_in_stdio_mode`（按实际 test path 调整）
-- [ ] `cargo test --lib code::tests::rejects_explicit_plan_mode_true_for_non_codex_provider`（按实际 test path 调整）
+- [ ] `cargo test --lib code::tests::rejects_web_flags_in_stdio_mode`（fn 已存在于 `src/command/code.rs:4342`；完整路径为 `command::code::tests::…`，子串过滤即可命中）
+- [ ] `cargo test --lib code::tests::rejects_explicit_plan_mode_true_for_non_codex_provider`（fn 已存在于 `src/command/code.rs:4712`）
 
 **依赖**：C1。
 
@@ -1198,7 +1278,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 - [ ] `cargo test --test ai_code_ui_wire_test`
 - [ ] `cargo test --test ai_code_ui_projection_test`
 
-（`code_ui_remote_*` matrices 整文件被 `#[cfg(feature = "test-provider")]` 门控：不带 feature 会编译为 0 个测试空跑"通过"，不得计为验收证据；与 CI compat-offline-core 第二遍口径一致。）
+（`code_ui_remote_*` matrices 的全部真实用例逐项被 `#[cfg(feature = "test-provider")]` 门控：不带 feature 只编译并通过 1 个 `*_requires_test_provider_feature` 跳过占位测试，显示"通过"但未执行任何真实用例，不得计为验收证据；与 CI compat-offline-core 第二遍口径一致。）
 
 **依赖**：C1、C2。
 
@@ -1230,7 +1310,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **验证**：
 
-- [ ] `cargo test --features test-provider --test code_resume_test -- --test-threads=1`（整文件 feature 门控，裸跑为 0 个测试空跑）
+- [ ] `cargo test --features test-provider --test code_resume_test -- --test-threads=1`（真实用例逐项 feature 门控，裸跑只过 1 个跳过占位测试）
 - [ ] `cargo test --test ai_session_jsonl_test`
 - [ ] `cargo test --test ai_code_ui_projection_test`
 - [ ] `cargo test --test ai_goal_resume_test`
@@ -1263,7 +1343,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 
 **验证**：
 
-- [ ] `cargo test --features test-provider --test code_mcp_dual_entry_test -- --test-threads=1`（整文件 feature 门控，裸跑为 0 个测试空跑）
+- [ ] `cargo test --features test-provider --test code_mcp_dual_entry_test -- --test-threads=1`（真实用例逐项 feature 门控，裸跑只过 1 个跳过占位测试）
 - [ ] `cargo test --features test-provider --test code_ui_remote_security_matrix -- --test-threads=1`
 - [ ] `rg -n "code-control --stdio|libra code --stdio|MCP" docs/commands docs/development/tracing/code.md docs/development/tracing/agent.md docs/development/tracing/plan.md src/command`（§0 范围外的 memory.md/sandbox.md/web-api.md 不在扫描范围；其 `libra mcp --stdio` 等表述按 §0 out-of-scope 声明处理，不作为本卡验收对象。判定口径：输出经人工复核，不得存在把 MCP stdio 描述为 live TUI turn control plane 的表述；复核结论附入 PR 描述）
 
@@ -1297,7 +1377,7 @@ AG-16..AG-23 + A6.5 + A8.5/AG-24a -> AG-24 docs/tests/compat/release closeout ->
 **验证**：
 
 - [ ] `cargo test --test code_tool_acl_test`
-- [ ] `cargo test --features test-provider --test code_ui_remote_approval_matrix -- --test-threads=1`（整文件 feature 门控，裸跑为 0 个测试空跑）
+- [ ] `cargo test --features test-provider --test code_ui_remote_approval_matrix -- --test-threads=1`（真实用例逐项 feature 门控，裸跑只过 1 个跳过占位测试）
 - [ ] `cargo test --test ai_subagent_worktree_readonly_test`
 - [ ] `cargo test --test compat_all_production_unwrap_guard`
 
@@ -1459,10 +1539,10 @@ cargo test --features test-provider --test code_ui_remote_generation_matrix -- -
 cargo test --features test-provider --test code_ui_remote_approval_matrix -- --test-threads=1
 cargo test --test ai_code_ui_wire_test
 cargo test --test ai_code_ui_projection_test
-cargo test --test ai_code_ui_headless_test
+cargo test --features test-provider --test ai_code_ui_headless_test -- --test-threads=1
 ```
 
-注意：`code_ui_remote_*` matrices、`code_mcp_dual_entry_test`、`code_resume_test` 整文件被 `#[cfg(feature = "test-provider")]` 门控——不带 `--features test-provider` 时编译为 0 个测试、空跑显示"通过"，不得计为验收证据（与 CI compat-offline-core 第二遍 `--features test-provider ... --test-threads=1` 口径一致）。
+注意：`code_ui_remote_*` matrices、`code_mcp_dual_entry_test`、`code_resume_test` 的全部真实用例逐项被 `#[cfg(feature = "test-provider")]` 门控——不带 `--features test-provider` 时只编译 1 个 `#[cfg(not(feature = "test-provider"))]` 的 `*_requires_test_provider_feature` 跳过占位测试，显示"通过"但未执行任何真实用例，不得计为验收证据（与 CI compat-offline-core 第二遍 `--features test-provider ... --test-threads=1` 口径一致）。另：`ai_code_ui_headless_test` 是**整文件** `#![cfg(feature = "test-provider")]` 门控（`tests/ai_code_ui_headless_test.rs:10`，无占位测试，裸跑编译为 0 个测试"通过"），同样必须带 feature 运行才计为证据。
 
 Code 阶段的 live/provider-backed 验证使用仓库根目录 `.env.test`。其中 CLI 场景传 `--env-file .env.test`；直接读取进程环境的 Cargo live tests 先导出该文件中的 Key：
 
@@ -1496,4 +1576,5 @@ cargo test --lib cli::tests::root_after_help_lists_every_visible_command
 
 | 日期 | 任务/slice | 结果 | 版本 | commit | 验证摘要 / blocked 原因与恢复步骤 |
 |---|---|---|---|---|---|
-| 2026-07-03 | （基线）计划四轮复核完成（§0.1.3），尚未开始执行 | 基线 | Cargo.toml `0.17.1808`；web/worker package.json `0.17.1758`（滞后，首次发布时同步） | — | 三份 tracing 文档已统一；两处守卫断链（`agent_docs_contract.rs` 编译期 include_str! + `matrix_alignment.rs:104` 运行时 read_repo_file 均指旧路径）导致 `cargo test --all` 当前失败——执行顺序为 0.1 → 0.3（修断链）→ 0.2 |
+| 2026-07-03 | （基线）计划四轮复核完成（§0.1.3），尚未开始执行 | 基线 | Cargo.toml `0.17.1808`；web/worker package.json `0.17.1758`（滞后，首次发布时同步） | — | 三份 tracing 文档已统一；两处守卫断链（`agent_docs_contract.rs` 编译期 include_str! + `matrix_alignment.rs:104` 运行时 read_repo_file 均指旧路径）导致 `cargo test --all` 当前失败——执行顺序为 0.1 → 0.3（修断链）→ 0.4（清理 internal/tracing 事实源 drift）→ 0.2 |
+| 2026-07-04 | （基线）第五轮落地核查完成（§0.1.5），仍未开始执行任务 | 基线 | 本行文档改动随 `v0.18.0` 发布（Cargo.toml 由 `0.17.1832` 升至 `0.18.0`；web/worker package.json 同步 `0.18.0`，`0.17.1758` 滞后已消除） | — | 七维核查：源码锚点/跨文档回写/测试 target 命名全部成立；修复 Task 0.3、Task 0.4、A9 三条按原文不可跑绿的验证命令；Task 0.3 触达面补全（29 处命中/约 25 文件，规模 XS/S→S）并明确四类豁免；A5 补孤儿测试模块（`tests/command/agent_checkpoint_test.rs`）接线验收；feature 门控口径改为"逐项门控 + 1 个跳过占位测试"。A6.5 环境前置实测通过（codex 0.142.5 / claude 2.1.200 / opencode 1.17.11 均在位且登录态检查通过），当前不 blocked。codex review 三轮 FAIL→均已修（§0.1.5 第 8/9/10 条）：第一轮——Task 0.3 并入 `compat_matrix_alignment` 对已迁移 integration-test-plan.md 的第三处断链重指（15 处/9 文件）、§9 的 `ai_code_ui_headless_test` 改为带 `--features test-provider`（整文件门控，裸跑 0 测试）；第二轮——integration-scenarios 家族（yaml + 场景文档目录，含 integration-runner 4 处功能性拼接）补全 21 处/10 文件清单 + 家族否定断言；第三轮——bare/相对简写残留（README 父级相对链接断链 + 13 行简写缺口）补规范化验收与两条守卫。守卫断链未修（仍待 Task 0.3），`cargo test --all` 仍失败 |
