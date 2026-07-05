@@ -1,5 +1,7 @@
 # Libra Web API 设计
 
+> **Out-of-scope of `tracing/plan.md`**（§0 范围声明）：Web/HTTP API 设计面不属于 AG-16~AG-24 外部捕获改进计划；已知交叠：`libra login/logout/whoami` 的 host-scoped token 面与本文档相关，但其兼容矩阵登记由 A9 closeout 完成。
+
 > **状态**：草稿 / 接口规范
 > **负责人**：Web 团队、Agent runtime 团队
 > **读者**：Rust 后端实现者、web 客户端工程师

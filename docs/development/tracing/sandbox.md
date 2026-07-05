@@ -1,5 +1,7 @@
 # Libra `code` 沙箱改进计划：macOS Apple `container` VM 级隔离后端
 
+> **Out-of-scope of `tracing/plan.md`**（§0 范围声明）：命令沙箱/安全策略设计面不属于 AG-16~AG-24 外部捕获改进计划；已知交叠：外部 agent RPC spawn（AG-18）复用 `env_clear`+allowlist 硬化，但沙箱 enforcement（seatbelt/seccomp/bwrap）由本文档而非 plan.md 管辖。
+
 > 状态：设计提案（Design Proposal）/ 实现路线图
 > 兼容级别：`intentionally-different`（Libra AI 安全运行扩展，非 Git 命令）
 > 适用范围：`libra code`（TUI / headless / web-only 会话）执行 AI agent shell 命令时的进程隔离后端

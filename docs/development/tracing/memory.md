@@ -1,5 +1,7 @@
 # Memory：为 Libra Agent 提供持久化、可版本化的知识
 
+> **Out-of-scope of `tracing/plan.md`**（§0 范围声明）：AI-agent persistent memory 设计面（agent knowledge store）不属于 AG-16~AG-24 外部捕获改进计划；与 plan.md Agent 阶段的已知交叠仅在于都读写 `.libra/` 元数据，二者无 schema 依赖。
+
 > Status: draft
 > Last updated: 2026-06-23
 > Scope: 规范 Memory 子系统——agent 跨 run / thread / branch 的持久化知识存储，及其在 Libra 三层对象模型（快照/事件/投影）、运行时生命周期与 MCP 边界上的落地约定。
