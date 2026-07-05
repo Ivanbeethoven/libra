@@ -129,6 +129,7 @@ pub mod worktree;
 
 pub mod stash;
 pub mod status;
+pub(crate) mod status_untracked;
 pub mod switch;
 pub mod web_assets;
 pub mod write_tree;
