@@ -58,6 +58,8 @@ EXAMPLES:
     libra agent checkpoint list                     List captured checkpoints
     libra agent checkpoint show <id>                Show a single checkpoint by id
     libra agent checkpoint rewind <id>              Preview/apply checkpoint rewind
+    libra agent checkpoint export <id>              Export the redacted transcript (no authorization needed)
+    libra agent checkpoint export <id> --allow-raw --raw  Export the raw transcript (audited; requires --allow-raw)
     libra agent clean                               Drop temporary checkpoints from the most recent stopped session
     libra agent clean --all                         Drop temporary checkpoints from every stopped session
     libra agent doctor                              Diagnose hook installation and capture state
@@ -216,6 +218,10 @@ pub enum CheckpointSubcommand {
         about = "Rewind a checkpoint (dry-run by default; --apply restores worktree and supported transcripts)"
     )]
     Rewind(CheckpointRewindArgs),
+    /// Export a checkpoint's transcript. Redacted by default; raw
+    /// (un-redacted) export requires `--allow-raw` and is audited (AG-24a).
+    #[command(about = "Export a checkpoint transcript (raw export requires --allow-raw; audited)")]
+    Export(CheckpointExportArgs),
 }
 
 #[derive(Args, Debug)]
@@ -238,6 +244,37 @@ pub struct CheckpointShowArgs {
     /// Checkpoint identifier returned by `libra agent checkpoint list`
     #[arg(value_name = "CHECKPOINT_ID")]
     pub checkpoint_id: String,
+}
+
+/// `libra agent checkpoint export <id>` — export a checkpoint's stored
+/// transcript. Redacted output is the default and requires no special
+/// authorization; RAW (un-redacted) export requires `--allow-raw` and
+/// writes one append-only `agent_audit_log` row per access (AG-24a).
+#[derive(Args, Debug)]
+pub struct CheckpointExportArgs {
+    /// Checkpoint identifier returned by `libra agent checkpoint list`
+    #[arg(value_name = "CHECKPOINT_ID")]
+    pub checkpoint_id: String,
+
+    /// Authorize a RAW (un-redacted) export. Without it, the redacted
+    /// transcript is exported and no audit row is required. A raw export
+    /// without this flag is refused fail-closed (`LBR-AGENT-013`) and the
+    /// refusal is itself audited.
+    #[arg(long)]
+    pub allow_raw: bool,
+
+    /// Request the raw (un-redacted) transcript. Only honored together
+    /// with `--allow-raw`; on its own it triggers the fail-closed refusal.
+    #[arg(long)]
+    pub raw: bool,
+
+    /// Operator justification recorded in the audit row (who/why).
+    #[arg(long, value_name = "TEXT")]
+    pub justification: Option<String>,
+
+    /// Write the export to this file instead of stdout.
+    #[arg(long, short = 'o', value_name = "PATH")]
+    pub output_path: Option<String>,
 }
 
 #[derive(Args, Debug)]
