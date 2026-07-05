@@ -242,7 +242,7 @@ async fn write_loopback_response(stream: &mut tokio::net::TcpStream, ok: bool) {
     let body = loopback_response_html(ok);
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.as_bytes().len(),
+        body.len(),
         body
     );
     let _ = stream.write_all(response.as_bytes()).await;
@@ -426,9 +426,7 @@ pub async fn logout(args: LogoutArgs, output: &OutputConfig) -> CliResult<()> {
     let removed = if args.all {
         account::remove_all_sessions().await
     } else {
-        account::remove_session(&host)
-            .await
-            .map(|removed| usize::from(removed))
+        account::remove_session(&host).await.map(usize::from)
     }
     .map_err(|e| CliError::fatal(format!("failed to remove local account session: {e}")))?;
     if output.is_json() {

@@ -114,7 +114,7 @@ When the server is bound to a non-loopback host, non-loopback browsers receive a
 
 When `--browser-control loopback` is requested and the browser holds the active lease, the TUI initial controller is `LocalTui` (visible owner, can be reclaimed) instead of `Fixed { Tui }` (permanently blocking). If the TUI also wants to drive writes, `--control write` must be supplied alongside `--browser-control loopback`; the two writers serialize through the same `TuiControlCommand` channel.
 
-For `--web-only` non-Codex providers (`--provider ollama` is the canonical Phase 3 verification path), Libra builds a [`HeadlessCodeRuntime`](../../src/internal/ai/web/headless.rs) that runs the agent's tool loop directly so the browser can drive a real session -- no terminal required. Headless mode advertises `messageInput`, `streamingText`, `toolCalls`, `planUpdates`, `patchsets`, `interactiveApprovals`, `structuredQuestions`, and `providerSessionResume`; `--resume <thread_id>` restores persisted transcript/history for the same working directory. `update_plan` projects into `plans[]`, and `apply_patch` metadata projects into `patchsets[]`.
+For `--web-only` non-Codex providers (`--provider ollama` is the canonical Phase 3 verification path), Libra builds a [`HeadlessCodeRuntime`](../../src/internal/ai/web/headless.rs) that runs the agent's tool loop directly so the browser can drive a real session -- no terminal required. Headless mode advertises `messageInput`, `streamingText`, `toolCalls`, `planUpdates`, `patchsets`, `interactiveApprovals`, `structuredQuestions`, and `providerSessionResume`. The web-only resume path (`--resume <thread_id>`, restoring persisted transcript/history for the same working directory) is implemented in the headless runtime but the `--resume` CLI flag is still rejected in web-only mode; exposing it lands in a later change (Task C5). `update_plan` projects into `plans[]`, and `apply_patch` metadata projects into `patchsets[]`.
 
 ### Code UI Wire Contract
 
@@ -239,6 +239,8 @@ libra code --repo=/Volumes/Data/linked --provider ollama --model gemma4:31b
 libra code --resume 11111111-1111-4111-8111-111111111111
 
 # Resume a browser-driven non-Codex headless session
+# NOTE: web-only `--resume` is still validated as unsupported today; the CLI
+# relaxation that makes this example runnable lands in a later change.
 libra code --web-only --provider ollama --resume 11111111-1111-4111-8111-111111111111 --browser-control loopback
 
 # Inspect the same thread's version graph

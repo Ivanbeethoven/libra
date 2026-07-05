@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use libra::command::code::{CodeArgs, CodeNetworkAccess, ControlMode};
+use libra::command::code::{CodeArgs, CodeNetworkAccess, CodeProvider, ControlMode};
 
 /// Helper: parse `argv0 + args` with a fixed binary name. Strip the
 /// `--web`/`--stdio` from the spelling caller passed since clap
@@ -126,6 +126,56 @@ fn browser_control_loopback_conflicts_with_stdio() {
         rendered.contains("--browser-control") && rendered.contains("--stdio"),
         "expected conflict error to mention both flags; got: {rendered}",
     );
+}
+
+#[test]
+fn web_only_with_non_gemini_provider_parses() {
+    // C2 (GAP-1): `--web-only --provider <non-gemini>` must parse cleanly at the
+    // CLI layer; the previous web-only rejection lived in `validate_mode_args`,
+    // not the parser, and is now relaxed (verified in code.rs unit tests).
+    for provider in [
+        "codex",
+        "openai",
+        "anthropic",
+        "deepseek",
+        "kimi",
+        "zhipu",
+        "ollama",
+    ] {
+        let parsed = parse(&["--web-only", "--provider", provider])
+            .unwrap_or_else(|e| panic!("--web-only --provider {provider} must parse: {e}"));
+        assert!(parsed.web_only);
+        assert_ne!(parsed.provider, CodeProvider::Gemini);
+    }
+}
+
+#[test]
+fn web_only_with_provider_tuning_flags_parse() {
+    // C2 (GAP-3): the provider-tuning flags the headless runtime consumes must
+    // reach `CodeArgs` under `--web-only`.
+    let parsed = parse(&[
+        "--web-only",
+        "--provider",
+        "ollama",
+        "--model",
+        "llama3",
+        "--api-base",
+        "http://127.0.0.1:11434/v1",
+        "--temperature",
+        "0.2",
+        "--ollama-thinking",
+        "high",
+    ])
+    .expect("--web-only provider-tuning flags must parse");
+    assert!(parsed.web_only);
+    assert_eq!(parsed.provider, CodeProvider::Ollama);
+    assert_eq!(parsed.model.as_deref(), Some("llama3"));
+    assert_eq!(
+        parsed.api_base.as_deref(),
+        Some("http://127.0.0.1:11434/v1")
+    );
+    assert_eq!(parsed.temperature, Some(0.2));
+    assert!(parsed.ollama_thinking.is_some());
 }
 
 #[test]

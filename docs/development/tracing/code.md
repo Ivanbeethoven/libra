@@ -20,7 +20,10 @@
 - 入口与分发：`src/cli.rs::Commands` 公开接入；`src/command/mod.rs` 导出；主要实现文件是 `src/command/code.rs`，入口为 `execute`。
 - 参数模型：`CodeArgs`、`CodeProvider`。`validate_mode_args` 当前负责三类 mode 校验：TUI 默认、`--web`/`--web-only`、`--stdio`。
 - `--stdio` 是 MCP stdio transport。源码在 `validate_mode_args` 中明确拒绝 `--control write` 并提示使用 `libra code-control --stdio` 做本地 automation。
-- 非 TUI mode 当前调用 `reject_non_tui_flags`，会拒绝 `--resume`、`--model`、`--temperature`、`--env-file`、provider-specific flags、非默认 `--approval-policy`、`--network-access`、`--api-base` 等。该函数还会拒绝 `args.provider != CodeProvider::Gemini`（无 codex 豁免），因此当前源码行为与 help/banner 示例中**所有非 Gemini provider** 的 web-only 组合表述冲突（如 `--web-only --provider ollama`、`--web-only --provider codex --browser-control loopback`；`BrowserControlMode` 注释与 banner 亦受影响，Codex web-only 的 loopback/app-server 分支当前为 CLI 不可达代码）；C1 必须先把它分类为 docs drift、help drift 或 code behavior 再改。
+- 非 TUI mode 调用 `reject_non_tui_flags(args, mode, web_only)`，该函数按 mode 区分放宽（C2 已落地 C1 对 GAP-1/GAP-3 的 **code behavior** 分类）：
+  - `--web`/`--web-only`（`web_only = true`）**放宽** `--provider`（全部 7 个 provider + Codex 分支）、`--model`、`--api-base`、`--temperature` 和 provider-specific tuning flags，使已构建的 headless web runtime / Codex web 分支 CLI 可达；这些 flag 转由 `validate_mode_args` 中的 cross-provider match gate 校验（不匹配的 provider-specific flag 仍拒绝，`--api-base` 在 `--provider=codex` 下仍拒绝）。banner/`BrowserControlMode` 注释/用户文档中的 `--web-only --provider <ollama|codex>` 示例因此变为真实可用。
+  - `--stdio`（`web_only = false`）保持**完全锁定** provider/model/api-base/temperature 和 provider-specific flags —— 它是 MCP transport，没有 provider surface。
+  - 两种非 TUI mode 都仍拒绝 `--resume`、`--env-file`、`--network-access allow`、`--context`、`--approval-policy`、`--approval-ttl`。其中 web-only `--resume` 的放宽 **延后到 Task C5**；web-only `--env-file` 的支持因 headless runtime 目前传 `CodeEnvFile::default()` 而**延后**（源码内已加注释说明）。
 - provider-specific 约束：`--codex-bin`、`--codex-port`、`--plan-mode=true` 只允许 `--provider=codex`；`--api-base` 在 `--provider=codex` 下被拒绝；Ollama/DeepSeek/Kimi 的 thinking/stream/compact flags 只能用于对应 provider。
 - `--control write` 要求 loopback host；control token、control info、browser control 和 Code UI API 的安全边界必须继续由 Code UI / code-control 相关测试守卫。
 
@@ -69,7 +72,7 @@ flowchart TD
 
 | 类别 | 风险 | 当前处理 |
 |---|---|---|
-| Mode 文档漂移 | help/banner 示例、`docs/commands/code.md` 或本文可能声称某 web-only provider 组合可用，但 `validate_mode_args` 实际拒绝一切非 Gemini provider（含 codex；Codex web-only loopback/app-server 分支为 CLI 不可达代码）。 | C1 必须先分类并给出修复方向；C2/C4 的 mode/provider 验收为以 C1 分类结果为前置的条件式验收（见 plan.md §6）。 |
+| Mode 文档漂移 | ~~help/banner 示例、`docs/commands/code.md` 或本文声称某 web-only provider 组合可用，但 `validate_mode_args` 实际拒绝一切非 Gemini provider~~。**已在 C2 解决**：按 C1 的 code-behavior 分类放宽了 web-only 的 provider/model/api-base/temperature 与 provider-specific flags，Codex + 非 Gemini headless web 分支现已 CLI 可达，banner/文档示例变为真实。 | C2 已落地放宽 + CLI regression（`code_cli_dispatch_test`、`src/command/code.rs::tests` 的 web-only accept/reject 矩阵）；`--stdio` 保持锁定；web-only `--resume`→C5、web-only `--env-file` 延后。C4 复核端到端可达性。 |
 | Mutating fix bridge | observed external agent 的 review/investigate findings 不能直接改工作区。 | 未找到内部 serialized fix bridge 证据前，Agent 阶段 fix/action 统一 unsupported。 |
 | MCP/control 混同 | 把 MCP stdio 当 live turn/control plane 会绕过 token/lease/approval 边界。 | C6 固定 `code --stdio` 与 `code-control --stdio` 分工。 |
 | Secret 泄露 | `.env.test`、provider key、control token、diagnostics、SSE、raw transcript 都可能泄露。 | live tests 关闭 xtrace；输出只保留 redacted summary；diagnostics/control/SSE 必测 redaction。 |

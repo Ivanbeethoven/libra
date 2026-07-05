@@ -3961,8 +3961,13 @@ async fn execute_stdio(args: &CodeArgs) -> CliResult<()> {
 ///
 /// Enforces constraints such as:
 /// - Web and MCP ports must differ (except in stdio mode).
-/// - TUI-specific flags (--model, --temperature, --resume, etc.) are rejected
-///   in web-only and stdio modes.
+/// - `--stdio` (MCP transport) rejects provider/model/api-base/temperature and
+///   the provider-specific tuning flags — it has no provider surface.
+/// - `--web`/`--web-only` relaxes provider/model/api-base/temperature and the
+///   provider-specific tuning flags (they feed the headless web runtime) but
+///   still rejects `--resume`, `--env-file`, `--network-access allow`,
+///   `--context`, `--approval-policy`, and `--approval-ttl` (see
+///   [`reject_non_tui_flags`]).
 /// - Provider-specific flags are only accepted for their respective providers.
 fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), String> {
     if !args.stdio && args.port == args.mcp_port && args.port != 0 {
@@ -3997,7 +4002,10 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
     }
 
     if args.web_only {
-        reject_non_tui_flags(args, "--web")?;
+        // web_only = true: relax provider/model/api-base/temperature and the
+        // provider-specific tuning flags (they feed the headless web runtime and
+        // still pass through the cross-provider match gate below).
+        reject_non_tui_flags(args, "--web", true)?;
     }
 
     if args.stdio {
@@ -4007,7 +4015,10 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
                     .to_string(),
             );
         }
-        reject_non_tui_flags(args, "--stdio")?;
+        // web_only = false: --stdio is the MCP transport with no provider
+        // surface, so it stays fully locked on provider/model/api-base and the
+        // provider-specific flags.
+        reject_non_tui_flags(args, "--stdio", false)?;
         reject_mode_flag(args.host != DEFAULT_BIND_HOST, "--host", "--stdio")?;
         reject_mode_flag(args.port != DEFAULT_WEB_PORT, "--port", "--stdio")?;
         reject_mode_flag(args.mcp_port != DEFAULT_MCP_PORT, "--mcp-port", "--stdio")?;
@@ -4045,6 +4056,19 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
                 return Err(format!("--api-base is not a valid URL: {e}"));
             }
         }
+    }
+
+    // Temperature is mode-independent: the C2 web-only relaxation lets
+    // `--temperature` reach the headless `ToolLoopConfig` directly, so its
+    // documented 0.0–2.0 contract must be enforced here rather than relying on
+    // the TUI-only reject that previously masked out-of-range values (codex C2
+    // review). NaN/inf are rejected too — they would silently corrupt sampling.
+    if let Some(temperature) = args.temperature
+        && (!temperature.is_finite() || !(0.0..=2.0).contains(&temperature))
+    {
+        return Err(format!(
+            "--temperature must be a finite value between 0.0 and 2.0 (got {temperature})"
+        ));
     }
 
     if args.provider != CodeProvider::Ollama && args.ollama_thinking.is_some() {
@@ -4102,10 +4126,14 @@ fn validate_mode_args(args: &CodeArgs, _output: &OutputConfig) -> Result<(), Str
 }
 
 /// Helper: rejects a flag if it was set (`is_invalid == true`) with a
-/// standardized error message indicating the flag is not supported in the given mode.
+/// standardized error message indicating the flag is not supported in the given
+/// mode. The message names the offending flag and the mode and gives an
+/// actionable next step so the user is not left guessing.
 fn reject_mode_flag(is_invalid: bool, flag: &str, mode: &str) -> Result<(), String> {
     if is_invalid {
-        return Err(format!("{flag} is not supported in {mode} mode"));
+        return Err(format!(
+            "{flag} is not supported in {mode} mode; remove {flag} and rerun"
+        ));
     }
     Ok(())
 }
@@ -4125,29 +4153,71 @@ fn ensure_loopback_control_host_for_validation(host: &str) -> Result<(), String>
     }
 }
 
-/// Rejects all TUI-specific flags when running in a non-TUI mode (web-only or stdio).
-/// This ensures users get clear errors instead of silently ignored flags.
-fn reject_non_tui_flags(args: &CodeArgs, mode: &str) -> Result<(), String> {
-    reject_mode_flag(args.provider != CodeProvider::Gemini, "--provider", mode)?;
-    reject_mode_flag(args.model.is_some(), "--model", mode)?;
-    reject_mode_flag(args.temperature.is_some(), "--temperature", mode)?;
+/// Rejects TUI-specific flags that are invalid in a non-TUI mode.
+///
+/// Two non-TUI modes reach this helper — `--web`/`--web-only` and `--stdio` —
+/// and they receive DIFFERENT relaxations (plan.md Task C2). The `web_only`
+/// argument selects which set applies; `--stdio` passes `web_only = false`.
+///
+/// * `--stdio` is the MCP stdio transport and has no provider / model / browser
+///   surface, so it stays fully locked: `--provider != gemini`, `--model`,
+///   `--api-base`, `--temperature`, and every provider-specific tuning flag are
+///   rejected here.
+/// * `--web`/`--web-only` drives the headless web runtime, which DOES consume
+///   `--provider` (all seven providers plus the Codex branch), `--model`,
+///   `--api-base`, `--temperature`, and the provider-specific tuning flags via
+///   `build_any_completion_model_for_args` / the headless config factory. Under
+///   web-only those are therefore NOT blanket-rejected here as "TUI-only"; they
+///   flow through to the cross-provider match gate in `validate_mode_args`,
+///   which still rejects a provider-specific flag that does not match the
+///   selected provider and still rejects `--api-base` under `--provider=codex`.
+///
+/// Flags that stay rejected in BOTH non-TUI modes (safety / deferred work):
+/// `--resume` (web-only resume relaxation is deferred to Task C5), `--env-file`
+/// (the headless runtime still boots with `CodeEnvFile::default()`, so honoring
+/// a user `--env-file` web-only needs additional plumbing — deferred),
+/// `--network-access allow` (safety gate), plus `--context`,
+/// `--approval-policy`, and `--approval-ttl`.
+fn reject_non_tui_flags(args: &CodeArgs, mode: &str, web_only: bool) -> Result<(), String> {
+    // Provider / model / api-base / temperature and the provider-specific tuning
+    // flags feed the headless web runtime, so they are relaxed under web-only and
+    // rejected only under stdio. Under web-only they still pass through the
+    // cross-provider match gate and the Codex `--api-base` rejection in
+    // `validate_mode_args` (invoked after this helper), so mismatched flags and
+    // `--api-base` under Codex are still rejected there.
+    if !web_only {
+        reject_mode_flag(args.provider != CodeProvider::Gemini, "--provider", mode)?;
+        reject_mode_flag(args.model.is_some(), "--model", mode)?;
+        reject_mode_flag(args.temperature.is_some(), "--temperature", mode)?;
+        reject_mode_flag(args.api_base.is_some(), "--api-base", mode)?;
+        reject_mode_flag(args.ollama_thinking.is_some(), "--ollama-thinking", mode)?;
+        reject_mode_flag(args.ollama_compact_tools, "--ollama-compact-tools", mode)?;
+        reject_mode_flag(
+            args.deepseek_thinking.is_some(),
+            "--deepseek-thinking",
+            mode,
+        )?;
+        reject_mode_flag(
+            args.deepseek_reasoning_effort.is_some(),
+            "--deepseek-reasoning-effort",
+            mode,
+        )?;
+        reject_mode_flag(args.deepseek_stream.is_some(), "--deepseek-stream", mode)?;
+        reject_mode_flag(args.kimi_thinking.is_some(), "--kimi-thinking", mode)?;
+        reject_mode_flag(args.kimi_stream.is_some(), "--kimi-stream", mode)?;
+    }
+
+    // Rejected in BOTH non-TUI modes.
+    // NOTE (C2): web-only `--env-file` support is deferred. The headless runtime
+    // currently boots with `CodeEnvFile::default()` (see
+    // `build_non_codex_headless_runtime`), so honoring a user-supplied
+    // `--env-file` web-only needs additional plumbing; keep it rejected until
+    // that lands.
     reject_mode_flag(args.env_file.is_some(), "--env-file", mode)?;
-    reject_mode_flag(args.ollama_thinking.is_some(), "--ollama-thinking", mode)?;
-    reject_mode_flag(args.ollama_compact_tools, "--ollama-compact-tools", mode)?;
-    reject_mode_flag(
-        args.deepseek_thinking.is_some(),
-        "--deepseek-thinking",
-        mode,
-    )?;
-    reject_mode_flag(
-        args.deepseek_reasoning_effort.is_some(),
-        "--deepseek-reasoning-effort",
-        mode,
-    )?;
-    reject_mode_flag(args.deepseek_stream.is_some(), "--deepseek-stream", mode)?;
-    reject_mode_flag(args.kimi_thinking.is_some(), "--kimi-thinking", mode)?;
-    reject_mode_flag(args.kimi_stream.is_some(), "--kimi-stream", mode)?;
     reject_mode_flag(args.context.is_some(), "--context", mode)?;
+    // NOTE (C2): web-only `--resume` is implemented at the session layer
+    // (`load_or_create_headless_web_session_state`) but its CLI relaxation is
+    // deferred to Task C5; keep it rejected in both non-TUI modes for now.
     reject_mode_flag(args.resume.is_some(), "--resume", mode)?;
     reject_mode_flag(
         args.approval_policy != CodeApprovalPolicy::OnRequest,
@@ -4160,7 +4230,6 @@ fn reject_non_tui_flags(args: &CodeArgs, mode: &str) -> Result<(), String> {
         "--network-access",
         mode,
     )?;
-    reject_mode_flag(args.api_base.is_some(), "--api-base", mode)?;
     Ok(())
 }
 
@@ -4330,12 +4399,20 @@ mod tests {
         assert!(err.contains("exceeds the"));
     }
 
+    /// C2: `--resume` is a TUI-only flag that stays rejected under `--web-only`
+    /// (its web-only relaxation is deferred to Task C5). `--model` used to be
+    /// rejected here too, but C2 relaxed it web-only — see
+    /// `accepts_model_api_base_and_temperature_in_web_only_mode`.
     #[test]
     fn rejects_tui_flags_in_web_mode() {
         let mut args = base_args();
         args.web_only = true;
-        args.model = Some("foo".to_string());
-        assert!(validate_mode_args(&args, &OutputConfig::default()).is_err());
+        args.resume = Some("thread-id".to_string());
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--resume") && err.contains("--web") && err.contains("remove"),
+            "web-only --resume rejection must name the flag, the mode, and an action; got: {err}"
+        );
     }
 
     #[test]
@@ -4344,6 +4421,202 @@ mod tests {
         args.stdio = true;
         args.host = "0.0.0.0".to_string();
         assert!(validate_mode_args(&args, &OutputConfig::default()).is_err());
+    }
+
+    /// C2 (GAP-1): web-only now accepts every supported provider — the headless
+    /// web runtime + Codex web branch are reachable, not just Gemini.
+    #[test]
+    fn accepts_all_supported_providers_in_web_only_mode() {
+        let providers = [
+            CodeProvider::Gemini,
+            CodeProvider::Openai,
+            CodeProvider::Anthropic,
+            CodeProvider::Deepseek,
+            CodeProvider::Kimi,
+            CodeProvider::Zhipu,
+            CodeProvider::Ollama,
+            CodeProvider::Codex,
+        ];
+        for provider in providers {
+            let mut args = base_args();
+            args.web_only = true;
+            args.provider = provider;
+            assert!(
+                validate_mode_args(&args, &OutputConfig::default()).is_ok(),
+                "web-only must accept --provider {provider:?}"
+            );
+        }
+    }
+
+    /// C2 (GAP-3): web-only accepts `--model`, a non-Codex `--api-base`, and
+    /// `--temperature` — all consumed by the headless runtime.
+    #[test]
+    fn accepts_model_api_base_and_temperature_in_web_only_mode() {
+        let mut args = base_args();
+        args.web_only = true;
+        args.provider = CodeProvider::Ollama;
+        args.model = Some("llama3".to_string());
+        args.api_base = Some("http://127.0.0.1:11434/v1".to_string());
+        args.temperature = Some(0.2);
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
+    }
+
+    /// C2 (GAP-3): a provider-specific flag that MATCHES the selected provider is
+    /// accepted under web-only.
+    #[test]
+    fn accepts_matching_provider_flag_in_web_only_mode() {
+        let mut args = base_args();
+        args.web_only = true;
+        args.provider = CodeProvider::Ollama;
+        args.ollama_thinking = Some(OllamaThinkingArg::High);
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
+    }
+
+    /// C2 (GAP-3, codex review): the matching-provider-flag acceptance must be
+    /// pinned across the relaxed provider surface, not just Ollama — DeepSeek
+    /// and Kimi tuning flags are accepted under web-only with their provider.
+    #[test]
+    fn accepts_matching_deepseek_flag_in_web_only_mode() {
+        let mut args = base_args();
+        args.web_only = true;
+        args.provider = CodeProvider::Deepseek;
+        args.deepseek_thinking = Some(DeepSeekThinkingArg::Enabled);
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn accepts_matching_kimi_flag_in_web_only_mode() {
+        let mut args = base_args();
+        args.web_only = true;
+        args.provider = CodeProvider::Kimi;
+        args.kimi_thinking = Some(KimiThinkingArg::Enabled);
+        assert!(validate_mode_args(&args, &OutputConfig::default()).is_ok());
+    }
+
+    /// C2 (P1, codex review): `--temperature` reaches the headless runtime after
+    /// the web-only relaxation, so its 0.0–2.0 contract is enforced
+    /// mode-independently. Out-of-range and non-finite values are rejected.
+    #[test]
+    fn rejects_out_of_range_temperature() {
+        for (mode_web_only, bad) in [
+            (true, 2.5_f64),
+            (true, -0.1),
+            (true, f64::NAN),
+            (false, 3.0),
+        ] {
+            let mut args = base_args();
+            args.web_only = mode_web_only;
+            args.provider = CodeProvider::Ollama;
+            args.temperature = Some(bad);
+            let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+            assert!(
+                err.contains("--temperature"),
+                "temperature {bad} (web_only={mode_web_only}) must be rejected; got: {err}"
+            );
+        }
+        // Boundary values are accepted.
+        for good in [0.0_f64, 2.0, 1.0] {
+            let mut args = base_args();
+            args.web_only = true;
+            args.provider = CodeProvider::Ollama;
+            args.temperature = Some(good);
+            assert!(
+                validate_mode_args(&args, &OutputConfig::default()).is_ok(),
+                "temperature {good} must be accepted"
+            );
+        }
+    }
+
+    /// C2 (R4): relaxing the web-only "TUI-only" blanket must NOT weaken the
+    /// cross-provider match gate — a provider-specific flag that does not match
+    /// the selected provider is still rejected under web-only.
+    #[test]
+    fn rejects_mismatched_provider_flag_in_web_only_mode() {
+        let mut args = base_args();
+        args.web_only = true;
+        args.provider = CodeProvider::Deepseek;
+        args.ollama_thinking = Some(OllamaThinkingArg::High);
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--ollama-thinking") && err.contains("ollama"),
+            "mismatched provider flag must still be rejected under web-only; got: {err}"
+        );
+    }
+
+    /// C2 (R2): the Codex `--api-base` rejection survives the web-only relaxation.
+    #[test]
+    fn rejects_api_base_under_codex_in_web_only_mode() {
+        let mut args = base_args();
+        args.web_only = true;
+        args.provider = CodeProvider::Codex;
+        args.api_base = Some("http://127.0.0.1:8080".to_string());
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--api-base") && err.contains("codex"),
+            "web-only --api-base under Codex must still be rejected; got: {err}"
+        );
+    }
+
+    /// C2 (R3): `--env-file` and `--network-access allow` stay rejected under
+    /// web-only (env-file support deferred; network-access is a safety gate).
+    #[test]
+    fn rejects_deferred_and_safety_flags_in_web_only_mode() {
+        let mut env_file_args = base_args();
+        env_file_args.web_only = true;
+        env_file_args.env_file = Some(PathBuf::from(".env.test"));
+        let err = validate_mode_args(&env_file_args, &OutputConfig::default()).unwrap_err();
+        assert!(err.contains("--env-file") && err.contains("--web"));
+
+        let mut net_args = base_args();
+        net_args.web_only = true;
+        net_args.network_access = CodeNetworkAccess::Allow;
+        let err = validate_mode_args(&net_args, &OutputConfig::default()).unwrap_err();
+        assert!(err.contains("--network-access") && err.contains("--web"));
+    }
+
+    /// C2 (R1 + codex R2, critical): `--stdio` stays fully provider-locked. One
+    /// regression per class — provider, model, api-base, provider-specific flag.
+    #[test]
+    fn stdio_mode_stays_provider_locked() {
+        // provider != gemini
+        let mut args = base_args();
+        args.stdio = true;
+        args.provider = CodeProvider::Openai;
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--provider") && err.contains("--stdio"),
+            "stdio must reject non-Gemini --provider; got: {err}"
+        );
+
+        // --model
+        let mut args = base_args();
+        args.stdio = true;
+        args.model = Some("gpt-foo".to_string());
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--model") && err.contains("--stdio"),
+            "stdio must reject --model; got: {err}"
+        );
+
+        // --api-base
+        let mut args = base_args();
+        args.stdio = true;
+        args.api_base = Some("http://127.0.0.1:11434/v1".to_string());
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--api-base") && err.contains("--stdio"),
+            "stdio must reject --api-base; got: {err}"
+        );
+
+        // provider-specific flag (blanket-rejected under stdio regardless of provider)
+        let mut args = base_args();
+        args.stdio = true;
+        args.ollama_thinking = Some(OllamaThinkingArg::High);
+        let err = validate_mode_args(&args, &OutputConfig::default()).unwrap_err();
+        assert!(
+            err.contains("--ollama-thinking") && err.contains("--stdio"),
+            "stdio must reject provider-specific flags; got: {err}"
+        );
     }
 
     #[test]
