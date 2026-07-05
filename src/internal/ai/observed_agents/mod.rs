@@ -30,6 +30,7 @@ pub mod adapter;
 pub mod builtin;
 pub mod capability;
 pub mod derived;
+pub mod extract;
 pub mod preview;
 pub mod redaction;
 pub mod registry;

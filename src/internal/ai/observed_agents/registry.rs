@@ -83,9 +83,23 @@ const NO_CAPS: DeclaredAgentCaps = DeclaredAgentCaps {
     subagent_aware_extractor: false,
 };
 
-/// Hooks-only capability set (Claude Code today).
-const HOOKS_ONLY: DeclaredAgentCaps = DeclaredAgentCaps {
+/// Claude Code capability set (AG-19 hooks + AG-21 transcript
+/// intelligence: analyzer, token calculator, subagent-aware extractor;
+/// prompt extraction rides the analyzer gate, model/skill extraction are
+/// deliberately outside the 8-bool set).
+const CLAUDE_CODE_CAPS: DeclaredAgentCaps = DeclaredAgentCaps {
     hooks: true,
+    transcript_analyzer: true,
+    token_calculator: true,
+    subagent_aware_extractor: true,
+    ..NO_CAPS
+};
+
+/// Codex / OpenCode capability set (AG-19 hooks + AG-21 best-effort
+/// token calculation over their rollout/export formats).
+const HOOKS_AND_TOKENS: DeclaredAgentCaps = DeclaredAgentCaps {
+    hooks: true,
+    token_calculator: true,
     ..NO_CAPS
 };
 
@@ -106,7 +120,7 @@ static REGISTRY: [AgentRegistration; 7] = [
         launchable_investigate: false,
         external_binary: false,
         config_paths: &[".claude/settings.json"],
-        capabilities: HOOKS_ONLY,
+        capabilities: CLAUDE_CODE_CAPS,
     },
     AgentRegistration {
         slug: "cursor",
@@ -143,7 +157,7 @@ static REGISTRY: [AgentRegistration; 7] = [
         launchable_investigate: false,
         external_binary: false,
         config_paths: &[".codex/hooks.json"],
-        capabilities: HOOKS_ONLY,
+        capabilities: HOOKS_AND_TOKENS,
     },
     AgentRegistration {
         slug: "gemini",
@@ -181,7 +195,7 @@ static REGISTRY: [AgentRegistration; 7] = [
         launchable_investigate: false,
         external_binary: false,
         config_paths: &[".opencode/plugin/libra-hooks.js"],
-        capabilities: HOOKS_ONLY,
+        capabilities: HOOKS_AND_TOKENS,
     },
     AgentRegistration {
         slug: "copilot",

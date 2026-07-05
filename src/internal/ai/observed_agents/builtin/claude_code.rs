@@ -19,8 +19,18 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 
-use super::super::adapter::{AgentKind, AgentSessionCtx, ObservedAgent, TranscriptTruncator};
-use crate::internal::ai::hooks::{provider::HookProvider, providers::claude::ClaudeProvider};
+use super::super::{
+    adapter::{AgentKind, AgentSessionCtx, ObservedAgent, TranscriptTruncator},
+    capability::{
+        ModelExtractor, PromptExtractor, SkillEvent, SkillEventExtractor, SubagentAwareExtractor,
+        TokenCalculator, TranscriptAnalyzer,
+    },
+    extract,
+};
+use crate::internal::ai::{
+    completion::CompletionUsageSummary,
+    hooks::{provider::HookProvider, providers::claude::ClaudeProvider},
+};
 
 /// Hard cap on how many bytes the transcript reader will pull off disk.
 /// Claude Code transcripts grow with conversation length; in practice
@@ -85,6 +95,92 @@ impl ObservedAgent for ClaudeCodeObservedAgent {
     fn as_hooks(&self) -> Option<&dyn HookProvider> {
         static CLAUDE_HOOKS: ClaudeProvider = ClaudeProvider;
         Some(&CLAUDE_HOOKS)
+    }
+
+    // AG-21 transcript intelligence: Claude Code session JSONL supports
+    // the full extraction surface (see `observed_agents::extract`).
+    fn as_transcript_analyzer(&self) -> Option<&dyn TranscriptAnalyzer> {
+        Some(self)
+    }
+    fn as_prompt_extractor(&self) -> Option<&dyn PromptExtractor> {
+        Some(self)
+    }
+    fn as_token_calculator(&self) -> Option<&dyn TokenCalculator> {
+        Some(self)
+    }
+    fn as_model_extractor(&self) -> Option<&dyn ModelExtractor> {
+        Some(self)
+    }
+    fn as_subagent_aware_extractor(&self) -> Option<&dyn SubagentAwareExtractor> {
+        Some(self)
+    }
+    fn as_skill_event_extractor(&self) -> Option<&dyn SkillEventExtractor> {
+        Some(self)
+    }
+}
+
+fn tail(data: &[u8], from_offset: usize) -> &[u8] {
+    &data[from_offset.min(data.len())..]
+}
+
+impl TranscriptAnalyzer for ClaudeCodeObservedAgent {
+    fn transcript_position(&self, data: &[u8]) -> Result<usize> {
+        Ok(data.len())
+    }
+    fn extract_modified_files_from_offset(
+        &self,
+        data: &[u8],
+        from_offset: usize,
+    ) -> Result<Vec<PathBuf>> {
+        Ok(extract::extract_claude_code(tail(data, from_offset))
+            .modified_files
+            .into_iter()
+            .map(PathBuf::from)
+            .collect())
+    }
+}
+
+impl PromptExtractor for ClaudeCodeObservedAgent {
+    fn extract_prompts(&self, data: &[u8], from_offset: usize) -> Result<Vec<String>> {
+        Ok(extract::extract_claude_code(tail(data, from_offset)).prompts)
+    }
+}
+
+impl TokenCalculator for ClaudeCodeObservedAgent {
+    fn calculate_token_usage(
+        &self,
+        data: &[u8],
+        from_offset: usize,
+    ) -> Result<CompletionUsageSummary> {
+        Ok(extract::extract_claude_code(tail(data, from_offset))
+            .usage
+            .unwrap_or_default())
+    }
+}
+
+impl ModelExtractor for ClaudeCodeObservedAgent {
+    fn extract_model(&self, data: &[u8]) -> Result<Option<String>> {
+        Ok(extract::extract_claude_code(data).model)
+    }
+}
+
+impl SubagentAwareExtractor for ClaudeCodeObservedAgent {
+    fn extract_all_modified_files(&self, data: &[u8]) -> Result<Vec<PathBuf>> {
+        Ok(extract::extract_claude_code(data)
+            .modified_files
+            .into_iter()
+            .map(PathBuf::from)
+            .collect())
+    }
+    fn total_token_usage_including_subagents(&self, data: &[u8]) -> Result<CompletionUsageSummary> {
+        let summary = extract::extract_claude_code(data);
+        Ok(summary.subagent_usage.or(summary.usage).unwrap_or_default())
+    }
+}
+
+impl SkillEventExtractor for ClaudeCodeObservedAgent {
+    fn extract_skill_events(&self, data: &[u8], from_offset: usize) -> Result<Vec<SkillEvent>> {
+        Ok(extract::extract_claude_code(tail(data, from_offset)).skill_events)
     }
 }
 

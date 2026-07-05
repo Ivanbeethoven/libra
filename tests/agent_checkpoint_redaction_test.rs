@@ -343,3 +343,239 @@ async fn assistant_message_is_redacted_too() {
         "raw token leaked into `agent checkpoint list --json`:\n{list_stdout}"
     );
 }
+
+/// AG-21: extractor warnings recorded in the checkpoint's `extraction`
+/// metadata carry no secret, no session-owner detail and no prompt text —
+/// a transcript whose broken line embeds an AWS key yields a count-only
+/// warning, `partial:true`, and a metadata document free of the raw
+/// values (extraction failures never block the checkpoint write).
+#[tokio::test]
+async fn extractor_warning_does_not_include_secret_owner_or_prompt() {
+    let repo = HookRepo::init();
+    let token = aws_token();
+    let provider_session = "sess-extract-warning";
+    let libra_session = format!("claude__{provider_session}");
+    let secret_prompt = "top-secret business plan phrase";
+
+    // Transcript inside the provider's trusted root (~/.claude), with one
+    // valid user line carrying a distinctive prompt phrase and one
+    // undecodable line embedding the token — extraction must degrade to a
+    // count-only warning without echoing either.
+    let transcript_dir = repo.home.join(".claude").join("projects").join("p");
+    std::fs::create_dir_all(&transcript_dir).expect("mkdir transcript dir");
+    let transcript_path = transcript_dir.join("session.jsonl");
+    std::fs::write(
+        &transcript_path,
+        format!(
+            "{}\nBROKEN {token} BROKEN\n",
+            serde_json::json!({
+                "type": "user",
+                "uuid": "u-x",
+                "message": {"role": "user", "content": secret_prompt}
+            })
+        ),
+    )
+    .expect("write transcript fixture");
+
+    let out = repo.hook(
+        "session-start",
+        &repo.envelope(
+            "SessionStart",
+            provider_session,
+            json!({ "transcript_path": transcript_path.to_string_lossy() }),
+        ),
+    );
+    assert!(out.status.success(), "session-start: {}", describe(&out));
+
+    // Stop materialises the committed checkpoint (metadata + extraction).
+    let out = repo.hook(
+        "stop",
+        &repo.envelope(
+            "Stop",
+            provider_session,
+            json!({
+                "transcript_path": transcript_path.to_string_lossy(),
+                "last_assistant_message": "done",
+            }),
+        ),
+    );
+    assert!(out.status.success(), "stop hook: {}", describe(&out));
+
+    // The checkpoint's metadata (via CLI show --json) must carry the
+    // extraction block with partial=true + warnings, and must NOT carry
+    // the raw token or the prompt text.
+    let list = repo.run(&["agent", "checkpoint", "list", "--json"], None);
+    assert!(
+        list.status.success(),
+        "checkpoint list: {}",
+        describe(&list)
+    );
+    let list_json: Value =
+        serde_json::from_str(String::from_utf8_lossy(&list.stdout).trim()).expect("list JSON");
+    let checkpoints = list_json["data"]["checkpoints"]
+        .as_array()
+        .or_else(|| list_json["data"].as_array())
+        .unwrap_or_else(|| panic!("unexpected checkpoint list shape: {list_json}"));
+    let checkpoint_id = checkpoints
+        .iter()
+        .find_map(|row| {
+            let sid = row.get("session_id").and_then(Value::as_str)?;
+            (sid == libra_session).then(|| {
+                row.get("checkpoint_id")
+                    .or_else(|| row.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })?
+        })
+        .unwrap_or_else(|| panic!("no checkpoint for {libra_session}: {list_json}"));
+
+    let show = repo.run(
+        &["agent", "checkpoint", "show", &checkpoint_id, "--json"],
+        None,
+    );
+    assert!(
+        show.status.success(),
+        "checkpoint show: {}",
+        describe(&show)
+    );
+    let show_stdout = String::from_utf8_lossy(&show.stdout).to_string();
+    assert!(
+        !show_stdout.contains(&token),
+        "raw token leaked into checkpoint show: {show_stdout}"
+    );
+    assert!(
+        !show_stdout.contains(secret_prompt),
+        "prompt text leaked into checkpoint metadata: {show_stdout}"
+    );
+
+    let show_json: Value = serde_json::from_str(show_stdout.trim()).expect("show JSON");
+    let metadata = &show_json["data"]["metadata"];
+    let extraction = metadata
+        .get("extraction")
+        .unwrap_or_else(|| panic!("metadata missing extraction block: {metadata}"));
+    assert_eq!(extraction["present"], json!(true));
+    assert_eq!(
+        extraction["partial"],
+        json!(true),
+        "undecodable transcript line must mark extraction partial: {extraction}"
+    );
+    let warnings = extraction["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().is_some_and(|w| w.contains("not valid JSON"))),
+        "count-only warning present: {warnings:?}"
+    );
+    // prompt_count is derived, but the prompt text itself must be absent
+    // (asserted above) — only the count may appear.
+    assert_eq!(extraction["prompt_count"], json!(1));
+}
+
+/// AG-21 security regression: a secret embedded in transcript-DERIVED
+/// extraction fields (`model`, tool_use `file_path`) must be redacted in
+/// the checkpoint metadata — not just the transcript blob. Codex review
+/// P1 (2026-07-05): extraction strings were persisted verbatim.
+#[tokio::test]
+async fn extraction_derived_strings_are_redacted_in_metadata() {
+    let repo = HookRepo::init();
+    let token = aws_token();
+    let provider_session = "sess-extract-derived";
+    let libra_session = format!("claude__{provider_session}");
+
+    // Transcript with the token hidden in BOTH a model id and a Write
+    // tool's file_path (adversarial — real agents would not, but a hostile
+    // or buggy transcript could).
+    let transcript_dir = repo.home.join(".claude").join("projects").join("p2");
+    std::fs::create_dir_all(&transcript_dir).expect("mkdir transcript dir");
+    let transcript_path = transcript_dir.join("session.jsonl");
+    let line = serde_json::json!({
+        "type": "assistant",
+        "uuid": "a-x",
+        "message": {
+            "role": "assistant",
+            "model": format!("claude-{token}"),
+            "content": [{
+                "type": "tool_use",
+                "name": "Write",
+                "input": { "file_path": format!("secrets/{token}/out.rs") }
+            }],
+            "usage": { "input_tokens": 5, "output_tokens": 2 }
+        }
+    });
+    std::fs::write(&transcript_path, format!("{line}\n")).expect("write transcript");
+
+    let out = repo.hook(
+        "session-start",
+        &repo.envelope(
+            "SessionStart",
+            provider_session,
+            json!({ "transcript_path": transcript_path.to_string_lossy() }),
+        ),
+    );
+    assert!(out.status.success(), "session-start: {}", describe(&out));
+    let out = repo.hook(
+        "stop",
+        &repo.envelope(
+            "Stop",
+            provider_session,
+            json!({
+                "transcript_path": transcript_path.to_string_lossy(),
+                "last_assistant_message": "done",
+            }),
+        ),
+    );
+    assert!(out.status.success(), "stop hook: {}", describe(&out));
+
+    let list = repo.run(&["agent", "checkpoint", "list", "--json"], None);
+    let list_json: Value =
+        serde_json::from_str(String::from_utf8_lossy(&list.stdout).trim()).expect("list JSON");
+    let checkpoints = list_json["data"]["checkpoints"]
+        .as_array()
+        .or_else(|| list_json["data"].as_array())
+        .unwrap_or_else(|| panic!("unexpected shape: {list_json}"));
+    let checkpoint_id = checkpoints
+        .iter()
+        .find_map(|row| {
+            let sid = row.get("session_id").and_then(Value::as_str)?;
+            (sid == libra_session).then(|| {
+                row.get("checkpoint_id")
+                    .or_else(|| row.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })?
+        })
+        .unwrap_or_else(|| panic!("no checkpoint for {libra_session}"));
+
+    let show = repo.run(
+        &["agent", "checkpoint", "show", &checkpoint_id, "--json"],
+        None,
+    );
+    assert!(
+        show.status.success(),
+        "checkpoint show: {}",
+        describe(&show)
+    );
+    let show_stdout = String::from_utf8_lossy(&show.stdout).to_string();
+    assert!(
+        !show_stdout.contains(&token),
+        "token leaked through an extraction-derived field: {show_stdout}"
+    );
+    let show_json: Value = serde_json::from_str(show_stdout.trim()).expect("show JSON");
+    let extraction = &show_json["data"]["metadata"]["extraction"];
+    // The fields are still present (redacted), proving they went through
+    // the scrubber rather than being dropped.
+    let model = extraction["model"].as_str().unwrap_or_default();
+    assert!(
+        model.starts_with("claude-") && !model.contains(&token),
+        "model redacted: {model}"
+    );
+    let files = extraction["modified_files"]
+        .as_array()
+        .expect("files array");
+    assert!(
+        files
+            .iter()
+            .all(|f| !f.as_str().unwrap_or_default().contains(&token)),
+        "file paths redacted: {files:?}"
+    );
+}

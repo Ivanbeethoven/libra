@@ -932,6 +932,10 @@ async fn write_committed_checkpoint(
         .unwrap_or_else(|_| serde_json::json!({}));
     let prompt_fallback =
         || RedactedBytes::new_unchecked(redacted_prompt.unwrap_or("").as_bytes().to_vec());
+    // AG-21: keep the raw transcript bytes in scope (never persisted) so
+    // the adapter's extraction capabilities can derive metadata from them
+    // after the redacted blob is produced.
+    let mut transcript_raw_for_extraction: Option<Vec<u8>> = None;
     let transcript_redacted = match AgentKind::from_db_str(agent_kind) {
         Some(kind) => {
             let adapter = agent_for(kind);
@@ -960,6 +964,7 @@ async fn write_committed_checkpoint(
                     Ok(Some(raw)) if !raw.is_empty() => {
                         let (redacted, report) = Redactor::new_default().redact(&raw);
                         merge_redaction_report_into(&mut report_value, &report);
+                        transcript_raw_for_extraction = Some(raw);
                         redacted
                     }
                     Ok(_) => prompt_fallback(),
@@ -983,6 +988,13 @@ async fn write_committed_checkpoint(
     // E4-entire tolerance: taken from the triggering lifecycle event when
     // present, else the literal "unknown".
     let redaction_report_value = report_value.clone();
+    // AG-21 transcript intelligence: derive token usage / model / skill
+    // events from the raw transcript via the adapter's capability
+    // accessors. Strictly fail-open — extraction problems mark the
+    // metadata `partial` with redacted warnings and never block the
+    // checkpoint write (redaction/path/write paths stay fail-closed).
+    let extraction_value =
+        build_extraction_metadata(agent_kind, transcript_raw_for_extraction.as_deref());
     let metadata = serde_json::json!({
         "schema_version": history::CHECKPOINT_METADATA_SCHEMA_VERSION,
         "checkpoint_id": null, // filled in below once we have the UUID
@@ -994,6 +1006,7 @@ async fn write_committed_checkpoint(
         "model": checkpoint_model_field(event.model.as_ref()),
         "redaction_report": report_value,
         "created_at": now,
+        "extraction": extraction_value,
     });
 
     // Fresh id per write attempt — it names both the catalog row and the
@@ -1247,6 +1260,234 @@ pub async fn insert_agent_checkpoint_row_idempotent(
 /// unrecognisable shapes become the literal `"unknown"` rather than an
 /// error. Providers emit either a plain string or an object carrying an
 /// id/name-ish key.
+/// Redact a single extracted string (model id, file path) through the
+/// default `Redactor` before it lands in checkpoint metadata. Extraction
+/// fields are derived from the raw (un-redacted) transcript, so they must
+/// pass the same scrubbing the transcript blob does.
+fn redact_extracted_string(value: &str) -> String {
+    use crate::internal::ai::observed_agents::Redactor;
+    let (bytes, _report) = Redactor::new_default().redact(value.as_bytes());
+    String::from_utf8_lossy(bytes.as_ref()).into_owned()
+}
+
+/// Recursively redact every string leaf of a JSON value (used for the
+/// skill-events array so anchors / names are scrubbed uniformly).
+fn redact_extracted_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_extracted_string(&text))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_extracted_json).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, redact_extracted_json(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// AG-21: run the adapter's transcript-intelligence capabilities over the
+/// raw transcript and shape the result for `metadata.json`'s additive
+/// `extraction` object. Fail-open by construction:
+///
+/// - no adapter / no raw transcript → `{present:false, partial:true}` with
+///   an explanatory (non-sensitive) warning;
+/// - individual extractor failure → warning + `partial:true`, remaining
+///   dimensions still recorded;
+/// - warnings pass through the default `Redactor` before persistence so a
+///   pathological error string can never leak transcript content.
+///
+/// Prompt TEXT is deliberately NOT persisted here — only the prompt count.
+/// The redacted transcript blob remains the sole persisted content
+/// carrier; extraction stores derived, low-sensitivity facts (usage
+/// numbers, model id, file paths, curated skill events).
+fn build_extraction_metadata(agent_kind: &str, raw: Option<&[u8]>) -> serde_json::Value {
+    use crate::internal::ai::observed_agents::{AgentKind, agent_for};
+
+    let mut partial = false;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut value = serde_json::json!({
+        "schema_version": 1,
+        "present": false,
+        "partial": false,
+        "warnings": [],
+    });
+
+    let adapter = AgentKind::from_db_str(agent_kind).map(agent_for);
+    let (Some(adapter), Some(raw)) = (adapter, raw) else {
+        partial = true;
+        warnings.push(if adapter.is_none() {
+            format!("unknown agent kind '{agent_kind}'; extraction skipped")
+        } else {
+            "no raw transcript available; extraction skipped".to_string()
+        });
+        finalize_extraction(&mut value, partial, warnings);
+        return value;
+    };
+
+    let object = value
+        .as_object_mut()
+        .expect("extraction value is an object");
+    object.insert("present".into(), serde_json::Value::Bool(true));
+
+    if let Some(calculator) = adapter.as_token_calculator() {
+        match calculator.calculate_token_usage(raw, 0) {
+            Ok(usage) => {
+                object.insert(
+                    "token_usage".into(),
+                    serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("token usage extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(extractor) = adapter.as_model_extractor() {
+        match extractor.extract_model(raw) {
+            Ok(Some(model)) => {
+                object.insert(
+                    "model".into(),
+                    serde_json::Value::String(redact_extracted_string(&model)),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("model extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(extractor) = adapter.as_prompt_extractor() {
+        match extractor.extract_prompts(raw, 0) {
+            Ok(prompts) => {
+                object.insert("prompt_count".into(), serde_json::json!(prompts.len()));
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("prompt extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(extractor) = adapter.as_subagent_aware_extractor() {
+        match extractor.total_token_usage_including_subagents(raw) {
+            Ok(usage) => {
+                object.insert(
+                    "subagent_token_usage".into(),
+                    serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("subagent usage extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(analyzer) = adapter.as_transcript_analyzer() {
+        match analyzer.extract_modified_files_from_offset(raw, 0) {
+            Ok(files) => {
+                // File paths are derived from untrusted tool_use input —
+                // redact them before persistence (a path can embed a
+                // secret, e.g. a token in a URL-like path segment).
+                let list: Vec<String> = files
+                    .iter()
+                    .map(|path| redact_extracted_string(&path.display().to_string()))
+                    .collect();
+                object.insert(
+                    "modified_files".into(),
+                    serde_json::to_value(list).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("modified-files extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(extractor) = adapter.as_skill_event_extractor() {
+        match extractor.extract_skill_events(raw, 0) {
+            Ok(events) => {
+                // Skill events carry curated slash-command names + opaque
+                // anchors; redact the serialized form defensively so any
+                // transcript-derived string is scrubbed uniformly.
+                let value = serde_json::to_value(&events).unwrap_or(serde_json::Value::Null);
+                object.insert("skill_events".into(), redact_extracted_json(value));
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("skill event extraction failed: {err:#}"));
+            }
+        }
+    }
+
+    // The per-format parsers may themselves flag partial results (e.g.
+    // undecodable lines) — surface their warnings through the same
+    // channel. They live on the summary the extractors already consumed;
+    // recompute cheaply through the analyzer-agnostic path.
+    let format_summary = match AgentKind::from_db_str(agent_kind) {
+        Some(AgentKind::ClaudeCode) => {
+            Some(crate::internal::ai::observed_agents::extract::extract_claude_code(raw))
+        }
+        Some(AgentKind::Codex) => {
+            Some(crate::internal::ai::observed_agents::extract::extract_codex(raw))
+        }
+        Some(AgentKind::OpenCode) => {
+            Some(crate::internal::ai::observed_agents::extract::extract_opencode(raw))
+        }
+        _ => None,
+    };
+    if let Some(summary) = format_summary {
+        if summary.partial {
+            partial = true;
+        }
+        // Additive E6 count fields (numbers only — no redaction needed).
+        object.insert(
+            "api_call_count".into(),
+            serde_json::json!(summary.api_call_count),
+        );
+        // The generic E6 path (codex/opencode) folds the wire
+        // `subagent_tokens` into `subagent_usage` but exposes no
+        // `SubagentAwareExtractor`, so persist it here when the
+        // accessor block above did not already write it.
+        if !object.contains_key("subagent_token_usage")
+            && let Some(subagent) = &summary.subagent_usage
+        {
+            object.insert(
+                "subagent_token_usage".into(),
+                serde_json::to_value(subagent).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        warnings.extend(summary.warnings);
+    }
+
+    finalize_extraction(&mut value, partial, warnings);
+    value
+}
+
+/// Stamp `partial` + redacted warnings onto the extraction object.
+fn finalize_extraction(value: &mut serde_json::Value, partial: bool, warnings: Vec<String>) {
+    use crate::internal::ai::observed_agents::Redactor;
+    let redactor = Redactor::new_default();
+    let redacted: Vec<String> = warnings
+        .into_iter()
+        .map(|warning| {
+            let (bytes, _report) = redactor.redact(warning.as_bytes());
+            String::from_utf8_lossy(bytes.as_ref()).into_owned()
+        })
+        .collect();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("partial".into(), serde_json::Value::Bool(partial));
+        object.insert(
+            "warnings".into(),
+            serde_json::to_value(redacted).unwrap_or_else(|_| serde_json::json!([])),
+        );
+    }
+}
+
 fn checkpoint_model_field(model: Option<&serde_json::Value>) -> String {
     match model {
         Some(serde_json::Value::String(name)) if !name.trim().is_empty() => name.clone(),
@@ -1696,6 +1937,55 @@ mod tests {
 
     use super::*;
     use crate::internal::ai::hooks::providers::{claude_provider, gemini_provider};
+
+    /// AG-21 metadata persistence (codex review R2 P1): the generic E6
+    /// path (codex/opencode) must persist `subagent_token_usage` and
+    /// `api_call_count` into the checkpoint metadata `extraction` block —
+    /// not just into the in-memory summary. Drives the exact
+    /// `build_extraction_metadata` path a checkpoint write uses.
+    #[test]
+    fn extraction_metadata_persists_generic_subagent_and_api_count() {
+        let transcript = concat!(
+            r#"{"role":"user","content":"/review"}"#,
+            "\n",
+            r#"{"model":"gpt-5.3-codex","usage":{"input_tokens":10,"output_tokens":4,"api_call_count":5,"subagent_tokens":30}}"#,
+            "\n",
+        );
+        let value = build_extraction_metadata("codex", Some(transcript.as_bytes()));
+        let extraction = value.as_object().expect("extraction object");
+        assert_eq!(extraction["present"], serde_json::json!(true));
+        assert_eq!(
+            extraction["api_call_count"],
+            serde_json::json!(5),
+            "wire api_call_count persisted (not +1): {value}"
+        );
+        let subagent = &extraction["subagent_token_usage"];
+        assert_eq!(
+            subagent["input_tokens"],
+            serde_json::json!(30),
+            "generic-path subagent tokens persisted: {value}"
+        );
+
+        // Claude uses the SubagentAwareExtractor accessor — its
+        // subagent_token_usage must be written by that block and NOT
+        // double-written by the generic fallback (value stays the
+        // accessor's, and the key exists exactly once in a JSON object).
+        let claude_line = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "tool_use", "name": "Task", "input": {"prompt": "x"}}],
+                "usage": {"input_tokens": 7, "output_tokens": 2}
+            }
+        });
+        let claude =
+            build_extraction_metadata("claude_code", Some(format!("{claude_line}\n").as_bytes()));
+        assert!(
+            claude["subagent_token_usage"].is_object(),
+            "claude subagent usage present via accessor: {claude}"
+        );
+    }
 
     // Scenario: pushing many keys past the cap evicts the oldest, never exceeding
     // `MAX_PROCESSED_EVENT_KEYS`.
