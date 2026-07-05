@@ -966,6 +966,108 @@ async fn test_status_untracked_files_no() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_status_untracked_files_no_skips_untracked_directory_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+
+    fs::create_dir_all("artifacts/deep").unwrap();
+    fs::write("artifacts/deep/blob.bin", "untracked build output").unwrap();
+    fs::set_permissions("artifacts", fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut output = Vec::new();
+    let result = status_execute_inner(
+        StatusArgs {
+            short: true,
+            untracked_files: UntrackedFiles::No,
+            ..Default::default()
+        },
+        &mut output,
+    )
+    .await;
+
+    fs::set_permissions("artifacts", fs::Permissions::from_mode(0o700)).unwrap();
+    result.expect("status -uno should not scan hidden untracked directories");
+    let output_str = String::from_utf8(output).unwrap();
+    assert!(
+        !output_str.contains("artifacts"),
+        "status -uno should hide untracked directories: {output_str}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_status_normal_reports_untracked_directory_without_descending() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+
+    fs::create_dir_all("artifacts/deep").unwrap();
+    fs::write("artifacts/deep/blob.bin", "untracked build output").unwrap();
+    fs::set_permissions("artifacts", fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut output = Vec::new();
+    let result = status_execute_inner(
+        StatusArgs {
+            short: true,
+            ..Default::default()
+        },
+        &mut output,
+    )
+    .await;
+
+    fs::set_permissions("artifacts", fs::Permissions::from_mode(0o700)).unwrap();
+    result.expect("status -s should report a top-level untracked directory without reading it");
+    let output_str = String::from_utf8(output).unwrap();
+    assert!(
+        output_str.lines().any(|line| line == "?? artifacts/"),
+        "status -s should report the untracked directory itself: {output_str}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_status_normal_untracked_directories_are_sorted() {
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+
+    fs::create_dir_all("zeta").unwrap();
+    fs::write("zeta/file.txt", "z").unwrap();
+    fs::create_dir_all("alpha").unwrap();
+    fs::write("alpha/file.txt", "a").unwrap();
+
+    let mut output = Vec::new();
+    status_execute(
+        StatusArgs {
+            untracked_files: UntrackedFiles::Normal,
+            ..Default::default()
+        },
+        &mut output,
+    )
+    .await;
+
+    let output_str = String::from_utf8(output).unwrap().replace("\\", "/");
+    let alpha = output_str
+        .find("\talpha/")
+        .expect("normal status should list alpha/ as a collapsed directory");
+    let zeta = output_str
+        .find("\tzeta/")
+        .expect("normal status should list zeta/ as a collapsed directory");
+    assert!(
+        alpha < zeta,
+        "normal status should sort collapsed untracked directories: {output_str}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 /// Tests --untracked-files=all retains untracked output (same as normal for now).

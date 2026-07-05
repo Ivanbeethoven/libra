@@ -22,7 +22,7 @@ use git_internal::{
 };
 use serde::Serialize;
 
-use super::{merge, stash};
+use super::{merge, stash, status_untracked};
 use crate::{
     command::calc_file_blob_hash,
     internal::{
@@ -406,39 +406,16 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         .await
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
-    let mut unstaged = changes_to_be_staged()
-        .map(|c| c.to_relative())
-        .map_err(CliError::from)?;
-    let mut ignored_files = if args.ignored && !matches!(args.untracked_files, UntrackedFiles::No) {
-        list_ignored_files()
-            .map(|c| c.to_relative().new)
-            .map_err(CliError::from)?
-    } else {
-        vec![]
-    };
-    let needs_index = matches!(args.untracked_files, UntrackedFiles::Normal)
-        || matches!(args.porcelain, Some(PorcelainVersion::V2));
-    let mut maybe_index = if needs_index {
-        Some(load_status_index()?)
-    } else {
-        None
-    };
-
-    // Apply untracked-files filter
-    match args.untracked_files {
-        UntrackedFiles::No => {
-            unstaged.new.clear();
-            ignored_files.clear();
-        }
-        UntrackedFiles::Normal => {
-            let index = maybe_index
-                .as_ref()
-                .ok_or_else(|| CliError::internal("status index should be loaded"))?;
-            unstaged.new = collapse_untracked_directories(unstaged.new, index);
-            ignored_files = collapse_untracked_directories(ignored_files, index);
-        }
-        UntrackedFiles::All => {}
-    }
+    let worktree =
+        status_untracked::collect_status_worktree_changes(args.untracked_files, args.ignored)
+            .map_err(CliError::from)?;
+    let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
+    let ignored_files = worktree
+        .ignored_files
+        .into_iter()
+        .map(util::workdir_to_current)
+        .collect();
+    let mut maybe_index = Some(worktree.index);
 
     // Resolve rename detection: `--no-renames` wins (off); otherwise `--renames`
     // (or `--find-renames`) enables it at the given threshold (default 50).
@@ -733,8 +710,9 @@ pub async fn execute_safe(args: StatusArgs, output: &OutputConfig) -> CliResult<
 
 // ─── Dirty-set cache modes (lore.md §1.1) ───────────────────────────────────
 
-/// The raw (repo-relative) staged + unstaged sets, computed by the same full
-/// safe reconcile the default status uses.
+/// The raw (repo-relative) staged + unstaged sets for dirty-cache snapshots.
+/// This remains a full reconcile so `status --scan` can discover every dirty
+/// path before replacing the cache.
 async fn compute_raw_sets() -> CliResult<(Changes, Changes)> {
     let staged = changes_to_be_committed_safe()
         .await
