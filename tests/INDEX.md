@@ -182,6 +182,14 @@
 
 ---
 
+## Wave 7 — Local agent capture smoke (LIBRA_RUN_LOCAL_AGENTS=1)
+
+| target | wave | one-line purpose | relevant src |
+|---|---|---|---|
+| `agent_local_capture_smoke_test` | 7 | A6.5 first-batch hard gate: drives the real local `codex`/`claude`/`opencode` CLIs (one paid session each; `#[ignore]` + env-gate, serial) through hook install → capture → session/checkpoint/traces/doctor assertions → uninstall smoke; driver in `tests/harness/agent_local_capture.rs` | `src/command/agent/`, `src/command/hooks.rs`, `src/internal/ai/hooks/` |
+
+---
+
 ## TODO — uncategorised (one-liner pass needed)
 
 None. All currently known integration targets have a wave, purpose, and
