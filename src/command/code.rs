@@ -1110,6 +1110,34 @@ fn build_any_completion_model_for_args(
     })
 }
 
+/// Resolve a provider's API base URL from the CLI `--api-base` flag and the
+/// provider-specific `*_BASE_URL` env fallback. Pure and table-testable
+/// (`resolve_env` is the env-file→process→vault lookup at the call site).
+///
+/// Per-provider rules (kept identical to the inline match this replaced):
+/// - `openai`/`anthropic`/`kimi`/`zhipu`/`ollama`: CLI flag wins, else the
+///   provider's `*_BASE_URL` env var (`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`,
+///   `MOONSHOT_BASE_URL`, `ZHIPU_BASE_URL`, `OLLAMA_BASE_URL`).
+/// - `deepseek`/`gemini`: CLI flag only — no env fallback.
+/// - anything else (incl. codex, which never reaches the factory): `None`.
+fn resolve_provider_api_base(
+    provider_id_str: &str,
+    cli_api_base: Option<String>,
+    resolve_env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    use crate::internal::ai::providers::runtime::provider_id;
+    match provider_id_str {
+        provider_id::ANTHROPIC => cli_api_base.or_else(|| resolve_env("ANTHROPIC_BASE_URL")),
+        provider_id::OPENAI => cli_api_base.or_else(|| resolve_env("OPENAI_BASE_URL")),
+        provider_id::DEEPSEEK => cli_api_base,
+        provider_id::GEMINI => cli_api_base,
+        provider_id::KIMI => cli_api_base.or_else(|| resolve_env("MOONSHOT_BASE_URL")),
+        provider_id::ZHIPU => cli_api_base.or_else(|| resolve_env("ZHIPU_BASE_URL")),
+        provider_id::OLLAMA => cli_api_base.or_else(|| resolve_env("OLLAMA_BASE_URL")),
+        _ => None,
+    }
+}
+
 fn build_any_completion_model_for_args_with_lookup(
     args: &CodeArgs,
     env_file: &CodeEnvFile,
@@ -1208,17 +1236,7 @@ fn build_any_completion_model_for_args_with_lookup(
         _ => None,
     };
 
-    let cli_api_base = args.api_base.clone();
-    let api_base = match provider_id_str.as_str() {
-        provider_id::ANTHROPIC => cli_api_base.or_else(|| resolve_env("ANTHROPIC_BASE_URL")),
-        provider_id::OPENAI => cli_api_base.or_else(|| resolve_env("OPENAI_BASE_URL")),
-        provider_id::DEEPSEEK => cli_api_base,
-        provider_id::GEMINI => cli_api_base,
-        provider_id::KIMI => cli_api_base.or_else(|| resolve_env("MOONSHOT_BASE_URL")),
-        provider_id::ZHIPU => cli_api_base.or_else(|| resolve_env("ZHIPU_BASE_URL")),
-        provider_id::OLLAMA => cli_api_base.or_else(|| resolve_env("OLLAMA_BASE_URL")),
-        _ => None,
-    };
+    let api_base = resolve_provider_api_base(&provider_id_str, args.api_base.clone(), resolve_env);
 
     #[cfg(feature = "test-provider")]
     let fake_fixture_path = if provider_id_str == provider_id::FAKE {
@@ -1277,7 +1295,16 @@ fn build_any_completion_model_for_args_with_lookup(
                      (set --api-base https://ollama.com or OLLAMA_BASE_URL=https://ollama.com)",
                     )
                 } else {
-                    CliError::auth(format!("{env_var} is not set"))
+                    // Name the missing variable AND how to configure it, so
+                    // the user has an actionable next step rather than a bare
+                    // "not set" (C3 criterion: missing-key errors must say
+                    // which env var and how to set it). Mirrors the
+                    // vault-aware resolution chain in
+                    // `build_any_completion_model_for_args`.
+                    CliError::auth(format!(
+                        "{env_var} is not set; export {env_var} or store it with \
+                         `libra config --global add vault.env.{env_var} <value>`"
+                    ))
                 }
             }
             ProviderFactoryError::BuildFailed { reason, .. } => CliError::io(reason),
@@ -2427,7 +2454,15 @@ fn pick_free_local_port(host: &str) -> CliResult<u16> {
 /// or [`CODEX_STARTUP_TIMEOUT`] is exceeded. The probe connection is immediately
 /// dropped after a successful handshake.
 async fn wait_for_codex_ready(ws_url: &str) -> CliResult<()> {
-    let deadline = Instant::now() + CODEX_STARTUP_TIMEOUT;
+    wait_for_codex_ready_within(ws_url, CODEX_STARTUP_TIMEOUT).await
+}
+
+/// Poll variant with an injectable overall `timeout`, so tests can assert the
+/// human-readable startup-timeout diagnostic without waiting the full
+/// [`CODEX_STARTUP_TIMEOUT`]. Production always goes through
+/// [`wait_for_codex_ready`].
+async fn wait_for_codex_ready_within(ws_url: &str, timeout: Duration) -> CliResult<()> {
+    let deadline = Instant::now() + timeout;
 
     loop {
         match connect_async(ws_url).await {
@@ -5721,6 +5756,16 @@ no_cache_unknown_network = true
                 msg.contains("is not set") || msg.contains("is required"),
                 "missing-key error should be readable and actionable for {provider:?}, got: {msg}"
             );
+            // C3 criterion: the error must also explain HOW to configure the
+            // key, not just name it. Non-Ollama providers point at the
+            // vault/export path; Ollama's cloud message points at
+            // `--api-base` / `OLLAMA_BASE_URL`.
+            assert!(
+                msg.contains("vault.env")
+                    || msg.contains("OLLAMA_BASE_URL")
+                    || msg.contains("--api-base"),
+                "missing-key error must explain how to configure {provider:?}, got: {msg}"
+            );
         }
     }
 
@@ -5862,6 +5907,219 @@ no_cache_unknown_network = true
         assert!(
             !msg.contains("GEMINI_API_KEY"),
             "CLI --provider gemini must NOT win after agent override, got: {msg}"
+        );
+    }
+
+    /// C3 criterion 1 (default model id): with `--model` omitted the build
+    /// helper must fall back to each provider's documented flagship default,
+    /// and Ollama must instead demand an explicit `--model`. A lookup that
+    /// only answers `*_API_KEY` keeps every base URL at its provider default
+    /// so the client constructs without touching a bogus endpoint.
+    #[test]
+    fn build_helper_defaults_model_id_per_provider() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let api_key_only = |key: &str| -> Option<String> {
+            key.ends_with("_API_KEY").then(|| "dummy-key".to_string())
+        };
+        let cases: &[(CodeProvider, &str, &str)] = &[
+            (CodeProvider::Gemini, GEMINI_2_5_FLASH, "gemini"),
+            (CodeProvider::Openai, GPT_4O_MINI, "openai"),
+            (CodeProvider::Anthropic, CLAUDE_3_5_SONNET, "anthropic"),
+            (CodeProvider::Deepseek, "deepseek-chat", "deepseek"),
+            (CodeProvider::Kimi, KIMI_K2_6, "kimi"),
+            (CodeProvider::Zhipu, GLM_5, "zhipu"),
+        ];
+        for (provider, expected_model, expected_provider_id) in cases {
+            let mut args = base_args();
+            args.provider = *provider;
+            args.model = None;
+            let (_model, model_name, provider_id) =
+                build_any_completion_model_for_args_with_lookup(
+                    &args,
+                    &CodeEnvFile::default(),
+                    tmp.path(),
+                    api_key_only,
+                )
+                .unwrap_or_else(|err| panic!("default-model build for {provider:?} failed: {err}"));
+            assert_eq!(
+                model_name, *expected_model,
+                "wrong default model for {provider:?}"
+            );
+            assert_eq!(
+                provider_id, *expected_provider_id,
+                "wrong provider id for {provider:?}"
+            );
+        }
+
+        // Ollama has no sensible local default — omitting `--model` must be a
+        // usage error, not a silent fallback.
+        let mut ollama = base_args();
+        ollama.provider = CodeProvider::Ollama;
+        ollama.model = None;
+        let err = build_any_completion_model_for_args_with_lookup(
+            &ollama,
+            &CodeEnvFile::default(),
+            tmp.path(),
+            api_key_only,
+        )
+        .expect_err("ollama without --model must error");
+        assert!(
+            err.to_string().contains("--model is required"),
+            "ollama default-model error must be actionable: {err}"
+        );
+    }
+
+    /// C3 criterion 1 (api-base rules): for the OpenAI-compat family a
+    /// `*_BASE_URL` value supplied through `--env-file` is honored when the
+    /// CLI `--api-base` flag is absent (the `.or_else(resolve_env(...))`
+    /// fallback arm). Complements `build_helper_honors_cli_api_base_for_deepseek`,
+    /// which pins the CLI-flag arm.
+    #[tokio::test]
+    async fn build_helper_honors_env_file_base_url_for_openai() {
+        let (base_url, captured, server) = start_chat_completions_stub().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut args = base_args();
+        args.provider = CodeProvider::Openai;
+        args.model = Some("gpt-4o-mini".to_string());
+        // No CLI --api-base; the base URL must come from the env-file.
+        args.api_base = None;
+        let mut env_file = CodeEnvFile::default();
+        env_file
+            .values
+            .insert("OPENAI_API_KEY".to_string(), "test-key".to_string());
+        env_file
+            .values
+            .insert("OPENAI_BASE_URL".to_string(), base_url);
+
+        let (model, _model_name, provider_id) =
+            build_any_completion_model_for_args_with_lookup(&args, &env_file, tmp.path(), |_| None)
+                .expect("OpenAI model builds with env-file base URL");
+        assert_eq!(provider_id, "openai");
+
+        let request = CompletionRequest::new(vec![crate::internal::ai::completion::Message::user(
+            "hello",
+        )]);
+        let _response = model
+            .completion(request)
+            .await
+            .expect("env-file OPENAI_BASE_URL endpoint should receive the request");
+
+        let bodies = captured.lock().await;
+        assert_eq!(
+            bodies.len(),
+            1,
+            "OpenAI request should reach the env-file OPENAI_BASE_URL endpoint"
+        );
+        server.abort();
+    }
+
+    /// C3 criterion 1 (api-base rules across ALL providers, codex review):
+    /// pins the per-provider api-base source — CLI `--api-base` always wins,
+    /// and only openai/anthropic/kimi/zhipu/ollama fall back to their
+    /// `*_BASE_URL` env var; deepseek/gemini are CLI-only; codex/unknown
+    /// resolve to None. Guards each arm against silent regression.
+    #[test]
+    fn resolve_provider_api_base_matches_per_provider_rules() {
+        use crate::internal::ai::providers::runtime::provider_id;
+        let env = |var: &str, val: &str| {
+            let var = var.to_string();
+            let val = val.to_string();
+            move |k: &str| if k == var { Some(val.clone()) } else { None }
+        };
+
+        // (provider_id, env_var_name_or_empty_if_cli_only)
+        let env_fallback = [
+            (provider_id::OPENAI, "OPENAI_BASE_URL"),
+            (provider_id::ANTHROPIC, "ANTHROPIC_BASE_URL"),
+            (provider_id::KIMI, "MOONSHOT_BASE_URL"),
+            (provider_id::ZHIPU, "ZHIPU_BASE_URL"),
+            (provider_id::OLLAMA, "OLLAMA_BASE_URL"),
+        ];
+        for (pid, var) in env_fallback {
+            // CLI flag wins over the env fallback.
+            assert_eq!(
+                resolve_provider_api_base(
+                    pid,
+                    Some("https://cli.example".to_string()),
+                    env(var, "https://env.example")
+                ),
+                Some("https://cli.example".to_string()),
+                "{pid}: CLI --api-base must win over {var}"
+            );
+            // Env fallback used when the CLI flag is absent.
+            assert_eq!(
+                resolve_provider_api_base(pid, None, env(var, "https://env.example")),
+                Some("https://env.example".to_string()),
+                "{pid}: must fall back to {var}"
+            );
+            // The env var name is provider-specific: another provider's
+            // *_BASE_URL must NOT leak through.
+            assert_eq!(
+                resolve_provider_api_base(pid, None, env("SOME_OTHER_BASE_URL", "https://x")),
+                None,
+                "{pid}: must only read {var}"
+            );
+        }
+
+        // deepseek/gemini: CLI-only, no env fallback.
+        for pid in [provider_id::DEEPSEEK, provider_id::GEMINI] {
+            assert_eq!(
+                resolve_provider_api_base(
+                    pid,
+                    Some("https://cli.example".to_string()),
+                    env("DEEPSEEK_BASE_URL", "https://env.example")
+                ),
+                Some("https://cli.example".to_string()),
+                "{pid}: CLI --api-base honored"
+            );
+            assert_eq!(
+                resolve_provider_api_base(
+                    pid,
+                    None,
+                    env("DEEPSEEK_BASE_URL", "https://env.example")
+                ),
+                None,
+                "{pid}: CLI-only, no env fallback"
+            );
+        }
+
+        // codex never reaches the factory; an unknown id resolves to None
+        // even with a CLI flag (the `_ => None` arm), so a future misroute
+        // cannot smuggle a base URL into the managed Codex runtime.
+        assert_eq!(
+            resolve_provider_api_base("codex", None, env("ANYTHING", "https://x")),
+            None
+        );
+        assert_eq!(
+            resolve_provider_api_base("codex", Some("https://cli.example".to_string()), |_| None),
+            None,
+            "codex/unknown resolves to None regardless of the CLI flag"
+        );
+    }
+
+    /// C3 criterion 4 (Codex preflight): a WebSocket startup that never
+    /// becomes reachable must surface a human-readable, url-bearing timeout
+    /// diagnostic rather than a bare error or a hang. Uses a freed local port
+    /// (nothing listening) and a short injected timeout.
+    #[tokio::test]
+    async fn codex_ready_probe_times_out_with_human_readable_diagnostic() {
+        let ws_url = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener); // release the port so the probe connection is refused
+            format!("ws://127.0.0.1:{port}")
+        };
+        let err = wait_for_codex_ready_within(&ws_url, Duration::from_millis(50))
+            .await
+            .expect_err("connecting to a dead port must time out");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out waiting for Codex app-server"),
+            "startup-timeout diagnostic must be human-readable: {msg}"
+        );
+        assert!(
+            msg.contains(&ws_url),
+            "startup-timeout diagnostic must name the WebSocket url: {msg}"
         );
     }
 }

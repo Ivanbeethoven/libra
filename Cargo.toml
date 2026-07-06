@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.14"
+version = "0.18.15"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -308,3 +308,23 @@ required-features = ["otlp"]
 name = "auth_keyring_backend"
 path = "tests/auth_keyring_backend.rs"
 required-features = ["keyring"]
+
+# Live LLM-provider tests (L3): call real APIs when their key/opt-in env is
+# set. Per the L3 convention (CLAUDE.md: match the env gate AND the
+# `test-live-ai` feature), require the feature so a bare `cargo test --all`
+# excludes them — a machine with DEEPSEEK_API_KEY / LIBRA_AI_LIVE_OLLAMA set
+# can no longer hit live providers in default L1 (C3, codex review).
+[[test]]
+name = "ai_agent_test"
+path = "tests/ai_agent_test.rs"
+required-features = ["test-live-ai"]
+
+[[test]]
+name = "ai_chat_agent_test"
+path = "tests/ai_chat_agent_test.rs"
+required-features = ["test-live-ai"]
+
+[[test]]
+name = "ai_ollama_live_gate_test"
+path = "tests/ai_ollama_live_gate_test.rs"
+required-features = ["test-live-ai"]
