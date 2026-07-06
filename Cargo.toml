@@ -328,3 +328,6 @@ required-features = ["test-live-ai"]
 name = "ai_ollama_live_gate_test"
 path = "tests/ai_ollama_live_gate_test.rs"
 required-features = ["test-live-ai"]
+
+[patch.crates-io]
+git-internal = { path = "../git-internal" }
