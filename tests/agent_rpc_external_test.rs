@@ -185,20 +185,24 @@ fn stderr_is_capped_redacted_and_not_inherited() {
     );
 }
 
-/// `env_clear()` + allowlist: the child sees the protocol variables but
-/// none of the parent's secrets.
+/// `env_clear()` + allowlist: the child sees the derived protocol
+/// variables and the non-secret passthrough allowlist (`PATH`, `HOME`, …)
+/// that real external CLIs need — but none of the parent's secrets.
 #[test]
 #[serial(rpc_env_probe)]
 fn spawn_clears_parent_env_and_injects_allowlist() {
     let dir = tempfile::tempdir().unwrap();
     let body = "#!/bin/sh\n\
         read _l; printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"methods\":[\"capabilities\",\"env_probe\"]}}\\n'\n\
-        read _l; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"secret\":\"%s\",\"proto\":\"%s\",\"repo\":\"%s\"}}\\n' \"$LIBRA_TEST_SECRET_PROBE\" \"$LIBRA_AGENT_PROTOCOL_VERSION\" \"$LIBRA_REPO_ROOT\"\n";
+        read _l; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"secret\":\"%s\",\"proto\":\"%s\",\"repo\":\"%s\",\"home\":\"%s\",\"haspath\":\"%s\"}}\\n' \"$LIBRA_TEST_SECRET_PROBE\" \"$LIBRA_AGENT_PROTOCOL_VERSION\" \"$LIBRA_REPO_ROOT\" \"$HOME\" \"${PATH:+yes}\"\n";
     let binary = plant_script(dir.path(), "envprobe", body);
 
-    // SAFETY: serialized via #[serial(rpc_env_probe)]; removed below.
+    let home_sentinel = dir.path().join("home-sentinel");
+    let original_home = std::env::var_os("HOME");
+    // SAFETY: serialized via #[serial(rpc_env_probe)]; removed/restored below.
     unsafe {
         std::env::set_var("LIBRA_TEST_SECRET_PROBE", "super-secret-value");
+        std::env::set_var("HOME", &home_sentinel);
     }
     let repo_root = dir.path().join("repo");
     std::fs::create_dir_all(&repo_root).unwrap();
@@ -207,11 +211,26 @@ fn spawn_clears_parent_env_and_injects_allowlist() {
     let result = agent.invoke("env_probe", None).unwrap();
     unsafe {
         std::env::remove_var("LIBRA_TEST_SECRET_PROBE");
+        match original_home {
+            Some(prev) => std::env::set_var("HOME", prev),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
+    // Secrets stay cleared by env_clear(); the derived + passthrough
+    // allowlist reaches the child so external CLIs can actually run.
     assert_eq!(result["secret"], "", "parent secrets must not leak");
     assert_eq!(result["proto"], RPC_PROTOCOL_VERSION.to_string());
     assert_eq!(result["repo"], repo_root.display().to_string());
+    assert_eq!(
+        result["home"],
+        home_sentinel.display().to_string(),
+        "HOME must pass through the allowlist"
+    );
+    assert_eq!(
+        result["haspath"], "yes",
+        "PATH must pass through the allowlist so the child can find deps"
+    );
 }
 
 /// Built-in slug impersonation is skipped-and-logged at discovery.
