@@ -214,6 +214,34 @@ The same banner is rendered by `libra agent --help` so the doc and the
 CLI surface stay in sync (cross-cutting `--help` EXAMPLES rollout, see
 `docs/development/commands/_general.md` item B).
 
+## Deferred parity (non-goals)
+
+The following external-agent parity surfaces are intentionally **not** exposed
+in this wave. They are recorded — with their handling and restart condition —
+in the Agent tracing contract
+([`../development/tracing/agent.md`](../development/tracing/agent.md), section
+「还未实现的功能」), and are called out here so scripts and users do not depend
+on them:
+
+- **`agent add`/`remove` `--local-dev` / `--force` flags** are unpublished — use
+  the canonical `enable` / `disable` (and their `add` / `remove` aliases) only.
+  If they ever ship, each will be wired onto both the canonical verb and its
+  alias.
+- **Provider-specific transcript compaction / reassemble traits** are a future
+  parity item. The writer already stores large transcripts as manifest-relative
+  chunks, but there is no provider-specific compactor/reassembler yet.
+- **Optional capability traits** (`ProtectedFilesProvider`, `TranscriptCompactor`,
+  `HookResponseWriter`, `RestoredSessionPathResolver`, …) beyond the landed
+  `DeclaredAgentCaps` matrix have no public behavior yet.
+- **External-RPC method families beyond the v2 `info` / capability gate** are not
+  implemented; an agent that does not declare a capability continues to fail
+  closed.
+- **The non-first-batch roster is unsupported.** Only `claude-code`, `codex` and
+  `opencode` are supported, hook-installable and launchable for
+  review/investigate. `gemini` (uninstall-only, see the Description above),
+  `cursor`, `copilot` and `factory-ai` are `supported=false`: `add`/`enable`
+  returns an actionable unsupported error and they are not launchable.
+
 ## Notes
 
 - External `libra-agent-*` agents are **disabled by default**. Opt in with
