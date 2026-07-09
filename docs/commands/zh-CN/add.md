@@ -13,7 +13,7 @@ libra add --refresh [PATHSPEC...]
 
 ## 说明
 
-`libra add` 将工作树中的文件更改暂存到索引中，为下一次 `libra commit` 做准备。它支持 pathspec、glob 模式、`--dry-run` 预览，以及用 `--refresh` 对已跟踪条目重新 stat 而不暂存新内容。
+`libra add` 将工作树中的文件更改暂存到索引中，为下一次 `libra commit` 做准备。它支持共享 Git 风格 pathspec 匹配、`--dry-run` 预览，以及用 `--refresh` 对已跟踪条目重新 stat 而不暂存新内容。
 
 该命令相对于当前工作目录解析 pathspec，验证它们位于仓库根内，并遵守 `.libraignore` 规则。由 LFS 跟踪的文件会自动作为指针文件暂存。`-A` 标志会暂存整个工作树中的所有更改（新增、修改、删除），而 `-u` 只更新已跟踪文件，不添加新文件。
 
@@ -25,10 +25,14 @@ libra add --refresh [PATHSPEC...]
 
 要暂存的一个或多个文件或目录。路径相对于当前目录解析。除非指定 `-A`、`-u` 或 `--refresh`，否则必需。
 
+Pathspec 使用 Libra 共享的 Git 风格匹配器：普通 pathspec 匹配文件或目录前缀，支持通配符，并支持高价值 magic 形式 `:(top)`、`:/`、`:(glob)`、`:(literal)`、`:(icase)`、`:(exclude)`、`:!`、`:^`。排除 pathspec 会从正向选择中扣除；启用 `core.ignorecase` 时，匹配会按忽略大小写处理。看起来像通配符的 pathspec 也会匹配同名的字面路径或目录前缀，以保留 Git 对 bracket 文件名和目录名的行为。
+
 ```bash
 libra add file.txt
 libra add src/ tests/
 libra add .
+libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
+libra add ':(literal)literal/[abc].txt'
 ```
 
 ### `-A, --all`
@@ -89,6 +93,19 @@ libra add -v src/
 libra add --ignore-errors src/
 ```
 
+### `--pathspec-from-file <file>`
+
+从 `<file>` 读取 pathspec（每行一个），并与命令行 pathspec 合并。文件中的条目使用与位置 pathspec 相同的共享匹配器和 magic 形式。不支持用 `-` 表示 stdin；请传入真实路径。列表为 NUL 分隔时，配合 `--pathspec-file-nul` 使用。空行会被忽略。
+
+```bash
+libra add --pathspec-from-file paths.txt
+libra add --pathspec-from-file paths.bin --pathspec-file-nul
+```
+
+### `--pathspec-file-nul`
+
+将 `--pathspec-from-file` 输入视为 NUL 分隔，而不是换行分隔。必须与 `--pathspec-from-file` 一起使用；单独使用是用法错误。
+
 ### `--chmod=(+|-)x`
 
 强制设置命中路径在索引中记录的可执行位：`+x` 记为 mode `100755`，`-x` 记为 `100644`。
@@ -112,8 +129,8 @@ libra add --renormalize src/
 
 ### `--ignore-missing`
 
-在 `--dry-run` 下，对不存在的 pathspec 静默跳过而非报错（会向 stderr 打印警告）。与 Git 一致：
-`--ignore-missing` 需要配合 `--dry-run`，且存在但未匹配任何文件的 pathspec 仍会报错。
+在 `--dry-run` 下，对没有匹配 add 候选的 pathspec 跳过而非报错（会向 stderr 打印警告）。与 Git 一致：
+`--ignore-missing` 需要配合 `--dry-run`。只命中 ignored 文件的 pathspec 仍按 ignored-path warning 报告。
 
 ```bash
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt
@@ -128,6 +145,8 @@ libra add .
 libra add -n file.txt
 libra add --refresh
 libra add --ignore-errors src/
+libra add --pathspec-from-file paths.txt
+libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 libra add --chmod=+x scripts/build.sh
 libra add --renormalize
 ```

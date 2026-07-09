@@ -1147,6 +1147,10 @@ fn map_checkout_error(source: RestoreError) -> CliError {
             "internal error: clone checkout reported an unsupported conflict style '{style}'"
         ))
         .with_stable_code(StableErrorCode::RepoStateInvalid),
+        RestoreError::InvalidPathspec(detail) => CliError::fatal(format!(
+            "internal error: clone checkout reported an invalid pathspec: {detail}"
+        ))
+        .with_stable_code(StableErrorCode::RepoStateInvalid),
     }
 }
 

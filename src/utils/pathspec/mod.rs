@@ -47,8 +47,15 @@ struct Pathspec {
 
 #[derive(Debug, Clone)]
 enum PathMatcher {
-    Prefix { pattern: String, icase: bool },
-    Regex(Regex),
+    Prefix {
+        pattern: String,
+        icase: bool,
+    },
+    Regex {
+        pattern: String,
+        regex: Regex,
+        icase: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -66,9 +73,18 @@ impl PathspecSet {
         current_dir: &Path,
         workdir: &Path,
     ) -> Result<Self, PathspecError> {
+        Self::from_workdir_with_default_icase(raw_specs, current_dir, workdir, false)
+    }
+
+    pub fn from_workdir_with_default_icase(
+        raw_specs: &[String],
+        current_dir: &Path,
+        workdir: &Path,
+        default_icase: bool,
+    ) -> Result<Self, PathspecError> {
         let specs = raw_specs
             .iter()
-            .map(|raw| Pathspec::parse(raw, current_dir, workdir))
+            .map(|raw| Pathspec::parse(raw, current_dir, workdir, default_icase))
             .collect::<Result<Vec<_>, _>>()?;
         let has_positive = specs.iter().any(|spec| !spec.exclude);
         Ok(Self {
@@ -121,6 +137,27 @@ impl PathspecSet {
             .map(|spec| spec.raw.as_str())
     }
 
+    pub fn unmatched_positive_specs<I, P>(&self, paths: I) -> Vec<&str>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let normalized = paths
+            .into_iter()
+            .map(|path| normalize_candidate(path.as_ref()))
+            .collect::<Vec<_>>();
+        self.specs
+            .iter()
+            .filter(|spec| !spec.exclude)
+            .filter(|spec| {
+                !normalized
+                    .iter()
+                    .any(|path| spec.matcher.matches(path.as_str()))
+            })
+            .map(|spec| spec.raw.as_str())
+            .collect()
+    }
+
     /// Return plain positive prefix pathspecs that can be passed to older
     /// command engines as a pre-filter without changing behavior.
     pub fn plain_positive_prefixes(&self) -> Option<Vec<PathBuf>> {
@@ -141,6 +178,21 @@ impl PathspecSet {
             }
         }
         Some(prefixes)
+    }
+
+    pub fn positive_prefixes(&self) -> Vec<PathBuf> {
+        self.specs
+            .iter()
+            .filter(|spec| !spec.exclude)
+            .filter_map(|spec| match &spec.matcher {
+                PathMatcher::Prefix { pattern, .. } => Some(if pattern.is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    PathBuf::from(pattern)
+                }),
+                PathMatcher::Regex { .. } => None,
+            })
+            .collect()
     }
 
     pub fn positive_depth_roots(&self) -> Vec<PathspecDepthRoot> {
@@ -167,30 +219,40 @@ impl PathspecDepthRoot {
 }
 
 impl Pathspec {
-    fn parse(raw: &str, current_dir: &Path, workdir: &Path) -> Result<Self, PathspecError> {
+    fn parse(
+        raw: &str,
+        current_dir: &Path,
+        workdir: &Path,
+        default_icase: bool,
+    ) -> Result<Self, PathspecError> {
         let (magic, body) = parse_magic(raw)?;
         let normalized = resolve_body(raw, body, magic.top, current_dir, workdir)?;
+        let icase = magic.icase || default_icase;
         let matcher = if magic.literal || !has_wildcard(&normalized) {
             PathMatcher::Prefix {
                 pattern: normalized.clone(),
-                icase: magic.icase,
+                icase,
             }
         } else {
-            PathMatcher::Regex(compile_pattern(raw, &normalized, magic.glob, magic.icase)?)
+            PathMatcher::Regex {
+                pattern: normalized.clone(),
+                regex: compile_pattern(raw, &normalized, magic.glob, icase)?,
+                icase,
+            }
         };
         Ok(Self {
             raw: raw.to_string(),
             normalized,
             matcher,
             exclude: magic.exclude,
-            icase: magic.icase,
+            icase,
         })
     }
 
     fn depth_root(&self) -> PathspecDepthRoot {
         let path = match &self.matcher {
             PathMatcher::Prefix { pattern, .. } => PathBuf::from(pattern),
-            PathMatcher::Regex(_) => wildcard_base(&self.normalized),
+            PathMatcher::Regex { .. } => wildcard_base(&self.normalized),
         };
         PathspecDepthRoot {
             path,
@@ -203,7 +265,11 @@ impl PathMatcher {
     fn matches(&self, path: &str) -> bool {
         match self {
             Self::Prefix { pattern, icase } => prefix_matches(pattern, path, *icase),
-            Self::Regex(regex) => regex.is_match(path),
+            Self::Regex {
+                pattern,
+                regex,
+                icase,
+            } => prefix_matches(pattern, path, *icase) || regex.is_match(path),
         }
     }
 }
@@ -506,6 +572,18 @@ mod tests {
         let glob = set(&[":(glob)*.rs"], "");
         assert!(!glob.matches_path("src/main.rs"));
         assert!(glob.matches_path("main.rs"));
+    }
+
+    #[test]
+    fn wildcard_pathspecs_also_match_exact_metachar_paths() {
+        let specs = set(&["literal/[abc].txt"], "");
+        assert!(specs.matches_path("literal/[abc].txt"));
+        assert!(specs.matches_path("literal/a.txt"));
+        assert!(!specs.matches_path("literal/d.txt"));
+
+        let directory = set(&["literal/[abc]"], "");
+        assert!(directory.matches_path("literal/[abc]/child.txt"));
+        assert!(directory.matches_path("literal/a"));
     }
 
     #[test]

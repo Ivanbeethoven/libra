@@ -44,7 +44,9 @@ use crate::{
         error::{CliError, CliResult, StableErrorCode},
         object_ext::BlobExt,
         output::{self, OutputConfig},
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -190,6 +192,9 @@ pub enum AddError {
     /// [`status::StatusError`] is preserved as a source.
     #[error("failed to inspect repository status: {source}")]
     Status { source: status::StatusError },
+    /// The shared Git-style pathspec parser rejected the user input.
+    #[error("{source}")]
+    Pathspec { source: PathspecError },
 }
 
 impl From<AddError> for CliError {
@@ -236,6 +241,9 @@ impl From<AddError> for CliError {
             AddError::Status { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("failed to compute working tree status"),
+            AddError::Pathspec { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob"),
         }
     }
 }
@@ -337,13 +345,12 @@ enum StagedAction {
 /// Result of [`validate_pathspecs`]: the canonicalised set of pathspecs that
 /// should drive staging, plus any pathspecs that only matched
 /// `.libraignore`d entries (reported as warnings).
-#[derive(Default)]
 struct ValidatedPathspecs {
-    files: Vec<PathBuf>,
+    pathspecs: PathspecSet,
     ignored: Vec<String>,
-    /// Pathspecs skipped under `--ignore-missing` because they do not exist in
-    /// the working tree (dry-run only). Reported as stderr warnings, never in
-    /// the JSON payload.
+    /// Pathspecs skipped under `--ignore-missing` because they matched no add
+    /// candidate (dry-run only). Reported as stderr warnings and the JSON
+    /// payload.
     missing: Vec<String>,
 }
 
@@ -501,16 +508,11 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
 
     // Resolve pathspecs. `--renormalize` implies `-u` (tracked-only), so it also
     // permits an empty pathspec (operate on the whole tracked set).
-    let requested_paths: Vec<PathBuf> = if args.pathspec.is_empty() {
-        if !args.all && !args.update && !args.refresh && !args.renormalize {
-            return Err(CliError::command_usage("nothing specified, nothing added")
-                .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint("maybe you wanted to say 'libra add .'?"));
-        }
-        vec![workdir.clone()]
-    } else {
-        args.pathspec.iter().map(PathBuf::from).collect()
-    };
+    if args.pathspec.is_empty() && !args.all && !args.update && !args.refresh && !args.renormalize {
+        return Err(CliError::command_usage("nothing specified, nothing added")
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint("maybe you wanted to say 'libra add .'?"));
+    }
 
     let mut index = Index::load(&index_path).map_err(|source| AddError::IndexLoad {
         path: index_path.clone(),
@@ -542,7 +544,6 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
 
     let validated = validate_pathspecs(
         &args.pathspec,
-        &requested_paths,
         pathspec_ctx,
         &visible_changes,
         &ignored_changes,
@@ -565,7 +566,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // --- Refresh mode ---
     if args.refresh {
         let tracked_modified =
-            filter_refresh_candidates(&visible_changes.modified, &validated.files, pathspec_ctx);
+            filter_refresh_candidates(&visible_changes.modified, &validated.pathspecs);
         if args.dry_run {
             add_output.refreshed = tracked_modified
                 .iter()
@@ -589,14 +590,14 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     // `--renormalize` operates on the tracked set (implies `-u`) and force-rewrites
     // each matched blob; the regular path collects working-tree changes.
     let mut files = if args.renormalize {
-        filter_candidates(&index.tracked_files(), &validated.files, pathspec_ctx)
+        filter_candidates(&index.tracked_files(), &validated.pathspecs)
     } else {
         let mut f = visible_changes.modified;
         f.extend(visible_changes.deleted);
         if !args.update {
             f.extend(visible_changes.new);
         }
-        filter_candidates(&f, &validated.files, pathspec_ctx)
+        filter_candidates(&f, &validated.pathspecs)
     };
     filter_out_current_executable(&mut files);
     files.sort();
@@ -679,8 +680,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             apply_chmod(
                 &mut index,
                 target_mode,
-                &validated.files,
-                pathspec_ctx,
+                &validated.pathspecs,
                 true,
                 &mut add_output,
             )?;
@@ -798,8 +798,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         apply_chmod(
             &mut index,
             target_mode,
-            &validated.files,
-            pathspec_ctx,
+            &validated.pathspecs,
             false,
             &mut add_output,
         )?;
@@ -836,12 +835,12 @@ fn parse_chmod(value: &str) -> CliResult<u32> {
 fn apply_chmod(
     index: &mut Index,
     target_mode: u32,
-    validated_files: &[PathBuf],
-    pathspec_ctx: PathspecMatchContext<'_>,
+    pathspecs: &PathspecSet,
     dry_run: bool,
     out: &mut AddOutput,
 ) -> Result<(), AddError> {
-    let matched = filter_candidates(&index.tracked_files(), validated_files, pathspec_ctx);
+    let workdir = util::working_dir();
+    let matched = filter_candidates(&index.tracked_files(), pathspecs);
     for file in &matched {
         let file_str = file
             .to_str()
@@ -856,7 +855,7 @@ fn apply_chmod(
         if current_mode & 0o170000 != 0o100000 || current_mode == target_mode {
             continue;
         }
-        let file_abs = pathspec_ctx.workdir.join(file);
+        let file_abs = workdir.join(file);
         let Ok(metadata) = std::fs::symlink_metadata(&file_abs) else {
             // The tracked path is gone: nothing to chmod.
             continue;
@@ -869,7 +868,7 @@ fn apply_chmod(
             // Rebuild the entry from the working-tree stat, keeping the existing
             // blob (no content change) and forcing the requested mode.
             let mut updated =
-                IndexEntry::new_from_file(file, hash, pathspec_ctx.workdir).map_err(|source| {
+                IndexEntry::new_from_file(file, hash, &workdir).map_err(|source| {
                     AddError::CreateIndexEntry {
                         path: file.to_path_buf(),
                         source,
@@ -1162,70 +1161,59 @@ fn write_err(e: io::Error) -> CliError {
 #[allow(clippy::too_many_arguments)]
 fn validate_pathspecs(
     raw_pathspecs: &[String],
-    requested_paths: &[PathBuf],
     pathspec_ctx: PathspecMatchContext<'_>,
     visible_changes: &Changes,
     ignored_changes: &Changes,
     index: &Index,
     ignore_missing: bool,
 ) -> Result<ValidatedPathspecs, AddError> {
-    if raw_pathspecs.is_empty() {
-        return Ok(ValidatedPathspecs {
-            files: requested_paths.to_vec(),
-            ignored: Vec::new(),
-            missing: Vec::new(),
-        });
-    }
+    let pathspecs = PathspecSet::from_workdir_with_default_icase(
+        raw_pathspecs,
+        pathspec_ctx.current_dir,
+        pathspec_ctx.workdir,
+        pathspec_ctx.ignore_case,
+    )
+    .map_err(|source| AddError::Pathspec { source })?;
 
     let tracked_files = index.tracked_files();
     let change_candidates = collect_change_candidates(visible_changes);
     let ignored_candidates = collect_change_candidates(ignored_changes);
+    let selectable_candidates = pathspec_candidates(&change_candidates, &tracked_files);
+    let all_candidates = pathspec_candidates(&selectable_candidates, &ignored_candidates);
 
     let mut ignored = Vec::new();
-    let mut files = Vec::new();
     let mut missing = Vec::new();
-    for (raw, requested_path) in raw_pathspecs.iter().zip(requested_paths.iter()) {
-        let requested_abs = resolve_pathspec(requested_path, pathspec_ctx.current_dir);
-        if !util::is_sub_path(&requested_abs, pathspec_ctx.workdir) {
-            return Err(AddError::PathOutsideRepo {
-                path: raw.clone(),
-                repo_root: pathspec_ctx.workdir.to_path_buf(),
+
+    let unmatched_selectable = pathspecs.unmatched_positive_specs(&selectable_candidates);
+    if !unmatched_selectable.is_empty() {
+        let unmatched_all = pathspecs.unmatched_positive_specs(&all_candidates);
+        for raw in unmatched_selectable {
+            if !unmatched_all.contains(&raw) {
+                ignored.push(raw.to_string());
+                continue;
+            }
+            if ignore_missing {
+                missing.push(raw.to_string());
+                continue;
+            }
+            return Err(AddError::PathspecNotMatched {
+                pathspec: raw.to_string(),
             });
         }
-
-        let matches_changes =
-            pathspec_matches_any(&requested_abs, &change_candidates, pathspec_ctx);
-        let matches_tracked = pathspec_matches_any(&requested_abs, &tracked_files, pathspec_ctx);
-        let matches_ignored =
-            pathspec_matches_any(&requested_abs, &ignored_candidates, pathspec_ctx);
-
-        if matches_changes || matches_tracked {
-            files.push(requested_path.clone());
-            continue;
-        }
-        if matches_ignored {
-            ignored.push(raw.clone());
-            continue;
-        }
-
-        // `--ignore-missing` (dry-run only) skips a pathspec that does not exist
-        // on disk instead of failing; a path that EXISTS but still matches
-        // nothing is a real error even under `--ignore-missing` (matching Git).
-        if ignore_missing && requested_abs.symlink_metadata().is_err() {
-            missing.push(raw.clone());
-            continue;
-        }
-
-        return Err(AddError::PathspecNotMatched {
-            pathspec: raw.clone(),
-        });
     }
 
     Ok(ValidatedPathspecs {
-        files,
+        pathspecs,
         ignored,
         missing,
     })
+}
+
+fn pathspec_candidates(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(left.len() + right.len());
+    candidates.extend(left.iter().cloned());
+    candidates.extend(right.iter().cloned());
+    candidates
 }
 
 /// Flatten the three change buckets (`new`, `modified`, `deleted`) into a
@@ -1241,52 +1229,13 @@ fn collect_change_candidates(changes: &Changes) -> Vec<PathBuf> {
 /// Make a user-supplied pathspec absolute by joining onto `current_dir` when
 /// it is relative. Mirrors how Git's pathspec parser anchors specs to the
 /// invoking shell's CWD rather than to the worktree root.
-fn resolve_pathspec(pathspec: &Path, current_dir: &Path) -> PathBuf {
-    if pathspec.is_absolute() {
-        pathspec.to_path_buf()
-    } else {
-        current_dir.join(pathspec)
-    }
-}
-
-fn pathspec_contains(candidate_abs: &Path, requested_abs: &Path, ignore_case: bool) -> bool {
-    if util::is_sub_path(candidate_abs, requested_abs) {
-        return true;
-    }
-    ignore_case && crate::utils::path_case::path_starts_with_casefold(candidate_abs, requested_abs)
-}
-
-/// True iff any path in `candidates` (interpreted relative to `workdir`) is a
-/// subpath of `requested_abs`. Used both for tracked-file matching and for
-/// status-change matching.
-fn pathspec_matches_any(
-    requested_abs: &Path,
-    candidates: &[PathBuf],
-    pathspec_ctx: PathspecMatchContext<'_>,
-) -> bool {
-    candidates.iter().any(|candidate| {
-        let candidate_abs = pathspec_ctx.workdir.join(candidate);
-        pathspec_contains(&candidate_abs, requested_abs, pathspec_ctx.ignore_case)
-    })
-}
-
 /// Restrict `files` (workdir-relative) to entries that fall under at least
 /// one of the user's pathspecs. Used to scope `-A`/`-u`-derived candidate
 /// sets to the explicit positional arguments.
-fn filter_candidates(
-    files: &[PathBuf],
-    requested_paths: &[PathBuf],
-    pathspec_ctx: PathspecMatchContext<'_>,
-) -> Vec<PathBuf> {
+fn filter_candidates(files: &[PathBuf], pathspecs: &PathspecSet) -> Vec<PathBuf> {
     files
         .iter()
-        .filter(|file| {
-            let file_abs = pathspec_ctx.workdir.join(file.as_path());
-            requested_paths.iter().any(|pathspec| {
-                let requested_abs = resolve_pathspec(pathspec, pathspec_ctx.current_dir);
-                pathspec_contains(&file_abs, &requested_abs, pathspec_ctx.ignore_case)
-            })
-        })
+        .filter(|file| pathspecs.matches_path(file.as_path()))
         .cloned()
         .collect()
 }
@@ -1294,12 +1243,8 @@ fn filter_candidates(
 /// Alias of [`filter_candidates`] used in `--refresh` mode. Kept separate so
 /// future divergence in semantics (e.g. submodule handling) only needs to
 /// touch one branch.
-fn filter_refresh_candidates(
-    files: &[PathBuf],
-    requested_paths: &[PathBuf],
-    pathspec_ctx: PathspecMatchContext<'_>,
-) -> Vec<PathBuf> {
-    filter_candidates(files, requested_paths, pathspec_ctx)
+fn filter_refresh_candidates(files: &[PathBuf], pathspecs: &PathspecSet) -> Vec<PathBuf> {
+    filter_candidates(files, pathspecs)
 }
 
 /// Remove the running `libra` binary from the candidate list.

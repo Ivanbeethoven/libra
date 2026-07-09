@@ -21,7 +21,7 @@ This command exists so that developers migrating from Git can use familiar muscl
 
 When checking out a branch name that does not exist locally but matches a remote-tracking branch (e.g., `origin/feature`), Libra automatically creates a local tracking branch, sets upstream, and pulls -- going further than Git's auto-track by also synchronizing content immediately.
 
-Path restoration is only enabled by an explicit `--` separator. Without `--`, `libra checkout <name>` is always branch mode, even when a file has the same name.
+Path restoration is only enabled by an explicit `--` separator. Without `--`, `libra checkout <name>` is always branch mode, even when a file has the same name. The pathspecs after `--` use the same shared Git-style matcher as `libra restore`: plain prefixes, wildcard pathspecs, and `:(top)`/`:/`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)`/`:!`/`:^` magic are honored. Wildcard-looking pathspecs also match an exact path or directory prefix with the same literal text.
 
 When path restoration materializes a tracked symlink, Libra writes a real
 symlink on Unix using the stored link target bytes. Platforms without symlink
@@ -42,7 +42,7 @@ writing a regular file that contains the target path.
 | | `--ignore-other-worktrees` | | Check out a branch even if another linked worktree has that shared branch checked out; bypasses Libra's other-worktree safety guard. |
 | | `--no-progress` | | Do not show a progress meter. Accepted as a no-op: Libra's checkout never renders a progress meter. |
 | | `--no-overlay` | | Do not check out paths in overlay mode (paths missing from the source are still removed). Accepted as a no-op: Libra's checkout is never in overlay mode, matching the Git default. (Git's `--overlay` is not implemented.) |
-| | `[<tree-ish>] -- <pathspec>...` | positional | Restore paths. Without `<tree-ish>`, restores the worktree from the index. With `<tree-ish>`, restores both index and worktree from that source. |
+| | `[<tree-ish>] -- <pathspec>...` | positional | Restore paths with shared pathspec magic. Without `<tree-ish>`, restores the worktree from the index. With `<tree-ish>`, restores both index and worktree from that source. |
 
 ### Flag examples
 
@@ -72,6 +72,9 @@ libra checkout -- src/main.rs
 
 # Restore a path from HEAD to both index and worktree
 libra checkout HEAD -- src/main.rs
+
+# Restore Rust files except generated output
+libra checkout -- ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 
 # Restore a tracked symlink as a symlink
 libra checkout HEAD -- link-to-target

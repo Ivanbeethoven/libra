@@ -21,7 +21,7 @@ libra checkout [<tree-ish>] -- <pathspec>...
 
 当 checkout 一个本地不存在、但匹配远程跟踪分支（例如 `origin/feature`）的分支名时，Libra 会自动创建本地 tracking 分支，设置 upstream，并执行 pull；这比 Git 的 auto-track 更进一步，会立即同步内容。
 
-路径恢复只有在显式 `--` 分隔符存在时才启用。没有 `--` 时，`libra checkout <name>` 始终是分支模式，即使存在同名文件。
+路径恢复只有在显式 `--` 分隔符存在时才启用。没有 `--` 时，`libra checkout <name>` 始终是分支模式，即使存在同名文件。`--` 后的 pathspec 使用与 `libra restore` 相同的共享 Git 风格匹配器：普通前缀、通配符 pathspec，以及 `:(top)`/`:/`/`:(glob)`/`:(literal)`/`:(icase)`/`:(exclude)`/`:!`/`:^` magic 都会生效；看起来像通配符的 pathspec 也会匹配同名的字面路径或目录前缀。
 
 如果恢复的路径在来源 tree 中是符号链接，Libra 会在支持 symlink 的平台上恢复为真正的 symlink，而不是写入一个普通文件。链接内容按 blob 字节作为目标路径保存；不会跟随或打开该目标。
 
@@ -39,7 +39,7 @@ libra checkout [<tree-ish>] -- <pathspec>...
 | | `--ignore-other-worktrees` | | 即使另一个 linked worktree 已 checkout 这个共享分支，也允许 checkout；该标志会绕过 Libra 的 other-worktree 安全保护。 |
 | | `--no-progress` | | 不显示进度条。接受式 no-op：Libra 的 checkout 从不渲染进度条。 |
 | | `--no-overlay` | | 不以 overlay 模式检出路径（source 中缺失的路径仍会被移除）。接受式 no-op：Libra 的 checkout 从不处于 overlay 模式，已是 Git 默认。（Git 的 `--overlay` 未实现。） |
-| | `[<tree-ish>] -- <pathspec>...` | 位置参数 | 恢复路径。没有 `<tree-ish>` 时，从索引恢复工作树。带 `<tree-ish>` 时，从该来源同时恢复索引和工作树。 |
+| | `[<tree-ish>] -- <pathspec>...` | 位置参数 | 用共享 pathspec magic 恢复路径。没有 `<tree-ish>` 时，从索引恢复工作树。带 `<tree-ish>` 时，从该来源同时恢复索引和工作树。 |
 
 ### 标志示例
 
@@ -69,6 +69,9 @@ libra checkout -- src/main.rs
 
 # 从 HEAD 恢复路径到索引和工作树
 libra checkout HEAD -- src/main.rs
+
+# 恢复 Rust 文件，但排除生成文件
+libra checkout -- ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 
 # 从 HEAD 恢复已跟踪符号链接
 libra checkout HEAD -- link-to-target

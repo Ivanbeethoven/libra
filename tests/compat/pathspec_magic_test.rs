@@ -47,18 +47,8 @@ impl Fixture {
         fixture.write("src/Case.TXT", "NEEDLE case\n");
         fixture.write("docs/readme.md", "NEEDLE docs\n");
         fixture.write("literal/[abc].txt", "NEEDLE literal\n");
-        fixture.success(
-            &fixture.repo,
-            &[
-                "add",
-                "README.md",
-                "src/main.rs",
-                "src/generated.rs",
-                "src/Case.TXT",
-                "docs/readme.md",
-                "literal/[abc].txt",
-            ],
-        );
+        fixture.write("literal/[abc]/child.txt", "NEEDLE literal child\n");
+        fixture.success(&fixture.repo, &["add", "."]);
         fixture.success(
             &fixture.repo,
             &["commit", "--no-gpg-sign", "--no-verify", "-m", "base"],
@@ -106,6 +96,18 @@ impl Fixture {
         output
     }
 
+    fn failure(&self, cwd: &Path, args: &[&str]) -> Output {
+        let output = self.run(cwd, args);
+        assert!(
+            !output.status.success(),
+            "{} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
     fn stdout(&self, cwd: &Path, args: &[&str]) -> String {
         String::from_utf8(self.success(cwd, args).stdout).expect("stdout is utf8")
     }
@@ -114,6 +116,10 @@ impl Fixture {
         let path = self.repo.join(path);
         fs::create_dir_all(path.parent().expect("file has parent")).expect("create parent");
         fs::write(path, contents).expect("write fixture file");
+    }
+
+    fn read(&self, path: &str) -> String {
+        fs::read_to_string(self.repo.join(path)).expect("read fixture file")
     }
 }
 
@@ -277,4 +283,273 @@ fn diff_accepts_magic_pathspecs_without_dashdash() {
         &["diff", "--name-only", ":(literal)literal/[abc].txt"],
     );
     assert_eq!(literal, "literal/[abc].txt\n");
+}
+
+#[test]
+fn add_honors_shared_pathspec_magic() {
+    let fixture = Fixture::new();
+    fixture.write("src/main.rs", "NEEDLE main\nchanged\n");
+    fixture.write("src/generated.rs", "NEEDLE generated\nchanged\n");
+    fixture.write("docs/readme.md", "NEEDLE docs\nchanged\n");
+    fixture.write("src/extra.rs", "NEEDLE extra\n");
+    fixture.write("literal/[abc].txt", "NEEDLE literal\nchanged\n");
+    fixture.write("literal/[abc]/child.txt", "NEEDLE literal child\nchanged\n");
+
+    fixture.success(
+        &fixture.repo,
+        &[
+            "add",
+            ":(glob)src/*.rs",
+            ":(exclude)src/generated.rs",
+            ":(literal)literal/[abc].txt",
+            "literal/[abc]",
+        ],
+    );
+
+    let staged = fixture.stdout(&fixture.repo, &["diff", "--cached", "--name-only"]);
+    assert!(
+        staged.contains("src/main.rs\n"),
+        "glob pathspec should stage src/main.rs:\n{staged}"
+    );
+    assert!(
+        staged.contains("src/extra.rs\n"),
+        "glob pathspec should stage new src/extra.rs:\n{staged}"
+    );
+    assert!(
+        staged.contains("literal/[abc].txt\n"),
+        "literal magic should stage the literal bracket path:\n{staged}"
+    );
+    assert!(
+        staged.contains("literal/[abc]/child.txt\n"),
+        "wildcard-looking pathspec should also match the literal bracket directory prefix:\n{staged}"
+    );
+    assert!(
+        !staged.contains("src/generated.rs") && !staged.contains("docs/readme.md"),
+        "exclude and positive pathspecs should restrict staged paths:\n{staged}"
+    );
+
+    fixture.write("src/Case.TXT", "NEEDLE case\nchanged\n");
+    fixture.success(&fixture.repo, &["add", ":(icase)src/case.txt"]);
+    let staged_case = fixture.stdout(&fixture.repo, &["diff", "--cached", "--name-only"]);
+    assert!(
+        staged_case.contains("src/Case.TXT\n"),
+        "icase pathspec should stage the differently cased path:\n{staged_case}"
+    );
+}
+
+#[test]
+fn add_pathspec_from_file_honors_shared_magic() {
+    let fixture = Fixture::new();
+    fixture.write("src/main.rs", "NEEDLE main\nchanged\n");
+    fixture.write("src/generated.rs", "NEEDLE generated\nchanged\n");
+    fixture.write("docs/readme.md", "NEEDLE docs\nchanged\n");
+    fixture.write("paths.txt", ":(glob)src/*.rs\n:(exclude)src/generated.rs\n");
+
+    fixture.success(&fixture.repo, &["add", "--pathspec-from-file", "paths.txt"]);
+
+    let staged = fixture.stdout(&fixture.repo, &["diff", "--cached", "--name-only"]);
+    assert!(
+        staged.contains("src/main.rs\n"),
+        "pathspec-from-file glob should stage src/main.rs:\n{staged}"
+    );
+    assert!(
+        !staged.contains("src/generated.rs") && !staged.contains("docs/readme.md"),
+        "pathspec-from-file exclude should restrict staged paths:\n{staged}"
+    );
+}
+
+#[test]
+fn rm_honors_shared_pathspec_magic() {
+    let fixture = Fixture::new();
+
+    let dry_run = fixture.stdout(
+        &fixture.repo,
+        &[
+            "rm",
+            "--dry-run",
+            "--cached",
+            ":(glob)src/*.rs",
+            ":(exclude)src/generated.rs",
+        ],
+    );
+    assert!(
+        dry_run.contains("rm 'src/main.rs'"),
+        "glob pathspec should select src/main.rs:\n{dry_run}"
+    );
+    assert!(
+        !dry_run.contains("src/generated.rs"),
+        "exclude pathspec should remove generated.rs from rm candidates:\n{dry_run}"
+    );
+
+    fixture.success(
+        &fixture.repo,
+        &[
+            "rm",
+            "--cached",
+            ":(glob)src/*.rs",
+            ":(exclude)src/generated.rs",
+        ],
+    );
+    let tracked = fixture.stdout(&fixture.repo, &["ls-files"]);
+    assert!(
+        !tracked.contains("src/main.rs\n"),
+        "rm --cached should remove the matched path from the index:\n{tracked}"
+    );
+    assert!(
+        tracked.contains("src/generated.rs\n"),
+        "exclude pathspec should keep generated.rs tracked:\n{tracked}"
+    );
+
+    fixture.success(&fixture.repo, &["rm", "--cached", ":(icase)src/case.txt"]);
+    let tracked_after_case = fixture.stdout(&fixture.repo, &["ls-files"]);
+    assert!(
+        !tracked_after_case.contains("src/Case.TXT\n"),
+        "icase pathspec should remove the differently cased tracked path:\n{tracked_after_case}"
+    );
+
+    fixture.success(&fixture.repo, &["rm", "--cached", "literal/[abc]"]);
+    let tracked_after_literal_dir = fixture.stdout(&fixture.repo, &["ls-files"]);
+    assert!(
+        !tracked_after_literal_dir.contains("literal/[abc]/child.txt\n"),
+        "wildcard-looking pathspec should remove the literal bracket directory prefix:\n{tracked_after_literal_dir}"
+    );
+}
+
+#[test]
+fn rm_recursive_does_not_delete_excluded_paths() {
+    let fixture = Fixture::new();
+
+    fixture.success(
+        &fixture.repo,
+        &["rm", "-r", "src", ":(exclude)src/generated.rs"],
+    );
+
+    assert!(
+        !fixture.repo.join("src/main.rs").exists(),
+        "matched file should be deleted from disk"
+    );
+    assert!(
+        fixture.repo.join("src/generated.rs").exists(),
+        "exclude pathspec must prevent recursive directory deletion from removing generated.rs"
+    );
+    let tracked = fixture.stdout(&fixture.repo, &["ls-files"]);
+    assert!(
+        !tracked.contains("src/main.rs\n"),
+        "matched file should be removed from the index:\n{tracked}"
+    );
+    assert!(
+        tracked.contains("src/generated.rs\n"),
+        "excluded file should remain tracked:\n{tracked}"
+    );
+}
+
+#[test]
+fn rm_recursive_preserves_untracked_files_in_matched_directory() {
+    let fixture = Fixture::new();
+    fixture.write("src/untracked.log", "local only\n");
+
+    fixture.success(&fixture.repo, &["rm", "-r", "src"]);
+
+    assert!(
+        fixture.repo.join("src/untracked.log").exists(),
+        "recursive rm should preserve untracked files under matched directories"
+    );
+    assert!(
+        !fixture.repo.join("src/main.rs").exists(),
+        "matched tracked file should be deleted from disk"
+    );
+    let tracked = fixture.stdout(&fixture.repo, &["ls-files"]);
+    assert!(
+        !tracked.contains("src/main.rs\n")
+            && !tracked.contains("src/generated.rs\n")
+            && !tracked.contains("src/Case.TXT\n"),
+        "all tracked files under src should be removed from the index:\n{tracked}"
+    );
+}
+
+#[test]
+fn restore_honors_shared_pathspec_magic() {
+    let fixture = Fixture::new();
+    fixture.write("src/main.rs", "NEEDLE main\nchanged\n");
+    fixture.write("src/generated.rs", "NEEDLE generated\nchanged\n");
+    fixture.write("docs/readme.md", "NEEDLE docs\nchanged\n");
+    fixture.write("src/Case.TXT", "NEEDLE case\nchanged\n");
+    fixture.write("README.md", "root\nchanged\n");
+    fixture.write("literal/[abc]/child.txt", "NEEDLE literal child\nchanged\n");
+
+    fixture.success(
+        &fixture.repo,
+        &["restore", ":(glob)src/*.rs", ":(exclude)src/generated.rs"],
+    );
+    assert_eq!(fixture.read("src/main.rs"), "NEEDLE main\n");
+    assert_eq!(
+        fixture.read("src/generated.rs"),
+        "NEEDLE generated\nchanged\n"
+    );
+    assert_eq!(fixture.read("docs/readme.md"), "NEEDLE docs\nchanged\n");
+
+    fixture.success(&fixture.repo, &["restore", ":(icase)src/case.txt"]);
+    assert_eq!(fixture.read("src/Case.TXT"), "NEEDLE case\n");
+
+    let src_dir = fixture.repo.join("src");
+    fixture.success(&src_dir, &["restore", ":(top)README.md"]);
+    assert_eq!(fixture.read("README.md"), "root\n");
+
+    fixture.success(&fixture.repo, &["restore", "literal/[abc]"]);
+    assert_eq!(
+        fixture.read("literal/[abc]/child.txt"),
+        "NEEDLE literal child\n"
+    );
+}
+
+#[test]
+fn restore_empty_pathspec_file_errors_without_restoring_everything() {
+    let fixture = Fixture::new();
+    fixture.write("README.md", "root\nchanged\n");
+    fixture.write("src/main.rs", "NEEDLE main\nchanged\n");
+    fixture.write("empty-pathspecs.txt", "");
+
+    let output = fixture.failure(
+        &fixture.repo,
+        &["restore", "--pathspec-from-file", "empty-pathspecs.txt"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no pathspec was given"),
+        "empty pathspec file should be a usage error, got:\n{stderr}"
+    );
+    assert_eq!(fixture.read("README.md"), "root\nchanged\n");
+    assert_eq!(fixture.read("src/main.rs"), "NEEDLE main\nchanged\n");
+}
+
+#[test]
+fn checkout_path_mode_honors_shared_pathspec_magic() {
+    let fixture = Fixture::new();
+    fixture.write("src/main.rs", "NEEDLE main\nchanged\n");
+    fixture.write("src/generated.rs", "NEEDLE generated\nchanged\n");
+    fixture.write("docs/readme.md", "NEEDLE docs\nchanged\n");
+    fixture.write("literal/[abc]/child.txt", "NEEDLE literal child\nchanged\n");
+
+    fixture.success(
+        &fixture.repo,
+        &[
+            "checkout",
+            "--",
+            ":(glob)src/*.rs",
+            ":(exclude)src/generated.rs",
+        ],
+    );
+
+    assert_eq!(fixture.read("src/main.rs"), "NEEDLE main\n");
+    assert_eq!(
+        fixture.read("src/generated.rs"),
+        "NEEDLE generated\nchanged\n"
+    );
+    assert_eq!(fixture.read("docs/readme.md"), "NEEDLE docs\nchanged\n");
+
+    fixture.success(&fixture.repo, &["checkout", "--", "literal/[abc]"]);
+    assert_eq!(
+        fixture.read("literal/[abc]/child.txt"),
+        "NEEDLE literal child\n"
+    );
 }

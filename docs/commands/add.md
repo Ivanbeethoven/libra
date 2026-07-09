@@ -14,8 +14,9 @@ libra add --refresh [PATHSPEC...]
 ## Description
 
 `libra add` stages file changes from the working tree into the index, preparing them
-for the next `libra commit`. It supports pathspecs, glob patterns, `--dry-run` preview,
-and `--refresh` to re-stat already tracked entries without staging new content.
+for the next `libra commit`. It supports shared Git-style pathspec matching,
+`--dry-run` preview, and `--refresh` to re-stat already tracked entries without
+staging new content.
 
 The command resolves pathspecs relative to the current working directory, validates them
 against the repository root, and respects `.libraignore` rules. Files tracked by LFS are
@@ -35,10 +36,21 @@ as the link itself rather than as the target file's contents.
 One or more files or directories to stage. Paths are resolved relative to the current
 directory. Required unless `-A`, `-u`, or `--refresh` is specified.
 
+Pathspecs use Libra's shared Git-style matcher: plain pathspecs match a file or
+directory prefix, wildcard pathspecs are supported, and the high-value magic
+forms `:(top)`, `:/`, `:(glob)`, `:(literal)`, `:(icase)`,
+`:(exclude)`, `:!`, and `:^` are honored. Exclude pathspecs subtract from the
+positive selection, and pathspec matching follows `core.ignorecase` when enabled.
+Wildcard-looking pathspecs also match an exact path or directory prefix with
+the same literal text, matching Git's bracket-file and bracket-directory
+behavior.
+
 ```bash
 libra add file.txt
 libra add src/ tests/
 libra add .
+libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
+libra add ':(literal)literal/[abc].txt'
 ```
 
 ### `-A, --all`
@@ -111,7 +123,8 @@ libra add --ignore-errors src/
 ### `--pathspec-from-file <file>`
 
 Read pathspecs from `<file>` (one per line) and merge them with any pathspecs given on
-the command line. Use `-` is not supported; pass a real path. Pair with
+the command line. Entries use the same shared pathspec matcher and magic forms as
+positional pathspecs. Use `-` is not supported; pass a real path. Pair with
 `--pathspec-file-nul` when the list is NUL-separated (e.g. produced by another tool's
 `-z` output). Empty lines are ignored.
 
@@ -151,9 +164,10 @@ libra add --renormalize src/
 
 ### `--ignore-missing`
 
-Under `--dry-run`, silently skip pathspecs that do not exist instead of failing (a
-warning is printed to stderr). Mirrors Git: `--ignore-missing` requires `--dry-run`,
-and a pathspec that exists but matches nothing is still an error.
+Under `--dry-run`, skip pathspecs that match no add candidate instead of failing
+(a warning is printed to stderr). Mirrors Git: `--ignore-missing` requires
+`--dry-run`. Pathspecs that only match ignored files are still reported as
+ignored-path warnings.
 
 ```bash
 libra add --dry-run --ignore-missing maybe-missing.txt other.txt
@@ -169,6 +183,7 @@ libra add -n file.txt
 libra add --refresh
 libra add --ignore-errors src/
 libra add --pathspec-from-file paths.txt
+libra add ':(glob)src/*.rs' ':(exclude)src/generated.rs'
 libra add --chmod=+x scripts/build.sh
 libra add --renormalize
 ```
