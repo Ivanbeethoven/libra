@@ -52,7 +52,7 @@ Pathspec arguments filter the diff to only show changes in matching files or dir
 | No patch | `-s` | `--no-patch` | Suppress the patch (diff body). Combine with `--exit-code` for a status-only check. |
 | Exit code | | `--exit-code` | Still print the diff, but exit with code 1 when there are differences (0 otherwise). Unlike `--quiet`, the diff is not suppressed. |
 | NUL output | `-z` | `--null` | NUL-terminate `--name-only`/`--name-status`/`--numstat` records (and split the `--name-status` status and path into separate NUL fields); other modes are unaffected. |
-| Whitespace check | | `--check` | Instead of the diff, warn about whitespace errors on added lines (trailing whitespace and space-before-tab in the indent), printing `<path>:<line>: <message>` and exiting 2 when any are found. Git's blank-at-eof check is not performed; takes precedence over other output modes. |
+| Whitespace check | | `--check` | Instead of the diff, warn about safety problems on added lines: trailing whitespace, space-before-tab in the indent, leftover conflict markers, and new blank lines at EOF. Prints `<path>:<line>: <message>` and exits 2 when any are found; takes precedence over other output modes. |
 | Reverse | `-R` | `--reverse` | Swap the two sides so additions become deletions and vice-versa (the patch that would undo the change). |
 | Text | `-a` | `--text` | Treat all files as text: diff the content even of files detected as binary (a NUL byte in either side, or non-UTF-8 content), suppressing the "Binary files … differ" line. Libra's diff is text-based, so a non-UTF-8 change that is identical after lossy-UTF-8 conversion still shows "Binary files … differ". |
 | Binary patch | | `--binary` | Emit a `GIT binary patch` (base85 `literal` chunks for both directions) for binary files instead of "Binary files … differ". The patch is valid and appliable, but its compressed bytes are not byte-identical to Git's (Libra deflates with a different zlib and always emits `literal`, not Git's smaller-of-literal/delta). |
@@ -180,6 +180,7 @@ Supported output modes:
 - `-s` / `--no-patch` suppresses the patch body (for status-only checks)
 - `--exit-code` still prints the diff but exits `1` when there are differences
 - `-z` / `--null` NUL-terminates `--name-only`/`--name-status`/`--numstat` records (status and path become separate NUL fields under `--name-status`)
+- `--check` scans added lines for trailing whitespace, space-before-tab, leftover conflict markers, and new blank lines at EOF; any hit exits `2`
 - `--quiet` suppresses stdout and uses exit `1` to signal that differences exist
 
 Unmerged conflict paths are shown with `diff --cc <path>` headers in the default working-tree diff.
@@ -285,7 +286,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Suppress patch | `-s` / `--no-patch` | `-s` / `--no-patch` | N/A |
 | Exit code | `--exit-code` | `--exit-code` | N/A |
 | NUL-terminated output | `-z` / `--null` | `-z` | N/A |
-| Whitespace check | `--check` (trailing-ws / space-before-tab) | `--check` | N/A |
+| Whitespace check | `--check` (trailing-ws / space-before-tab / conflict markers / blank-at-eof) | `--check` | N/A |
 | Reverse diff | `-R` / `--reverse` | `-R` | N/A |
 | Treat as text | `-a` / `--text` (force content diff of binary files) | `-a` / `--text` | N/A |
 | Word diff | `--word-diff[=<mode>]` (no `--color-words`/`--word-diff-regex`) | `--word-diff` / `--color-words` | N/A |

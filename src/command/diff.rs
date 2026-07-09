@@ -60,7 +60,7 @@ EXAMPLES:
     libra diff --ignore-blank-lines         Ignore changes that are only blank lines
     libra diff -s --exit-code               Status-only check: no output, exit 1 if changes
     libra diff --name-only -z               NUL-terminated changed-file list for scripts
-    libra diff --cached --check             Warn about whitespace errors on added lines
+    libra diff --cached --check             Warn about whitespace/conflict-marker errors
     libra diff -R                           Reverse diff (swap additions and deletions)
     libra --json diff --staged              Structured JSON output for agents";
 
@@ -204,9 +204,9 @@ pub struct DiffArgs {
     #[clap(short = 'z', long = "null")]
     pub null: bool,
 
-    /// Warn about whitespace errors on added lines instead of printing the diff.
-    /// Detects trailing whitespace and space-before-tab in the indent; exits 2
-    /// when any problem is found. (Git's blank-at-eof check is not performed.)
+    /// Warn about safety problems on added lines instead of printing the diff.
+    /// Detects trailing whitespace, space-before-tab in the indent, leftover
+    /// conflict markers, and new blank lines at EOF; exits 2 when any problem is found.
     /// Unaffected by `-w`/`-b`/`--ignore-space-at-eol` — like Git, the scan runs
     /// on the full diff, so added trailing whitespace is still reported.
     #[clap(long = "check")]
@@ -366,6 +366,9 @@ pub struct DiffFileStat {
     /// `None` for text files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<(u64, u64)>,
+    /// First new-side line in a trailing blank run, used only by `diff --check`.
+    #[serde(skip)]
+    check_trailing_blank_start: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1632,6 +1635,16 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
         false
     };
 
+    if args.check {
+        annotate_diff_check_trailing_blanks(
+            &mut files,
+            &second_map,
+            &ext_worktree_entries,
+            &worktree_cache,
+            &repo_cache,
+        )?;
+    }
+
     let total_insertions = files.iter().map(|file| file.insertions).sum();
     let total_deletions = files.iter().map(|file| file.deletions).sum();
     let files_changed = files.len();
@@ -2032,6 +2045,7 @@ fn build_unmerged_diff_file(entry: &UnmergedEntry) -> Result<DiffFileStat, DiffE
         rename_from: None,
         similarity: None,
         binary: None,
+        check_trailing_blank_start: None,
     })
 }
 
@@ -2555,6 +2569,7 @@ fn build_rename_entry(
         rename_from: Some(old_path.to_string()),
         similarity: Some(percent),
         binary: None,
+        check_trailing_blank_start: None,
     }
 }
 
@@ -3256,9 +3271,8 @@ fn record_diff_content_error(slot: &Rc<RefCell<Option<DiffError>>>, error: DiffE
 }
 
 /// Identify the first whitespace problem on an added line's content (the text
-/// after the leading `+`). Returns `None` for a clean line. Checks Git's two
-/// most common defaults: trailing whitespace (`blank-at-eol`) and a space
-/// immediately before a tab in the leading indent (`space-before-tab`).
+/// after the leading `+`). Returns `None` for a clean line. Checks Git's
+/// blank-at-eol and space-before-tab defaults.
 fn whitespace_problem(content: &str) -> Option<&'static str> {
     if content.ends_with(' ') || content.ends_with('\t') {
         return Some("trailing whitespace");
@@ -3273,10 +3287,67 @@ fn whitespace_problem(content: &str) -> Option<&'static str> {
     None
 }
 
-/// Scan one file's unified diff for whitespace errors on added (`+`) lines,
+fn is_leftover_conflict_marker(content: &str) -> bool {
+    content.starts_with("<<<<<<<")
+        || content.starts_with("|||||||")
+        || content.starts_with("=======")
+        || content.starts_with(">>>>>>>")
+}
+
+fn first_trailing_blank_line(text: &str) -> Option<usize> {
+    let mut first_blank = None;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            if first_blank.is_none() {
+                first_blank = Some(index + 1);
+            }
+        } else {
+            first_blank = None;
+        }
+    }
+    first_blank
+}
+
+fn annotate_diff_check_trailing_blanks(
+    files: &mut [DiffFileStat],
+    second_map: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_cache: &Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>>,
+    repo_cache: &Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>>,
+) -> Result<(), DiffError> {
+    for file in files {
+        let path = PathBuf::from(&file.path);
+        let Some(hash) = second_map.get(&path) else {
+            file.check_trailing_blank_start = None;
+            continue;
+        };
+        let bytes = worktree_cache
+            .borrow()
+            .get(hash)
+            .cloned()
+            .or_else(|| repo_cache.borrow().get(hash).cloned())
+            .map(Ok)
+            .unwrap_or_else(|| {
+                if worktree_entries.get(&path) == Some(hash) {
+                    read_worktree_blob_content(&path)
+                } else {
+                    load_repo_blob_content(hash)
+                }
+            })?;
+        file.check_trailing_blank_start =
+            first_trailing_blank_line(&String::from_utf8_lossy(&bytes));
+    }
+    Ok(())
+}
+
+/// Scan one file's unified diff for `--check` problems on added (`+`) lines,
 /// tracking new-file line numbers from each hunk header. Returns one
 /// `path:line: message` string per problem.
-fn check_whitespace_in_file(path: &str, raw_diff: &str) -> Vec<String> {
+fn check_whitespace_in_file(
+    path: &str,
+    raw_diff: &str,
+    trailing_blank_start: Option<usize>,
+) -> Vec<String> {
     let mut problems = Vec::new();
     let mut new_lineno = 0usize;
     for line in raw_diff.lines() {
@@ -3297,6 +3368,14 @@ fn check_whitespace_in_file(path: &str, raw_diff: &str) -> Vec<String> {
             if let Some(msg) = whitespace_problem(content) {
                 problems.push(format!("{path}:{new_lineno}: {msg}"));
             }
+            if is_leftover_conflict_marker(content) {
+                problems.push(format!("{path}:{new_lineno}: leftover conflict marker"));
+            }
+            if trailing_blank_start.is_some_and(|start| new_lineno >= start)
+                && content.trim().is_empty()
+            {
+                problems.push(format!("{path}:{new_lineno}: new blank line at EOF."));
+            }
             new_lineno += 1;
         } else if line.starts_with(' ') {
             // Context line: advances the new-file counter.
@@ -3314,7 +3393,9 @@ fn render_diff_check(result: &DiffOutput) -> CliResult<()> {
     let problems: Vec<String> = result
         .files
         .iter()
-        .flat_map(|file| check_whitespace_in_file(&file.path, &file.raw_diff))
+        .flat_map(|file| {
+            check_whitespace_in_file(&file.path, &file.raw_diff, file.check_trailing_blank_start)
+        })
         .collect();
     if problems.is_empty() {
         return Ok(());
@@ -4450,6 +4531,7 @@ fn parse_diff_item(item: &git_internal::diff::DiffItem) -> DiffFileStat {
         rename_from: None,
         similarity: None,
         binary: None,
+        check_trailing_blank_start: None,
     }
 }
 
