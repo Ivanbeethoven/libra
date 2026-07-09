@@ -279,6 +279,7 @@ mod agent_push_test;
 mod agent_roster_test;
 mod agent_rpc_trust_test;
 mod agent_run_admission_test;
+mod agent_skill_search_test;
 mod alternates_test;
 mod apply_test;
 mod archive_test;

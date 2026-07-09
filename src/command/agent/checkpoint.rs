@@ -1546,7 +1546,7 @@ async fn write_export_audit(
         .map_err(|e| CliError::fatal(format!("append audit record: {e:#}")))
 }
 
-fn load_metadata_blob(oid: &str) -> Result<String, CliError> {
+pub(super) fn load_metadata_blob(oid: &str) -> Result<String, CliError> {
     let hash = ObjectHash::from_str(oid)
         .map_err(|e| CliError::fatal(format!("invalid metadata_blob_oid '{oid}': {e}")))?;
     let storage = util::try_get_storage_path(None)
@@ -1687,7 +1687,10 @@ fn emit_one(
     Ok(())
 }
 
-async fn table_exists(conn: &(impl ConnectionTrait + ?Sized), name: &str) -> CliResult<bool> {
+pub(super) async fn table_exists(
+    conn: &(impl ConnectionTrait + ?Sized),
+    name: &str,
+) -> CliResult<bool> {
     let backend = conn.get_database_backend();
     let stmt = Statement::from_sql_and_values(
         backend,

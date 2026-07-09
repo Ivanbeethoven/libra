@@ -13,6 +13,7 @@ libra agent disable [--agent <name>]...
 libra agent remove [<name>...]
 libra agent session <subcommand>
 libra agent checkpoint <subcommand>
+libra agent skill <subcommand>
 libra agent clean [--all]
 libra agent doctor [--repair]
 libra agent push [--remote <name>] [--force-rewrite]
@@ -45,6 +46,9 @@ libra agent rpc <subcommand>
 | `checkpoint show <id>` | 显示 checkpoint 元数据 |
 | `checkpoint rewind <id>` | 检查或应用某个 checkpoint 的工作树回退 |
 | `checkpoint export <id>` | 导出 checkpoint transcript：默认脱敏（无需授权）；raw（未脱敏）导出须 `--allow-raw --raw` 并写入 append-only `agent_audit_log`（缺失授权时拒绝并返回 `LBR-AGENT-013`） |
+| `skill search` | 按 `--skill`、`--provider`、`--session`、RFC3339 `--since`/`--until` 搜索捕获的 skill events（`--limit`/`--cursor` keyset 分页、`--json`）。基于 checkpoint metadata 的读时投影，无独立表 |
+| `skill list` | `skill search` 的别名（同过滤项） |
+| `skill registry` | 展示各 agent 的 curated 可发现 skill 注册表（`--provider <slug>` 限定；公开 SkillDiscoverer 面） |
 | `clean` | 清理已停止会话的临时 checkpoint（prune 遇到进行中的 checkpoint 写入或 traces 引用可达但无 catalog 行的提交时 fail-closed 拒绝；同时删除因此不可达的 `object_index` 行） |
 | `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致 |
 | `push` | 将 `refs/libra/traces` 推送到远程（`clean` prune 重写后的非快进推送用 `--force-rewrite`，采用 force-with-lease 语义） |

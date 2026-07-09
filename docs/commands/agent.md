@@ -13,6 +13,7 @@ libra agent disable [--agent <name>]...
 libra agent remove [<name>...]
 libra agent session <subcommand>
 libra agent checkpoint <subcommand>
+libra agent skill <subcommand>
 libra agent clean [--all]
 libra agent doctor [--repair]
 libra agent push [--remote <name>] [--force-rewrite]
@@ -57,6 +58,9 @@ for any other non-roster agent — return an actionable unsupported error.
 | `checkpoint show <id>` | Show checkpoint metadata |
 | `checkpoint rewind <id>` | Inspect or apply a working-tree rewind for one checkpoint |
 | `checkpoint export <id>` | Export a checkpoint's transcript. Redacted by default (no authorization); raw (un-redacted) export requires `--allow-raw --raw` and is recorded in the append-only `agent_audit_log` (`LBR-AGENT-013` when refused without it) |
+| `skill search` | Search captured skill events by `--skill`, `--provider`, `--session`, and RFC3339 `--since`/`--until` (keyset-paginated with `--limit`/`--cursor`, `--json`). A read-time projection over checkpoint metadata — no dedicated table |
+| `skill list` | Alias of `skill search` (same filters) |
+| `skill registry` | Show the curated per-agent discoverable-skill registry (`--provider <slug>` to scope; the public SkillDiscoverer surface) |
 | `clean` | Clean up temporary checkpoints from stopped sessions (prune fails closed while a checkpoint write is in flight or the traces ref reaches uncataloged commits; also drops `object_index` rows made unreachable) |
 | `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies |
 | `push` | Push `refs/libra/traces` to a remote (`--force-rewrite` for the non-fast-forward push after a `clean` prune, using force-with-lease) |

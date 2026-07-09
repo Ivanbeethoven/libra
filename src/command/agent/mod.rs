@@ -35,6 +35,7 @@ pub mod review;
 pub mod investigate;
 mod rpc;
 mod session;
+mod skill;
 mod status;
 
 /// A0-06: derive a safe display/record name from a `review/investigate attach`
@@ -80,6 +81,8 @@ EXAMPLES:
     libra agent checkpoint rewind <id>              Preview/apply checkpoint rewind
     libra agent checkpoint export <id>              Export the redacted transcript (no authorization needed)
     libra agent checkpoint export <id> --allow-raw --raw  Export the raw transcript (audited; requires --allow-raw)
+    libra agent skill search --skill /review        Search captured skill events (by skill/provider/session/time)
+    libra agent skill registry                      Show the curated per-agent discoverable-skill registry
     libra agent clean                               Drop temporary checkpoints from the most recent stopped session
     libra agent clean --all                         Drop temporary checkpoints from every stopped session
     libra agent doctor                              Diagnose hook installation and capture state
@@ -133,6 +136,10 @@ pub enum AgentSubcommand {
     /// Inspect captured checkpoints.
     #[command(subcommand, about = "Inspect captured checkpoints")]
     Checkpoint(CheckpointSubcommand),
+
+    /// Discover and search captured skill events.
+    #[command(subcommand, about = "Discover and search captured skill events")]
+    Skill(skill::SkillSubcommand),
 
     /// Remove temporary checkpoints from stopped sessions.
     #[command(about = "Clean up temporary checkpoints from stopped sessions")]
@@ -324,6 +331,7 @@ pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<(
         AgentSubcommand::Remove(args) => disable_agents(&args.agents, output),
         AgentSubcommand::Session(cmd) => session::execute_safe(cmd, output).await,
         AgentSubcommand::Checkpoint(cmd) => checkpoint::execute_safe(cmd, output).await,
+        AgentSubcommand::Skill(cmd) => skill::execute_safe(cmd, output).await,
         AgentSubcommand::Clean(cmd) => clean::execute_safe(cmd, output).await,
         AgentSubcommand::Doctor(cmd) => doctor::execute_safe(cmd, output).await,
         AgentSubcommand::Push(cmd) => push::execute_safe(cmd, output).await,

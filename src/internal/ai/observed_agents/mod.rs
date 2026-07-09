@@ -36,6 +36,7 @@ pub mod preview;
 pub mod redaction;
 pub mod registry;
 pub mod rpc;
+pub mod skill_projection;
 pub mod trust;
 
 pub use adapter::{
@@ -68,6 +69,10 @@ pub use registry::{
 pub use rpc::{
     AgentInfo, RPC_BINARY_PREFIX, RPC_DEFAULT_TIMEOUT, RPC_MAX_STDERR_BYTES, RPC_PROTOCOL_VERSION,
     RpcAgent, RpcAgentBinary, RpcError, RpcRequest, RpcResponse, discover_rpc_agents,
+};
+pub use skill_projection::{
+    DiscoveredSkill, IndexedSkillEvent, SKILL_PROJECTION_SCHEMA_VERSION, SkillEventProjection,
+    SkillQuery, discover_skills,
 };
 pub use trust::{
     EXTERNAL_AGENTS_ENABLED_KEY, Provenance, TrustRecord, compute_provenance,
