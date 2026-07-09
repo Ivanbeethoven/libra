@@ -673,7 +673,7 @@ pub async fn run_commit(
                 detail: e.to_string(),
             }
         })?;
-        let grandpa_commit_id = parent_commit.parent_commit_ids;
+        let grandpa_commit_id = parent_commit.parent_commit_ids.clone();
 
         // Git-compatible amend authorship: preserve the original commit's author
         // (name, email, and authored date) unless the user explicitly resets it
@@ -710,6 +710,15 @@ pub async fn run_commit(
             Some(line) => append_trailers(&final_message, std::slice::from_ref(line)),
             None => final_message.clone(),
         };
+        let mut committer = committer;
+        refresh_noop_amend_committer_timestamp(
+            &parent_commit,
+            &author,
+            &mut committer,
+            &tree.id,
+            &grandpa_commit_id,
+            &commit_message,
+        );
 
         // Conventional commit validation
         if is_conventional
@@ -876,6 +885,32 @@ pub async fn run_commit(
         porcelain_text.take(),
     )
     .await)
+}
+
+fn refresh_noop_amend_committer_timestamp(
+    parent_commit: &Commit,
+    author: &Signature,
+    committer: &mut Signature,
+    tree_id: &ObjectHash,
+    parent_ids: &[ObjectHash],
+    commit_message: &str,
+) {
+    let parent_message = parse_commit_msg(&parent_commit.message).0;
+    let same_committer_identity = parent_commit.committer.signature_type
+        == committer.signature_type
+        && parent_commit.committer.name == committer.name
+        && parent_commit.committer.email == committer.email
+        && parent_commit.committer.timezone == committer.timezone;
+
+    if parent_commit.tree_id == *tree_id
+        && parent_commit.parent_commit_ids == parent_ids
+        && parent_commit.author == *author
+        && same_committer_identity
+        && parent_message == commit_message
+        && committer.timestamp <= parent_commit.committer.timestamp
+    {
+        committer.timestamp = parent_commit.committer.timestamp.saturating_add(1);
+    }
 }
 
 /// Resolve the final commit message from CLI arguments.

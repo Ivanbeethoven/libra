@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.40"
+version = "0.18.41"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -324,6 +324,10 @@ path = "tests/compat/switch_orphan_root_test.rs"
 [[test]]
 name = "compat_broken_pipe_output"
 path = "tests/compat/broken_pipe_output_test.rs"
+
+[[test]]
+name = "compat_commit_amend_no_edit"
+path = "tests/compat/commit_amend_no_edit_test.rs"
 
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).

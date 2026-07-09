@@ -47,6 +47,8 @@ libra commit -t .libra/commit-template.txt
 ### `--amend`
 
 通过创建新提交替换当前分支 tip。新提交拥有与被替换提交相同的父提交。不能 amend merge commits（有多个父提交的提交）。
+当 index tree 与提交消息都未变化时，`--amend --no-edit` 仍会重写提交并刷新 committer metadata；
+不会打印成功但让 `HEAD` 保持不变。
 
 ```bash
 libra commit --amend
@@ -55,7 +57,8 @@ libra commit --amend -m "Updated message"
 
 ### `--no-edit`
 
-与 `--amend` 一起使用时，复用原提交消息，不提示修改。与 `-m` 和 `-F` 冲突。
+与 `--amend` 一起使用时，复用原提交消息，不提示修改。clean amend 仍会生成替换提交并刷新
+committer date。与 `-m` 和 `-F` 冲突。
 
 ```bash
 libra commit --amend --no-edit

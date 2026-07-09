@@ -10,6 +10,7 @@
 
 - 当前矩阵承诺常用 Git commit 子集已支持；`--cleanup`、`--dry-run`、`--fixup`、`--squash`、`-C/-c`、`--trailer`、`--reset-author`、`-e/--edit`、`-v/--verbose`、`--porcelain`、`--status`/`--no-status`（last-wins 切换，`--status` 注入注释化 status 段，仅在 cleanup 会剥离注释时）、`commit.cleanup`/`commit.verbose` 配置默认、`-t/--template`（含 `commit.template` 配置回落）与 `--no-gpg-sign`（抑制 vault 签名，覆盖 `vault.signing=true`）已补齐。新增语义必须同步矩阵、用户文档和测试。
 - `--amend` 作者归属与 Git 对齐：默认**保留**被修订提交的原作者（name/email/authored date），只有显式 `--reset-author` 或 `--author <AUTHOR>` 才会改写为当前身份；committer 始终取当前身份。此前 `--amend` 会静默把作者改成当前身份、使 `--reset-author` 沦为空操作，已修正（见 `src/command/commit.rs` amend 分支）。
+- `--amend --no-edit` 的 clean amend 行为与 Git 对齐：即使 tree、父列表、作者和消息都未变化，也必须生成替换提交并刷新 committer date，避免脚本看到成功摘要但 `HEAD` 未改变。实现点是 `refresh_noop_amend_committer_timestamp`：当新提交除 committer timestamp 外会复用父提交内容，且新 timestamp 不大于父提交时，将 committer timestamp 推进到父提交之后。
 
 
 ## 设计方案

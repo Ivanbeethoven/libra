@@ -101,6 +101,9 @@ libra commit -F message.txt
 
 Replace the tip of the current branch by creating a new commit. The new commit has the same
 parent(s) as the replaced commit. Cannot amend merge commits (commits with multiple parents).
+When the index tree and message are unchanged, `--amend --no-edit` still rewrites the commit
+and refreshes committer metadata; it never reports a successful amend while leaving `HEAD`
+unchanged.
 
 ```bash
 libra commit --amend
@@ -110,7 +113,8 @@ libra commit --amend -m "Updated message"
 ### `--no-edit`
 
 When used with `--amend`, reuse the message from the original commit without prompting for
-changes. Conflicts with `-m` and `-F`.
+changes. A clean amend still creates a replacement commit with a refreshed committer date.
+Conflicts with `-m` and `-F`.
 
 ```bash
 libra commit --amend --no-edit
