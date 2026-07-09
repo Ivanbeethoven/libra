@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.41"
+version = "0.18.42"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -328,6 +328,14 @@ path = "tests/compat/broken_pipe_output_test.rs"
 [[test]]
 name = "compat_commit_amend_no_edit"
 path = "tests/compat/commit_amend_no_edit_test.rs"
+
+[[test]]
+name = "compat_commit_identity_date"
+path = "tests/compat/commit_identity_date_test.rs"
+
+[[test]]
+name = "compat_sequencer_message_author"
+path = "tests/compat/sequencer_message_author_test.rs"
 
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).
