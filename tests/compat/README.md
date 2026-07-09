@@ -66,6 +66,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `commit_identity_date_test.rs` | P0-08 (plan-20260708) | `commit` 必须支持 Git author/committer 身份与日期环境变量、`--date`、`--reset-author`，并让 `-C/-c` 复用来源提交的 message 与 author metadata |
 | `sequencer_message_author_test.rs` | P0-08 (plan-20260708) | `cherry-pick` 必须保留原提交 author metadata，`revert` 必须使用当前身份创建提交，且二者生成消息不得从签名块派生错误 subject |
 | `write_tree_missing_object_test.rs` | P0-09 (plan-20260708) | `write-tree` / `commit` 在写 tree 或 commit 前必须拒绝 index 中缺失或类型不匹配的对象（`LBR-REPO-002`），且失败不得移动 `HEAD` |
+| `init_shared_mode_test.rs` | P0-10 (plan-20260708) | `init --shared=<numeric>` 必须预拒绝不可遍历目录权限且不留下半仓库；`group`/`all`/可用 numeric 模式必须持久化 `core.sharedRepository`，reinit 同步更新该配置 |
 
 ## Authoring guidelines
 
