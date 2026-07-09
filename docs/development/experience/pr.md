@@ -1,7 +1,7 @@
 # Libra PR 长期方案：基于 `gh` 的 GitHub PR 命令
 
 > **文档状态**：设计定稿（实现前约束）。第一版仅 `libra pr create`，后端为本机 GitHub CLI `gh`。  
-> **最后修订**：2026-07-09（第二轮十二维复核 + 契约对齐）。
+> **最后修订**：2026-07-09（第二轮十二维复核 + 契约对齐；第三轮补充 `--offline`、错误码 category、dry-run schema 等细节）。
 
 ## 1. 决策摘要
 
@@ -111,7 +111,7 @@ libra pr view [<number>] [OPTIONS]    # 后续阶段
 libra pr checkout <number> [OPTIONS]  # 后续阶段
 ```
 
-在 `src/cli.rs` 注册为 Libra extension（`COMPATIBILITY.md`：`intentionally-different`），并加入 `ROOT_AFTER_HELP` 的 Command Groups 行（满足 `root_after_help_lists_every_visible_command`）。
+在 `src/cli.rs` 注册为 Libra extension（`COMPATIBILITY.md`：`intentionally-different`），并加入 `ROOT_AFTER_HELP` 的 `Remote And Cloud` 分组（与 `push` / `fetch` / `open` 同组，满足 `root_after_help_lists_every_visible_command`）。
 
 ### 5.1 `libra pr create` 参数
 
@@ -155,9 +155,10 @@ libra pr create --fill --json
 | `--push` 且 `--head` 不是当前分支 | 拒绝 | `LBR-PR-005` |
 | detached HEAD | 拒绝 | `LBR-PR-007` / `LBR-REPO-003` |
 | 相对 base 无 ahead commit | 拒绝 | `LBR-PR-007` |
-| 工作区 dirty | 默认允许 + warning；`--require-clean` 拒绝 | 拒绝时 `LBR-PR-007` |
+| 工作区 dirty | 默认允许 + warning；`--require-clean` 拒绝（dirty 指 index/worktree 与 HEAD 不一致，含 untracked 文件） | 拒绝时 `LBR-PR-007` |
 | 远端 head 缺失或 OID 不一致且无 `--push` | 拒绝 | `LBR-PR-004` |
 | remote 非 GitHub（第一版判定失败） | 拒绝 | `LBR-PR-003` |
+| `--offline`（全局）与 `pr create` | 拒绝：`pr create` 必须调用 GitHub API | `LBR-PR-005` / `LBR-NET-001` |
 
 ### 5.3 默认行为推断
 
@@ -165,7 +166,7 @@ libra pr create --fill --json
 - **目标 remote**：当前分支 upstream remote → 否则 `origin` → 否则错误（要求用户配置 remote）。
 - **`--base` 优先级**（任一成功即停）：
   1. 显式 `--base <branch>`
-  2. 当前分支 upstream 的 merge 分支名（若与 head 不同仓库语义冲突则跳过）
+  2. 当前分支 upstream 的 merge 分支名，即读取 `branch.<name>.merge`（若与 head 同名或该配置指向非 remote-tracking 则跳过）
   3. 本地 `refs/remotes/<remote>/HEAD` 解析出的默认分支
   4. `libra ls-remote --symref <remote> HEAD` 解析默认分支（**一次**网络查询；失败则继续）
   5. 探测本地是否存在 `main` / `master` 的 remote-tracking 或本地分支
@@ -173,6 +174,7 @@ libra pr create --fill --json
 - **未 push**：默认拒绝并提示 `--push` 或 `libra push -u <remote> <branch>`；不静默 push。
 - **dirty**：默认允许（PR 关心已 push 的 commit）；human 提示；JSON 中 `data.dirty: true`。
 - **成功输出**：PR URL；`--web` 只走浏览器创建流，且不可与 JSON/machine 同次调用。
+- **`--offline`（全局）**：`pr create` 必须通过网络调用 GitHub API（或 Enterprise equivalent），在 `--offline` 下直接拒绝，避免用户误以为纯本地推断可继续。
 
 ---
 
@@ -207,10 +209,10 @@ parse + 互斥校验
 6. dirty：默认记 warning；`--require-clean` → 错误。
 7. **Ahead 检查**（见 §6.2）。
 8. **远端 head 状态**（见 §6.3）。
-9. 若远端缺失或不一致：无 `--push` → 错误；有 `--push` → 调用 Libra push（§6.4），用 push 结果更新远端状态。
-10. 解析 `gh` 可执行文件；检查最低版本。
+9. 若远端缺失或不一致：无 `--push` → 错误；有 `--push` → 调用 Libra push（§6.4）。push 成功后以 `push` 返回的 remote tip 作为 `remote_head_oid == local_head_oid` 的依据，并更新本地 tracking ref。
+10. 解析 `gh` 可执行文件；检查最低版本（临时 `>=2.40.0`，实现前用目标平台实测后写入用户文档最终值）。
 11. 非 `--dry-run`：`gh auth status --hostname <host>`（不传 `--show-token`，不透传 token 到日志）。  
-    `--dry-run`：默认**跳过** auth 与 `gh pr create`；JSON 标 `auth_checked: false`。版本检查在 dry-run 下**建议执行**（本地、无副作用），以便尽早发现缺失 `gh`。
+    `--dry-run`：跳过 auth 与 `gh pr create`，JSON 标 `auth_checked: false`；但**仍执行**第 10 步版本检查（本地、无副作用），以便尽早发现缺失 `gh`。
 12. 组装 `gh pr create` argv：显式 `-R`/`--repo`，Enterprise 时 host 与 auth 一致；**永不**加入 `gh` 的 `--dry-run`。
 13. `--dry-run`：输出将执行动作与脱敏 `gh_args`，成功退出（无 push、无 create、无 browser）。
 14. 非 dry-run：`std::process::Command` 执行，stdin 置空/null，捕获 stdout/stderr，超时默认 **120s**（可配置 env，见 §11），stderr 捕获上限建议 **64 KiB**。
@@ -232,7 +234,7 @@ parse + 互斥校验
 
 **禁止**仅依赖 `refs/remotes/<remote>/<head>`。
 
-1. 若刚执行的 Libra push 成功：以 push 结果为 `remote_head_oid == local_head_oid` 的依据。
+1. 若本命令内刚执行的 Libra push 成功：以 push 返回的远程更新结果作为 `remote_head_oid == local_head_oid` 的依据，并同步更新本地 `refs/remotes/<remote>/<head>`。
 2. 否则：`libra ls-remote --heads <remote> <head>`（或等价 `refs/heads/<head>`）取远端 tip，与本地 HEAD OID 比较。
 3. 仅当 1/2 不可用时，可读本地 remote-tracking ref，但必须标 `stale_risk: true`；缺失或不一致时提示 `libra push -u <remote> <head>` 或 `--push`。
 4. 第一版**不**调用 `git fetch`，**不**让 `gh` 隐式修正远端 ref。
@@ -340,7 +342,7 @@ Command::new(&gh_path)
 
 | 项 | 默认 | 说明 |
 | --- | --- | --- |
-| `gh` 进程超时 | 120s | 超时 SIGTERM→SIGKILL；错误可行动 |
+| `gh` 进程超时 | 120s | 超时后先 SIGTERM，5s 内未退出再 SIGKILL；错误可行动 |
 | stderr 捕获 | 64 KiB | 超长截断并标记 truncated |
 | body-file 大小 | 512 KiB | 防意外大文件进入 argv/日志 |
 | 可选 env（落地时命名并写 README） | `LIBRA_PR_GH_TIMEOUT_SECS` 等 | 非法值 → 硬错误，不静默回落 |
@@ -363,6 +365,7 @@ fake `gh` 证明未走 shell：title/body 含空格、引号、`;`、`$()`、换
 6. 全局 JSON/machine **成功**（stdout）：`ok: true`、`command`、`data` 含 §9 schema 必选字段。
 7. 全局 JSON/machine **失败**（stderr）：`CliErrorReport`（`ok: false`、`error_code: "LBR-*"`、`category`、`exit_code`、`severity`、`message`、`hints`），不依赖解析 human 文本。
 8. 非 `--web` 路径在无 `--fill` 且无 `--title` 时不得调用 `gh`（防交互阻塞）。
+9. `--offline` 下不得调用 `gh` 或发起任何远程请求。
 
 ### 8.2 CLI 兼容性
 
@@ -373,7 +376,7 @@ fake `gh` 证明未走 shell：title/body 含空格、引号、`;`、`$()`、换
 
 ### 8.3 `gh` 版本
 
-- **临时最低版本**：`gh >= 2.40.0`（实现阶段用 fake 矩阵 + 一台真机验证后可上调；不得依赖低于该版本不存在的 flag）。
+- **临时最低版本**：`gh >= 2.40.0`（实现阶段用 fake 矩阵 + 一台真机验证后可上调；不得依赖低于该版本不存在的 flag）。实现 PR 必须在 CI 与至少一台目标平台真机上验证后，把最终值写入 `docs/commands/pr.md` 与 `COMPATIBILITY.md`。
 - 过低时：
 
 ```text
@@ -429,7 +432,7 @@ hint: upgrade gh to version 2.40.0 or newer (https://cli.github.com/)
 ```
 
 **必选**（非 dry-run 成功）：`provider`、`backend`、`remote`、`repository`、`host`、`base`、`head`、`url`、`number`、`pushed`、`dirty`、`draft`。  
-**dry-run 成功**：无 `url`/`number`；含 `dry_run: true`、`would_push`、`auth_checked`、`gh_args`（脱敏）。
+**dry-run 成功**：无 `url`/`number`；含 `dry_run: true`、`would_push`、`auth_checked`、`gh_args`（脱敏），以及已解析的 `title`/`body`/`draft`/`fill`/`web` 等选项字段（若用户提供）。
 
 ```json
 {
@@ -444,6 +447,9 @@ hint: upgrade gh to version 2.40.0 or newer (https://cli.github.com/)
     "host": "github.com",
     "base": "main",
     "head": "feature/my-change",
+    "fill": true,
+    "draft": false,
+    "web": false,
     "would_push": false,
     "auth_checked": false,
     "dirty": false,
@@ -492,7 +498,7 @@ hint: upgrade gh to version 2.40.0 or newer (https://cli.github.com/)
 
 | 码 | category | 默认 exit | 场景 | 可复用 |
 | --- | --- | --- | --- | --- |
-| `LBR-PR-001` | `cli` 或 `internal`* | 128/129 | `gh` 未安装或版本过低 | 无直接等价 |
+| `LBR-PR-001` | `internal` | 128 | `gh` 未安装或版本过低 | 无直接等价 |
 | `LBR-PR-002` | `auth` | 128 | `gh auth status --hostname` 失败 | 近 `LBR-AUTH-001` |
 | `LBR-PR-003` | `repo` | 128 | 非 GitHub remote / 无法解析 owner/repo/host | 近 `LBR-REPO-003` |
 | `LBR-PR-004` | `repo` | 128 | head 未 push / OID 不一致且无 `--push` | 无 |
@@ -500,7 +506,7 @@ hint: upgrade gh to version 2.40.0 or newer (https://cli.github.com/)
 | `LBR-PR-006` | `network` | 128 | `gh pr create` 非 0、超时、URL 解析失败 | 近 `LBR-NET-001` |
 | `LBR-PR-007` | `conflict` 或 `repo` | 128 | 无 ahead、`--require-clean` dirty、detached HEAD | 近 `LBR-CONFLICT-002` / `LBR-REPO-003` |
 
-\* 若希望「缺外部工具」与「用户参数错误」分开，可将 `LBR-PR-001` 归 `internal` 或引入 `unsupported`（现有 `LBR-UNSUPPORTED-001`）——**实现时二选一写死并测 Display pin**，本文不强制。
+> `gh` 未安装属于运行环境不满足内部依赖，不是用户 CLI 参数错误，因此 `LBR-PR-001` 推荐 `internal` 而非 `cli`。实现时写死该 category 并测 Display pin。
 
 ### 9.5 Human 错误示例
 
@@ -603,7 +609,7 @@ hint: the remote branch is up to date; fix the GitHub error and re-run without -
 
 ```text
 src/command/pr.rs              CLI 参数、互斥、输出、错误展示、PR_EXAMPLES
-src/internal/github/mod.rs     remote 识别、owner/repo/host 解析（可供 open 复用思路）
+src/internal/github/mod.rs     remote 识别、owner/repo/host 解析（`open` 后续可复用该模块，但 v1 保持 `open` 行为不变，避免回归）
 src/internal/github/gh.rs      gh 路径/版本、auth status、pr create、超时与脱敏
 src/internal/pr/mod.rs         前置校验、base/head 推断、push 编排、调用 provider
 ```
@@ -733,7 +739,7 @@ cargo test --features test-network --test pr_github_live_test
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all`
 - `tests/INDEX.md` 新 target 行
-- CLI help、`docs/commands/pr.md` + zh-CN、`docs/error-codes.md`、`COMPATIBILITY.md`、三份 compat 守卫（`compat_help_examples_banner`、`compat_command_docs_examples_section`、ROOT_AFTER_HELP 命令组）
+- CLI help、`docs/commands/pr.md` + zh-CN、`docs/error-codes.md`、`COMPATIBILITY.md`、四份 compat 守卫（`compat_help_examples_banner`、`compat_command_docs_examples_section`、`compat_matrix_alignment`、ROOT_AFTER_HELP 命令组）
 
 ---
 
@@ -742,8 +748,8 @@ cargo test --features test-network --test pr_github_live_test
 | 项 | 要求 |
 | --- | --- |
 | `src/command/pr.rs` | `PR_EXAMPLES` + `#[command(after_help = …)]` |
-| `src/cli.rs` | 注册 `Commands::Pr`；`ROOT_AFTER_HELP` 分组行 |
-| `docs/commands/pr.md` + `docs/commands/zh-CN/pr.md` | Examples / Common Commands 小节 |
+| `src/cli.rs` | 注册 `Commands::Pr`；`ROOT_AFTER_HELP` 的 `Remote And Cloud` 分组行；`--offline` 互斥处理 |
+| `docs/commands/pr.md` + `docs/commands/zh-CN/pr.md` | Examples / Common Commands 小节；`--offline` 限制说明 |
 | `COMPATIBILITY.md` | `intentionally-different` |
 | `docs/error-codes.md` | `LBR-PR-*` 或复用映射表 |
 | `tests/INDEX.md` | integration / live 行 |
@@ -781,13 +787,14 @@ libra pr create --push --fill
 6. 远端状态：push 结果或 `ls-remote --heads`，不单信 tracking。  
 7. Dry-run 纯 Libra，不映射 `gh --dry-run`。  
 8. 非 web 路径必须 `--fill` 或 `--title`，避免交互阻塞。  
-9. 错误可行动且不泄露凭据。
+9. `--offline` 下直接拒绝，不尝试调用 `gh`。
+10. 错误可行动且不泄露凭据。
 
 ---
 
 ## 附录 A：十二维评审与前后冲突扫描
 
-### A.1 评审矩阵（第二轮，2026-07-09）
+### A.1 评审矩阵（第二轮 + 第三轮补丁，2026-07-09）
 
 | 维度 | 结论 | 主要依据 / 残留风险 | 文档处置 |
 | --- | --- | --- | --- |
@@ -823,8 +830,14 @@ libra pr create --push --fill
 | P13 | 低 | CreatePullRequestRequest 混入 push/dry_run 破坏分层 | §13.2 |
 | P14 | 低 | 评审矩阵曾写 `LBR-NETWORK`（正确为 `LBR-NET-*`） | 已改正 |
 | P15 | 低 | P1 原文写「`libra open --json` 均为全局」易误解 | 澄清：`--json` 为 clap `global = true`，推荐 `libra --json open` / `libra --json pr create` |
+| P16 | 中 | 未处理全局 `--offline` 与 `pr create` 的冲突 | §5.2 互斥表 / §5.3 / 不变量 9 |
+| P17 | 中 | `LBR-PR-001` category 在 `cli`/`internal` 间摇摆 | §9.4 明确为 `internal` |
+| P18 | 中 | dry-run JSON schema 未展示已解析选项字段 | §9.2 示例补充 `fill`/`draft`/`web` 等 |
+| P19 | 低 | `--require-clean` 的 dirty 定义未明确 | §5.2 补充含 untracked |
+| P20 | 低 | 远端 push 成功后如何更新本地状态未明确 | §6.1 第 9 步 / §6.3 第 1 步补充 |
+| P21 | 低 | `pr` 在 `ROOT_AFTER_HELP` 中的分组未指定 | §5 明确为 `Remote And Cloud` |
 
-**冲突扫描结论**：P1–P4 为落地前必须遵守的契约/正确性约束；其余为完整性与可维护性补强。无与「第一版仅 GitHub 同仓库 PR + gh 后端」目标相悖的条款。
+**冲突扫描结论**：P1–P4 为落地前必须遵守的契约/正确性约束；P16–P18 为第三轮补全的正确性/完整性约束；其余为完整性与可维护性补强。无与「第一版仅 GitHub 同仓库 PR + gh 后端」目标相悖的条款。
 
 ### A.3 第一轮已吸收、本轮保留的结论
 
@@ -839,8 +852,7 @@ libra pr create --push --fill
 
 1. **`gh` 最低版本**：临时 `2.40.0`，用目标平台实测后写入用户文档最终值。  
 2. **`LBR-PR-*` vs 复用现有码**：二选一；禁止半套新码半套推断。  
-3. **`LBR-PR-001` 的 category**：`cli` / `internal` / `unsupported` 定一种。  
+3. **`LBR-PR-001` 的 category**：已定 `internal`；实现时写死并测 Display pin。  
 4. **超时 env 正式名**：实现时写入 `docs/commands/pr.md`（候选 `LIBRA_PR_GH_TIMEOUT_SECS`）。  
 5. **是否暴露 `pr.ghPath` 配置**：v1 可用 PATH 解析；配置项可阶段 4+。  
 6. **已存在 PR 时是否自动 `gh pr view --json url`**：建议阶段 2 做只读补救，失败则错误。
-)
