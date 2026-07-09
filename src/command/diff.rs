@@ -39,7 +39,9 @@ use crate::{
         object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, ProgressMode, emit_json_data},
         pager::Pager,
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -455,6 +457,9 @@ pub(crate) enum DiffError {
     /// `A...B` where both sides resolve but share no merge base.
     #[error("no merge base found for '{left}' and '{right}'")]
     NoMergeBase { left: String, right: String },
+
+    #[error("{0}")]
+    Pathspec(String),
 }
 
 impl From<DiffError> for CliError {
@@ -517,6 +522,9 @@ impl From<DiffError> for CliError {
             DiffError::NoMergeBase { .. } => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("the two revisions share no common ancestor"),
+            DiffError::Pathspec(_) => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob"),
         }
     }
 }
@@ -1037,11 +1045,16 @@ fn exists_as_path(tok: &str) -> bool {
     std::path::Path::new(tok).symlink_metadata().is_ok()
 }
 
-/// Whether `tok` carries pathspec glob magic. Git's `check_filename` exempts
-/// wildcard pathspecs from the unknown-revision-or-path error (`git diff '*.c'`
-/// works with no literal `*.c` file); mirror that so globs stay pathspecs.
-fn has_glob_magic(tok: &str) -> bool {
+/// Whether `tok` carries pathspec syntax that should bypass the
+/// unknown-revision-or-path precheck. Git accepts wildcard pathspecs and magic
+/// pathspecs without a literal matching file; let the shared pathspec parser
+/// validate magic support and pattern details after revision disambiguation.
+fn has_pathspec_syntax(tok: &str) -> bool {
     tok.contains(['*', '?', '['])
+        || tok.starts_with(":(")
+        || tok.starts_with(":/")
+        || tok.starts_with(":!")
+        || tok.starts_with(":^")
 }
 
 /// Resolve leading positional revisions and the `--` pathspec separator,
@@ -1176,7 +1189,7 @@ async fn resolve_positional_revisions(args: &mut DiffArgs) -> Result<(), DiffErr
         if dashdash {
             return Err(DiffError::UnknownRevisionOrPath(tok));
         }
-        if !is_path && !has_glob_magic(&tok) {
+        if !is_path && !has_pathspec_syntax(&tok) {
             return Err(DiffError::UnknownRevisionOrPath(tok));
         }
         paths_started = true;
@@ -1229,7 +1242,10 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     let old_side = resolve_diff_side(&args.old, args.staged, false, &index).await?;
     let new_side = resolve_diff_side(&args.new, args.staged, true, &index).await?;
 
-    let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
+    let pathspecs =
+        PathspecSet::from_workdir(&args.pathspec, &util::cur_dir(), &util::working_dir())
+            .map_err(pathspec_error_to_diff)?;
+    let paths: Vec<PathBuf> = pathspecs.plain_positive_prefixes().unwrap_or_default();
     let diff_pathspecs = paths.clone();
     let worktree_entries = new_side.worktree_entries.clone();
     // Separate copy for the external-diff pass (the one above is moved into the
@@ -1310,6 +1326,7 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     if args.old.is_none() && args.new.is_none() && !args.staged {
         apply_unmerged_worktree_diff(&mut files, &index, &diff_pathspecs)?;
     }
+    filter_diff_files_by_pathspec(&mut files, &pathspecs);
 
     // Resolve the external diff driver (`diff.external`) when it should drive this
     // run: a patch-body output mode (not `--stat`/name/numstat/summary/`-s`/
@@ -1659,6 +1676,27 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
         external_diff_applied,
         binary_patch,
     })
+}
+
+fn pathspec_error_to_diff(error: PathspecError) -> DiffError {
+    match error {
+        PathspecError::OutsideRepository { .. }
+        | PathspecError::UnsupportedMagic { .. }
+        | PathspecError::InvalidPattern { .. } => DiffError::Pathspec(error.to_string()),
+    }
+}
+
+fn filter_diff_files_by_pathspec(files: &mut Vec<DiffFileStat>, pathspecs: &PathspecSet) {
+    if pathspecs.is_empty() {
+        return;
+    }
+    files.retain(|file| {
+        pathspecs.matches_path(&file.path)
+            || file
+                .rename_from
+                .as_ref()
+                .is_some_and(|old_path| pathspecs.matches_path(old_path))
+    });
 }
 
 #[derive(Debug)]

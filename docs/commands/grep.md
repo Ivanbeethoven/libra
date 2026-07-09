@@ -16,7 +16,7 @@ libra grep -f <file> [-- <pathspec>...]
 
 Multiple patterns can be supplied via `-e` flags or read from files via `-f`. When multiple patterns are active, a file matches if any pattern matches at least one line (OR semantics). With `--all-match`, a file is included only if every pattern matches at least one line in that file (AND semantics across patterns, not across lines).
 
-Output can be tuned with flags to show only filenames (`-l`, `-L`), match counts per file (`-c`), line numbers (`-n`), byte offsets (`-b`), or inverted matches (`-v`). The command supports pathspec filtering to restrict the search to specific files or directories.
+Output can be tuned with flags to show only filenames (`-l`, `-L`), match counts per file (`-c`), line numbers (`-n`), byte offsets (`-b`), or inverted matches (`-v`). The command supports pathspec filtering to restrict the search to specific files or directories. Repository searches use the shared pathspec engine, including `:(top)`, `:(exclude)`, `:(icase)`, `:(literal)`, and `:(glob)` magic.
 
 When stdout is a terminal, output is sent through a pager. In JSON mode, structured output is emitted for programmatic consumption.
 

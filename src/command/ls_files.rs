@@ -1,11 +1,6 @@
 //! Implements `ls-files` to list files in the index with basic filters.
 
-use std::{
-    collections::HashSet,
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, fs, io::Write, path::Path};
 
 use clap::Parser;
 use git_internal::{
@@ -20,7 +15,9 @@ use crate::{
         error::{CliError, CliResult, StableErrorCode},
         ignore,
         output::{OutputConfig, emit_json_data, stdout_write_error},
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -144,12 +141,6 @@ pub struct FileEntry {
     status: String,
 }
 
-#[derive(Debug, Clone)]
-struct ResolvedPathspec {
-    raw: String,
-    absolute: PathBuf,
-}
-
 pub async fn execute(args: LsFilesArgs) -> CliResult<()> {
     let output = OutputConfig::default();
     let view = crate::internal::sparse::SparseView::load().await;
@@ -172,7 +163,8 @@ fn run_ls_files(
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
     let workdir = util::working_dir();
     let current_dir = util::cur_dir();
-    let pathspecs = resolve_ls_files_pathspecs(_args, &workdir, &current_dir)?;
+    let pathspecs = PathspecSet::from_workdir(&_args.pathspec, &current_dir, &workdir)
+        .map_err(pathspec_error_to_cli)?;
 
     let index = Index::load(path::index()).map_err(|source| {
         CliError::fatal(format!("failed to load index: {source}"))
@@ -347,9 +339,9 @@ fn run_ls_files(
         entries.retain(|entry| entry.stage.unwrap_or(0) > 0 || view.contains_str(&entry.path));
     }
 
-    entries = filter_entries_by_pathspec(entries, &pathspecs, &workdir);
+    entries = filter_entries_by_pathspec(entries, &pathspecs);
     if _args.error_unmatch {
-        ensure_error_unmatch(&pathspecs, &entries, &workdir)?;
+        ensure_error_unmatch(&pathspecs, &entries)?;
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path).then(a.stage.cmp(&b.stage)));
@@ -383,83 +375,43 @@ fn collect_ls_files_exclude_patterns(args: &LsFilesArgs) -> CliResult<Vec<String
     Ok(patterns)
 }
 
-fn resolve_ls_files_pathspecs(
-    args: &LsFilesArgs,
-    workdir: &Path,
-    current_dir: &Path,
-) -> CliResult<Vec<ResolvedPathspec>> {
-    args.pathspec
-        .iter()
-        .map(|raw| {
-            let absolute = resolve_pathspec(Path::new(raw), current_dir);
-            if !util::is_sub_path(&absolute, workdir) {
-                return Err(CliError::fatal(format!(
-                    "'{raw}' is outside repository at '{}'",
-                    workdir.display()
-                ))
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-                .with_hint("all paths must be within the repository working tree"));
-            }
-            Ok(ResolvedPathspec {
-                raw: raw.clone(),
-                absolute,
-            })
-        })
-        .collect()
-}
-
-fn resolve_pathspec(pathspec: &Path, current_dir: &Path) -> PathBuf {
-    if pathspec.is_absolute() {
-        pathspec.to_path_buf()
-    } else {
-        current_dir.join(pathspec)
-    }
-}
-
-fn filter_entries_by_pathspec(
-    entries: Vec<FileEntry>,
-    pathspecs: &[ResolvedPathspec],
-    workdir: &Path,
-) -> Vec<FileEntry> {
+fn filter_entries_by_pathspec(entries: Vec<FileEntry>, pathspecs: &PathspecSet) -> Vec<FileEntry> {
     if pathspecs.is_empty() {
         return entries;
     }
 
     entries
         .into_iter()
-        .filter(|entry| {
-            pathspecs
-                .iter()
-                .any(|pathspec| entry_matches_pathspec(entry, pathspec, workdir))
-        })
+        .filter(|entry| pathspecs.matches_path(&entry.path))
         .collect()
 }
 
-fn ensure_error_unmatch(
-    pathspecs: &[ResolvedPathspec],
-    entries: &[FileEntry],
-    workdir: &Path,
-) -> CliResult<()> {
-    if let Some(unmatched) = pathspecs.iter().find(|pathspec| {
-        !entries
-            .iter()
-            .any(|entry| entry_matches_pathspec(entry, pathspec, workdir))
-    }) {
-        return Err(CliError::fatal(format!(
-            "pathspec '{}' did not match any files",
-            unmatched.raw
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidTarget)
-        .with_hint("check the path and try again.")
-        .with_hint("use 'libra ls-files' to inspect visible paths."));
+fn ensure_error_unmatch(pathspecs: &PathspecSet, entries: &[FileEntry]) -> CliResult<()> {
+    if let Some(unmatched) =
+        pathspecs.unmatched_positive(entries.iter().map(|entry| Path::new(&entry.path)))
+    {
+        return Err(
+            CliError::fatal(format!("pathspec '{unmatched}' did not match any files"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("check the path and try again.")
+                .with_hint("use 'libra ls-files' to inspect visible paths."),
+        );
     }
 
     Ok(())
 }
 
-fn entry_matches_pathspec(entry: &FileEntry, pathspec: &ResolvedPathspec, workdir: &Path) -> bool {
-    let entry_abs = workdir.join(Path::new(&entry.path));
-    util::is_sub_path(&entry_abs, &pathspec.absolute)
+fn pathspec_error_to_cli(error: PathspecError) -> CliError {
+    match error {
+        PathspecError::OutsideRepository { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("all pathspecs must stay within the repository working tree"),
+        PathspecError::UnsupportedMagic { .. } | PathspecError::InvalidPattern { .. } => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use supported magic: top, exclude, icase, literal, glob")
+        }
+    }
 }
 
 fn entry_modified(worktree_path: &Path, display_path: &str, indexed_hash: &str) -> CliResult<bool> {

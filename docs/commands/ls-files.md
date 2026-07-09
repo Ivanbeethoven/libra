@@ -30,9 +30,10 @@ link target is listed as modified.
 
 Pathspecs are resolved from the caller's current working directory, not forced
 to the repository root. Exact-file and directory-prefix filtering are both
-supported; pathspecs that resolve outside the repository are rejected. The
-resolve-undo and
-sparse-checkout integration remain deferred.
+supported, and the shared pathspec engine also accepts `:(top)`, `:(exclude)`,
+`:(icase)`, `:(literal)`, and `:(glob)` magic. Pathspecs that resolve outside
+the repository are rejected. The resolve-undo and sparse-checkout integration
+remain deferred.
 
 When stdout is piped and the downstream command exits early, `libra ls-files` exits quietly
 without printing panic/backtrace or `Broken pipe` diagnostics.
@@ -59,7 +60,7 @@ without printing panic/backtrace or `Broken pipe` diagnostics.
 | `--error-unmatch` | Exit with `LBR-CLI-003` if any explicit pathspec matches no files in the selected result set. |
 | `--eol` | Prefix each cached entry with `i/<eol> w/<eol> attr/<attr>` line-ending info: `<eol>` is `lf`/`crlf`/`mixed`/`none`/`-text` (binary) for the index blob (`i/`) and the worktree file (`w/`). Byte-compatible with `git ls-files --eol`; `attr/` is always empty (Libra has no `.gitattributes`). |
 | `-z` | Emit NUL-delimited text records instead of newline-delimited output. Text mode only; rejects `--json` / `--machine`. |
-| `<pathspec>...` | Limit output to an exact file or directory prefix. Pathspecs resolve from the current working directory. |
+| `<pathspec>...` | Limit output to matching paths. Supports exact files, directory prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic. Pathspecs resolve from the current working directory unless `:(top)` is used. |
 | `--json` | Emit the standard Libra JSON envelope. |
 | `--machine` | Emit the same envelope as one compact JSON line. |
 

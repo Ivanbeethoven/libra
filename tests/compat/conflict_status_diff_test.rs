@@ -46,6 +46,10 @@ impl TestRepo {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_in(&self.repo, args)
+    }
+
+    fn command_in(&self, cwd: &PathBuf, args: &[&str]) -> Command {
         let home = self.repo.join(".libra-test-home");
         let config_home = home.join(".config");
         let global_db = home.join(".libra").join("config.db");
@@ -54,7 +58,7 @@ impl TestRepo {
         let mut command = Command::new(env!("CARGO_BIN_EXE_libra"));
         command
             .args(args)
-            .current_dir(&self.repo)
+            .current_dir(cwd)
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env("HOME", &home)
@@ -72,6 +76,10 @@ impl TestRepo {
 
     fn run(&self, args: &[&str]) -> Output {
         self.command(args).output().expect("spawn libra")
+    }
+
+    fn run_in(&self, cwd: &PathBuf, args: &[&str]) -> Output {
+        self.command_in(cwd, args).output().expect("spawn libra")
     }
 
     fn success(&self, args: &[&str]) -> Output {
@@ -162,6 +170,67 @@ fn conflict_paths_are_unmerged_across_status_ls_files_and_diff() {
         repo.create_conflict(flow);
         assert_unmerged_contract(&repo, flow.label());
     }
+}
+
+#[test]
+fn status_pathspec_preserves_global_merge_state() {
+    let repo = TestRepo::new();
+    repo.create_conflict(ConflictFlow::Merge);
+
+    let status = repo.run(&["status", "--exit-code", ".libraignore"]);
+    assert_eq!(
+        status.status.code(),
+        Some(1),
+        "merge-in-progress must keep --exit-code dirty even when the conflict path is filtered"
+    );
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("You are in the middle of a merge"),
+        "pathspec-filtered status should keep the merge recovery prompt:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("conflicts remain outside the selected pathspec"),
+        "pathspec-filtered status should not claim all conflicts are fixed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("all conflicts fixed"),
+        "hidden conflicts must not be reported as resolved:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("working tree clean"),
+        "hidden conflicts must not be followed by a clean-tree summary:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("UU conflict.txt"),
+        "pathspec should still filter the conflict path rows:\n{stdout}"
+    );
+}
+
+#[test]
+fn status_top_pathspec_from_subdir_keeps_merge_conflict_paths() {
+    let repo = TestRepo::new();
+    repo.create_conflict(ConflictFlow::Merge);
+    let subdir = repo.repo.join("subdir");
+    fs::create_dir_all(&subdir).expect("create subdir");
+
+    let status = repo.run_in(&subdir, &["--json", "status", ":(top)conflict.txt"]);
+    assert!(
+        status.status.success(),
+        "status from subdir should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status stdout is json");
+    let conflicted_paths = json["data"]["merge_state"]["conflicted_paths"]
+        .as_array()
+        .expect("merge_state conflicted_paths is an array");
+    assert!(
+        conflicted_paths
+            .iter()
+            .any(|path| path.as_str() == Some("conflict.txt")),
+        "top pathspec from a subdir should keep repo-root merge conflict paths: {json}"
+    );
 }
 
 fn assert_unmerged_contract(repo: &TestRepo, label: &str) {

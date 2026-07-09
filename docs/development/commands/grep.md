@@ -6,7 +6,7 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。tracked/index/tree search 与常用匹配/count/list/line flags 已支持；`-A`/`-B`/`-C` 上下文行、`-E`/`-G` 正则别名（`-P` 拒绝 129）、`-a`/`-I` 二进制控制、`--heading`/`--break`、`-z`/`--null`、`-m`/`--max-count`、`-o`/`--only-matching`、`--untracked`（worktree 搜索额外纳入未跟踪、非忽略文件）、`--no-index`（无仓库、递归遍历文件系统、不套用 ignore）、`--max-depth <DEPTH>`（每个 pathspec 下最多下降 DEPTH 层目录；无 pathspec 时相对搜索根；负值=无限制）已支持。
+- 兼容级别：`partial`。tracked/index/tree search 与常用匹配/count/list/line flags 已支持；仓库搜索 pathspec 经共享 `utils::pathspec::PathspecSet` 支持普通路径/目录前缀、默认通配符、`:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)`；`-A`/`-B`/`-C` 上下文行、`-E`/`-G` 正则别名（`-P` 拒绝 129）、`-a`/`-I` 二进制控制、`--heading`/`--break`、`-z`/`--null`、`-m`/`--max-count`、`-o`/`--only-matching`、`--untracked`（worktree 搜索额外纳入未跟踪、非忽略文件）、`--no-index`（无仓库、递归遍历文件系统、不套用 ignore；不使用仓库 pathspec magic）、`--max-depth <DEPTH>`（每个 pathspec 下最多下降 DEPTH 层目录；无 pathspec 时相对搜索根；负值=无限制）已支持。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -47,6 +47,7 @@ flowchart TD
 - 2026-06-05 `3e17784`（`feat(grep): accept -E/-G as regex aliases and decline -P/--perl-regexp (129)`）：曾添加 `-E`/`-G` 正则别名并以 129 退出拒绝 `-P`/`--perl-regexp`；但该批改动同样被 `900c062`（`Update integration`）回退，当前 HEAD 的 `GrepArgs` 已无这些参数（参见缺口表「扩展正则」「Perl 正则」两行）。
 - 2026-06-07 `6d60ee03`（`fix(grep): close compatibility plan gaps`）：实现修正：close compatibility plan gaps；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 2026-07-09（plan-20260708 P0-06）：stdout 下游提前关闭时经全局入口与 `Pager` 输出层静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
+- 2026-07-09（plan-20260708 P1-01）：仓库模式（working tree / `--cached` / `--tree` / `--untracked`）文件枚举切到共享 pathspec matcher，支持 `top`/`exclude`/`icase`/`literal`/`glob` magic；`--no-index` 保持纯文件系统路径根语义。回归覆盖：`compat_pathspec_magic`。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
@@ -55,6 +56,7 @@ flowchart TD
 - 用户文档：`docs/commands/grep.md`。
 - Synopsis：`libra grep [<options>] [<pattern>] [<pathspec>...]`。
 - 公开参数/子命令包括：位置参数 `<PATTERN>`（可选，`pattern`）、位置参数 `<PATHS>...`（`pathspec`）、`-e, --regexp <PATTERN>`、`-f, --file <FILE>`、`--all-match`、`-F, --fixed-string`、`-E, --extended-regexp`、`-G, --basic-regexp`、`-P, --perl-regexp`（拒绝，退出 129）、`-i, --ignore-case`、`-c, --count`、`-l, --files-with-matches`、`-L, --files-without-matches`、`-n, --line-number`、`-w, --word-regexp`、`-v, --invert-match`、`-b, --byte-offset`、`-A, --after-context <NUM>`、`-B, --before-context <NUM>`、`-C, --context <NUM>`、`-a, --text`、`-I`、`--tree <REVISION>`、`--cached`、`--heading`/`--no-heading`、`--break`/`--no-break`、`-z, --null`、`-m, --max-count <NUM>`、`-o, --only-matching`、`--max-depth <DEPTH>` 等。`-m`/`--max-count` 在 `search_in_content` 之后按文件截断到前 NUM 个真实匹配行（连同其后续上下文）；`-o`/`--only-matching` 用 `matcher.find_iter` 把每个匹配行展开为逐个匹配子串（每个匹配一行，上下文行被丢弃；`-b` 时输出每个匹配的行内字节偏移 `m.start()`，与 Libra 既有的行内 `-b`（首个匹配的行内偏移）一致）。
+- P1-01 后，仓库内 pathspec 通过 `compile_repo_pathspecs` 统一解析，`get_working_tree_files` / `get_index_files` / `get_tree_files` / `get_working_tree_files_with_untracked` 共享同一 matcher；exclude-only pathspec 表示“全部路径再排除”。
 
 
 ## 还未实现的功能

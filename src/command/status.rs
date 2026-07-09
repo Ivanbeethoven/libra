@@ -38,7 +38,9 @@ use crate::{
         ignore::IgnorePolicy,
         object_ext::{CommitExt, TreeExt},
         output::{ColorChoice, OutputConfig, emit_json_data},
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -182,6 +184,10 @@ pub struct StatusArgs {
     /// Can be combined with --quiet for silent dirty checking.
     #[clap(long = "exit-code")]
     pub exit_code: bool,
+
+    /// Limit status output to files matching the given pathspec(s).
+    #[clap(value_name = "pathspec")]
+    pub pathspec: Vec<String>,
 }
 
 impl StatusArgs {
@@ -336,6 +342,7 @@ pub struct UpstreamInfo {
 pub struct MergeStatusInfo {
     pub target_ref: String,
     pub conflicted_paths: Vec<String>,
+    pub unresolved_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -482,12 +489,12 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             let index = maybe_index
                 .as_ref()
                 .ok_or_else(|| CliError::internal("status index should be loaded"))?;
+            let conflicted_paths =
+                merge::unresolved_conflicted_paths(index, &state.conflicted_paths);
             Some(MergeStatusInfo {
                 target_ref: state.target_ref,
-                conflicted_paths: merge::unresolved_conflicted_paths(
-                    index,
-                    &state.conflicted_paths,
-                ),
+                unresolved_count: conflicted_paths.len(),
+                conflicted_paths,
             })
         }
         None => None,
@@ -501,7 +508,7 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         None
     };
 
-    Ok(StatusData {
+    let mut data = StatusData {
         head,
         head_oid,
         has_commits,
@@ -517,7 +524,64 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             .await
             .is_active(),
         porcelain_v2,
-    })
+    };
+    filter_status_data_by_pathspec(&mut data, args)?;
+    Ok(data)
+}
+
+fn filter_status_data_by_pathspec(data: &mut StatusData, args: &StatusArgs) -> CliResult<()> {
+    if args.pathspec.is_empty() {
+        return Ok(());
+    }
+    let pathspecs =
+        PathspecSet::from_workdir(&args.pathspec, &util::cur_dir(), &util::working_dir())
+            .map_err(pathspec_error_to_cli)?;
+
+    filter_changes_by_pathspec(&mut data.staged, &pathspecs);
+    filter_changes_by_pathspec(&mut data.unstaged, &pathspecs);
+    data.unmerged
+        .retain(|entry| current_relative_matches(&entry.path, &pathspecs));
+    data.ignored_files
+        .retain(|path| current_relative_matches(path, &pathspecs));
+    if let Some(merge_state) = data.merge_state.as_mut() {
+        merge_state
+            .conflicted_paths
+            .retain(|path| pathspecs.matches_path(Path::new(path)));
+    }
+
+    Ok(())
+}
+
+fn filter_changes_by_pathspec(changes: &mut Changes, pathspecs: &PathspecSet) {
+    changes
+        .new
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes
+        .modified
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes
+        .deleted
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes.renamed.retain(|(old, new)| {
+        current_relative_matches(old, pathspecs) || current_relative_matches(new, pathspecs)
+    });
+}
+
+fn current_relative_matches(path: &Path, pathspecs: &PathspecSet) -> bool {
+    pathspecs.matches_path(util::to_workdir_path(path))
+}
+
+fn pathspec_error_to_cli(error: PathspecError) -> CliError {
+    match error {
+        PathspecError::OutsideRepository { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("all pathspecs must stay within the repository working tree"),
+        PathspecError::UnsupportedMagic { .. } | PathspecError::InvalidPattern { .. } => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use supported magic: top, exclude, icase, literal, glob")
+        }
+    }
 }
 
 /// Detect renames between deleted and new files in `changes`.
@@ -1130,13 +1194,18 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         CliError::fatal(format!("failed to inspect merge state: {detail}"))
             .with_stable_code(StableErrorCode::IoReadFailed)
     })? {
-        Some(state) => Some(MergeStatusInfo {
-            target_ref: state.target_ref.clone(),
-            conflicted_paths: state.conflicted_paths.clone(),
-        }),
+        Some(state) => {
+            let conflicted_paths =
+                merge::unresolved_conflicted_paths(&index, &state.conflicted_paths);
+            Some(MergeStatusInfo {
+                target_ref: state.target_ref.clone(),
+                unresolved_count: conflicted_paths.len(),
+                conflicted_paths,
+            })
+        }
         None => None,
     };
-    let data = StatusData {
+    let mut data = StatusData {
         head,
         has_commits: head_oid_hash.is_some(),
         head_oid: head_oid_hash,
@@ -1153,6 +1222,7 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
             .is_active(),
         porcelain_v2: None,
     };
+    filter_status_data_by_pathspec(&mut data, args)?;
 
     if output.is_json() {
         let mut json_data = build_status_json(&data, args);
@@ -1368,7 +1438,11 @@ fn render_human_status(
     }
 
     // Clean tree
-    if data.staged.is_empty() && data.unstaged.is_empty() && data.unmerged.is_empty() {
+    if data.merge_state.is_none()
+        && data.staged.is_empty()
+        && data.unstaged.is_empty()
+        && data.unmerged.is_empty()
+    {
         writeln!(buffer, "nothing to commit, working tree clean").map_err(write_error)?;
         return Ok(());
     }
@@ -1631,10 +1705,16 @@ fn render_merge_state_human(merge_state: &MergeStatusInfo, buffer: &mut Vec<u8>)
         merge_state.target_ref
     )
     .map_err(write_error)?;
-    if merge_state.conflicted_paths.is_empty() {
+    if merge_state.unresolved_count == 0 {
         writeln!(
             buffer,
             "  (all conflicts fixed: run \"libra merge --continue\")"
+        )
+        .map_err(write_error)?;
+    } else if merge_state.conflicted_paths.is_empty() {
+        writeln!(
+            buffer,
+            "  (conflicts remain outside the selected pathspec; run \"libra status\" to see them)"
         )
         .map_err(write_error)?;
     } else {

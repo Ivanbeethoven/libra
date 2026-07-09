@@ -41,7 +41,7 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | New commit | | `--new <COMMIT>` | Specifies the "new" side. Requires `--old`. Conflicts with `--staged`. |
 | Staged | | `--staged` | Compare HEAD against the index (staged changes). Conflicts with `--new`. |
 | Revisions | | positional | Up to two leading revisions, Git-style: `diff A` (A vs worktree), `diff A B` (≡ `A..B`), `diff A..B`, `diff A...B` (merge-base(A,B) vs B), `diff --staged A` (A vs index). Not interpreted when `--old`/`--new` is given. |
-| Pathspec | | positional | One or more files or directories to restrict the diff (after any revisions; use `--` to force the path reading). Pre-`--` paths must exist (or carry glob magic); post-`--` paths are taken verbatim. |
+| Pathspec | | positional | One or more files or directories to restrict the diff (after any revisions; use `--` to force the path reading). Supports exact files, directory prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic. Pre-`--` paths must exist or carry wildcard syntax / supported pathspec magic; post-`--` paths are taken verbatim. |
 | Algorithm | | `--algorithm <name>` | Diff algorithm: `histogram` (default), `myers`, or `myersMinimal`. |
 | Output file | | `--output <FILENAME>` | Write human-readable output to a file instead of stdout. Ignored in `--json` mode. |
 | Name only | | `--name-only` | Show only the names of changed files. |

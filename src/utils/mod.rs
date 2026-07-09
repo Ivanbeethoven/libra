@@ -21,6 +21,7 @@ pub mod pager;
 pub mod path;
 pub mod path_case;
 pub mod path_ext;
+pub mod pathspec;
 pub mod read_policy;
 pub mod redact;
 pub mod resource_limits;

@@ -7,20 +7,24 @@
 ## 概要
 
 ```
-libra status [OPTIONS]
+libra status [OPTIONS] [pathspec]...
 ```
 
 ## 说明
 
 `libra status` 显示工作树和暂存区状态：哪些文件已暂存到下一次提交，哪些有尚未暂存的修改，哪些未跟踪。它还报告当前分支、detached HEAD 状态和 upstream tracking 信息。
 
-该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式，以及供代理消费的结构化 JSON。
+该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式，以及供代理消费的结构化 JSON。可选 pathspec 会限制 staged、unstaged、unmerged、ignored 和 untracked 输出；它们使用共享 pathspec 引擎，支持 `:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)` magic。进行中的 merge 仍作为全局仓库状态报告，即使所选 pathspec 隐藏了所有冲突路径，`--exit-code` 也会保持 dirty，直到继续或中止该 merge。
 
 在 merge、rebase、cherry-pick 冲突期间，未合并的 index stage 条目会按冲突输出，而不会被误报为未跟踪文件。porcelain v1/短格式使用 Git 风格 XY 码（例如 `UU conflict.txt`）；porcelain v2 输出带 stage mode 与 object id 的 `u <XY> ...` 记录。
 
 已跟踪符号链接按链接本身比较，而不是跟随目标文件。链接目标字节或文件类型变化会显示为修改；dangling symlink 仍被视为存在的工作树路径，不会误报为删除。
 
 ## 选项
+
+### `<pathspec>...`
+
+将 status 输出限制为匹配路径。除 `:(top)` 外，pathspec 相对于当前工作目录解析；支持精确文件、目录前缀、默认通配符，以及 `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic。
 
 ### `-s, --short`
 
@@ -256,7 +260,8 @@ Detached HEAD：
 - 未配置 tracking 分支或 HEAD detached 时，`upstream` 为 `null`
 - 远程 tracking 分支不再存在时，`upstream.gone` 为 `true`
 - `gone` 为 `true` 时，`upstream.ahead` / `upstream.behind` 为 `null`
-- 所有 staged、unstaged 和 untracked 列表都为空时，`is_clean` 为 `true`
+- 只有 staged、unstaged、untracked、unmerged 列表都为空且没有全局 merge
+  状态时，`is_clean` 才为 `true`
 - 新初始化且无提交的仓库中，`has_commits` 为 `false`
 - `stash_entries`（可选，整数）：仅在传递 `--show-stash` 时存在。统计 stash 栈上的条目（匹配 `libra stash list`），可为 `0`。没有 `--show-stash` 时完全省略，因此 JSON 消费者可以区分“未查询 stash 子系统”和“已查询 stash 子系统，返回零”；也就是说，该字段的*存在*表示显式 opt-in，而不是表示存在 stashed work。
 
