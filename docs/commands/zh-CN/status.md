@@ -14,11 +14,23 @@ libra status [OPTIONS] [pathspec]...
 
 `libra status` 显示工作树和暂存区状态：哪些文件已暂存到下一次提交，哪些有尚未暂存的修改，哪些未跟踪。它还报告当前分支、detached HEAD 状态和 upstream tracking 信息。
 
-该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式，以及供代理消费的结构化 JSON。可选 pathspec 会限制 staged、unstaged、unmerged、ignored 和 untracked 输出；它们使用共享 pathspec 引擎，支持 `:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)` magic。进行中的 merge 仍作为全局仓库状态报告，即使所选 pathspec 隐藏了所有冲突路径，`--exit-code` 也会保持 dirty，直到继续或中止该 merge。
+该命令计算 HEAD、索引和工作树之间的 diff，将文件分类到 staged、unstaged 和 untracked 类别。它支持多种输出格式：人类可读长格式（默认，也可用 `--long` 显式选择）、短格式（`--short`）、机器可读 porcelain 格式、供代理消费的结构化 JSON，以及 `-z` NUL 终止的机器输出。它还能检测 renames（`--find-renames`）、将输出按列对齐（`--column`），并控制是否显示 upstream ahead/behind 计数（`--ahead-behind` / `--no-ahead-behind`）。可选 pathspec 会限制报告的 staged、unstaged、unmerged、ignored 和 untracked 路径；它们使用共享 pathspec 引擎，支持 `:(top)`、`:(exclude)`、`:(icase)`、`:(literal)`、`:(glob)` magic。进行中的 merge 仍作为全局仓库状态报告，即使所选 pathspec 隐藏了所有冲突路径，`--exit-code` 也会保持 dirty，直到继续或中止该 merge。
 
 在 merge、rebase、cherry-pick 冲突期间，未合并的 index stage 条目会按冲突输出，而不会被误报为未跟踪文件。porcelain v1/短格式使用 Git 风格 XY 码（例如 `UU conflict.txt`）；porcelain v2 输出带 stage mode 与 object id 的 `u <XY> ...` 记录。
 
-已跟踪符号链接按链接本身比较，而不是跟随目标文件。链接目标字节或文件类型变化会显示为修改；dangling symlink 仍被视为存在的工作树路径，不会误报为删除。
+已跟踪符号链接与普通文件参与相同的 HEAD/索引/工作树比较。`status` 将符号链接本身视为工作树对象，比较存储的链接目标字节，并将目标变化报告为修改，而不是跟随链接或将 dangling symlink 视为已删除。
+
+### 显示相关的 config 默认值（`status.*`）
+
+未传对应 CLI 标志时，Libra 会尊重以下 Git 兼容默认值，每个键都按 local → global → system 级联读取（键不区分大小写；local/global 的加密值先解密；legacy 行同样生效；不可读或不支持的 system scope 会被跳过）：
+
+- `status.showUntrackedFiles=no|normal|all` 为所有输出格式选择未跟踪文件模式（`-u`/`--untracked-files` 覆盖它）。
+- `status.short=true|false` 默认选择短格式；显式 `--long` 或 `--porcelain` 仍然优先。
+- `status.branch=true|false` **仅为短格式**添加分支 header（与 Git 一致）；porcelain header 仍需要显式 `-b`/`--branch`，从而保持 porcelain 输出对配置免疫。`--no-branch` 覆盖配置的 `true`。
+- `status.showStash=true|false` 在长格式中显示 stash 数量提示；`--no-show-stash` 覆盖配置的 `true`。
+- `status.relativePaths=true|false`（仅配置项，与 Git 一致）：`true`——默认值——将人类可读长/短格式的路径渲染为相对当前目录；`false` 保持相对仓库根的路径。
+
+五个键都会在前置阶段统一校验：无效值以 `LBR-CLI-002` fail-closed，local/global scope 不可读以 `LBR-IO-001` 失败，二者都发生在产生任何 status 输出之前。布尔值使用完整的 Git 语法（`true`/`yes`/`on`、`false`/`no`/`off`，以及整数——非零为 true——可带可选 `k`/`m`/`g` 后缀）；空值会被拒绝。
 
 ## 选项
 
@@ -28,7 +40,7 @@ libra status [OPTIONS] [pathspec]...
 
 ### `-s, --short`
 
-以短格式输出。每个文件以带两个字符状态码的单行显示（例如 `M ` 表示已暂存修改，` M` 表示未暂存修改，`??` 表示未跟踪）。与 `--porcelain` 冲突。
+以短格式输出。每个文件以带两个字符状态码的单行显示（例如 `M ` 表示已暂存修改，` M` 表示未暂存修改，`??` 表示未跟踪）。与 `--porcelain` 冲突。`status.short=true` 默认选择此格式。
 
 ```bash
 libra status -s
@@ -37,7 +49,7 @@ libra status --short
 
 ### `--long`
 
-以长格式输出。这是 Libra 的默认格式，故该标志仅为 Git 对齐而接受、显式选择默认渲染；与 `--short`/`--porcelain` 互斥。
+以长格式输出——这是 Libra 的默认格式——并覆盖 `status.short=true`。与 `--short`/`--porcelain` 冲突。
 
 ```bash
 libra status --long
@@ -53,23 +65,72 @@ libra status --porcelain v1
 libra status --porcelain v2
 ```
 
-### `--branch`（`-b`）
+### `--branch`（`-b`）/ `--no-branch`
 
-在 short 或 porcelain 输出中包含分支信息。第一行显示当前分支及其 tracking 关系。`-b` 是短别名，故 `libra status -sb` 与 `git status -sb` 一致。
+在 short 或 porcelain 输出中包含分支信息。第一行显示当前分支及其 tracking 关系。`-b` 是短别名，故 `libra status -sb` 与 `git status -sb` 一致。`status.branch=true` 仅为短格式启用该 header（porcelain 需要显式标志，与 Git 一致）；`--no-branch` 覆盖该配置（以及先前的 `--branch`；last-wins，最后出现者生效）。
 
 ```bash
 libra status --short --branch
 libra status -sb
 libra status --porcelain --branch
+libra status --no-branch          # 抑制配置的 status.branch=true
 ```
 
-### `--show-stash`
+### `--ahead-behind` / `--no-ahead-behind`
 
-显示 stash 条目数量。仅在标准（长）输出模式中生效。
+控制分支 tracking 行中是否显示 ahead/behind 计数。`--no-ahead-behind` 抑制计数，但仍显示 upstream 分支名。默认是在配置了 upstream 时显示计数。
 
 ```bash
-libra status --show-stash
+libra status --short --branch --no-ahead-behind
+libra status --porcelain --branch --no-ahead-behind
 ```
+
+### `-z`
+
+以 NUL（`\0`）字节而不是换行符终止每条机器可读的 status 记录。它用于与 `--porcelain` 或 `--short` 组合，使包含空格或换行符的路径能被可靠解析。
+
+```bash
+libra status --porcelain -z
+libra status -s -z
+```
+
+### `--column`
+
+将人类可读的 status 条目按列对齐。在 staged/unstaged 区块中，状态标签（`modified:`、`deleted:`、`new file:`、`renamed:`）填充到相同宽度。在 untracked 和 ignored 区块中，文件名按多列排布。
+
+```bash
+libra status --column
+```
+
+### `--no-column`
+
+不将 status 条目按列对齐（等价于 `--column=never`），撤销先前的 `--column`（命令行上最后出现者生效）。status 默认非列式，故单独使用为 no-op。
+
+```bash
+libra status --no-column
+```
+
+### `--find-renames [PERCENT]`
+
+在 staged 和 unstaged 变更中检测 renames。当一个被删除的文件与一个新文件具有相同的 blob 哈希，或它们的文件名足够相似时，它们会作为 rename 对（`old -> new`）报告，而不是分开的 delete/add 条目。可选值是最小相似度百分比（0-100）；默认 50。
+
+```bash
+libra status --find-renames
+libra status --find-renames=75
+```
+
+### `--renames` / `--no-renames`
+
+切换 rename 检测。`--renames` 以默认（或 `--find-renames` 给出的）阈值启用它；`--no-renames` 禁用它，并在组合时覆盖 `--renames`/`--find-renames`。
+
+```bash
+libra status --renames
+libra status --no-renames
+```
+
+### `--scan` / `--cached` / `--check-dirty`（Libra 扩展，lore.md 1.1）
+
+`--scan` 运行正常的完整 status，并同时用其结果原子化地重建 dirty-set 缓存（以索引指纹 + HEAD 做 TOCTOU 防护；scan 锁阻止并发扫描者，陈旧锁会被抢占）。`--cached` 消费缓存而不遍历工作树——O(dirty paths)；任何对新鲜度的疑问都会降级为完整 status 并给出提示。快照语义：扫描之后发生的仅工作树编辑在重新扫描或 `libra dirty` 标记之前不可见（这正是标记的用途）。注意：与 Git 的 `--cached`（= 索引）无关。`--check-dirty` 仅重新验证已缓存的集合，剪除已被证明干净的行。三者互斥，且与 `--porcelain`/`--short`/`--ignored` 冲突；默认 `status` 从不触碰缓存，其 JSON 不新增任何键。参见 [dirty.md](dirty.md)。
 
 ### `--ignored`
 
@@ -81,12 +142,21 @@ libra status --ignored
 
 ### `-u, --untracked-files [<MODE>]`
 
-控制如何显示未跟踪文件。可接受值：`normal`（默认，显示未跟踪目录但不显示其内容）、`all`（递归列出未跟踪目录内的文件）、`no`（完全隐藏未跟踪文件）。与 Git 一致：不带值即 `all`，短形式接受附加值（`-uno`、`-uall`、`-unormal`）。
+控制如何显示未跟踪文件。可接受值：`normal`（默认，显示未跟踪目录但不显示其内容）、`all`（递归列出未跟踪目录内的文件）、`no`（完全隐藏未跟踪文件）。与 Git 一致：不带值即 `all`，短形式接受附加值（`-uno`、`-uall`、`-unormal`）。未传该标志时，应用 `status.showUntrackedFiles` 配置默认值（任意输出格式）；标志始终优先。
 
 ```bash
 libra status -uno                  # 隐藏未跟踪文件
 libra status -u                    # 等同 -uall（递归未跟踪目录）
 libra status --untracked-files=all
+```
+
+### `--show-stash` / `--no-show-stash`
+
+在长格式 status 之后显示 stash 条目数量（"Your stash currently has N entries"）。只有长格式渲染该提示（short 和 porcelain 不受影响）。`status.showStash=true` 默认启用它；`--no-show-stash` 覆盖该配置（以及先前的 `--show-stash`；最后出现者生效）。
+
+```bash
+libra status --show-stash
+libra status --no-show-stash
 ```
 
 ### `--exit-code`
@@ -103,6 +173,9 @@ libra status --quiet --exit-code   # 静默脏状态检查
 ```bash
 libra status
 libra status --short
+libra status --porcelain -z
+libra status --column
+libra status --find-renames
 libra status --json
 libra status --exit-code
 ```

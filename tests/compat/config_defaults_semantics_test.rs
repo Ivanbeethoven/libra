@@ -979,3 +979,259 @@ fn pull_rebase_accepts_git_numeric_boolean() {
         "pull.rebase=2 must count as a Git-boolean true and rebase"
     );
 }
+
+// ── P1-05d: status.* display defaults ────────────────────────────────────────
+
+#[test]
+fn status_show_untracked_files_config_controls_all_formats_and_cli_wins() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("status-untracked");
+    fixture.init_repo(&repo);
+    fixture.commit_file(&repo, "base.txt", "base\n", "base");
+    fs::create_dir_all(repo.join("dir")).expect("mkdir");
+    fs::write(repo.join("dir/nested.txt"), "n\n").expect("write untracked");
+
+    // Default (unset): normal mode collapses the directory.
+    let normal = fixture.success(&repo, &["status", "--porcelain"]);
+    assert!(stdout_trim(&normal).contains("?? dir/"));
+    assert!(!stdout_trim(&normal).contains("dir/nested.txt"));
+
+    // no: untracked entries disappear (porcelain honors the config, like Git).
+    fixture.success(&repo, &["config", "status.showUntrackedFiles", "no"]);
+    let none = fixture.success(&repo, &["status", "--porcelain"]);
+    assert!(!stdout_trim(&none).contains("??"));
+
+    // all: nested paths are listed individually.
+    fixture.success(&repo, &["config", "status.showUntrackedFiles", "all"]);
+    let all = fixture.success(&repo, &["status", "--porcelain"]);
+    assert!(stdout_trim(&all).contains("?? dir/nested.txt"));
+
+    // The CLI flag overrides the configured mode.
+    let cli = fixture.success(&repo, &["status", "--porcelain", "-unormal"]);
+    assert!(stdout_trim(&cli).contains("?? dir/"));
+    assert!(!stdout_trim(&cli).contains("dir/nested.txt"));
+}
+
+#[test]
+fn status_short_and_branch_configs_shape_only_the_human_short_format() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("status-short-branch");
+    fixture.init_repo(&repo);
+    fixture.commit_file(&repo, "base.txt", "base\n", "base");
+    fs::write(repo.join("base.txt"), "changed\n").expect("modify");
+
+    // status.short=true selects the short format without any flag …
+    fixture.success(&repo, &["config", "status.short", "true"]);
+    let short = fixture.success(&repo, &["status"]);
+    let short_out = stdout_trim(&short);
+    assert!(short_out.contains(" M base.txt"), "short: {short_out}");
+    assert!(!short_out.contains("On branch"));
+
+    // … an explicit --long still wins over the config …
+    let long = fixture.success(&repo, &["status", "--long"]);
+    assert!(stdout_trim(&long).contains("On branch"));
+
+    // … and status.branch=true adds the ## header to the short format only.
+    fixture.success(&repo, &["config", "status.branch", "true"]);
+    let with_branch = fixture.success(&repo, &["status"]);
+    assert!(stdout_trim(&with_branch).starts_with("## "));
+    let no_branch = fixture.success(&repo, &["status", "--no-branch"]);
+    assert!(!stdout_trim(&no_branch).starts_with("## "));
+
+    // Porcelain stays config-immune: no branch header without an explicit -b.
+    let porcelain = fixture.success(&repo, &["status", "--porcelain"]);
+    assert!(!stdout_trim(&porcelain).contains("## "));
+    assert!(stdout_trim(&porcelain).contains(" M base.txt"));
+}
+
+#[test]
+fn status_show_stash_config_adds_hint_and_cli_negation_wins() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("status-stash");
+    fixture.init_repo(&repo);
+    fixture.commit_file(&repo, "base.txt", "base\n", "base");
+    fs::write(repo.join("base.txt"), "stash me\n").expect("modify");
+    fixture.success(&repo, &["stash", "push"]);
+    fs::write(repo.join("base.txt"), "changed again\n").expect("modify");
+
+    let plain = fixture.success(&repo, &["status"]);
+    assert!(!stdout_trim(&plain).contains("stash"));
+
+    fixture.success(&repo, &["config", "status.showStash", "true"]);
+    let hinted = fixture.success(&repo, &["status"]);
+    assert!(
+        stdout_trim(&hinted).contains("stash currently has 1"),
+        "config must enable the stash hint: {}",
+        stdout_trim(&hinted)
+    );
+
+    let suppressed = fixture.success(&repo, &["status", "--no-show-stash"]);
+    assert!(!stdout_trim(&suppressed).contains("stash currently has"));
+}
+
+#[test]
+fn status_relative_paths_false_keeps_repo_root_paths() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("status-relpaths");
+    fixture.init_repo(&repo);
+    fs::create_dir_all(repo.join("sub")).expect("mkdir");
+    fixture.commit_file(&repo, "sub/inner.txt", "base\n", "base");
+    fs::write(repo.join("sub/inner.txt"), "changed\n").expect("modify");
+    let subdir = repo.join("sub");
+
+    // Default (true): paths render relative to the current directory.
+    let relative = fixture.success(&subdir, &["status", "--short"]);
+    let relative_out = stdout_trim(&relative);
+    assert!(
+        relative_out.contains(" M inner.txt"),
+        "cwd-relative: {relative_out}"
+    );
+
+    // false: repository-root-relative paths, even from a subdirectory.
+    fixture.success(&repo, &["config", "status.relativePaths", "false"]);
+    let rooted = fixture.success(&subdir, &["status", "--short"]);
+    let rooted_out = stdout_trim(&rooted);
+    assert!(
+        rooted_out.contains(" M sub/inner.txt"),
+        "repo-root: {rooted_out}"
+    );
+
+    // Filtering and metadata pipelines must keep working: a cwd-relative
+    // pathspec still matches …
+    let by_pathspec = fixture.success(&subdir, &["status", "--short", "inner.txt"]);
+    assert!(
+        stdout_trim(&by_pathspec).contains("M sub/inner.txt"),
+        "pathspec filtering must survive relativePaths=false: {}",
+        stdout_trim(&by_pathspec)
+    );
+    let by_top = fixture.success(&subdir, &["status", "--short", ":(top)sub/inner.txt"]);
+    assert!(
+        stdout_trim(&by_top).contains("M sub/inner.txt"),
+        ":(top) pathspec must survive relativePaths=false: {}",
+        stdout_trim(&by_top)
+    );
+    // … and porcelain v2 keeps real modes/object ids (no zeroed metadata).
+    let v2 = fixture.success(&subdir, &["status", "--porcelain=v2"]);
+    let v2_out = stdout_trim(&v2);
+    assert!(
+        v2_out.contains("100644") && !v2_out.contains("000000 000000 000000"),
+        "porcelain v2 metadata must survive relativePaths=false: {v2_out}"
+    );
+    // `--exit-code` still sees the dirty file.
+    let dirty = fixture.run(&subdir, &["status", "--exit-code", "--quiet"]);
+    assert_eq!(dirty.status.code(), Some(1), "--exit-code must stay dirty");
+
+    // Collapsed untracked directories keep their trailing `/` marker after
+    // the repo-root conversion.
+    fs::create_dir_all(repo.join("newdir")).expect("mkdir");
+    fs::write(
+        repo.join("newdir/inside.txt"),
+        "n
+",
+    )
+    .expect("write untracked");
+    let with_dir = fixture.success(&subdir, &["status", "--short"]);
+    assert!(
+        stdout_trim(&with_dir).contains("?? newdir/"),
+        "collapsed directory must keep its trailing slash: {}",
+        stdout_trim(&with_dir)
+    );
+}
+
+#[test]
+fn status_config_defaults_apply_to_fresh_dirty_cache() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("status-cache-config");
+    fixture.init_repo(&repo);
+    fs::create_dir_all(repo.join("sub")).expect("mkdir");
+    fixture.commit_file(
+        &repo,
+        "sub/inner.txt",
+        "base
+",
+        "base",
+    );
+    fs::write(
+        repo.join("sub/inner.txt"),
+        "changed
+",
+    )
+    .expect("modify");
+    fs::write(
+        repo.join("stray.txt"),
+        "untracked
+",
+    )
+    .expect("untracked");
+
+    // Build a fresh dirty-set cache, then flip the display configs: the
+    // fresh `--cached` view must honor them exactly like the full status.
+    fixture.success(&repo, &["status", "--scan"]);
+
+    fixture.success(&repo, &["config", "status.showUntrackedFiles", "no"]);
+    let cached = fixture.success(&repo, &["status", "--cached"]);
+    assert!(
+        !stdout_trim(&cached).contains("stray.txt"),
+        "fresh --cached must honor status.showUntrackedFiles=no: {}",
+        stdout_trim(&cached)
+    );
+
+    fixture.success(&repo, &["config", "status.relativePaths", "false"]);
+    let rooted = fixture.success(&repo.join("sub"), &["status", "--cached"]);
+    let rooted_out = stdout_trim(&rooted);
+    assert!(
+        rooted_out.contains("modified: sub/inner.txt"),
+        "fresh --cached must honor relativePaths=false: {rooted_out}"
+    );
+
+    fs::write(
+        repo.join("sub/inner.txt"),
+        "stash me
+",
+    )
+    .expect("modify");
+    fixture.success(&repo, &["stash", "push"]);
+    fs::write(
+        repo.join("sub/inner.txt"),
+        "changed
+",
+    )
+    .expect("modify");
+    fixture.success(&repo, &["status", "--scan"]);
+    fixture.success(&repo, &["config", "status.showStash", "true"]);
+    let hinted = fixture.success(&repo, &["status", "--cached"]);
+    assert!(
+        stdout_trim(&hinted).contains("stash currently has 1"),
+        "fresh --cached must honor status.showStash=true: {}",
+        stdout_trim(&hinted)
+    );
+}
+
+#[test]
+fn invalid_status_config_fails_before_output() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("status-invalid");
+    fixture.init_repo(&repo);
+    fixture.commit_file(&repo, "base.txt", "base\n", "base");
+
+    for key in [
+        "status.showUntrackedFiles",
+        "status.short",
+        "status.branch",
+        "status.showStash",
+        "status.relativePaths",
+    ] {
+        fixture.success(&repo, &["config", key, "sometimes"]);
+        let rejected = fixture.run(&repo, &["status"]);
+        assert_eq!(rejected.status.code(), Some(129), "key: {key}");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(key),
+            "error must name {key}"
+        );
+        assert!(
+            rejected.stdout.is_empty(),
+            "no status output may precede the failure for {key}"
+        );
+        fixture.success(&repo, &["config", "--unset", key]);
+    }
+}

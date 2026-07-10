@@ -95,6 +95,11 @@ pub struct StatusArgs {
     #[clap(short = 'b', long = "branch")]
     pub branch: bool,
 
+    /// Do not show branch info in the short format, overriding
+    /// `status.branch=true` (and an earlier `--branch`; the last one wins).
+    #[clap(long = "no-branch", overrides_with = "branch")]
+    pub no_branch: bool,
+
     /// Show ahead/behind counts in branch info (default: true).
     /// Use --no-ahead-behind to suppress the counts.
     #[clap(long = "ahead-behind")]
@@ -108,22 +113,28 @@ pub struct StatusArgs {
     #[clap(long = "show-stash")]
     pub show_stash: bool,
 
+    /// Do not show the stash hint, overriding `status.showStash=true` (and an
+    /// earlier `--show-stash`; the last one wins).
+    #[clap(long = "no-show-stash", overrides_with = "show_stash")]
+    pub no_show_stash: bool,
+
     /// Show ignored files
     #[clap(long = "ignored")]
     pub ignored: bool,
 
-    /// Control untracked files display: `no`, `normal` (default), or `all`. As
-    /// in Git, the short `-u`/long `--untracked-files` with no value means
-    /// `all` (e.g. `-u`, `-uno`, `--untracked-files=all`).
+    /// Control untracked files display: `no`, `normal` (the default when both
+    /// the flag and `status.showUntrackedFiles` are absent), or `all`. As in
+    /// Git, the short `-u`/long `--untracked-files` with no value means `all`
+    /// (e.g. `-u`, `-uno`, `--untracked-files=all`); when the flag is absent
+    /// the `status.showUntrackedFiles` config default applies.
     #[clap(
         short = 'u',
         long = "untracked-files",
         value_name = "MODE",
         num_args = 0..=1,
-        default_value = "normal",
         default_missing_value = "all"
     )]
-    pub untracked_files: UntrackedFiles,
+    pub untracked_files: Option<UntrackedFiles>,
 
     /// Libra extension (lore.md 1.1): consume the dirty-set cache instead of
     /// walking the working tree. Requires a fresh cache (`status --scan`);
@@ -188,6 +199,13 @@ pub struct StatusArgs {
     /// Limit status output to files matching the given pathspec(s).
     #[clap(value_name = "pathspec")]
     pub pathspec: Vec<String>,
+
+    /// Resolved `status.relativePaths` (config-only, like Git): `true` (the
+    /// default) renders human long/short paths relative to the current
+    /// directory; `false` keeps repository-root-relative paths. Populated by
+    /// [`apply_status_config_defaults`], never by the CLI.
+    #[clap(skip = true)]
+    pub relative_paths: bool,
 }
 
 impl StatusArgs {
@@ -195,6 +213,88 @@ impl StatusArgs {
     fn show_ahead_behind(&self) -> bool {
         !self.no_ahead_behind
     }
+}
+
+/// Resolve the Git-compatible `status.*` config defaults (plan-20260708
+/// P1-05d): `status.showUntrackedFiles`, `status.short`, `status.branch`,
+/// `status.showStash`, and `status.relativePaths`, each read through the
+/// strict local → global → system cascade. All five keys are validated
+/// UP FRONT — an invalid value is a usage error and an unreadable
+/// local/global scope an IO error, both before any status output — and then
+/// applied only where Git applies them: CLI flags always win;
+/// `status.short` yields to an explicit `--long`/`--porcelain`;
+/// `status.branch` affects only the short format (porcelain stays
+/// config-immune, matching Git's stable-script contract).
+async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
+    use crate::internal::config::{
+        LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
+    };
+
+    async fn read_value(key: &str) -> CliResult<Option<String>> {
+        read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, key)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("failed to read config '{key}': {error:#}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })
+    }
+    fn invalid(key: &str, value: &str, expected: &str) -> CliError {
+        CliError::command_usage(format!(
+            "bad config value '{value}' for '{key}' (expected {expected})"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint(format!(
+            "fix the offending value with 'libra config {key} <value>'"
+        ))
+    }
+    async fn read_bool(key: &str) -> CliResult<Option<bool>> {
+        match read_value(key).await? {
+            Some(value) => match parse_git_config_bool(&value) {
+                Some(enabled) => Ok(Some(enabled)),
+                None => Err(invalid(key, &value, "a Git boolean")),
+            },
+            None => Ok(None),
+        }
+    }
+
+    // Validate every key up front so a bad value fails closed even when the
+    // requested format would not consult it.
+    let untracked = match read_value("status.showUntrackedFiles").await? {
+        Some(value) => Some(match value.trim().to_ascii_lowercase().as_str() {
+            "no" => UntrackedFiles::No,
+            "normal" => UntrackedFiles::Normal,
+            "all" => UntrackedFiles::All,
+            _ => {
+                return Err(invalid(
+                    "status.showUntrackedFiles",
+                    &value,
+                    "no, normal, or all",
+                ));
+            }
+        }),
+        None => None,
+    };
+    let short = read_bool("status.short").await?;
+    let branch = read_bool("status.branch").await?;
+    let show_stash = read_bool("status.showStash").await?;
+    let relative_paths = read_bool("status.relativePaths").await?;
+
+    if args.untracked_files.is_none() {
+        args.untracked_files = untracked;
+    }
+    if !args.short && !args.long_format && args.porcelain.is_none() && short == Some(true) {
+        args.short = true;
+    }
+    // Git scopes the status.branch default to the short format; porcelain
+    // headers still require an explicit `-b`/`--branch`.
+    if args.short && !args.branch && !args.no_branch && branch == Some(true) {
+        args.branch = true;
+    }
+    if !args.show_stash && !args.no_show_stash && show_stash == Some(true) {
+        args.show_stash = true;
+    }
+    args.relative_paths = relative_paths.unwrap_or(true);
+    Ok(())
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -350,6 +450,7 @@ pub struct MergeStatusInfo {
 // ---------------------------------------------------------------------------
 
 /// Pre-computed status data shared across all renderers (human/JSON/short/porcelain).
+#[derive(Clone)]
 struct StatusData {
     head: Head,
     head_oid: Option<ObjectHash>,
@@ -371,7 +472,7 @@ struct StatusData {
     /// this is only an advisory that ls-files/diff are scoped. An
     /// enabled-but-empty view is a no-op, so no advisory.
     sparse_view_active: bool,
-    porcelain_v2: Option<PorcelainV2Data>,
+    porcelain_v2: Option<std::sync::Arc<PorcelainV2Data>>,
 }
 
 /// Human advisory for a non-merge sequence in progress (read-only detection).
@@ -427,7 +528,7 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
     let worktree = status_untracked::collect_status_worktree_changes(
-        args.untracked_files,
+        args.untracked_files.unwrap_or(UntrackedFiles::Normal),
         args.ignored,
         ignore_case,
     )
@@ -503,7 +604,10 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         let index = maybe_index
             .take()
             .ok_or_else(|| CliError::internal("porcelain v2 metadata should be loaded"))?;
-        Some(build_porcelain_v2_data(index, head_oid.as_ref()))
+        Some(std::sync::Arc::new(build_porcelain_v2_data(
+            index,
+            head_oid.as_ref(),
+        )))
     } else {
         None
     };
@@ -735,7 +839,7 @@ pub async fn collect_status_json_envelope_for_api(
 ) -> CliResult<serde_json::Value> {
     use std::path::PathBuf;
 
-    let args = StatusArgs::default();
+    let mut args = StatusArgs::default();
     let canon_working =
         std::fs::canonicalize(working_dir).unwrap_or_else(|_| PathBuf::from(working_dir));
     let canon_cwd = std::env::current_dir()
@@ -752,6 +856,11 @@ pub async fn collect_status_json_envelope_for_api(
         )));
     }
 
+    // Byte-parity with `libra status --json`: the API honors the same
+    // resolved `status.*` defaults (and the same fail-closed validation) as
+    // the CLI entry points.
+    apply_status_config_defaults(&mut args).await?;
+    let args = args;
     let data = collect_status_data(&args).await?;
     let inner = build_status_json(&data, &args);
     Ok(serde_json::json!({
@@ -770,8 +879,13 @@ pub async fn execute(args: StatusArgs) {
 /// Safe entry point that returns structured [`CliResult`] instead of printing
 /// errors and exiting. JSON mode propagates status-computation failures as
 /// structured CLI errors; text mode uses the same structured error contract.
-pub async fn execute_safe(args: StatusArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute_safe(mut args: StatusArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
+
+    // Fail closed on invalid `status.*` config before any mode runs or any
+    // output is produced; CLI flags keep precedence inside the resolver.
+    apply_status_config_defaults(&mut args).await?;
+    let args = args;
 
     // Dirty-set cache modes (lore.md 1.1). NOTE: only this CLI entry routes
     // them — the legacy `execute_to` writer entry ignores the flags (its
@@ -1188,7 +1302,21 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
     let head = Head::current().await;
     let head_oid_hash = Head::current_commit().await;
     let staged = staged.to_relative();
-    let unstaged = unstaged.to_relative();
+    let mut unstaged = unstaged.to_relative();
+    // Honor the resolved display defaults exactly like the full status
+    // (P1-05d): `status.showUntrackedFiles=no`/`-uno` hides untracked
+    // entries (the cache stores explicit paths, so `normal` and `all`
+    // render identically here), and `--show-stash`/`status.showStash`
+    // surfaces the stash count. `status.relativePaths=false` is applied by
+    // the shared renderer.
+    if args.untracked_files == Some(UntrackedFiles::No) {
+        unstaged.new.clear();
+    }
+    let stash_count = if args.show_stash {
+        Some(stash::get_stash_num().unwrap_or(0))
+    } else {
+        None
+    };
     let upstream = resolve_upstream_info(&head, head_oid_hash.as_ref()).await?;
     let merge_state = match merge::MergeState::load_optional_sync().map_err(|detail| {
         CliError::fatal(format!("failed to inspect merge state: {detail}"))
@@ -1213,7 +1341,7 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         unstaged,
         unmerged: vec![],
         ignored_files: vec![],
-        stash_count: None,
+        stash_count,
         upstream,
         merge_state,
         sequence_notice: sequence_notice().await,
@@ -1259,9 +1387,11 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
 
 /// Legacy entry point that writes status to the given writer.
 /// Used by the old `execute()` path and tests.
-pub async fn execute_to(args: StatusArgs, writer: &mut impl Write) -> CliResult<()> {
+pub async fn execute_to(mut args: StatusArgs, writer: &mut impl Write) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
+    apply_status_config_defaults(&mut args).await?;
+    let args = args;
     let data = collect_status_data(&args).await?;
     let output = OutputConfig::default();
     render_status_to_writer(&data, &args, &output, writer).await
@@ -1299,7 +1429,7 @@ async fn render_status_to_writer(
                 &data.unstaged,
                 &data.unmerged,
                 &data.ignored_files,
-                data.porcelain_v2.as_ref(),
+                data.porcelain_v2.as_deref(),
                 args.null_terminated,
                 &mut buffer,
             )?;
@@ -1337,6 +1467,19 @@ async fn render_status_to_writer(
             return Ok(());
         }
         None => {}
+    };
+
+    // `status.relativePaths=false`: Git renders the HUMAN formats (short and
+    // long) with repository-root-relative paths. Collection stays cwd-relative
+    // throughout (pathspec filtering and porcelain metadata lookups depend on
+    // it); only the rendered copy is converted here. Porcelain/JSON output is
+    // reached before this point and keeps its existing path shape.
+    let rooted_data;
+    let data = if args.relative_paths {
+        data
+    } else {
+        rooted_data = data_with_repo_root_paths(data);
+        &rooted_data
     };
 
     // Short format
@@ -1377,6 +1520,46 @@ async fn render_status_to_writer(
     render_human_status(data, args, &mut buffer)?;
     writer.write_all(&buffer).map_err(write_error)?;
     Ok(())
+}
+
+/// Convert every display path in `data` from cwd-relative to
+/// repository-root-relative (`status.relativePaths=false`). Rename pairs,
+/// unmerged entries, and ignored paths are converted alongside the staged and
+/// unstaged change sets.
+fn data_with_repo_root_paths(data: &StatusData) -> StatusData {
+    // Collapsed untracked/ignored directories carry a deliberate trailing
+    // `/` marker (see `status_untracked`); path conversion must not eat it,
+    // or directories become indistinguishable from files in the output.
+    fn convert(path: &Path) -> PathBuf {
+        let rooted = util::to_workdir_path(path);
+        if path.to_string_lossy().ends_with('/') {
+            PathBuf::from(format!("{}/", rooted.display()))
+        } else {
+            rooted
+        }
+    }
+    fn changes(changes: &Changes) -> Changes {
+        Changes {
+            new: changes.new.iter().map(|p| convert(p)).collect(),
+            modified: changes.modified.iter().map(|p| convert(p)).collect(),
+            deleted: changes.deleted.iter().map(|p| convert(p)).collect(),
+            renamed: changes
+                .renamed
+                .iter()
+                .map(|(from, to)| (convert(from), convert(to)))
+                .collect(),
+        }
+    }
+    let mut rooted = data.clone();
+    rooted.staged = changes(&data.staged);
+    rooted.unstaged = changes(&data.unstaged);
+    rooted.unmerged = data
+        .unmerged
+        .iter()
+        .map(|entry| entry.clone().with_path(convert(&entry.path)))
+        .collect();
+    rooted.ignored_files = data.ignored_files.iter().map(|p| convert(p)).collect();
+    rooted
 }
 
 // ---------------------------------------------------------------------------

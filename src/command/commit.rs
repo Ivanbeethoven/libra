@@ -1502,9 +1502,13 @@ fn append_status_section(mut buffer: String, status_section: Option<&str>) -> St
 /// rendered or is empty — non-fatal, the template simply omits it.
 async fn build_status_section() -> Option<String> {
     let mut raw: Vec<u8> = Vec::new();
-    status::execute_to(status::StatusArgs::default(), &mut raw)
-        .await
-        .ok()?;
+    // Pin the long format: Git keeps the commit template's status section in
+    // the long format even when `status.short=true` is configured.
+    let status_args = status::StatusArgs {
+        long_format: true,
+        ..status::StatusArgs::default()
+    };
+    status::execute_to(status_args, &mut raw).await.ok()?;
     let text = String::from_utf8_lossy(&raw);
     if text.trim().is_empty() {
         return None;

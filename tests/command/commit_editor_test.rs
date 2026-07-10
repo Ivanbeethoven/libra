@@ -841,3 +841,46 @@ fn status_not_seeded_under_non_comment_stripping_cleanup() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn commit_template_status_section_stays_long_with_status_short_config() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    stage_file(&repo, "a.txt", "x\n");
+    let config = run_libra(&["config", "status.short", "true"], &repo);
+    assert!(config.status.success());
+
+    // Editor script that captures the template before writing the message.
+    let capture = temp.path().join("template.txt");
+    let editor_path = temp.path().join("capture-ed.sh");
+    fs::write(
+        &editor_path,
+        format!(
+            "#!/bin/sh\ncat \"$1\" > '{}'\nprintf 'template msg\\n' > \"$1\"\n",
+            capture.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&editor_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&editor_path, perms).unwrap();
+    let editor = editor_path.to_string_lossy().into_owned();
+
+    let out = run_libra_env(&["commit", "--status"], &repo, &[("EDITOR", &editor)]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "commit --status failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let template = fs::read_to_string(&capture).unwrap();
+    assert!(
+        template.contains("Changes to be committed"),
+        "the template's status section must stay in the long format even with \
+         status.short=true (Git behavior), got:\n{template}"
+    );
+}

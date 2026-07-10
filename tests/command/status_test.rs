@@ -823,7 +823,7 @@ async fn test_status_porcelain_v2_untracked_files_no() {
         StatusArgs {
             porcelain: Some(PorcelainVersion::V2),
             ignored: true,
-            untracked_files: UntrackedFiles::No,
+            untracked_files: Some(UntrackedFiles::No),
             ..Default::default()
         },
         &mut output,
@@ -883,7 +883,7 @@ async fn test_status_porcelain_v2_untracked_files_all() {
     status_execute(
         StatusArgs {
             porcelain: Some(PorcelainVersion::V2),
-            untracked_files: UntrackedFiles::All,
+            untracked_files: Some(UntrackedFiles::All),
             ..Default::default()
         },
         &mut output,
@@ -941,7 +941,7 @@ async fn test_status_untracked_files_no() {
         StatusArgs {
             porcelain: Some(PorcelainVersion::V1),
             ignored: true,
-            untracked_files: UntrackedFiles::No,
+            untracked_files: Some(UntrackedFiles::No),
             ..Default::default()
         },
         &mut output,
@@ -984,7 +984,7 @@ async fn test_status_untracked_files_no_skips_untracked_directory_scan() {
     let result = status_execute_inner(
         StatusArgs {
             short: true,
-            untracked_files: UntrackedFiles::No,
+            untracked_files: Some(UntrackedFiles::No),
             ..Default::default()
         },
         &mut output,
@@ -1093,7 +1093,7 @@ async fn test_status_normal_untracked_directories_are_sorted() {
     let mut output = Vec::new();
     status_execute(
         StatusArgs {
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             ..Default::default()
         },
         &mut output,
@@ -1148,7 +1148,7 @@ async fn test_status_untracked_files_all() {
     status_execute(
         StatusArgs {
             porcelain: Some(PorcelainVersion::V1),
-            untracked_files: UntrackedFiles::All,
+            untracked_files: Some(UntrackedFiles::All),
             ..Default::default()
         },
         &mut output,
@@ -1377,7 +1377,7 @@ async fn test_status_with_subdirectories() {
     let mut output = Vec::new();
     status_execute(
         StatusArgs {
-            untracked_files: UntrackedFiles::All,
+            untracked_files: Some(UntrackedFiles::All),
             ..Default::default()
         },
         &mut output,
@@ -1400,7 +1400,7 @@ async fn test_status_with_subdirectories() {
     let mut output = Vec::new();
     status_execute(
         StatusArgs {
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             ..Default::default()
         },
         &mut output,
@@ -1542,7 +1542,7 @@ async fn test_status_short_format_with_branch() {
             branch: true,
             show_stash: false,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1611,7 +1611,7 @@ async fn test_status_porcelain_format_with_branch() {
             branch: true,
             show_stash: false,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1707,7 +1707,7 @@ async fn test_status_show_stash_with_existing_stash() {
             branch: false,
             show_stash: true,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1735,7 +1735,7 @@ async fn test_status_show_stash_with_existing_stash() {
             branch: false,
             show_stash: true,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1763,7 +1763,7 @@ async fn test_status_show_stash_with_existing_stash() {
             branch: false,
             show_stash: true,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1824,7 +1824,7 @@ async fn test_status_show_stash_without_stash() {
             branch: false,
             show_stash: true,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1926,7 +1926,7 @@ async fn test_status_branch_detached_head() {
             branch: true,
             show_stash: false,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -2827,7 +2827,7 @@ fn status_no_column_countermands_column() {
 fn untracked_files_short_flag_parses_like_git() {
     use clap::Parser;
 
-    let mode = |args: &[&str]| -> UntrackedFiles {
+    let mode = |args: &[&str]| -> Option<UntrackedFiles> {
         StatusArgs::try_parse_from(args)
             .unwrap_or_else(|e| panic!("parse {args:?} failed: {e}"))
             .untracked_files
@@ -2835,24 +2835,69 @@ fn untracked_files_short_flag_parses_like_git() {
 
     assert_eq!(
         mode(&["status"]),
-        UntrackedFiles::Normal,
-        "default is normal"
+        None,
+        "absent flag leaves the mode to the status.showUntrackedFiles default"
     );
     assert_eq!(
         mode(&["status", "-u"]),
-        UntrackedFiles::All,
+        Some(UntrackedFiles::All),
         "bare -u is all"
     );
     assert_eq!(
         mode(&["status", "--untracked-files"]),
-        UntrackedFiles::All,
+        Some(UntrackedFiles::All),
         "bare --untracked-files is all"
     );
-    assert_eq!(mode(&["status", "-uno"]), UntrackedFiles::No);
-    assert_eq!(mode(&["status", "-uall"]), UntrackedFiles::All);
-    assert_eq!(mode(&["status", "-unormal"]), UntrackedFiles::Normal);
+    assert_eq!(mode(&["status", "-uno"]), Some(UntrackedFiles::No));
+    assert_eq!(mode(&["status", "-uall"]), Some(UntrackedFiles::All));
+    assert_eq!(mode(&["status", "-unormal"]), Some(UntrackedFiles::Normal));
     assert_eq!(
         mode(&["status", "--untracked-files=no"]),
-        UntrackedFiles::No
+        Some(UntrackedFiles::No)
     );
+}
+
+/// P1-05d: the `/api/repo/status` envelope honors the same resolved
+/// `status.*` defaults (and fail-closed validation) as `status --json`.
+#[tokio::test]
+#[serial]
+async fn api_status_envelope_honors_status_config_defaults() {
+    use libra::internal::config::ConfigKv;
+
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+    fs::write("untracked.txt", "x").unwrap();
+
+    let envelope = libra::command::status::collect_status_json_envelope_for_api(test_dir.path())
+        .await
+        .expect("api status succeeds");
+    let untracked = envelope["data"]["untracked"]
+        .as_array()
+        .expect("untracked array")
+        .len();
+    assert!(untracked > 0, "untracked file expected by default");
+
+    ConfigKv::set("status.showUntrackedFiles", "no", false)
+        .await
+        .expect("set config");
+    let envelope = libra::command::status::collect_status_json_envelope_for_api(test_dir.path())
+        .await
+        .expect("api status succeeds with config");
+    assert_eq!(
+        envelope["data"]["untracked"]
+            .as_array()
+            .expect("untracked array")
+            .len(),
+        0,
+        "the API must honor status.showUntrackedFiles=no like the CLI"
+    );
+
+    ConfigKv::set("status.showUntrackedFiles", "sometimes", false)
+        .await
+        .expect("set config");
+    let error = libra::command::status::collect_status_json_envelope_for_api(test_dir.path())
+        .await
+        .expect_err("invalid config must fail closed in the API too");
+    assert!(error.to_string().contains("status.showUntrackedFiles"));
 }

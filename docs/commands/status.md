@@ -39,6 +39,33 @@ compares the stored link target bytes, and reports target changes as
 modifications instead of following the link or treating dangling symlinks as
 deleted.
 
+### Display config defaults (`status.*`)
+
+When the corresponding CLI flag is absent, Libra honors these Git-compatible
+defaults, each read through the local → global → system cascade
+(case-insensitive keys; encrypted local/global values decrypted; legacy rows
+honored; an unreadable or unsupported system scope skipped):
+
+- `status.showUntrackedFiles=no|normal|all` selects the untracked-file mode for
+  every output format (`-u`/`--untracked-files` overrides it).
+- `status.short=true|false` selects the short format by default; an explicit
+  `--long` or `--porcelain` still wins.
+- `status.branch=true|false` adds the branch header to the **short format
+  only** (matching Git); porcelain headers still require an explicit
+  `-b`/`--branch`, keeping porcelain output config-immune. `--no-branch`
+  overrides a configured `true`.
+- `status.showStash=true|false` shows the stash-count hint in the long format;
+  `--no-show-stash` overrides a configured `true`.
+- `status.relativePaths=true|false` (config-only, like Git): `true` — the
+  default — renders human long/short paths relative to the current directory;
+  `false` keeps repository-root-relative paths.
+
+All five keys are validated up front: an invalid value fails closed with
+`LBR-CLI-002` and an unreadable local/global scope with `LBR-IO-001`, before
+any status output is produced. Boolean values use the full Git grammar
+(`true`/`yes`/`on`, `false`/`no`/`off`, and integers — non-zero is true — with
+optional `k`/`m`/`g` suffixes); an empty value is rejected.
+
 ## Options
 
 ### `<pathspec>...`
@@ -52,11 +79,20 @@ prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` /
 
 Give the output in the short format. Each file is shown on a single line with a two-character
 status code (e.g., `M ` for staged modified, ` M` for unstaged modified, `??` for untracked).
-Conflicts with `--porcelain`.
+Conflicts with `--porcelain`. `status.short=true` selects this format by default.
 
 ```bash
 libra status -s
 libra status --short
+```
+
+### `--long`
+
+Give the output in the long format — Libra's default — overriding
+`status.short=true`. Conflicts with `--short`/`--porcelain`.
+
+```bash
+libra status --long
 ```
 
 ### `--porcelain [VERSION]`
@@ -70,16 +106,19 @@ libra status --porcelain v1
 libra status --porcelain v2
 ```
 
-### `--branch` (`-b`)
+### `--branch` (`-b`) / `--no-branch`
 
 Include branch information in short or porcelain output. Shows the current branch and its
 tracking relationship on the first line. `-b` is the short alias, so `libra status -sb`
-matches `git status -sb`.
+matches `git status -sb`. `status.branch=true` enables the header for the short format only
+(porcelain requires the explicit flag, matching Git); `--no-branch` overrides the config
+(and an earlier `--branch`; the last one wins).
 
 ```bash
 libra status --short --branch
 libra status -sb
 libra status --porcelain --branch
+libra status --no-branch          # suppress a configured status.branch=true
 ```
 
 ### `--ahead-behind` / `--no-ahead-behind`
@@ -147,12 +186,6 @@ libra status --renames
 libra status --no-renames
 ```
 
-Show the number of stash entries. Only effective in standard (long) output mode.
-
-```bash
-libra status --show-stash
-```
-
 ### `--scan` / `--cached` / `--check-dirty` (Libra extensions, lore.md 1.1)
 
 `--scan` runs the normal full status AND atomically rebuilds the dirty-set
@@ -180,12 +213,26 @@ libra status --ignored
 Control how untracked files are displayed. Accepted values: `normal` (default, shows untracked
 directories but not their contents), `all` (recursively lists files within untracked directories),
 `no` (hides untracked files entirely). As in Git, the flag with no value means `all`, and the short
-form takes an attached value (`-uno`, `-uall`, `-unormal`).
+form takes an attached value (`-uno`, `-uall`, `-unormal`). When the flag is absent, the
+`status.showUntrackedFiles` config default applies (any output format); the flag always wins.
 
 ```bash
 libra status -uno                  # hide untracked files
 libra status -u                    # same as -uall (recurse into untracked dirs)
 libra status --untracked-files=all
+```
+
+### `--show-stash` / `--no-show-stash`
+
+Show the number of stash entries after the long-format status ("Your stash
+currently has N entries"). Only the long format renders the hint (short and
+porcelain are unaffected). `status.showStash=true` enables it by default;
+`--no-show-stash` overrides the config (and an earlier `--show-stash`; the
+last one wins).
+
+```bash
+libra status --show-stash
+libra status --no-show-stash
 ```
 
 ### `--exit-code`
