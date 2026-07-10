@@ -20,8 +20,10 @@ root `.libraignore` file for ignore rules. If `DIRECTORY` is given and does not 
 created first.
 
 When `--from-git-repository` is supplied, objects and refs are imported from the source Git
-repository and `origin` is configured to point at the source branch layout. Any `.gitignore`
-files found in the source worktree or checked-out import are copied to matching
+repository and `origin` is configured to point at the source branch layout. The converted
+repository reports the source repository's actual `HEAD` branch as `initial_branch`; the
+configured `init.defaultBranch` is not used to rename or misreport that imported branch. Any
+`.gitignore` files found in the source worktree or checked-out import are copied to matching
 `.libraignore` files.
 
 Running `libra init` again inside an already-initialized repository is safe: like
@@ -56,9 +58,15 @@ libra init --bare my-repo.git
 
 ### `-b, --initial-branch <NAME>`
 
-Override the name of the initial branch. Defaults to `main`. The branch name is validated
-against the same rules as `git check-ref-format`: no spaces, no `..`, no ASCII control
-characters, maximum 255 characters.
+Override the name of the initial branch. When the flag is omitted for a new repository, Libra
+reads `init.defaultBranch` from local, global, then system config (Git-style variable-name
+case-insensitive lookup) and falls back to `main` if that key is unset. Local and global
+encrypted values are decrypted before validation. An unreadable local or global config fails
+with `LBR-IO-001`; an unreadable or unsupported system config scope is skipped. For
+`--from-git-repository`, the source repository's `HEAD` branch wins so the import cannot claim
+a configured default that differs from the converted refs.
+The branch name is validated against the same rules as `git check-ref-format`: no spaces,
+no `..`, no ASCII control characters, maximum 255 characters.
 
 ```bash
 libra init -b develop
@@ -77,7 +85,9 @@ libra init --object-format sha256
 
 Import objects and refs from an existing local Git repository. The source must contain
 valid `HEAD`, `config`, and `objects` structures. An `origin` remote is configured pointing
-to the imported branch layout. Empty Git repositories (no refs) produce an error.
+to the imported branch layout, and the JSON/human result reports the source `HEAD` branch.
+`init.defaultBranch` is not consulted for this conversion path. Empty Git repositories
+(no refs) produce an error.
 
 For non-bare imports, Libra converts every `.gitignore` it can see into a sibling
 `.libraignore`. Existing user-owned `.libraignore` files are preserved and reported as
@@ -251,11 +261,15 @@ standalone Libra repository. This is a deliberate design choice: rather than wra
 (as jj does), Libra creates a fully independent `.libra` store, making it a standalone VCS
 rather than a Git frontend.
 
-### Default branch is `main`, not `master`
+### Default branch follows `init.defaultBranch`
 
-Following the industry-wide convention shift, Libra defaults to `main` as the initial
-branch name. This can be overridden with `-b` for organizations that use `trunk`, `develop`,
-or other naming conventions.
+Following the industry-wide convention shift, Libra falls back to `main` as the initial
+branch name. `init.defaultBranch` supplies the default when configured, and `-b` /
+`--initial-branch` overrides all config scopes for one new-repository invocation. Local/global
+encrypted values are decrypted before validation. An empty or invalid configured branch fails
+with `LBR-CLI-002` before repository layout is written; unreadable local/global config fails
+with `LBR-IO-001`, while an unreadable or unsupported system scope is skipped. A Git conversion
+reports the source `HEAD` branch instead of using this default.
 
 ### jj comparison
 
@@ -291,6 +305,8 @@ Every `InitError` variant maps to an explicit `StableErrorCode`.
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
 | Invalid argument (bad branch name, bad format) | `LBR-CLI-002` | 129 | varies by argument |
+| Empty or invalid `init.defaultBranch` | `LBR-CLI-002` | 129 | fix the local/global value or use `--initial-branch <name>` |
+| Unreadable local/global default config | `LBR-IO-001` | 128 | fix the config database or pass `--initial-branch <name>` |
 | `--from-git-repository` on an already-initialized repo | `LBR-CLI-002` | 129 | "convert into a fresh directory instead" |
 | Source Git repository not found | `LBR-IO-001` | 128 | -- |
 | Source is not a valid Git repository | `LBR-CLI-003` | 129 | "a valid Git repository must contain HEAD, config, and objects" |

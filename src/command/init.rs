@@ -17,7 +17,10 @@ use serde::Serialize;
 
 use crate::{
     internal::{
-        config::{ConfigKv, LocalIdentityTarget, resolve_user_identity_sources},
+        config::{
+            ConfigKv, LocalIdentityTarget, read_cascaded_config_value_strict,
+            resolve_user_identity_sources,
+        },
         db::{self, get_db_conn_instance_for_path},
         head::Head,
         model::{config, reference},
@@ -79,6 +82,9 @@ pub enum InitError {
         hint: Option<String>,
     },
 
+    #[error("failed to read config '{key}': {detail}")]
+    ConfigRead { key: String, detail: String },
+
     #[error("source git repository '{path}' does not exist")]
     SourcePathNotFound { path: PathBuf },
 
@@ -124,6 +130,13 @@ impl From<InitError> for CliError {
                 }
                 cli
             }
+            InitError::ConfigRead { key, detail } => CliError::fatal(format!(
+                "failed to read config '{key}': {detail}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+            .with_hint(format!(
+                "fix or remove the unreadable config with 'libra config --global {key} <name>'"
+            )),
             InitError::SourcePathNotFound { path } => {
                 // Intent: conversion cannot read the requested source path; the
                 // repository state is unchanged, so classify as a read failure.
@@ -245,7 +258,7 @@ pub struct InitArgs {
     #[clap(long = "template", name = "template-directory", required = false)]
     pub template: Option<String>,
 
-    /// Override the initial branch name (default: `main`)
+    /// Override the initial branch name (default: `init.defaultBranch`, then `main`)
     #[clap(short = 'b', long, required = false)]
     pub initial_branch: Option<String>,
 
@@ -480,6 +493,37 @@ pub async fn init(args: InitArgs) -> Result<(), InitError> {
     run_init(args).await.map(|_| ())
 }
 
+async fn resolve_initial_branch_name(
+    cli_value: Option<&str>,
+    ref_format: &RefFormat,
+) -> Result<String, InitError> {
+    if let Some(branch) = cli_value {
+        return Ok(branch.to_string());
+    }
+
+    match read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, "init.defaultBranch")
+        .await
+    {
+        Ok(Some(branch)) => {
+            if let Err(error) = validate_branch_name(&branch, ref_format) {
+                return Err(InitError::InvalidArgument {
+                    message: format!("invalid init.defaultBranch value '{branch}': {error}"),
+                    hint: Some(
+                        "set a valid branch with 'libra config --global init.defaultBranch <name>' or pass --initial-branch"
+                            .to_string(),
+                    ),
+                });
+            }
+            Ok(branch)
+        }
+        Ok(None) => Ok(DEFAULT_BRANCH.to_string()),
+        Err(error) => Err(InitError::ConfigRead {
+            key: "init.defaultBranch".to_string(),
+            detail: format!("{error:#}"),
+        }),
+    }
+}
+
 async fn run_init_internal(
     args: InitArgs,
     progress: &InitProgress,
@@ -515,12 +559,21 @@ async fn run_init_internal(
         .as_ref()
         .map(|path| resolve_existing_cli_path(&current_dir, path))
         .transpose()?;
+    if let Some(source) = from_git.as_deref() {
+        // Conversion validation must precede every target write. Keep the same
+        // validation inside the converter as defense in depth for direct callers.
+        convert::validate_source_head(source)?;
+    }
+    let is_git_conversion = from_git.is_some();
     let object_format = resolve_object_format(args.object_format.as_deref())?;
     let ref_format = args.ref_format.clone().unwrap_or(RefFormat::Strict);
-    let initial_branch_name = args
-        .initial_branch
-        .clone()
-        .unwrap_or_else(|| DEFAULT_BRANCH.to_string());
+    let initial_branch_name = if is_git_conversion {
+        // Git conversion selects HEAD from the source repository's branch layout;
+        // use a harmless placeholder until `clone::setup_repository` installs it.
+        DEFAULT_BRANCH.to_string()
+    } else {
+        resolve_initial_branch_name(args.initial_branch.as_deref(), &ref_format).await?
+    };
 
     validate_branch_name(&initial_branch_name, &ref_format)?;
 
@@ -594,6 +647,20 @@ async fn run_init_internal(
         Some(report.source_git_dir)
     } else {
         None
+    };
+
+    let initial_branch_name = if converted_from.is_some() {
+        let _guard = CurrentDirGuard::change_to(&target_guard_path)?;
+        match Head::current_result().await.map_err(|error| {
+            InitError::Database(DbErr::Custom(format!(
+                "failed to read converted HEAD: {error}"
+            )))
+        })? {
+            Head::Branch(name) => name,
+            Head::Detached(_) => "HEAD".to_string(),
+        }
+    } else {
+        initial_branch_name
     };
 
     if args.vault {
@@ -1464,6 +1531,14 @@ mod tests {
 
     #[test]
     fn init_error_display_pins_owned_variants() {
+        assert_eq!(
+            InitError::ConfigRead {
+                key: "init.defaultBranch".to_string(),
+                detail: "database is unreadable".to_string(),
+            }
+            .to_string(),
+            "failed to read config 'init.defaultBranch': database is unreadable",
+        );
         assert_eq!(
             InitError::InvalidArgument {
                 message: "missing target".to_string(),

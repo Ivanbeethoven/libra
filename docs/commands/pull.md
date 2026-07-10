@@ -14,17 +14,30 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 With `--rebase` (`-r`), the integration step instead replays local-only commits on top of the fetched upstream tip. This is equivalent to `libra fetch` followed by `libra rebase <upstream>`.
 
-With `--ff-only`, pull fetches the upstream but refuses to create a merge commit when local and remote histories have diverged. Fast-forward and already-up-to-date pulls still succeed. `--ff-only` conflicts with `--rebase`, `--ff`, and `--no-ff`.
+With `--ff-only`, pull fetches the upstream but refuses to create a merge commit when local and remote histories have diverged. Fast-forward and already-up-to-date pulls still succeed. `--ff-only` conflicts with `--rebase`, `--ff`, and `--no-ff`; like Git, it may be combined with `--squash`, `--no-commit`, or `--commit`.
 
-With `--no-ff`, pull always records a real merge commit even when the upstream could be fast-forwarded, mirroring `git pull --no-ff`. `--ff` explicitly allows the default fast-forward behaviour. `--ff`, `--no-ff`, and `--ff-only` are mutually exclusive and conflict with `--rebase`.
+With `--no-ff`, pull always records a real merge commit even when the upstream could be fast-forwarded, mirroring `git pull --no-ff`. `--ff` explicitly allows a fast-forward and overrides `pull.ff` for the invocation. `--ff`, `--no-ff`, and `--ff-only` are mutually exclusive and conflict with `--rebase`; each may be combined with `--commit`.
+
+Merge-only flags (`--ff-only`, `--ff`, `--no-ff`, `--squash`, `--no-commit`, and `--commit`) also select the merge path when `pull.rebase` or `branch.<name>.rebase` is configured. Contradictory explicit merge flags are rejected before fetch.
 
 With `--depth <n>`, the fetch phase is limited to a shallow history of `n` commits per tip before integration, mirroring `git pull --depth`. `--depth` is fetch-only and conflicts with `--rebase`. The selected upstream must support shallow-boundary negotiation; a local Libra upstream fails closed with `LBR-REPO-002` before integration.
+
+When command-line integration flags are omitted, Libra honors Git-style pull defaults
+from local, global, then system config (variable names are case-insensitive):
+`branch.<name>.rebase` overrides `pull.rebase`, and `pull.ff` accepts `true`, `false`,
+or `only`. CLI flags still take precedence. Local and global encrypted values are
+decrypted before validation. `pull.rebase=merges`/`interactive` (and `m`/`i`) are
+recognized Git modes but are explicitly unsupported by Libra pull and fail with an
+actionable `LBR-CLI-002` diagnostic. Empty or otherwise invalid local/global configured
+values fail before fetch or integration with `LBR-CLI-002`; local/global config read
+failures use `LBR-IO-001`. An unreadable or unsupported system config scope is skipped,
+so a lower-precedence default or the built-in merge behavior can still be used.
 
 When invoked with no arguments, the command reads the current branch tracking configuration (`branch.<name>.remote` and `branch.<name>.merge`). When `<repository>` is given alone, the current branch name is used as the remote branch. When both `<repository>` and `<refspec>` are given, the specified remote branch is fetched and merged.
 
 Pull supports already-up-to-date, fast-forward, and single-head three-way merge results. If the local and remote branches conflict, pull returns the merge-owned `LBR-CONFLICT-002` error with `phase: "merge"` and leaves the same merge state that `libra merge` uses. Resolve conflicts with `libra add <path>` and `libra merge --continue`, or run `libra merge --abort`.
 
-With `--squash`, pull fetches and computes the merge but stages the merged tree without creating a commit or moving `HEAD`, leaving the result ready for a plain `libra commit` (mirroring `git pull --squash`). With `--no-commit`, pull performs the merge and stages the result but stops before committing, recording merge state so the two-parent commit can be finalized with `libra merge --continue`. `--squash` and `--no-commit` conflict with each other and with `--rebase`. `--commit` forces a merge commit (the default merge behavior) and is last-one-wins with `--no-commit` (the final flag on the command line decides); it conflicts with `--squash` and `--rebase`, matching `git pull --commit`.
+With `--squash`, pull fetches and computes the merge but stages the merged tree without creating a commit or moving `HEAD`, leaving the result ready for a plain `libra commit` (mirroring `git pull --squash`). With `--no-commit`, pull performs the merge and stages the result but stops before committing, recording merge state so the two-parent commit can be finalized with `libra merge --continue`. `--squash` and `--no-commit` conflict with each other and with `--rebase`. `--commit` requests that the merge be committed and is last-one-wins with `--no-commit` (the final flag decides); it does not itself force a merge commit or override the selected fast-forward policy, and conflicts only with `--squash` and `--rebase`.
 
 With `--autostash`, pull stashes your tracked working-tree changes before integrating (so a dirty tree does not block the merge/rebase) and re-applies them afterwards — even if the merge/rebase fails. Untracked and ignored files are left in place. If re-applying the stash conflicts, the stash is kept and the failure is reported; recover it with `libra stash pop`.
 
@@ -48,18 +61,18 @@ global storage config for that run.
 |-----------------|-------------|---------|
 | `<repository>` | Remote name to pull from. When omitted, uses the current branch's configured upstream. | `libra pull origin` |
 | `<refspec>` | Branch name on the remote. Requires `<repository>`. When omitted, uses the current branch name. | `libra pull origin main` |
-| `--ff-only` | Refuse to create a merge commit; succeeds only for fast-forward or already-up-to-date pulls. Conflicts with `--rebase`, `--ff`, `--no-ff`. | `libra pull --ff-only` |
-| `--ff` | Explicitly allow a fast-forward merge (the default). Conflicts with `--no-ff`, `--ff-only`, `--rebase`. | `libra pull --ff` |
-| `--no-ff` | Always create a merge commit even when a fast-forward is possible. Conflicts with `--ff`, `--ff-only`, `--rebase`. | `libra pull --no-ff` |
+| `--ff-only` | Refuse to create a merge commit; succeeds only for fast-forward or already-up-to-date pulls. Conflicts with `--rebase`, `--ff`, and `--no-ff`. | `libra pull --ff-only` |
+| `--ff` | Explicitly allow a fast-forward merge, overriding `pull.ff=false|only`. Conflicts with `--no-ff`, `--ff-only`, and `--rebase`. | `libra pull --ff` |
+| `--no-ff` | Always create a merge commit even when a fast-forward is possible. Conflicts with `--ff`, `--ff-only`, and `--rebase`. | `libra pull --no-ff` |
 | `--squash` | Stage the merged tree without committing or moving `HEAD`, leaving the result for a plain `libra commit`. Conflicts with `--no-commit`, `--rebase`. | `libra pull --squash` |
 | `--no-commit` | Merge and stage but stop before committing, recording merge state to finalize with `libra merge --continue`. Conflicts with `--squash`, `--rebase`. | `libra pull --no-commit` |
-| `--commit` | Force a merge commit (the default); last-one-wins with `--no-commit`. Conflicts with `--squash`, `--rebase`. | `libra pull --commit` |
+| `--commit` | Commit the merge result; last-one-wins with `--no-commit` and does not override fast-forward policy. Conflicts with `--squash` and `--rebase`. | `libra pull --commit` |
 | `--autostash` | Stash tracked changes before integrating and re-apply them afterwards (even on failure), so `pull` works on a dirty tree. Untracked/ignored files are left in place. | `libra pull --autostash` |
 | `--no-progress` | Suppress the fetch progress meter (the "Receiving objects" spinner), matching `git pull --no-progress`. | `libra pull --no-progress` |
 | `--notes` | Forward to the fetch: also import the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from a **local Libra** upstream. Default OFF (Git parity); a network/plain-Git upstream warns and imports nothing (deferred, D17). See `libra fetch --notes`. | `libra pull --notes` |
 | `--depth <n>` | Limit the fetch phase to a shallow history of `n` commits per tip. Conflicts with `--rebase`. Local Libra upstreams fail closed with `LBR-REPO-002` because they cannot advertise shallow boundaries yet. | `libra pull --depth 1` |
 | `-r`, `--rebase` | After fetching, rebase the current branch onto the upstream tip instead of merging. | `libra pull --rebase` |
-| `--no-rebase` | Merge instead of rebasing (the default), countermanding an earlier `--rebase`/`-r` (last one wins). Pull merges by default, so on its own this is a no-op. | `libra pull --no-rebase` |
+| `--no-rebase` | Merge instead of rebasing, countermanding an earlier `--rebase`/`-r` and overriding `pull.rebase` for this invocation. | `libra pull --no-rebase` |
 | `--json` | Emit structured JSON envelope to stdout (global flag). | `libra pull --json` |
 | `--machine` | Compact single-line JSON; suppresses progress (global flag). | `libra pull --machine` |
 | `--quiet` | Suppress all progress and merge summary output. | `libra pull --quiet` |
@@ -198,7 +211,7 @@ Rebase output omits `merge` and includes `rebase`:
 - `branch` is the current local branch being updated.
 - `upstream` is the remote tracking branch name, such as `"origin/main"`.
 - `fetch.refs_updated` lists remote refs that changed during fetch.
-- Exactly one of `merge` or `rebase` is present, depending on whether `--rebase` was passed.
+- Exactly one of `merge` or `rebase` is present, depending on the effective integration mode selected by CLI flags and `pull.rebase`/`branch.<name>.rebase` defaults. Therefore a configured `pull.rebase=true` can produce the `rebase` object even when the command did not include `--rebase`.
 - `merge.old_commit` is the pre-merge `HEAD`; it is `null` on the first pull into an empty local branch.
 - `merge.strategy` is `"fast-forward"`, `"three-way"`, or `"already-up-to-date"`.
 - `merge.commit` is the new HEAD commit after merge; it is `null` when up to date.
@@ -218,7 +231,9 @@ Rebase output omits `merge` and includes `rebase`:
 | Fast-forward-only pull | `libra pull --ff-only` | `git pull --ff-only` | N/A |
 | Three-way integration | Supported through merge engine | Supported | N/A |
 | Rebase on pull | `libra pull --rebase` | `git pull --rebase` | N/A |
+| Rebase config defaults | `branch.<name>.rebase` overrides `pull.rebase` when no CLI rebase flag is present | Same | N/A |
 | Force merge commit | `libra pull --no-ff` | `git pull --no-ff` | N/A |
+| Fast-forward config defaults | `pull.ff=true|false|only` when no CLI fast-forward flag is present | Same | N/A |
 | Shallow pull | `libra pull --depth 1` | `git pull --depth 1` | N/A; requires a Git shallow-capable upstream, local Libra upstreams fail closed |
 | Squash | `libra pull --squash` | `git pull --squash` | N/A |
 | No-commit | `libra pull --no-commit` (finalize with `libra merge --continue`) | `git pull --no-commit` | N/A |
@@ -237,6 +252,8 @@ Every `PullError` variant maps to an explicit `StableErrorCode`. Fetch, merge, a
 | HEAD is detached | `LBR-REPO-003` | 128 | "checkout a branch before pulling" |
 | No tracking info for branch | `LBR-REPO-003` | 128 | Git-style advisory block with `libra pull <remote> <branch>` and `libra branch --set-upstream-to=...` |
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
+| Invalid `pull.rebase`, `branch.<name>.rebase`, or `pull.ff` config value | `LBR-CLI-002` | 129 | "libra config <key> <value>" |
+| Unsupported `pull.rebase=merges|interactive` mode | `LBR-CLI-002` | 129 | Use boolean rebase or an explicit supported pull flag |
 | Fetch: network unreachable / timeout | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch: authentication failed | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
 | Fetch: protocol error | `LBR-NET-002` | 128 | "the remote did not respond correctly" |

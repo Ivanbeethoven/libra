@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.51"
+version = "0.18.52"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -368,6 +368,14 @@ path = "tests/compat/machine_porcelain_contract_test.rs"
 [[test]]
 name = "compat_pretty_format_placeholders"
 path = "tests/compat/pretty_format_placeholders_test.rs"
+
+[[test]]
+name = "compat_config_defaults_semantics"
+path = "tests/compat/config_defaults_semantics_test.rs"
+
+[[test]]
+name = "compat_config_defaults_edge_cases"
+path = "tests/compat/config_defaults_edge_cases_test.rs"
 
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).

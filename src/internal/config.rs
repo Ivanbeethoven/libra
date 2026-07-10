@@ -1069,6 +1069,13 @@ fn global_config_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|home| home.join(".libra").join("config.db"))
 }
 
+fn system_config_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("LIBRA_CONFIG_SYSTEM_DB") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    Some(std::path::PathBuf::from("/etc/libra/config.db"))
+}
+
 /// Identity sources resolved for commands that need name/email defaults.
 ///
 /// `config_*` contains the cascaded local/global result for each field, while
@@ -1129,6 +1136,91 @@ pub async fn read_cascaded_config_value(
         return Ok(Some(value));
     }
     global_config_value(key).await
+}
+
+/// Read a Git-compatible default value across all config scopes.
+///
+/// Unlike [`read_cascaded_config_value`], this helper preserves a present empty
+/// value so callers can reject it as invalid, decrypts encrypted local/global
+/// values, includes the system scope, matches section and variable names
+/// case-insensitively (while preserving subsection case), and falls back to the
+/// legacy `config` table. System-scope read failures are intentionally skipped,
+/// matching the system-config contract documented by `libra config`.
+pub async fn read_cascaded_config_value_strict(
+    local_target: LocalIdentityTarget<'_>,
+    key: &str,
+) -> Result<Option<String>> {
+    if let Some(entry) = local_config_entry_for_target_case_insensitive(local_target, key).await? {
+        return Ok(Some(
+            decrypt_strict_config_entry(entry, StrictConfigScope::Local(local_target)).await?,
+        ));
+    }
+
+    if let Some(path) = global_config_path()
+        && let Some(entry) = read_config_entry_from_db_path_case_insensitive(&path, key).await?
+    {
+        return Ok(Some(
+            decrypt_strict_config_entry(entry, StrictConfigScope::Global).await?,
+        ));
+    }
+
+    if let Some(path) = system_config_path() {
+        match read_config_entry_from_db_path_case_insensitive(&path, key).await {
+            Ok(Some(entry)) => {
+                match decrypt_strict_config_entry(entry, StrictConfigScope::System).await {
+                    Ok(value) => return Ok(Some(value)),
+                    Err(error) => {
+                        tracing::debug!(
+                            key,
+                            path = %path.display(),
+                            error = %format!("{error:#}"),
+                            "skipping unsupported system config default"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    key,
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "skipping unreadable system config scope"
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+enum StrictConfigScope<'a> {
+    Local(LocalIdentityTarget<'a>),
+    Global,
+    System,
+}
+
+async fn decrypt_strict_config_entry(
+    entry: ConfigKvEntry,
+    scope: StrictConfigScope<'_>,
+) -> Result<String> {
+    if !entry.encrypted {
+        return Ok(entry.value);
+    }
+
+    match scope {
+        StrictConfigScope::Local(local_target) => {
+            decrypt_value_for_local_target(&entry.value, local_target)
+                .await
+                .context("failed to decrypt encrypted local config default")
+        }
+        StrictConfigScope::Global => decrypt_value(&entry.value, "global")
+            .await
+            .context("failed to decrypt encrypted global config default"),
+        StrictConfigScope::System => {
+            Err(anyhow!("encrypted system config defaults are unsupported"))
+        }
+    }
 }
 
 /// Read a config value for the given target using local-first, then global, and
@@ -1291,6 +1383,29 @@ async fn local_config_entry_for_target(
     }
 }
 
+async fn local_config_entry_for_target_case_insensitive(
+    local_target: LocalIdentityTarget<'_>,
+    key: &str,
+) -> Result<Option<ConfigKvEntry>> {
+    match local_target {
+        LocalIdentityTarget::CurrentRepo => {
+            let storage = match crate::utils::util::try_get_storage_path(None) {
+                Ok(storage) => storage,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error).context("failed to resolve current repository storage");
+                }
+            };
+            let db_path = storage.join(crate::utils::util::DATABASE);
+            read_config_entry_from_db_path_case_insensitive(&db_path, key).await
+        }
+        LocalIdentityTarget::ExplicitDb(db_path) => {
+            read_config_entry_from_db_path_case_insensitive(db_path, key).await
+        }
+        LocalIdentityTarget::None => Ok(None),
+    }
+}
+
 /// Look up a `vault.env.<name>` value from the global config DB.
 ///
 /// Returns `Ok(None)` if the global DB does not exist (user has never
@@ -1393,6 +1508,93 @@ async fn read_config_entry_from_db_path(
             db_path.display()
         )
     })
+}
+
+async fn read_config_entry_from_db_path_case_insensitive(
+    db_path: &Path,
+    key: &str,
+) -> Result<Option<ConfigKvEntry>> {
+    let exists = db_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?;
+    if !exists {
+        return Ok(None);
+    }
+
+    let Some((section, subsection, variable)) = split_git_config_key(key) else {
+        return Ok(None);
+    };
+    let conn = get_db_conn_instance_for_path(db_path)
+        .await
+        .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
+
+    let entries = config_kv::Entity::find()
+        .order_by_desc(config_kv::Column::Id)
+        .all(&conn)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query '{key}' from config database '{}'",
+                db_path.display()
+            )
+        })?;
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| git_config_key_matches(&entry.key, key))
+    {
+        return Ok(Some(ConfigKvEntry::from_model(entry)));
+    }
+
+    let legacy_entries = config::Entity::find()
+        .order_by_desc(config::Column::Id)
+        .all(&conn)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query legacy config for '{key}' from database '{}'",
+                db_path.display()
+            )
+        })?;
+    Ok(legacy_entries
+        .iter()
+        .find(|entry| {
+            entry.configuration.eq_ignore_ascii_case(section)
+                && entry.name.as_deref() == subsection
+                && entry.key.eq_ignore_ascii_case(variable)
+        })
+        .map(|entry| ConfigKvEntry {
+            key: key.to_string(),
+            value: entry.value.clone(),
+            encrypted: false,
+        }))
+}
+
+/// Split a Git-style dotted config key into section, optional subsection, and
+/// variable. The final dot separates the variable so branch names containing
+/// dots remain intact.
+fn split_git_config_key(key: &str) -> Option<(&str, Option<&str>, &str)> {
+    let (section, remainder) = key.split_once('.')?;
+    if let Some((subsection, variable)) = remainder.rsplit_once('.') {
+        Some((section, Some(subsection), variable))
+    } else {
+        Some((section, None, remainder))
+    }
+}
+
+fn git_config_key_matches(stored: &str, requested: &str) -> bool {
+    let Some((requested_section, requested_subsection, requested_variable)) =
+        split_git_config_key(requested)
+    else {
+        return false;
+    };
+    let Some((stored_section, stored_subsection, stored_variable)) = split_git_config_key(stored)
+    else {
+        return false;
+    };
+
+    stored_section.eq_ignore_ascii_case(requested_section)
+        && stored_subsection == requested_subsection
+        && stored_variable.eq_ignore_ascii_case(requested_variable)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

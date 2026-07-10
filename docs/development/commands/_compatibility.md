@@ -36,6 +36,7 @@ flowchart TD
 - identity/date 契约（plan-20260708 P0-08）：`commit` 支持 `--date`、`GIT_AUTHOR_*`/`GIT_COMMITTER_*` 身份与日期覆盖、`-C/-c` 复用来源 author metadata、`--reset-author` amend 重置 author；`cherry-pick` 保留源提交 author metadata；`revert` 使用当前身份并从去签名消息取 subject。由 `compat_commit_identity_date` 与 `compat_sequencer_message_author` 守卫。
 - index object integrity 契约（plan-20260708 P0-09）：`write-tree` 与 `commit` 在写 tree/commit 前必须校验 stage-0 index 条目的 blob/tree 对象存在且类型匹配；缺失或错类型以 `LBR-REPO-002` fail-closed，且 `commit` 失败不得移动 `HEAD`。`update-index --cacheinfo` 仍允许暂时登记不存在对象，后续写入路径负责拦截。由 `compat_write_tree_missing_object` 守卫。
 - symlink 基础兼容契约（plan-20260708 P0-11）：`add` / `update-index --add` 必须把 symlink 作为 mode `120000` 和 link target blob bytes 暂存；`checkout` / `restore` / `reset --hard` 必须在支持平台恢复真实 symlink，且不跟随目标路径；`status` / `diff` / `ls-files` 必须按 symlink 自身比较 target bytes，dangling symlink 不得误报为删除。不支持 symlink 的平台必须显式 fail-closed/skip 诊断，而不是写普通文件。由 `compat_symlink_basic` 守卫。
+- config defaults 契约（plan-20260708 P1-05a）：新仓库的 `init.defaultBranch` 与 `pull` 的 `branch.<name>.rebase`/`pull.rebase`/`pull.ff` 按 local → global → system 读取，section/variable 名按 Git 规则大小写不敏感；local/global 加密值先解密，legacy `config` 行仍可读取，system scope 读取失败或不支持时跳过。空值/非法值在副作用前 fail-closed；`pull.rebase=merges|interactive`（及短写）返回明确 unsupported 的 `LBR-CLI-002`。Git 转换使用并报告源 `HEAD` 分支。由 `compat_config_defaults_semantics` 与 `compat_config_defaults_edge_cases` 守卫。
 - 副作用边界：本文件解释“为什么这样兼容”，不替代 `COMPATIBILITY.md` 的用户承诺；新增命令或参数时必须同时给出 tier、测试证据和未完成项处理方式。
 
 ## 当前状态
@@ -43,7 +44,7 @@ flowchart TD
 | 命令 | 当前 tier | 治理结论 | 说明 |
 |---|---|---|---|
 | merge | partial | partial | fast-forward and single-head three-way merge supported; `-m`/`--ff-only`/`--no-ff`/`--squash`/`--no-commit`/`--no-edit`/`--verify-signatures` (vault-key PGP only) supported; octopus/custom strategies deferred |
-| pull | partial | partial | fetch + fast-forward/three-way merge supported; advanced strategy flags still partial |
+| pull | partial | partial | fetch + fast-forward/three-way merge supported; `pull.rebase`/`branch.<name>.rebase`/`pull.ff` defaults are config-aware with local/global decryption, system-scope skip, and explicit unsupported diagnostics for interactive/rebase-merges modes; advanced strategy flags still partial |
 | push | partial | partial | branch/tag update, multi-refspec, delete, `--tags`, and `--mirror` supported; local file remote rejected intentionally |
 | checkout | partial | partial | visible branch compatibility surface including `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
 

@@ -9,7 +9,7 @@ use serde::Serialize;
 use super::{fetch, merge, rebase, stash};
 use crate::{
     internal::{
-        config::{ConfigKv, RemoteConfig},
+        config::{ConfigKv, LocalIdentityTarget, RemoteConfig, read_cascaded_config_value_strict},
         head::Head,
     },
     utils::{
@@ -33,10 +33,11 @@ EXAMPLES:
     libra pull --quiet                     Suppress progress output
 
 NOTES:
-    By default pull uses the same merge engine as `libra merge`, including
-    clean three-way merges and merge-state conflicts. Use --ff-only to reject
-    divergent histories instead of creating a merge commit, or --no-ff to force
-    a merge commit even when a fast-forward is possible. Use --rebase to replay
+    When no integration flags are given, pull uses configured defaults
+    (`branch.<name>.rebase`, `pull.rebase`, and `pull.ff`) and falls back to
+    the usual merge/fast-forward behavior. Use --ff-only to reject divergent
+    histories instead of creating a merge commit, or --no-ff to force a merge
+    commit even when a fast-forward is possible. Use --rebase to replay
     local-only commits onto the upstream tip instead, and --depth to limit the
     fetch to a shallow history before integrating.";
 
@@ -58,9 +59,9 @@ pub struct PullArgs {
     #[clap(long, short = 'r', overrides_with = "no_rebase")]
     rebase: bool,
 
-    /// Merge instead of rebasing (the default), countermanding an earlier
+    /// Merge instead of rebasing, countermanding an earlier
     /// `--rebase`/`-r` (last one on the command line wins), matching `git pull
-    /// --no-rebase`. Pull merges by default, so on its own this is a no-op.
+    /// --no-rebase`. This overrides `pull.rebase` for the invocation.
     #[clap(long = "no-rebase", overrides_with = "rebase")]
     no_rebase: bool,
 
@@ -68,7 +69,7 @@ pub struct PullArgs {
     #[clap(long = "ff-only", conflicts_with_all = ["rebase", "ff", "no_ff"])]
     ff_only: bool,
 
-    /// Allow a fast-forward merge (the default; clears --no-ff)
+    /// Allow a fast-forward merge, overriding `pull.ff` for the invocation
     #[clap(long, conflicts_with_all = ["no_ff", "ff_only", "rebase"])]
     ff: bool,
 
@@ -88,7 +89,7 @@ pub struct PullArgs {
     #[clap(long = "no-commit", conflicts_with_all = ["rebase", "squash"], overrides_with = "commit")]
     no_commit: bool,
 
-    /// Force a merge commit, overriding an earlier --no-commit (the default; last one wins).
+    /// Complete the merge by committing, overriding an earlier --no-commit (last one wins).
     #[clap(long, conflicts_with_all = ["rebase", "squash"], overrides_with = "no_commit")]
     commit: bool,
 
@@ -203,6 +204,23 @@ pub(crate) enum PullError {
 
     #[error("pull --autostash failed: {0}")]
     Autostash(String),
+
+    #[error("failed to read config '{key}': {detail}")]
+    ConfigRead { key: String, detail: String },
+
+    #[error("bad config value '{value}' for '{key}' (expected {expected})")]
+    InvalidConfig {
+        key: String,
+        value: String,
+        expected: &'static str,
+    },
+
+    #[error("unsupported config value '{value}' for '{key}': {reason}")]
+    UnsupportedConfig {
+        key: String,
+        value: String,
+        reason: &'static str,
+    },
 }
 
 impl From<PullError> for CliError {
@@ -238,6 +256,31 @@ impl From<PullError> for CliError {
                         "resolve the working tree, then recover the stash with 'libra stash pop'",
                     )
             }
+            PullError::ConfigRead { key, detail } => {
+                CliError::fatal(format!("failed to read config '{key}': {detail}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                    .with_hint(format!(
+                        "inspect or reset the value with 'libra config --get {key}'"
+                    ))
+            }
+            PullError::InvalidConfig {
+                key,
+                value,
+                expected,
+            } => CliError::command_usage(format!(
+                "bad config value '{value}' for '{key}' (expected {expected})"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint(format!(
+                "fix the offending value with 'libra config {key} <value>'"
+            )),
+            PullError::UnsupportedConfig { key, value, reason } => CliError::command_usage(
+                format!("unsupported config value '{value}' for '{key}': {reason}"),
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint(format!(
+                "fix the offending value with 'libra config {key} <value>'"
+            )),
         }
     }
 }
@@ -272,6 +315,13 @@ struct ResolvedPullTarget {
     remote_config: RemoteConfig,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EffectivePullOptions {
+    rebase: bool,
+    ff_only: bool,
+    no_ff: bool,
+}
+
 pub async fn execute(args: PullArgs) {
     if let Err(err) = execute_safe(args, &OutputConfig::default()).await {
         err.print_stderr();
@@ -299,7 +349,9 @@ pub(crate) async fn run_pull(
     args: PullArgs,
     output: &OutputConfig,
 ) -> Result<PullOutput, PullError> {
-    let target = resolve_pull_target(&args).await?;
+    let branch = current_branch_for_pull().await?;
+    let effective = resolve_effective_pull_options(&args, &branch).await?;
+    let target = resolve_pull_target(&args, branch, effective.rebase).await?;
     // `--no-progress` forwards to the fetch: suppress its "Receiving objects"
     // meter just like `git pull --no-progress`.
     let child_output = child_output_for_pull(output);
@@ -343,7 +395,7 @@ pub(crate) async fn run_pull(
     // has no autostash machinery of its own — see COMPATIBILITY.md rebase
     // row). The MERGE path uses the Git-faithful merge-owned autostash below
     // (held on conflict rather than popped back into a conflicted tree).
-    let stashed = if args.autostash && args.rebase {
+    let stashed = if args.autostash && effective.rebase {
         stash::autostash_push()
             .await
             .map_err(PullError::Autostash)?
@@ -353,7 +405,7 @@ pub(crate) async fn run_pull(
 
     // Capture the integrate result so the autostash can be popped afterwards
     // even when the merge/rebase fails.
-    let integrate_result: Result<PullOutput, PullError> = if args.rebase {
+    let integrate_result: Result<PullOutput, PullError> = if effective.rebase {
         // Rebase resolves `<remote>/<branch>` through the same public ref
         // path used by `libra rebase`, so keep the human-readable upstream form.
         match rebase::run_rebase_for_pull(&target.upstream).await {
@@ -384,8 +436,8 @@ pub(crate) async fn run_pull(
             &target.upstream,
             &child_output,
             merge::PullMergeOptions {
-                ff_only: args.ff_only,
-                no_ff: args.no_ff,
+                ff_only: effective.ff_only,
+                no_ff: effective.no_ff,
                 message: None,
                 squash: args.squash,
                 no_commit: args.no_commit,
@@ -432,12 +484,111 @@ pub(crate) async fn run_pull(
     integrate_result
 }
 
-async fn resolve_pull_target(args: &PullArgs) -> Result<ResolvedPullTarget, PullError> {
-    let branch = match Head::current().await {
+async fn current_branch_for_pull() -> Result<String, PullError> {
+    Ok(match Head::current().await {
         Head::Branch(name) => name,
         Head::Detached(_) => return Err(PullError::NotOnBranch),
+    })
+}
+
+async fn resolve_effective_pull_options(
+    args: &PullArgs,
+    branch: &str,
+) -> Result<EffectivePullOptions, PullError> {
+    let explicit_merge_mode = args.no_rebase
+        || args.ff_only
+        || args.ff
+        || args.no_ff
+        || args.squash
+        || args.no_commit
+        || args.commit;
+    let rebase = if args.rebase {
+        true
+    } else if explicit_merge_mode {
+        false
+    } else {
+        configured_pull_rebase(branch).await?
     };
 
+    let (ff_only, no_ff) = if rebase {
+        // `pull.ff` is merge-only. Once the effective mode is rebase, do not
+        // read or validate an unrelated merge policy from the config cascade.
+        (false, false)
+    } else if args.ff_only {
+        (true, false)
+    } else if args.no_ff {
+        (false, true)
+    } else if args.ff {
+        (false, false)
+    } else {
+        configured_pull_ff().await?
+    };
+
+    Ok(EffectivePullOptions {
+        rebase,
+        ff_only,
+        no_ff,
+    })
+}
+
+async fn configured_pull_rebase(branch: &str) -> Result<bool, PullError> {
+    let branch_key = format!("branch.{branch}.rebase");
+    if let Some(value) = read_pull_config(&branch_key).await? {
+        return parse_config_bool(&branch_key, &value);
+    }
+    if let Some(value) = read_pull_config("pull.rebase").await? {
+        return parse_config_bool("pull.rebase", &value);
+    }
+    Ok(false)
+}
+
+async fn configured_pull_ff() -> Result<(bool, bool), PullError> {
+    let Some(value) = read_pull_config("pull.ff").await? else {
+        return Ok((false, false));
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok((false, false)),
+        "false" | "no" | "off" | "0" => Ok((false, true)),
+        "only" => Ok((true, false)),
+        _ => Err(PullError::InvalidConfig {
+            key: "pull.ff".to_string(),
+            value,
+            expected: "true, false, or only",
+        }),
+    }
+}
+
+async fn read_pull_config(key: &str) -> Result<Option<String>, PullError> {
+    read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, key)
+        .await
+        .map_err(|error| PullError::ConfigRead {
+            key: key.to_string(),
+            detail: format!("{error:#}"),
+        })
+}
+
+fn parse_config_bool(key: &str, value: &str) -> Result<bool, PullError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        "merges" | "m" | "interactive" | "i" => Err(PullError::UnsupportedConfig {
+            key: key.to_string(),
+            value: value.to_string(),
+            reason: "rebase-merges and interactive rebase are not supported by libra pull",
+        }),
+        _ => Err(PullError::InvalidConfig {
+            key: key.to_string(),
+            value: value.to_string(),
+            expected: "true or false",
+        }),
+    }
+}
+
+async fn resolve_pull_target(
+    args: &PullArgs,
+    branch: String,
+    rebase: bool,
+) -> Result<ResolvedPullTarget, PullError> {
     match (&args.repository, &args.refspec) {
         (Some(remote), Some(refspec)) => {
             let remote_branch = normalize_remote_branch_name(refspec);
@@ -470,7 +621,7 @@ async fn resolve_pull_target(args: &PullArgs) -> Result<ResolvedPullTarget, Pull
         }
         (None, None) => {
             let Some(branch_config) = ConfigKv::branch_config(&branch).await.ok().flatten() else {
-                return Err(no_tracking_error(&branch, args.rebase).await);
+                return Err(no_tracking_error(&branch, rebase).await);
             };
             let remote_config = ConfigKv::remote_config(&branch_config.remote)
                 .await
@@ -889,14 +1040,21 @@ mod tests {
 
     #[test]
     fn commit_flag_conflicts_and_last_one_wins() {
-        // `--commit` forces a merge commit; it is the default, so a bare
-        // `--commit` parses with no_commit cleared.
+        // `--commit` requests the normal commit step; a bare `--commit`
+        // parses with no_commit cleared without changing fast-forward policy.
         let c = PullArgs::try_parse_from(["pull", "--commit"]).expect("--commit should parse");
         assert!(c.commit && !c.no_commit);
 
         // Mirrors Git: `--squash`/`--commit` and `--rebase`/`--commit` conflict.
         assert!(PullArgs::try_parse_from(["pull", "--commit", "--squash"]).is_err());
         assert!(PullArgs::try_parse_from(["pull", "--commit", "--rebase"]).is_err());
+        // Git accepts commit policy together with fast-forward policy, and
+        // accepts ff-only with squash/no-commit. Preserve those combinations.
+        assert!(PullArgs::try_parse_from(["pull", "--commit", "--ff"]).is_ok());
+        assert!(PullArgs::try_parse_from(["pull", "--commit", "--ff-only"]).is_ok());
+        assert!(PullArgs::try_parse_from(["pull", "--commit", "--no-ff"]).is_ok());
+        assert!(PullArgs::try_parse_from(["pull", "--ff-only", "--squash"]).is_ok());
+        assert!(PullArgs::try_parse_from(["pull", "--ff-only", "--no-commit"]).is_ok());
 
         // `--commit` and `--no-commit` are last-one-wins (Git semantics), so the
         // effective `no_commit` (which the merge path reads) reflects the final flag.

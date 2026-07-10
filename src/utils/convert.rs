@@ -7,7 +7,7 @@
 //! ignore rules survive the migration.
 
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -35,6 +35,68 @@ pub struct ConversionReport {
     /// Non-fatal messages collected during conversion (e.g. unreadable
     /// `.gitignore` files that were skipped).
     pub warnings: Vec<String>,
+}
+
+/// Validate the source HEAD before `libra init` creates any target state.
+///
+/// Conversion currently requires a symbolic `refs/heads/*` HEAD because the
+/// clone setup path checks out a branch. Rejecting detached or unborn sources
+/// here prevents the later fallback to an empty `main` repository and keeps
+/// invalid conversions side-effect free.
+pub(crate) fn validate_source_head(git_repo: &Path) -> Result<(), InitError> {
+    let git_dir = resolve_git_source_dir(git_repo)?;
+    let head_path = git_dir.join("HEAD");
+    let head = fs::read_to_string(&head_path).map_err(|error| InitError::ConversionFailed {
+        repo: git_dir.clone(),
+        stage: "setup",
+        message: format!("failed to read source HEAD: {error}"),
+    })?;
+    let Some(ref_name) = head.trim().strip_prefix("ref: ") else {
+        return Err(InitError::ConversionFailed {
+            repo: git_dir,
+            stage: "setup",
+            message: "source Git HEAD is detached; conversion requires a symbolic branch HEAD"
+                .to_string(),
+        });
+    };
+    let Some(_) = ref_name.strip_prefix("refs/heads/") else {
+        return Err(InitError::ConversionFailed {
+            repo: git_dir,
+            stage: "setup",
+            message: format!("source Git HEAD points to unsupported ref '{ref_name}'"),
+        });
+    };
+    if !git_ref_exists(&git_dir, ref_name)? {
+        return Err(InitError::ConversionFailed {
+            repo: git_dir,
+            stage: "setup",
+            message: format!("source Git HEAD points to unborn branch '{ref_name}'"),
+        });
+    }
+    Ok(())
+}
+
+fn git_ref_exists(git_dir: &Path, ref_name: &str) -> Result<bool, InitError> {
+    if git_dir.join(ref_name).is_file() {
+        return Ok(true);
+    }
+    let packed_refs = git_dir.join("packed-refs");
+    if !packed_refs.exists() {
+        return Ok(false);
+    }
+    let content =
+        fs::read_to_string(&packed_refs).map_err(|error| InitError::ConversionFailed {
+            repo: git_dir.to_path_buf(),
+            stage: "setup",
+            message: format!("failed to read packed refs: {error}"),
+        })?;
+    Ok(content.lines().any(|line| {
+        !line.starts_with('#')
+            && !line.starts_with('^')
+            && line
+                .split_once(' ')
+                .is_some_and(|(_, ref_name_in_file)| ref_name_in_file == ref_name)
+    }))
 }
 
 /// Convert an existing local Git repository into the current Libra repository.
@@ -65,6 +127,7 @@ pub async fn convert_from_git_repository(
     is_bare: bool,
 ) -> Result<ConversionReport, InitError> {
     let git_dir = resolve_git_source_dir(git_repo)?;
+    validate_source_head(git_repo)?;
     let source_worktree = source_worktree_root(git_repo, &git_dir);
 
     let url = git_dir.to_str().ok_or_else(|| InitError::InvalidUtf8Path {
