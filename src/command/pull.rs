@@ -570,20 +570,18 @@ async fn read_pull_config(key: &str) -> Result<Option<String>, PullError> {
 }
 
 fn parse_config_bool(key: &str, value: &str) -> Result<bool, PullError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Ok(true),
-        "false" | "no" | "off" | "0" => Ok(false),
-        "merges" | "m" | "interactive" | "i" => Err(PullError::UnsupportedConfig {
+    if let "merges" | "m" | "interactive" | "i" = value.trim().to_ascii_lowercase().as_str() {
+        return Err(PullError::UnsupportedConfig {
             key: key.to_string(),
             value: value.to_string(),
             reason: "rebase-merges and interactive rebase are not supported by libra pull",
-        }),
-        _ => Err(PullError::InvalidConfig {
-            key: key.to_string(),
-            value: value.to_string(),
-            expected: "true or false",
-        }),
+        });
     }
+    crate::internal::config::parse_git_config_bool(value).ok_or_else(|| PullError::InvalidConfig {
+        key: key.to_string(),
+        value: value.to_string(),
+        expected: "a Git boolean",
+    })
 }
 
 async fn resolve_pull_target(

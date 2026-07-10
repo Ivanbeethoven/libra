@@ -662,19 +662,21 @@ pub struct FetchArgs {
     #[clap(long = "no-progress")]
     pub no_progress: bool,
 
-    /// Before fetching, delete any remote-tracking ref under
+    /// After the fetch, delete any remote-tracking ref under
     /// `refs/remotes/<remote>/*` that the remote no longer advertises (a
     /// `refs/heads/*` or `refs/mr/*` ref). Reuses `remote prune`'s stale
     /// classification. With `--dry-run`, the stale refs are reported but not
     /// deleted. Mutually exclusive with `--no-prune` on a last-one-wins basis
-    /// (matching Git). Local branches, tags, and other remotes are never
+    /// (matching Git). Overrides the `remote.<name>.prune` and `fetch.prune`
+    /// config defaults. Local branches, tags, and other remotes are never
     /// touched.
     #[clap(short = 'p', long = "prune", overrides_with = "no_prune")]
     pub prune: bool,
 
-    /// Do not prune remote-tracking refs that no longer exist on the remote.
-    /// This is the default. Pass `--prune`/`-p` to enable pruning; when both are
-    /// given, the last one on the command line wins (Git semantics).
+    /// Do not prune remote-tracking refs that no longer exist on the remote,
+    /// overriding the `remote.<name>.prune` and `fetch.prune` config defaults
+    /// (the built-in default is no pruning). When both flags are given, the
+    /// last one on the command line wins (Git semantics).
     #[clap(long = "no-prune", overrides_with = "prune")]
     pub no_prune: bool,
 
@@ -1046,7 +1048,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         no_auto_gc: _,
         no_progress,
         prune,
-        no_prune: _,
+        no_prune,
         notes,
     } = args;
 
@@ -1068,14 +1070,35 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         None
     };
 
+    // Resolve the CLI prune intent the same way: `--prune`/`-p` -> Some(true),
+    // `--no-prune` -> Some(false), neither -> None (fall back to the
+    // Git-compatible `remote.<name>.prune` then `fetch.prune` defaults, read
+    // per remote below). `overrides_with` guarantees the two flags can't both
+    // be set.
+    let prune_cli = if prune {
+        Some(true)
+    } else if no_prune {
+        Some(false)
+    } else {
+        None
+    };
+
     if all {
         let remotes = ConfigKv::all_remote_configs().await.map_err(|error| {
             CliError::fatal(format!("failed to read remote configuration: {error}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)
         })?;
 
+        // Fail closed BEFORE the first network fetch: resolve every remote's
+        // effective prune mode up front so an invalid `fetch.prune` /
+        // `remote.<name>.prune` value cannot leave a partially fetched set.
+        let mut prune_modes = Vec::with_capacity(remotes.len());
+        for remote in &remotes {
+            prune_modes.push(resolve_prune_mode(&remote.name, prune_cli).await?);
+        }
+
         let mut results = Vec::with_capacity(remotes.len());
-        for remote in remotes {
+        for (remote, prune) in remotes.into_iter().zip(prune_modes) {
             if verbose {
                 eprintln!(
                     "Fetching {} from {}",
@@ -1139,6 +1162,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         );
     }
 
+    let prune = resolve_prune_mode(&remote_config.name, prune_cli).await?;
     let result = fetch_repository_with_result(
         remote_config,
         refspec.clone(),
@@ -2718,6 +2742,59 @@ fn commit_is_ancestor(ancestor: &ObjectHash, descendant: &ObjectHash) -> bool {
         }
     }
     false
+}
+
+/// Resolve the effective prune mode for `remote_name`: an explicit CLI choice
+/// (`--prune`/`-p` / `--no-prune`) wins; otherwise the Git-compatible
+/// `remote.<name>.prune` then `fetch.prune` defaults, read through the strict
+/// local -> global -> system cascade (case-insensitive keys, encrypted
+/// local/global values decrypted, legacy rows honored, unreadable/unsupported
+/// system scope skipped); otherwise `false` — Git's shipped default.
+///
+/// Fail-closed contract (P1-05): an invalid value is a usage error and an
+/// unreadable local/global scope is an IO error, both raised BEFORE the fetch
+/// touches the network, so a bad config can never yield a fetch whose prune
+/// semantics silently diverge from what the user configured.
+async fn resolve_prune_mode(remote_name: &str, prune_cli: Option<bool>) -> Result<bool, CliError> {
+    if let Some(explicit) = prune_cli {
+        return Ok(explicit);
+    }
+    Ok(configured_fetch_prune(remote_name).await?.unwrap_or(false))
+}
+
+/// Read the first configured value among `remote.<name>.prune` and
+/// `fetch.prune` (that per-remote-first order matches Git). Returns `Ok(None)`
+/// when neither key is set anywhere in the cascade.
+async fn configured_fetch_prune(remote_name: &str) -> Result<Option<bool>, CliError> {
+    use crate::internal::config::{
+        LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
+    };
+
+    for key in [
+        format!("remote.{remote_name}.prune"),
+        "fetch.prune".to_string(),
+    ] {
+        let value = read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, &key)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("failed to read config '{key}': {error:#}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+        let Some(value) = value else {
+            continue;
+        };
+        return match parse_git_config_bool(&value) {
+            Some(enabled) => Ok(Some(enabled)),
+            None => Err(CliError::command_usage(format!(
+                "bad config value '{value}' for '{key}' (expected a Git boolean)"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint(format!(
+                "fix the offending value with 'libra config {key} <true|false>'"
+            ))),
+        };
+    }
+    Ok(None)
 }
 
 /// Resolve the effective [`TagFetchMode`] for `remote_name`: an explicit CLI

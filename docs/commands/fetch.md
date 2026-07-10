@@ -37,6 +37,27 @@ Use `libra --offline fetch ...` or `LIBRA_READ_POLICY=offline|local libra fetch 
 you intentionally want local-only object access. Libra will warn once and ignore the
 global storage config for that run.
 
+### Prune config defaults (`fetch.prune`, `remote.<name>.prune`)
+
+When neither `--prune`/`-p` nor `--no-prune` is given, Libra resolves the prune
+behavior from Git-compatible config defaults, per remote: `remote.<name>.prune`
+first, then `fetch.prune`, each read through the local → global → system cascade
+(case-insensitive keys; encrypted local/global values are decrypted; legacy rows
+are honored; an unreadable or unsupported system scope is skipped). When neither
+key is set the built-in default is `false` — the same shipped default as Git.
+CLI flags always win over config.
+
+An invalid value fails closed with `LBR-CLI-002` and an unreadable local/global
+scope with `LBR-IO-001`, in both cases **before the fetch touches the network**
+(with `--all`, every remote's prune mode is validated before the first fetch),
+so a bad config can never produce a fetch whose prune semantics silently
+diverge from what was configured.
+
+```bash
+libra config fetch.prune true           # prune on every fetch
+libra config remote.origin.prune false  # but never for origin
+```
+
 ## Options
 
 | Flag / Argument | Description | Example |
@@ -49,8 +70,8 @@ global storage config for that run.
 | `--no-tags` | Fetch no tags at all, not even tags reachable from fetched commits (overrides the default auto-follow). | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | Do not run a repacking/gc pass after fetching. Accepted no-op for Git parity: Libra's fetch never triggers an automatic gc, so there is nothing to disable. | `libra fetch origin --no-auto-gc` |
 | `--no-progress` | Do not show the progress meter (the "Receiving objects" spinner / remote progress) on stderr, matching `git fetch --no-progress`. | `libra fetch origin --no-progress` |
-| `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` that the remote no longer advertises (reusing `remote prune`'s stale classification). Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched. With `--dry-run`, the stale refs are reported but not deleted. | `libra fetch origin -p` |
-| `--no-prune` | Do not prune remote-tracking refs (the default). `--prune`/`--no-prune` form a last-one-wins toggle: when both are given, the last on the command line wins (Git semantics). | `libra fetch origin --no-prune` |
+| `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` whose branch the remote no longer advertises as a `refs/heads/*` or `refs/mr/*` ref (reusing `remote prune`'s stale classification). Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched. With `--dry-run`, the stale refs are reported but not deleted. Overrides the `remote.<name>.prune` / `fetch.prune` config defaults. | `libra fetch origin -p` |
+| `--no-prune` | Do not prune remote-tracking refs, overriding the `remote.<name>.prune` / `fetch.prune` config defaults (the built-in default is no pruning). `--prune`/`--no-prune` form a last-one-wins toggle: when both are given, the last on the command line wins (Git semantics). | `libra fetch origin --no-prune` |
 | `--notes` | Also import the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from the remote over a dedicated side-channel. Default OFF (Git never auto-fetches notes). v1 travels notes only from a **local Libra source**; a network or plain-Git remote emits an honest "not supported yet" warning and imports no graph (deferred, D17). Import union-merges into any local edges and re-validates every endpoint, and is per-note fault-tolerant (a malformed note, or one whose commit is absent locally, is skipped with a warning, never aborting the fetch). Persist the opt-in per remote with `remote.<name>.fetchNotesDeps=true`. | `libra fetch origin --notes` |
 | `-f`, `--force` | Allow non-fast-forward updates and overwrite (clobber) a local tag that points elsewhere. Forced updates are marked `+` in `--porcelain` / `(forced update)` in human output. | `libra fetch origin --tags --force` |
 | `--dry-run` | Preview the remote-tracking ref updates the fetch would produce without downloading any objects or writing refs, reflog, or `FETCH_HEAD`. | `libra fetch origin --dry-run` |
@@ -125,7 +146,8 @@ ref from pointing at a commit whose parents are missing without a shallow marker
 ## FETCH_HEAD
 
 Every successful fetch records the fetched refs in `.libra/FETCH_HEAD`, one
-`<oid>\tnot-for-merge\tbranch '<name>' of <url>` line per ref. Libra never
+`<oid>\tnot-for-merge\tbranch '<name>' of <url>` line per branch and one
+`<oid>\tnot-for-merge\ttag '<name>' of <url>` line per fetched tag. Libra never
 designates a merge target (merge with `libra pull`), so every line is marked
 `not-for-merge`. `--append` accumulates into the file instead of overwriting it;
 `--dry-run` writes nothing.
@@ -167,12 +189,14 @@ Already up to date with 'origin'
 - `refs_updated[]`: updated remote-tracking refs
 - `objects_fetched`: object count parsed from the received pack
 - `bytes_received`: byte size of the received pack stream (0 when nothing was transferred)
+- `pruned[]`: stale remote-tracking refs removed by pruning (`{remote_ref, branch, old_oid}`); present only when pruning removed at least one ref
 
 ### Refs Updated Schema
 
 - `remote_ref`: fully qualified local remote-tracking ref, e.g. `refs/remotes/origin/main`
 - `old_oid`: previous object id, or `null` when the ref is new
 - `new_oid`: fetched object id
+- `forced`: `true` when the update was not a fast-forward — a branch that moved non-linearly (recorded regardless of `--force`; tracking branches are always updated), or a tag clobbered under `--force`
 
 Example (single remote):
 
@@ -192,7 +216,8 @@ Example (single remote):
           {
             "remote_ref": "refs/remotes/origin/main",
             "old_oid": "abc1234...",
-            "new_oid": "def5678..."
+            "new_oid": "def5678...",
+            "forced": false
           }
         ],
         "objects_fetched": 32,
@@ -236,15 +261,17 @@ Example (already up to date):
 
 ### Pruning is opt-in, not the default
 
-Git ships `fetch.prune = true` as a recommended default because stale remote-tracking
-refs accumulate silently. Libra does **not** prune by default for two reasons: (1) in
+Git's shipped default is also `fetch.prune = false`, though enabling it is a commonly
+recommended setting because stale remote-tracking refs accumulate silently. Libra keeps
+the same shipped default — no pruning — for two additional reasons: (1) in
 agent-driven workflows, stale tracking refs can serve as useful historical anchors for
 diffing against a previous remote state, and (2) destructive ref cleanup should be a
-deliberate choice. Pruning is therefore opt-in via `--prune`/`-p` (or the standalone
-`libra remote prune <name>`). `--no-prune` is the default; `--prune`/`--no-prune` form a
-last-one-wins toggle, matching Git.
+deliberate choice. Pruning is opt-in via `--prune`/`-p`, the `fetch.prune` /
+`remote.<name>.prune` config defaults above, or the standalone
+`libra remote prune <name>`. `--no-prune` is the built-in default; `--prune`/`--no-prune`
+form a last-one-wins toggle and always override the config, matching Git.
 
-When `--prune` is given, after the fetch completes Libra removes every
+When pruning is enabled (flag or config), after the fetch completes Libra removes every
 `refs/remotes/<remote>/*` ref the remote no longer advertises, classified by the same rule
 `remote prune` uses. The deletions and a non-lossy audit reflog entry (`<old> -> 0…0`) run
 in a single transaction, so a mid-prune failure rolls back every deletion. `--dry-run`
@@ -297,7 +324,7 @@ by default for maximum script friendliness.
 | Named remote | `libra fetch origin` | `git fetch origin` | `jj git fetch --remote origin` |
 | Single branch | `libra fetch origin main` | `git fetch origin main` | `jj git fetch --remote origin --branch main` |
 | All remotes | `libra fetch --all` | `git fetch --all` | `jj git fetch --all-remotes` |
-| Prune stale refs | `libra fetch -p` / `libra remote prune <name>` | `git fetch --prune` | Automatic |
+| Prune stale refs | `libra fetch -p` / `fetch.prune`, `remote.<name>.prune` config / `libra remote prune <name>` | `git fetch --prune` / same config keys | Automatic |
 | Shallow fetch | `libra fetch --depth N` | `git fetch --depth N` | Not supported |
 | Dry-run preview | `libra fetch --dry-run` | `git fetch --dry-run` | Not supported |
 | Porcelain output | `libra fetch --porcelain` | `git fetch --porcelain` | No |

@@ -1138,6 +1138,36 @@ pub async fn read_cascaded_config_value(
     global_config_value(key).await
 }
 
+/// Parse a Git-compatible boolean config value (`git_config_bool` semantics):
+/// `true`/`yes`/`on` (case-insensitive) and any non-zero integer — with an
+/// optional `k`/`m`/`g` unit suffix, as Git's int parser accepts — are true;
+/// `false`/`no`/`off` and `0` (or `0k` …) are false. Returns `None` for
+/// anything else, INCLUDING the empty string: the strict-cascade config
+/// family (plan-20260708 P1-05) deliberately rejects present-but-empty
+/// values instead of adopting Git's implicit-bool reading of them.
+pub fn parse_git_config_bool(value: &str) -> Option<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "true" | "yes" | "on" => return Some(true),
+        "false" | "no" | "off" => return Some(false),
+        _ => {}
+    }
+    parse_git_config_int(&normalized).map(|number| number != 0)
+}
+
+/// Parse a Git-compatible integer config value: an optional sign, digits, and
+/// an optional `k`/`m`/`g` unit suffix (×1024 steps). `None` on anything else
+/// or on overflow. Expects pre-trimmed, pre-lowercased input.
+fn parse_git_config_int(value: &str) -> Option<i64> {
+    let (digits, multiplier) = match value.as_bytes().last()? {
+        b'k' => (&value[..value.len() - 1], 1024i64),
+        b'm' => (&value[..value.len() - 1], 1024i64 * 1024),
+        b'g' => (&value[..value.len() - 1], 1024i64 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    digits.parse::<i64>().ok()?.checked_mul(multiplier)
+}
+
 /// Read a Git-compatible default value across all config scopes.
 ///
 /// Unlike [`read_cascaded_config_value`], this helper preserves a present empty

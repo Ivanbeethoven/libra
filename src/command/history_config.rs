@@ -1,6 +1,8 @@
 //! Typed readers for Git config defaults that can change commit history.
 
-use crate::internal::config::{LocalIdentityTarget, read_cascaded_config_value_strict};
+use crate::internal::config::{
+    LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
+};
 
 const DEFAULT_MERGE_LOG_LIMIT: usize = 20;
 
@@ -34,11 +36,13 @@ pub(crate) async fn merge_fast_forward() -> Result<Option<MergeFastForward>, His
     let Some(value) = read_value("merge.ff").await? else {
         return Ok(None);
     };
-    let parsed = match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => MergeFastForward::Allow,
-        "false" | "no" | "off" | "0" => MergeFastForward::CreateMergeCommit,
-        "only" => MergeFastForward::Only,
-        _ => return Err(invalid("merge.ff", value, "true, false, or only")),
+    if value.trim().eq_ignore_ascii_case("only") {
+        return Ok(Some(MergeFastForward::Only));
+    }
+    let parsed = match parse_git_config_bool(&value) {
+        Some(true) => MergeFastForward::Allow,
+        Some(false) => MergeFastForward::CreateMergeCommit,
+        None => return Err(invalid("merge.ff", value, "true, false, or only")),
     };
     Ok(Some(parsed))
 }
@@ -77,10 +81,9 @@ async fn read_bool(key: &str) -> Result<Option<bool>, HistoryConfigError> {
     let Some(value) = read_value(key).await? else {
         return Ok(None);
     };
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Ok(Some(true)),
-        "false" | "no" | "off" | "0" => Ok(Some(false)),
-        _ => Err(invalid(key, value, "true or false")),
+    match parse_git_config_bool(&value) {
+        Some(enabled) => Ok(Some(enabled)),
+        None => Err(invalid(key, value, "a Git boolean")),
     }
 }
 

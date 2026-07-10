@@ -443,3 +443,64 @@ fn head_has_gpg_signature(fixture: &Fixture, repo: &Path) -> bool {
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("fixture path is utf8")
 }
+
+#[test]
+fn history_defaults_accept_git_numeric_booleans_and_keep_only() {
+    let fixture = Fixture::new();
+
+    // merge.ff=2 is a Git-boolean true: fast-forward stays allowed.
+    let repo = fixture.repo("numeric-ff-true");
+    fixture.feature_with_commits(&repo, &["feature tip"]);
+    fixture.success(&repo, &["config", "merge.ff", "2"]);
+    fixture.success(&repo, &["merge", "feature"]);
+    let parents = fixture.success(&repo, &["log", "-1", "--format=%P"]);
+    assert_eq!(
+        String::from_utf8_lossy(&parents.stdout)
+            .split_whitespace()
+            .count(),
+        1,
+        "merge.ff=2 must count as true (fast-forward allowed)"
+    );
+
+    // merge.ff=0k is a Git-boolean false: force a two-parent merge commit.
+    let repo = fixture.repo("numeric-ff-false");
+    fixture.feature_with_commits(&repo, &["feature tip"]);
+    fixture.success(&repo, &["config", "merge.ff", "0k"]);
+    fixture.success(&repo, &["merge", "feature"]);
+    let parents = fixture.success(&repo, &["log", "-1", "--format=%P"]);
+    assert_eq!(
+        String::from_utf8_lossy(&parents.stdout)
+            .split_whitespace()
+            .count(),
+        2,
+        "merge.ff=0k must count as false (merge commit forced)"
+    );
+
+    // The non-boolean 'only' keyword must survive the widened parser.
+    let repo = fixture.repo("numeric-ff-only");
+    fixture.feature_with_commits(&repo, &["feature tip"]);
+    write_and_commit(&fixture, &repo, "diverge.txt", "div", "diverge main");
+    fixture.success(&repo, &["config", "merge.ff", "only"]);
+    let rejected = fixture.run(&repo, &["merge", "feature"]);
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("non-fast-forward"),
+        "merge.ff=only must still reject a diverged merge"
+    );
+
+    // merge.verifySignatures=1m is true: an unsigned tip is rejected.
+    let repo = fixture.repo("numeric-verify");
+    fixture.feature_with_commits(&repo, &["unsigned feature"]);
+    fixture.success(&repo, &["config", "merge.verifySignatures", "1m"]);
+    let rejected = fixture.run(&repo, &["merge", "feature"]);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("does not have a GPG signature"));
+
+    // commit.gpgSign=2 is true: the commit is vault-signed even with
+    // vault.signing=false.
+    let repo = fixture.repo("numeric-gpgsign");
+    fixture.success(&repo, &["config", "vault.signing", "false"]);
+    fixture.success(&repo, &["config", "commit.gpgSign", "2"]);
+    write_and_commit(&fixture, &repo, "signed.txt", "signed", "numeric signed");
+    assert!(head_has_gpg_signature(&fixture, &repo));
+}

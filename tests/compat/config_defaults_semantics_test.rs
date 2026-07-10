@@ -723,3 +723,259 @@ fn assert_success(program: &str, args: &[&str], output: &Output) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// ── P1-05c: fetch.prune / remote.<name>.prune defaults ──────────────────────
+
+fn fetch_prune_local(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf, PathBuf, String) {
+    let (remote_dir, work_dir, branch) = fixture.remote_fixture(name);
+    // A second remote branch that will later go stale.
+    fixture.git_success(&work_dir, &["push", "origin", "HEAD:refs/heads/side"]);
+    let repo = fixture.path(&format!("{name}-local"));
+    fixture.init_repo(&repo);
+    fixture.success(&repo, &["remote", "add", "origin", path_str(&remote_dir)]);
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        has_tracking_ref(fixture, &repo, "side"),
+        "fixture must start with a live origin/side"
+    );
+    // Delete the branch on the remote so origin/side becomes stale.
+    fixture.git_success(&remote_dir, &["update-ref", "-d", "refs/heads/side"]);
+    (remote_dir, work_dir, repo, branch)
+}
+
+fn has_tracking_ref(fixture: &Fixture, repo: &Path, name: &str) -> bool {
+    fixture
+        .run(repo, &["rev-parse", &format!("refs/remotes/origin/{name}")])
+        .status
+        .success()
+}
+
+#[test]
+fn fetch_prune_config_removes_stale_tracking_ref_without_cli_flag() {
+    let fixture = Fixture::new();
+
+    // Local scope.
+    let (_remote, _work, repo, branch) = fetch_prune_local(&fixture, "prune-local");
+    fixture.success(&repo, &["config", "fetch.prune", "true"]);
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        !has_tracking_ref(&fixture, &repo, "side"),
+        "fetch.prune=true must prune the stale ref without --prune"
+    );
+    assert!(
+        has_tracking_ref(&fixture, &repo, &branch),
+        "the live branch must survive pruning"
+    );
+
+    // Global scope resolves through the same cascade.
+    let (_remote, _work, repo, _branch) = fetch_prune_local(&fixture, "prune-global");
+    fixture.success(&repo, &["config", "--global", "fetch.prune", "true"]);
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        !has_tracking_ref(&fixture, &repo, "side"),
+        "a global fetch.prune=true must be honored"
+    );
+    fixture.success(&repo, &["config", "--global", "--unset", "fetch.prune"]);
+}
+
+#[test]
+fn remote_scoped_prune_config_overrides_fetch_prune() {
+    let fixture = Fixture::new();
+    let (_remote, _work, repo, _branch) = fetch_prune_local(&fixture, "prune-remote-scope");
+
+    fixture.success(&repo, &["config", "fetch.prune", "true"]);
+    fixture.success(&repo, &["config", "remote.origin.prune", "false"]);
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        has_tracking_ref(&fixture, &repo, "side"),
+        "remote.origin.prune=false must override fetch.prune=true"
+    );
+
+    fixture.success(&repo, &["config", "--unset", "fetch.prune"]);
+    fixture.success(&repo, &["config", "remote.origin.prune", "true"]);
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        !has_tracking_ref(&fixture, &repo, "side"),
+        "remote.origin.prune=true alone must enable pruning"
+    );
+}
+
+#[test]
+fn fetch_cli_prune_flags_override_configured_prune() {
+    let fixture = Fixture::new();
+    let (_remote, _work, repo, _branch) = fetch_prune_local(&fixture, "prune-cli");
+
+    fixture.success(&repo, &["config", "fetch.prune", "true"]);
+    fixture.success(&repo, &["fetch", "--no-prune", "origin"]);
+    assert!(
+        has_tracking_ref(&fixture, &repo, "side"),
+        "--no-prune must override fetch.prune=true"
+    );
+
+    fixture.success(&repo, &["config", "fetch.prune", "false"]);
+    fixture.success(&repo, &["config", "remote.origin.prune", "false"]);
+    fixture.success(&repo, &["fetch", "--prune", "origin"]);
+    assert!(
+        !has_tracking_ref(&fixture, &repo, "side"),
+        "--prune must override configured false values"
+    );
+}
+
+#[test]
+fn fetch_prune_invalid_config_fails_before_fetch() {
+    let fixture = Fixture::new();
+    let (remote_dir, work_dir, branch) = fixture.remote_fixture("prune-invalid");
+    let repo = fixture.path("prune-invalid-local");
+    fixture.init_repo(&repo);
+    fixture.success(&repo, &["remote", "add", "origin", path_str(&remote_dir)]);
+    fixture.success(&repo, &["fetch", "origin"]);
+    let before = stdout_trim(&fixture.success(
+        &repo,
+        &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+    ));
+
+    // Advance the remote so a fetch WOULD move the tracking ref.
+    fixture.push_remote_commit(&work_dir, &branch, "advance.txt", "remote advance");
+
+    for key in ["fetch.prune", "remote.origin.prune"] {
+        fixture.success(&repo, &["config", key, "sometimes"]);
+        let rejected = fixture.run(&repo, &["fetch", "origin"]);
+        assert_eq!(
+            rejected.status.code(),
+            Some(129),
+            "invalid {key} must be a usage error"
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(key),
+            "the error must name the offending key {key}"
+        );
+        fixture.success(&repo, &["config", "--unset", key]);
+    }
+
+    let after = stdout_trim(&fixture.success(
+        &repo,
+        &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+    ));
+    assert_eq!(
+        before, after,
+        "an invalid prune config must fail before the fetch touches the network"
+    );
+}
+
+#[test]
+fn fetch_prune_accepts_git_numeric_booleans() {
+    let fixture = Fixture::new();
+    let (_remote, _work, repo, _branch) = fetch_prune_local(&fixture, "prune-numeric");
+
+    // Git treats any non-zero integer (with optional k/m/g suffix) as true …
+    fixture.success(&repo, &["config", "fetch.prune", "2"]);
+    // … and the remote-scoped key still wins, here as a zero-with-suffix false.
+    fixture.success(&repo, &["config", "remote.origin.prune", "0k"]);
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        has_tracking_ref(&fixture, &repo, "side"),
+        "remote.origin.prune=0k (Git false) must override fetch.prune=2"
+    );
+
+    fixture.success(&repo, &["config", "--unset", "remote.origin.prune"]);
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        !has_tracking_ref(&fixture, &repo, "side"),
+        "fetch.prune=2 must count as a Git-boolean true"
+    );
+}
+
+#[test]
+fn remote_scoped_prune_wins_across_scopes() {
+    let fixture = Fixture::new();
+
+    // A GLOBAL remote-scoped key beats a LOCAL fetch.prune: precedence is
+    // per key first (remote.<name>.prune > fetch.prune), scope second.
+    let (_remote, _work, repo, _branch) = fetch_prune_local(&fixture, "prune-xscope-keep");
+    fixture.success(&repo, &["config", "fetch.prune", "true"]);
+    fixture.success(
+        &repo,
+        &["config", "--global", "remote.origin.prune", "false"],
+    );
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        has_tracking_ref(&fixture, &repo, "side"),
+        "global remote.origin.prune=false must override local fetch.prune=true"
+    );
+    fixture.success(
+        &repo,
+        &["config", "--global", "--unset", "remote.origin.prune"],
+    );
+
+    let (_remote, _work, repo, _branch) = fetch_prune_local(&fixture, "prune-xscope-drop");
+    fixture.success(&repo, &["config", "fetch.prune", "false"]);
+    fixture.success(
+        &repo,
+        &["config", "--global", "remote.origin.prune", "true"],
+    );
+    fixture.success(&repo, &["fetch", "origin"]);
+    assert!(
+        !has_tracking_ref(&fixture, &repo, "side"),
+        "global remote.origin.prune=true must override local fetch.prune=false"
+    );
+    fixture.success(
+        &repo,
+        &["config", "--global", "--unset", "remote.origin.prune"],
+    );
+}
+
+#[test]
+fn fetch_all_invalid_prune_config_fails_before_any_fetch() {
+    let fixture = Fixture::new();
+    let (remote_a, work_a, branch_a) = fixture.remote_fixture("prune-all-a");
+    let (remote_b, _work_b, _branch_b) = fixture.remote_fixture("prune-all-b");
+    let repo = fixture.path("prune-all-local");
+    fixture.init_repo(&repo);
+    fixture.success(&repo, &["remote", "add", "origin", path_str(&remote_a)]);
+    fixture.success(&repo, &["remote", "add", "second", path_str(&remote_b)]);
+    fixture.success(&repo, &["fetch", "--all"]);
+    let before = stdout_trim(&fixture.success(
+        &repo,
+        &["rev-parse", &format!("refs/remotes/origin/{branch_a}")],
+    ));
+
+    // Advance the FIRST remote, break the SECOND remote's prune config: the
+    // pre-validation pass must reject the run before any remote is fetched.
+    fixture.push_remote_commit(&work_a, &branch_a, "advance-a.txt", "remote a advance");
+    fixture.success(&repo, &["config", "remote.second.prune", "sometimes"]);
+
+    let rejected = fixture.run(&repo, &["fetch", "--all"]);
+    assert_eq!(rejected.status.code(), Some(129));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("remote.second.prune"));
+
+    let after = stdout_trim(&fixture.success(
+        &repo,
+        &["rev-parse", &format!("refs/remotes/origin/{branch_a}")],
+    ));
+    assert_eq!(
+        before, after,
+        "with --all, an invalid prune config on ANY remote must fail before the FIRST fetch"
+    );
+}
+
+#[test]
+fn pull_rebase_accepts_git_numeric_boolean() {
+    let fixture = Fixture::new();
+    let (remote_dir, work_dir, branch) = fixture.remote_fixture("rebase-numeric");
+    let repo = fixture.path("rebase-numeric-local");
+    fixture.init_repo(&repo);
+    fixture.configure_tracking(&repo, &remote_dir, &branch);
+    fixture.success(&repo, &["pull"]);
+
+    fixture.push_remote_commit(&work_dir, &branch, "remote.txt", "remote update");
+    fixture.commit_file(&repo, "local.txt", "local change\n", "local update");
+    fixture.success(&repo, &["config", "pull.rebase", "2"]);
+    fixture.success(&repo, &["pull"]);
+
+    let parents = stdout_trim(&fixture.success(&repo, &["log", "-1", "--format=%P"]));
+    assert_eq!(
+        parents.split_whitespace().count(),
+        1,
+        "pull.rebase=2 must count as a Git-boolean true and rebase"
+    );
+}
