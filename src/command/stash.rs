@@ -953,7 +953,7 @@ pub(crate) async fn autostash_pop() -> Result<(), String> {
 }
 
 async fn run_list() -> Result<StashOutput, StashError> {
-    if !has_stash() {
+    if !has_stash()? {
         return Ok(StashOutput::List {
             entries: Vec::new(),
         });
@@ -1151,7 +1151,7 @@ async fn run_clear(force: bool, output: &OutputConfig) -> Result<StashOutput, St
         return Err(StashError::ClearRequiresForce);
     }
 
-    if !has_stash() {
+    if !has_stash()? {
         return Ok(StashOutput::Clear { cleared_count: 0 });
     }
 
@@ -1465,7 +1465,7 @@ fn ensure_untracked_restore_paths_clear(
 }
 
 fn do_drop(stash: Option<String>) -> Result<StashOutput, StashError> {
-    if !has_stash() {
+    if !has_stash()? {
         return Err(StashError::NoStashFound);
     }
 
@@ -1600,11 +1600,25 @@ async fn has_changes() -> bool {
     false
 }
 
-fn has_stash() -> bool {
-    util::try_get_storage_path(None)
-        .ok()
-        .map(|p| p.join("refs/stash").is_file())
-        .unwrap_or(false)
+fn has_stash() -> Result<bool, StashError> {
+    let storage = util::try_get_storage_path(None).map_err(|error| {
+        StashError::ReadObject(format!(
+            "failed to resolve storage while inspecting the stash ref: {error}"
+        ))
+    })?;
+    let stash_ref = storage.join("refs/stash");
+    match fs::symlink_metadata(&stash_ref) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(StashError::ReadObject(format!(
+            "stash ref '{}' is not a regular file",
+            stash_ref.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StashError::ReadObject(format!(
+            "failed to inspect stash ref '{}': {error}",
+            stash_ref.display()
+        ))),
+    }
 }
 
 fn empty_tree() -> Result<Tree, String> {
@@ -1674,7 +1688,7 @@ fn parse_stash_log_entries(lines: Vec<String>) -> Result<Vec<StashLogEntry>, Sta
 }
 
 fn resolve_stash_to_commit_hash(stash_ref: Option<String>) -> Result<(usize, String), StashError> {
-    if !has_stash() {
+    if !has_stash()? {
         return Err(StashError::NoStashFound);
     }
 
@@ -2045,13 +2059,18 @@ fn merge_trees(base: &Tree, head: &Tree, stash: &Tree, git_dir: &Path) -> Result
 
 /// Get the number of stashes
 pub(crate) fn get_stash_num() -> Result<usize, String> {
-    if !has_stash() {
+    if !has_stash().map_err(|error| error.to_string())? {
         return Ok(0);
     }
 
     let git_dir = util::try_get_storage_path(None).map_err(|e| e.to_string())?;
     let stash_log_path = git_dir.join("logs/refs/stash");
-    if !stash_log_path.exists() {
+    if !stash_log_path.try_exists().map_err(|error| {
+        format!(
+            "failed to inspect stash log '{}': {error}",
+            stash_log_path.display()
+        )
+    })? {
         return Ok(0);
     }
     let count =

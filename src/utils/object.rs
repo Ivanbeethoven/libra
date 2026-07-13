@@ -8,6 +8,7 @@ use std::{
 
 use flate2::read::ZlibDecoder;
 use git_internal::{errors::GitError, hash::ObjectHash};
+
 /// Helper function to read and decompress a git object from the object database.
 pub fn read_git_object(git_dir: &Path, hash: &ObjectHash) -> Result<Vec<u8>, GitError> {
     let hash_str = hash.to_string();

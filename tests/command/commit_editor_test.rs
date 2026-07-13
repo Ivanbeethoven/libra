@@ -672,7 +672,14 @@ fn verbose_without_editor_propagates_invalid_diff_config_before_commit() {
     );
 
     let out = run_libra(
-        &["commit", "-v", "-m", "must not commit", "--no-gpg-sign"],
+        &[
+            "commit",
+            "-v",
+            "--no-status",
+            "-m",
+            "must not commit",
+            "--no-gpg-sign",
+        ],
         &repo,
     );
     assert_eq!(
@@ -714,7 +721,14 @@ fn verbose_without_editor_preserves_diff_config_read_error_before_commit() {
     .unwrap();
 
     let out = run_libra(
-        &["commit", "-v", "-m", "must not commit", "--no-gpg-sign"],
+        &[
+            "commit",
+            "-v",
+            "--no-status",
+            "-m",
+            "must not commit",
+            "--no-gpg-sign",
+        ],
         &repo,
     );
     assert_eq!(out.status.code(), Some(128));
@@ -722,6 +736,12 @@ fn verbose_without_editor_preserves_diff_config_read_error_before_commit() {
     assert!(stderr.contains("LBR-IO-001"), "{stderr}");
     assert!(stderr.contains("diff.srcPrefix"), "{stderr}");
     assert!(!stderr.contains("LBR-REPO-002"), "{stderr}");
+    fs::remove_dir(
+        repo.join(".libra-test-home")
+            .join(".libra")
+            .join("config.db"),
+    )
+    .unwrap();
     assert!(
         last_commit_message(&repo).contains("base"),
         "HEAD must remain on the base commit"
@@ -888,10 +908,12 @@ fn status_flag_seeds_commented_status_into_template_and_strips_it() {
 
 #[cfg(unix)]
 #[test]
-fn default_and_no_status_omit_status_from_template() {
-    // Without `--status` (Libra's default) the template carries no status; the
-    // same holds for an explicit `--no-status`.
-    for flags in [vec!["commit"], vec!["commit", "--no-status"]] {
+fn default_includes_status_and_no_status_omits_it() {
+    // Git and Libra default to including status; explicit `--no-status` omits it.
+    for (flags, includes_status) in [
+        (vec!["commit"], true),
+        (vec!["commit", "--no-status"], false),
+    ] {
         let temp = tempdir().unwrap();
         let repo = temp.path().join("repo");
         init_repo(&repo);
@@ -907,9 +929,10 @@ fn default_and_no_status_omit_status_from_template() {
             String::from_utf8_lossy(&out.stderr)
         );
         let template = fs::read_to_string(&capture).unwrap();
-        assert!(
-            !template.contains("tracked.txt") && !template.contains("Changes to be committed"),
-            "{flags:?}: template must NOT include a status section:\n{template}"
+        assert_eq!(
+            template.contains("tracked.txt"),
+            includes_status,
+            "{flags:?}: unexpected status-template behavior:\n{template}"
         );
     }
 }

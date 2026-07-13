@@ -1695,7 +1695,7 @@ fn test_commit_all_porcelain_shows_autostaged_as_staged() {
 
     // `commit -a --porcelain`: `-a` auto-stages the modification for the
     // preview, so the porcelain must show it as STAGED ("M  tracked.txt"), not
-    // unstaged (" M tracked.txt") — the snapshot is taken after auto-staging.
+    // unstaged (" M tracked.txt") — the isolated preview is read after auto-staging.
     let output = run_libra_command(&["commit", "-a", "--porcelain", "-m", "x"], p);
     assert_cli_success(&output, "commit -a --porcelain");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1709,7 +1709,7 @@ fn test_commit_all_porcelain_shows_autostaged_as_staged() {
     );
 
     // The preview must NOT mutate the index: the modification is still unstaged
-    // afterwards (the dry-run `-a` auto-stage is rolled back).
+    // afterwards (the dry-run `-a` auto-stage used an isolated index).
     let status = run_libra_command(&["status", "--porcelain"], p);
     assert_cli_success(&status, "status --porcelain after preview");
     let status_out = String::from_utf8_lossy(&status.stdout);

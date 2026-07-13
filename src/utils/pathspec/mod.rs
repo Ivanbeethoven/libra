@@ -97,6 +97,19 @@ impl PathspecSet {
         self.specs.is_empty()
     }
 
+    /// Whether this set is exactly one positive repository-root prefix and
+    /// therefore selects the whole tree, including a legitimately empty tree.
+    pub fn is_full_tree_match(&self) -> bool {
+        matches!(
+            self.specs.as_slice(),
+            [Pathspec {
+                matcher: PathMatcher::Prefix { pattern, .. },
+                exclude: false,
+                ..
+            }] if pattern.is_empty()
+        )
+    }
+
     pub fn matches_path(&self, path: impl AsRef<Path>) -> bool {
         if self.specs.is_empty() {
             return true;
@@ -538,6 +551,22 @@ mod tests {
         assert!(specs.matches_path("src/main.rs"));
         assert!(specs.matches_path("src"));
         assert!(!specs.matches_path("srcfoo/main.rs"));
+    }
+
+    #[test]
+    fn repository_root_is_the_only_full_tree_match() {
+        let workdir = Path::new("/repo");
+        let root = PathspecSet::from_workdir(&[".".to_string()], workdir, workdir).unwrap();
+        assert!(root.is_full_tree_match());
+
+        let missing =
+            PathspecSet::from_workdir(&["missing".to_string()], workdir, workdir).unwrap();
+        assert!(!missing.is_full_tree_match());
+
+        let root_plus_missing =
+            PathspecSet::from_workdir(&[".".to_string(), "missing".to_string()], workdir, workdir)
+                .unwrap();
+        assert!(!root_plus_missing.is_full_tree_match());
     }
 
     #[test]

@@ -286,6 +286,36 @@ impl Storage for TieredStorage {
         self.remote.exist(hash).await
     }
 
+    async fn object_size(&self, hash: &ObjectHash) -> Result<Option<u64>, GitError> {
+        // A remote-only object cannot be sized without downloading an unbounded
+        // payload. Preview callers treat `None` as a safe refusal.
+        self.local.object_size(hash).await
+    }
+
+    async fn get_with_limit(
+        &self,
+        hash: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        // Preview reads are local-only: downloading a remote-only object would
+        // cross the boundary before its size could be trusted.
+        self.local.get_with_limit(hash, limit).await
+    }
+
+    async fn object_sizes(&self, hashes: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
+        self.local.object_sizes(hashes).await
+    }
+
+    async fn object_sizes_with_total_limit(
+        &self,
+        hashes: &[ObjectHash],
+        aggregate_limit: u64,
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        self.local
+            .object_sizes_with_total_limit(hashes, aggregate_limit)
+            .await
+    }
+
     /// Answer local hits without any round trip, then batch-probe the remote
     /// for the misses in a single bounded-concurrency call (`lore.md` §0.6).
     async fn exist_batch(&self, hashes: &[ObjectHash]) -> Vec<bool> {
@@ -546,6 +576,48 @@ mod tests {
         let _ambient_sha1 = set_hash_kind_for_test(HashKind::Sha1);
         assert!(verify_fetched_object(&expected_sha256, ObjectType::Blob, data).is_ok());
         assert!(verify_fetched_object(&expected_sha256, ObjectType::Blob, b"tampered").is_err());
+    }
+
+    #[test]
+    fn client_tiered_alternate_pack_honors_preview_minimum_charge() {
+        use std::{path::Path, str::FromStr, sync::Arc};
+
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+
+        use crate::utils::client_storage::ClientStorage;
+
+        let _kind = set_hash_kind_for_test(HashKind::Sha1);
+        let root = tempdir().expect("create tiered preview fixture");
+        let local_objects = root.path().join("local/objects");
+        let alternate_objects = root.path().join("alternate/objects");
+        let alternate_pack_dir = alternate_objects.join("pack");
+        fs::create_dir_all(&local_objects).expect("create local object store");
+        fs::create_dir_all(&alternate_pack_dir).expect("create alternate pack directory");
+
+        let pack = alternate_pack_dir.join("small.pack");
+        let idx = pack.with_extension("idx");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/small-sha1.pack");
+        fs::copy(&fixture, &pack).expect("copy small pack fixture");
+        crate::command::index_pack::build_index_v1(
+            pack.to_str().expect("UTF-8 pack path"),
+            idx.to_str().expect("UTF-8 index path"),
+        )
+        .expect("build alternate pack index");
+        crate::internal::alternates::add(&local_objects, &alternate_objects)
+            .expect("register alternate object store");
+
+        let local = LocalStorage::new_with_alternates(local_objects.clone());
+        let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
+        let tiered = TieredStorage::new(local, remote, 1 << 20, 1 << 20);
+        let client = ClientStorage::from_test_storage(Arc::new(tiered), local_objects);
+        let tiny_blob = ObjectHash::from_str("035f9b742ebf552ed87f003d4944480bfea6ba99")
+            .expect("parse packed tiny-blob OID");
+
+        let error = client
+            .object_sizes_with_total_limit(&[tiny_blob], 4_095)
+            .expect_err("a tiny alternate-pack object must carry the 4 KiB preview charge");
+        assert!(error.to_string().contains("aggregate cache"), "{error}");
     }
 
     /// End-to-end through `TieredStorage::get`: an object present only in the

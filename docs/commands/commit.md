@@ -237,6 +237,9 @@ libra config commit.cleanup whitespace   # default cleanup when --cleanup is omi
 ### `--dry-run`
 
 Do not actually create the commit. Show the commit summary that would be produced.
+The preview does not run the pre-commit hook or open the commit-message editor, so
+no message is required and subprocesses cannot observe or mutate a live index while
+`-a` is being previewed. `-v` still prints the staged preview diff directly.
 
 ```bash
 libra commit --dry-run -m "Draft commit"
@@ -258,9 +261,10 @@ libra commit --porcelain
 
 ### `--status` / `--no-status`
 
-`--status` seeds the working-tree status, as `#`-commented lines, into the
-commit-message editor template (Git shows this by default; Libra defaults to
-omitting it, so `--status` opts in). Because the lines are comments, the message
+The commit-message editor template includes the working-tree status as
+`#`-commented lines by default. `commit.status=false` disables it; `--status`
+and `--no-status` explicitly override that config (last flag wins). Because the
+lines are comments, the message
 cleanup strips them — they are informational only and never enter the final
 commit message. This has no effect when no editor is opened (e.g. with `-m`).
 The status is also omitted under cleanup modes that keep comment lines
@@ -268,12 +272,80 @@ The status is also omitted under cleanup modes that keep comment lines
 scissors keeps `#` lines above the marker), so it can never leak into the message;
 it is seeded only when an editor opens and the effective cleanup strips comments
 (`strip`/`default`). `-v` only truncates the appended diff — it does not force a
-strip — so the status stays omitted under those modes even with `-v`. `--no-status` (the
-default) omits the status section. The two are a last-one-wins toggle.
+strip — so the status stays omitted under those modes even with `-v`.
+
+`commit.status` uses the strict local -> global -> system cascade and accepts a
+Git boolean (including numeric forms such as `0k` and `2`). When an editor status
+template can actually be generated, an invalid value fails with `LBR-CLI-002`,
+and an unreadable local/global config store fails with `LBR-IO-001`, before `-a`,
+hooks, object writes, or history updates. `-m`, dry-run/porcelain, JSON, and
+non-comment-stripping cleanup bypass the key because no template can exist. An explicit
+`--status` or `--no-status` bypasses the matching config read. When the status
+section is enabled, failures from its `status.*` config, collection, or rendering
+also preserve their stable error code and abort before the pre-commit hook,
+editor, commit/tree object write, or ref update; `--no-status` bypasses that
+template path. Consequently, `--status` with an unreadable shared config store
+reports the first required `status.*` key rather than `commit.status`, proving
+the explicit toggle skipped the latter read. For `--dry-run -a`, the entire preview uses a task-local isolated
+temporary index; the live index is never replaced, and temporary auto-stage
+blobs, LFS backups, and tree objects are not persisted. Non-verbose previews
+hash regular files in a 64 KiB stream and retain no payload. Auto-stage detects
+tracked symlinks without following them (including dangling links and paths
+matched by an LFS attribute), hashes/stores the link-target bytes, and preserves
+mode `120000` in real commits and previews. Verbose previews
+reserve every unique blob on the changed HEAD, already-staged, and newly auto-staged sides before it
+is loaded, with limits of 32 MiB per blob, 64 MiB aggregate charged scratch, and
+4,096 objects. The complete changed-object count is rejected before any storage
+size batch, loose decode, or pack-index scan. Auto-stage reserves a provisional byte/count slot before reading
+the worktree payload, then reconciles it by object ID, so neither staging nor
+hash deduplication can bypass those limits. Scratch lives under the common
+repository storage at `.libra/tmp/commit-preview` (shared by linked worktrees),
+is capped at 256 MiB across concurrent runs,
+and scavenges at most 32 inactive runs older than 24 hours per bounded startup
+scan. A run with missing or unreadable reservation metadata fails closed instead
+of being charged as zero bytes, including while its run lock is still active.
+Limit failures preserve the live index/object store and advise rerunning
+without verbose output. A changed blob is likewise refused before loading when
+its backend cannot perform a bounded local preflight (for example, a remote-only
+blob or a packed blob whose index is missing); the preview never rebuilds pack
+indexes. Actual preview reads use an explicit local-only bounded-load API rather
+than relying on task-local state inside the storage runtime; this path reads
+existing pack indexes only and never rebuilds unrelated missing indexes. Loose and non-delta
+packed objects reject an over-limit declared length before decoding the payload;
+loose objects otherwise stream to the declared boundary and reject size
+mismatches or bytes after the zlib stream. An oversized delta instruction declaration
+is rejected before its base chain is visited; accepted packed deltas validate and charge the
+complete base/instruction/result chain with bounded depth and fail closed on
+malformed instructions; a batch enumerates packs once and opens each existing
+index once. The batch receives the remaining aggregate budget, uses the same
+4 KiB minimum per-object charge as the cache, and stops probing later pack
+payloads immediately after the budget is crossed. The subsequent bounded pack
+read uses an uncached delta decoder and moves its final payload, avoiding the
+process-wide 200 MiB pack cache and extra full-payload clones. Rerun without
+verbose output to avoid an unbounded preview load.
+Dry-run and porcelain previews also skip hooks, editors,
+rerere updates, and `post_commit` automation because no commit occurred.
+When `status.showStash=true`, an unreadable/non-file stash ref (including a
+symlink) or an unreadable/corrupt stash log aborts status template collection with `LBR-IO-001` before hooks, the
+editor, or ref writes. The same fail-closed behavior applies to fresh
+`status --cached` output.
+Auto-stage file/LFS reads fail as
+`LBR-IO-001`; preview, LFS-backup, and object writes fail as `LBR-IO-002`
+instead of panicking. For a real `-a`, blob/LFS
+materialization uses a streamed temporary snapshot, derives the pointer from
+those exact bytes, and atomically replaces any stale or truncated backup. With
+`--sync-data`, newly created shard ancestors, the temporary payload, and both
+the staging and destination directories are synced around that atomic
+replacement; Windows uses a write-through atomic replace because it has no
+portable directory-fsync equivalent. The
+objects and staged index intentionally remain if later status
+collection aborts, matching the existing auto-stage-on-abort behavior.
 
 ```bash
-libra commit --status          # opens the editor with the status commented in
-libra commit --no-status -m "message"
+libra commit                   # editor template includes commented status
+libra config commit.status false
+libra commit --status          # override commit.status=false for this commit
+libra commit --no-status       # omit status for this commit
 ```
 
 ### `--no-gpg-sign`
@@ -543,6 +615,7 @@ switching from Git do not need to learn a new flag name.
 | Reuse message + author | `git commit -C/-c <commit>` | N/A | `libra commit -C/-c <commit>` |
 | Interactive message | `git commit` (opens editor) | `jj commit` (opens editor) | `libra commit` / `libra commit -e` (opens editor) |
 | Verbose diff in editor | `git commit -v` | N/A | `libra commit -v` |
+| Status in editor template | default on; `commit.status` / `--[no-]status` | N/A | default on; `commit.status` / `--[no-]status` |
 | Reset author date | `git commit --reset-author` | N/A | `libra commit --reset-author` |
 | Cleanup mode | `git commit --cleanup=<mode>` | N/A | `libra commit --cleanup=<mode>` |
 | Trailer | `git commit --trailer="..."` | N/A | `libra commit --trailer="..."` |
@@ -565,6 +638,8 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | Amend merge commit | `LBR-REPO-003` | 128 | "create a new commit instead of amending a merge commit" |
 | Invalid author format | `LBR-CLI-002` | 129 | "expected format: 'Name <email>'" |
 | Invalid author/committer date | `LBR-CLI-002` | 129 | Supported date formats |
+| Invalid `commit.status` | `LBR-CLI-002` | 129 | Fix the offending config value |
+| `commit.status` config unreadable | `LBR-IO-001` | 128 | Repair the local/global config store |
 | Message file unreadable | `LBR-IO-001` | 128 | -- |
 | Empty commit message | `LBR-REPO-003` | 128 | "use -m to provide a commit message" |
 | Tree creation failed | `LBR-INTERNAL-001` | 128 | Issues URL |
@@ -574,7 +649,8 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | Pre-commit hook failed | `LBR-REPO-003` | 128 | "use --no-verify to bypass the hook" |
 | Conventional commit invalid | `LBR-CLI-002` | 129 | "see https://www.conventionalcommits.org for format rules" |
 | Vault signing failed | `LBR-AUTH-001` | 128 | "check vault configuration with 'libra config --list'" |
-| Auto-stage failed | `LBR-IO-001` | 128 | -- |
+| Auto-stage source read/hash failed | `LBR-IO-001` | 128 | Check the named working-tree file |
+| Auto-stage preview/object/LFS write failed | `LBR-IO-002` | 128 | Check space and permissions for the named target |
 | Staged changes computation | `LBR-REPO-002` | 128 | "failed to compute staged changes" |
 
 ## Compatibility Notes

@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use byteorder::{BigEndian, ReadBytesExt};
-use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
+use flate2::{Compression, write::ZlibEncoder};
 use git_internal::{
     errors::GitError,
     hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
@@ -93,13 +93,28 @@ impl LocalStorage {
 
     /// Read an object's bytes from THIS store only (loose→pack), no alternates.
     fn get_here(&self, hash: &ObjectHash) -> Result<Option<(Vec<u8>, ObjectType)>, GitError> {
+        self.get_here_with_limit(hash, None)
+    }
+
+    fn get_here_with_limit(
+        &self,
+        hash: &ObjectHash,
+        max_load_cost: Option<u64>,
+    ) -> Result<Option<(Vec<u8>, ObjectType)>, GitError> {
         if self.exist_loosely(hash) {
-            let raw_data = self.read_raw_data(hash)?;
-            let data = Self::decompress_zlib(&raw_data)?;
-            let (type_str, _, end_of_header) = Self::parse_header(&data)?;
-            let obj_type = ObjectType::from_string(&type_str)?;
-            Ok(Some((data[end_of_header + 1..].to_vec(), obj_type)))
+            super::load_cost::read_loose(&self.get_obj_path(hash), max_load_cost).map(Some)
         } else {
+            if let Some(limit) = max_load_cost {
+                let Some(cost) = self.object_sizes_here(&[*hash])?[0] else {
+                    return Ok(None);
+                };
+                if cost > limit {
+                    return Err(GitError::InvalidObjectInfo(format!(
+                        "packed object {hash} has load cost {cost} bytes, which exceeds preview limit of {limit} bytes"
+                    )));
+                }
+                return self.get_from_existing_indexed_pack_uncached(hash);
+            }
             Ok(self.get_from_pack(hash)?.map(|x| (x.0, x.1)))
         }
     }
@@ -127,23 +142,6 @@ impl LocalStorage {
     fn exist_loosely(&self, obj_id: &ObjectHash) -> bool {
         let path = self.get_obj_path(obj_id);
         Path::exists(&path)
-    }
-
-    /// Reads the raw compressed data of a loose object from the filesystem. This is used when we know the object exists as a loose object.
-    fn read_raw_data(&self, obj_id: &ObjectHash) -> Result<Vec<u8>, io::Error> {
-        let path = self.get_obj_path(obj_id);
-        let mut file = fs::File::open(path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-        Ok(buffer)
-    }
-
-    /// Decompresses zlib-compressed data, which is the format used for loose objects. This is used after reading the raw data of a loose object.
-    fn decompress_zlib(data: &[u8]) -> io::Result<Vec<u8>> {
-        let mut decoder = ZlibDecoder::new(data);
-        let mut decompressed_data = Vec::new();
-        decoder.read_to_end(&mut decompressed_data)?;
-        Ok(decompressed_data)
     }
 
     /// Compresses data using zlib, which is the format used for storing loose objects. This is used before writing a new loose object to the filesystem.
@@ -226,6 +224,7 @@ impl LocalStorage {
         len.parse().ok()
     }
 
+    #[cfg(test)]
     fn parse_header(data: &[u8]) -> Result<(String, usize, usize), GitError> {
         let end_of_header = data
             .iter()
@@ -536,6 +535,51 @@ impl LocalStorage {
         Ok(full_obj)
     }
 
+    /// Decode one packed object without consulting or populating the process-wide
+    /// pack cache. Bounded preview reads use this path so their preflighted peak
+    /// remains the actual retained/transient payload bound.
+    fn read_pack_obj_uncached(pack_file: &Path, offset: u64) -> Result<CacheObject, GitError> {
+        let object = {
+            let file = fs::File::open(pack_file)?;
+            let mut reader = io::BufReader::new(&file);
+            reader.seek(io::SeekFrom::Start(offset))?;
+            let mut decoded_offset = offset as usize;
+            Pack::decode_pack_object(&mut reader, &mut decoded_offset)?
+        }
+        .ok_or_else(|| {
+            GitError::InvalidObjectInfo(format!("Failed to decode pack object at offset {offset}"))
+        })?;
+
+        match object.object_type() {
+            ObjectType::OffsetDelta => {
+                let base_offset = object.offset_delta().ok_or_else(|| {
+                    GitError::InvalidObjectInfo(format!(
+                        "OffsetDelta object at offset {offset} has no base offset"
+                    ))
+                })? as u64;
+                let base = Arc::new(Self::read_pack_obj_uncached(pack_file, base_offset)?);
+                Ok(Pack::rebuild_delta(object, base))
+            }
+            ObjectType::HashDelta => {
+                let base_hash = object.hash_delta().ok_or_else(|| {
+                    GitError::InvalidObjectInfo(format!(
+                        "HashDelta object at offset {offset} has no base hash"
+                    ))
+                })?;
+                let index = pack_file.with_extension("idx");
+                let base_offset = Self::read_idx(&index, &base_hash)?.ok_or_else(|| {
+                    GitError::InvalidObjectInfo(format!(
+                        "HashDelta base {base_hash} not found in pack idx {}",
+                        index.display()
+                    ))
+                })?;
+                let base = Arc::new(Self::read_pack_obj_uncached(pack_file, base_offset)?);
+                Ok(Pack::rebuild_delta(object, base))
+            }
+            _ => Ok(object),
+        }
+    }
+
     fn get_from_pack(
         &self,
         obj_id: &ObjectHash,
@@ -548,6 +592,85 @@ impl LocalStorage {
             }
         }
         Ok(None)
+    }
+
+    /// Read from existing pack indexes without creating indexes or touching the
+    /// process-wide pack cache.
+    fn get_from_existing_indexed_pack_uncached(
+        &self,
+        obj_id: &ObjectHash,
+    ) -> Result<Option<(Vec<u8>, ObjectType)>, GitError> {
+        let mut packs = self.list_all_packs();
+        packs.sort();
+        for pack in packs {
+            let index = pack.with_extension("idx");
+            if !index.is_file() {
+                continue;
+            }
+            let Some(offset) = Self::read_idx(&index, obj_id)? else {
+                continue;
+            };
+            let mut object = Self::read_pack_obj_uncached(&pack, offset)?;
+            let object_type = object.object_type();
+            let payload = std::mem::take(&mut object.data_decompressed);
+            return Ok(Some((payload, object_type)));
+        }
+        Ok(None)
+    }
+
+    fn object_sizes_here(&self, hashes: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
+        self.object_sizes_here_with_limit(hashes, None)
+    }
+
+    fn object_sizes_here_with_limit(
+        &self,
+        hashes: &[ObjectHash],
+        aggregate_limit: Option<u64>,
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        let mut sizes = vec![None; hashes.len()];
+        let mut packed_hashes = Vec::new();
+        let mut packed_positions = Vec::new();
+        let mut aggregate_cost = 0u64;
+        for (position, hash) in hashes.iter().enumerate() {
+            let loose = self.get_obj_path(hash);
+            if loose.exists() {
+                let cost = super::load_cost::loose_cost(&loose)?;
+                aggregate_cost = aggregate_cost
+                    .checked_add(crate::utils::preview_object::charged_bytes(cost))
+                    .ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "preview aggregate cache load cost exceeds u64".to_string(),
+                        )
+                    })?;
+                if let Some(limit) = aggregate_limit
+                    && aggregate_cost > limit
+                {
+                    return Err(GitError::InvalidObjectInfo(format!(
+                        "preview aggregate cache load cost exceeds {limit} bytes"
+                    )));
+                }
+                sizes[position] = Some(cost);
+            } else {
+                packed_hashes.push(*hash);
+                packed_positions.push(position);
+            }
+        }
+        if !packed_hashes.is_empty() {
+            // Read-only sizing must not rebuild a missing/incompatible index.
+            let pack_dir = self.base_path.join("pack");
+            let packed = match aggregate_limit {
+                Some(limit) => super::load_cost::pack_costs_with_limit(
+                    &pack_dir,
+                    &packed_hashes,
+                    limit.saturating_sub(aggregate_cost),
+                )?,
+                None => super::load_cost::pack_costs(&pack_dir, &packed_hashes)?,
+            };
+            for (position, cost) in packed_positions.into_iter().zip(packed) {
+                sizes[position] = cost;
+            }
+        }
+        Ok(sizes)
     }
 
     fn read_pack_by_idx(
@@ -595,6 +718,34 @@ impl Storage for LocalStorage {
         })
         .await
         .map_err(|e| GitError::IOError(io::Error::other(e)))?
+    }
+
+    async fn get_with_limit(
+        &self,
+        hash: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let self_clone = self.clone();
+        let hash = *hash;
+        tokio::task::spawn_blocking(move || {
+            if let Some(kind) = self_clone.hash_kind {
+                set_hash_kind(kind);
+            }
+            if let Some(found) = self_clone.get_here_with_limit(&hash, Some(limit))? {
+                return Ok(found);
+            }
+            for alternate in &self_clone.alternates {
+                if let Some((payload, obj_type)) =
+                    alternate.get_here_with_limit(&hash, Some(limit))?
+                {
+                    super::tiered::verify_fetched_object(&hash, obj_type, &payload)?;
+                    return Ok((payload, obj_type));
+                }
+            }
+            Err(GitError::ObjectNotFound(hash.to_string()))
+        })
+        .await
+        .map_err(|error| GitError::IOError(io::Error::other(error)))?
     }
 
     async fn put(
@@ -676,6 +827,117 @@ impl Storage for LocalStorage {
         })
         .await
         .unwrap_or(false)
+    }
+
+    async fn object_size(&self, hash: &ObjectHash) -> Result<Option<u64>, GitError> {
+        let self_clone = self.clone();
+        let hash = *hash;
+        tokio::task::spawn_blocking(move || {
+            if let Some(kind) = self_clone.hash_kind {
+                set_hash_kind(kind);
+            }
+            let mut size = self_clone.object_sizes_here(&[hash])?[0];
+            for alternate in &self_clone.alternates {
+                if size.is_none() {
+                    size = alternate.object_sizes_here(&[hash])?[0];
+                }
+            }
+            Ok(size)
+        })
+        .await
+        .map_err(|error| GitError::IOError(io::Error::other(error)))?
+    }
+
+    async fn object_sizes(&self, hashes: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
+        let self_clone = self.clone();
+        let hashes = hashes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            if let Some(kind) = self_clone.hash_kind {
+                set_hash_kind(kind);
+            }
+            let mut sizes = self_clone.object_sizes_here(&hashes)?;
+            for alternate in &self_clone.alternates {
+                let missing_positions: Vec<_> = sizes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, size)| size.is_none().then_some(position))
+                    .collect();
+                if missing_positions.is_empty() {
+                    break;
+                }
+                let missing_hashes: Vec<_> = missing_positions
+                    .iter()
+                    .map(|position| hashes[*position])
+                    .collect();
+                let alternate_sizes = alternate.object_sizes_here(&missing_hashes)?;
+                for (position, found) in missing_positions.into_iter().zip(alternate_sizes) {
+                    if found.is_some() {
+                        sizes[position] = found;
+                    }
+                }
+            }
+            Ok(sizes)
+        })
+        .await
+        .map_err(|error| GitError::IOError(io::Error::other(error)))?
+    }
+
+    async fn object_sizes_with_total_limit(
+        &self,
+        hashes: &[ObjectHash],
+        aggregate_limit: u64,
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        let self_clone = self.clone();
+        let hashes = hashes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            if let Some(kind) = self_clone.hash_kind {
+                set_hash_kind(kind);
+            }
+            let mut sizes =
+                self_clone.object_sizes_here_with_limit(&hashes, Some(aggregate_limit))?;
+            let mut used = sizes.iter().flatten().try_fold(0u64, |total, size| {
+                total
+                    .checked_add(crate::utils::preview_object::charged_bytes(*size))
+                    .ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "preview aggregate cache load cost exceeds u64".to_string(),
+                        )
+                    })
+            })?;
+            for alternate in &self_clone.alternates {
+                let missing_positions: Vec<_> = sizes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, size)| size.is_none().then_some(position))
+                    .collect();
+                if missing_positions.is_empty() {
+                    break;
+                }
+                let missing_hashes: Vec<_> = missing_positions
+                    .iter()
+                    .map(|position| hashes[*position])
+                    .collect();
+                let alternate_sizes = alternate.object_sizes_here_with_limit(
+                    &missing_hashes,
+                    Some(aggregate_limit.saturating_sub(used)),
+                )?;
+                for (position, found) in missing_positions.into_iter().zip(alternate_sizes) {
+                    if let Some(found) = found {
+                        used = used
+                            .checked_add(crate::utils::preview_object::charged_bytes(found))
+                            .ok_or_else(|| {
+                                GitError::InvalidObjectInfo(
+                                    "preview aggregate cache load cost exceeds u64".to_string(),
+                                )
+                            })?;
+                        sizes[position] = Some(found);
+                    }
+                }
+            }
+            Ok(sizes)
+        })
+        .await
+        .map_err(|error| GitError::IOError(io::Error::other(error)))?
     }
 
     async fn search(&self, prefix: &str) -> Vec<ObjectHash> {
@@ -933,6 +1195,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bounded_get_rejects_oversized_loose_declaration_before_payload_decode() {
+        use std::{io::Write as _, str::FromStr};
+
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("create bounded-get fixture");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let hash = ObjectHash::from_str("1111111111111111111111111111111111111111")
+            .expect("parse fixture object ID");
+        let path = storage.get_obj_path(&hash);
+        std::fs::create_dir_all(path.parent().expect("object shard parent"))
+            .expect("create object shard");
+        let file = std::fs::File::create(path).expect("create loose fixture");
+        let mut encoder = flate2::write::ZlibEncoder::new(file, Compression::default());
+        let declared = crate::utils::preview_object::MAX_OBJECT_BYTES + 1;
+        write!(encoder, "blob {declared}\0").expect("write oversized declaration");
+        encoder.finish().expect("finish loose fixture");
+
+        let error = storage
+            .get_with_limit(&hash, crate::utils::preview_object::MAX_OBJECT_BYTES)
+            .await
+            .expect_err("bounded read must reject oversized declaration");
+        assert!(
+            error.to_string().contains("exceeds preview limit"),
+            "{error}"
+        );
+    }
+
     /// Regression test for OFS_DELTA base-offset resolution in `read_pack_obj`.
     ///
     /// git-internal's `offset_delta()` returns the ABSOLUTE base offset, so
@@ -968,9 +1258,143 @@ mod tests {
 
         assert_eq!(obj.object_type(), ObjectType::Blob);
         let expected = "libra ofs-delta base line\n".repeat(400).into_bytes();
+        let load_cost = crate::utils::storage::load_cost::pack_costs(dir.path(), &[ofs_delta])
+            .expect("probe OFS_DELTA load cost")[0]
+            .expect("OFS_DELTA cost must be available");
+        assert!(
+            load_cost > expected.len() as u64,
+            "load cost must include the delta base and instruction stream"
+        );
         assert_eq!(
             obj.data_decompressed, expected,
             "OFS_DELTA object must reconstruct to the correct blob contents"
+        );
+    }
+
+    #[test]
+    fn object_size_probe_does_not_build_a_missing_pack_index() {
+        use std::str::FromStr;
+
+        set_hash_kind(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_dir = dir.path().join("pack");
+        std::fs::create_dir(&pack_dir).expect("create pack directory");
+        let pack = pack_dir.join("ofs-delta-sha1.pack");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+        std::fs::copy(&fixture, &pack).expect("copy fixture pack");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let object = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse fixture object ID");
+
+        assert_eq!(
+            storage
+                .object_sizes_here(&[object])
+                .expect("probe object size without index")[0],
+            None
+        );
+        assert!(
+            !pack.with_extension("idx").exists(),
+            "read-only size probe must not build a pack index"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_pack_read_does_not_build_an_unrelated_missing_index() {
+        use std::str::FromStr;
+
+        set_hash_kind(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_dir = dir.path().join("pack");
+        std::fs::create_dir(&pack_dir).expect("create pack directory");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+
+        let indexed_pack = pack_dir.join("indexed.pack");
+        let indexed_idx = indexed_pack.with_extension("idx");
+        std::fs::copy(&fixture, &indexed_pack).expect("copy indexed pack fixture");
+        command::index_pack::build_index_v1(
+            indexed_pack.to_str().expect("UTF-8 indexed pack path"),
+            indexed_idx.to_str().expect("UTF-8 indexed idx path"),
+        )
+        .expect("build indexed fixture index");
+
+        let unrelated_pack = pack_dir.join("unrelated.pack");
+        let unrelated_idx = unrelated_pack.with_extension("idx");
+        std::fs::copy(&fixture, &unrelated_pack).expect("copy unrelated pack fixture");
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let object = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse fixture object ID");
+
+        storage
+            .get_with_limit(&object, crate::utils::preview_object::MAX_OBJECT_BYTES)
+            .await
+            .expect("bounded read from existing indexed pack");
+        assert!(
+            !unrelated_idx.exists(),
+            "bounded preview read must not build an unrelated missing pack index"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delta_read_does_not_populate_the_global_pack_cache() {
+        use std::str::FromStr;
+
+        set_hash_kind(HashKind::Sha1);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_dir = dir.path().join("pack");
+        std::fs::create_dir(&pack_dir).expect("create pack directory");
+        let unique = dir
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 temp directory name");
+        let pack = pack_dir.join(format!("bounded-{unique}.pack"));
+        let idx = pack.with_extension("idx");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
+        std::fs::copy(&fixture, &pack).expect("copy pack fixture");
+        command::index_pack::build_index_v1(
+            pack.to_str().expect("UTF-8 pack path"),
+            idx.to_str().expect("UTF-8 idx path"),
+        )
+        .expect("build fixture index");
+
+        let object = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
+            .expect("parse delta object ID");
+        let file_name = pack
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 pack file name");
+        let delta_key = format!("{file_name:?}-420");
+        let base_key = format!("{file_name:?}-241");
+        {
+            let mut cache = PACK_OBJ_CACHE.lock().expect("pack cache lock");
+            cache.remove(&delta_key);
+            cache.remove(&base_key);
+        }
+
+        let storage = LocalStorage::new(dir.path().to_path_buf());
+        let (payload, object_type) = storage
+            .get_with_limit(&object, crate::utils::preview_object::MAX_OBJECT_BYTES)
+            .await
+            .expect("bounded delta read");
+        assert_eq!(object_type, ObjectType::Blob);
+        assert_eq!(
+            payload,
+            "libra ofs-delta base line\n".repeat(400).into_bytes()
+        );
+        let load_cost = crate::utils::storage::load_cost::pack_costs(&pack_dir, &[object])
+            .expect("probe bounded delta load cost")[0]
+            .expect("delta load cost");
+        assert!(
+            load_cost > payload.len() as u64,
+            "charged peak must include delta base/instruction/result coexistence"
+        );
+        let cache = PACK_OBJ_CACHE.lock().expect("pack cache lock");
+        assert!(
+            !cache.contains(&delta_key) && !cache.contains(&base_key),
+            "bounded reads must not retain the delta or its base in the 200 MiB global pack cache"
         );
     }
 }

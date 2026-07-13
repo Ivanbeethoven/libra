@@ -946,6 +946,13 @@ fn cp_head_message(repo: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// Raw `HEAD` commit-object bytes via `cat-file --batch` (includes `gpgsig`).
+fn cp_raw_head_commit(repo: &std::path::Path) -> String {
+    let out = run_libra_command_with_stdin(&["cat-file", "--batch"], repo, "HEAD\n");
+    assert_cli_success(&out, "cat-file --batch HEAD");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 /// Fresh repo with a `feature` branch holding one commit that adds `file`=`content`
 /// (message `msg`). Returns `(repo, feature_oid)` with HEAD back on `main`.
 fn repo_with_feature_commit(file: &str, content: &str, msg: &str) -> (tempfile::TempDir, String) {
@@ -2037,7 +2044,12 @@ fn cherry_pick_gpg_sign_via_vault_succeeds() {
     let (repo, feat) = repo_with_feature_commit("f.txt", "feat\n", "feature work");
     assert_cli_success(
         &run_libra_command(&["cherry-pick", "-S", &feat], repo.path()),
-        "cherry-pick -S signs via vault (a clean exit proves the vault yielded a signature)",
+        "cherry-pick -S signs via vault",
+    );
+    let body = cp_raw_head_commit(repo.path());
+    assert!(
+        body.contains("-----BEGIN PGP SIGNATURE-----"),
+        "cherry-pick -S must write a signed commit: {body}"
     );
 }
 
@@ -2066,12 +2078,13 @@ fn cherry_pick_continue_retains_gpg_sign() {
     );
     // HEAD = f2's resumed commit; HEAD~1 = f1's finalized commit. Both must be
     // signed — proving `gpg_sign` was not dropped on resume.
-    let head_body = cp_head_message(p);
+    let head_body = cp_raw_head_commit(p);
     assert!(
         head_body.contains("-----BEGIN PGP SIGNATURE-----"),
         "resumed commit must stay signed: {head_body}"
     );
-    let prev = run_libra_command(&["cat-file", "-p", "HEAD~1"], p);
+    let prev = run_libra_command_with_stdin(&["cat-file", "--batch"], p, "HEAD~1\n");
+    assert_cli_success(&prev, "cat-file --batch HEAD~1");
     let prev_body = String::from_utf8_lossy(&prev.stdout);
     assert!(
         prev_body.contains("-----BEGIN PGP SIGNATURE-----"),

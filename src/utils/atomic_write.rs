@@ -55,15 +55,15 @@ pub fn init_sync_data_from_env() {
 ///
 /// Writes to a uniquely-named temp file in `path`'s parent directory, flushes
 /// it, optionally fsyncs it, then renames it over `path`. The rename is atomic
-/// on POSIX and on Windows (`ReplaceFile` semantics via `NamedTempFile::persist`),
-/// so a reader either sees the old file or the fully-written new file — never a
-/// partial write.
+/// on POSIX and on Windows (`MoveFileExW` replacement), so a reader either sees
+/// the old file or the fully-written new file — never a partial write. With
+/// `fsync=true`, Windows also requests `MOVEFILE_WRITE_THROUGH`.
 ///
 /// # Arguments
 /// * `path` - final destination path.
 /// * `bytes` - full contents to write.
-/// * `fsync` - when true, fsync the temp file before the rename and the parent
-///   directory after, for power-loss durability.
+/// * `fsync` - when true, fsync the temp file before replacement; Unix also
+///   fsyncs affected directories, while Windows uses write-through replacement.
 ///
 /// # Errors
 /// Propagates any IO error from creating the parent directory, writing/syncing
@@ -85,21 +85,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8], fsync: bool) -> io::Result<()> {
     // taking the object inside it with it.
     ensure_dir_exists(parent, fsync)?;
 
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(bytes)?;
-    tmp.flush()?;
-    if fsync {
-        tmp.as_file().sync_all()?;
-    }
-
-    // Atomic rename over the destination. `persist` maps to `rename` on POSIX
-    // and an atomic replace on Windows.
-    tmp.persist(path).map_err(|e| e.error)?;
-
-    if fsync {
-        fsync_parent_dir(parent)?;
-    }
-    Ok(())
+    let mut writer = crate::utils::atomic_stream::StreamingAtomicFile::new_in(parent, fsync)?;
+    writer.write_all(bytes)?;
+    writer.persist(path)
 }
 
 /// Create `dir` and any missing ancestors, fsyncing each newly-created
@@ -108,7 +96,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8], fsync: bool) -> io::Result<()> {
 /// Creates the deepest-missing-first by recursing on the parent, then creating
 /// this level. Race-safe: a concurrent creation surfaces as `AlreadyExists` and
 /// is treated as success.
-fn ensure_dir_exists(dir: &Path, fsync: bool) -> io::Result<()> {
+pub(crate) fn ensure_dir_exists(dir: &Path, fsync: bool) -> io::Result<()> {
     if dir.is_dir() {
         return Ok(());
     }
@@ -124,22 +112,29 @@ fn ensure_dir_exists(dir: &Path, fsync: bool) -> io::Result<()> {
             Ok(())
         }
         // Lost a create race with another writer — the directory now exists.
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
         Err(err) => Err(err),
     }
 }
 
-/// fsync a directory so a rename into it is durable. A no-op on platforms that
-/// do not support (or need) directory fsync.
+/// fsync a directory so a rename into it is durable.
 #[cfg(unix)]
-fn fsync_parent_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn fsync_parent_dir(dir: &Path) -> io::Result<()> {
     fs::File::open(dir)?.sync_all()
 }
 
-#[cfg(not(unix))]
-fn fsync_parent_dir(_dir: &Path) -> io::Result<()> {
-    // Windows does not support fsync on a directory handle the same way; the
-    // rename durability is handled by the filesystem. Treated as a no-op.
+#[cfg(windows)]
+pub(crate) fn fsync_parent_dir(_dir: &Path) -> io::Result<()> {
+    // Windows does not expose a reliable directory-fsync equivalent. The
+    // durable atomic replacement itself uses MOVEFILE_WRITE_THROUGH in
+    // `StreamingAtomicFile`, which waits for the move metadata to reach disk.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn fsync_parent_dir(_dir: &Path) -> io::Result<()> {
+    // Other targets have no portable directory-sync primitive. Atomic rename
+    // remains guaranteed, while power-loss durability is best effort.
     Ok(())
 }
 

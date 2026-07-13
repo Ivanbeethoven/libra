@@ -361,7 +361,7 @@ async fn test_init_from_git_repository_empty_git_repo_fails() {
 
     let (stderr, report) = parse_cli_error_stderr(&output.stderr);
     assert!(
-        stderr.contains("no refs fetched from source git repository"),
+        stderr.contains("source Git HEAD points to unborn branch 'refs/heads/main'"),
         "expected empty-git conversion failure, got: {stderr}"
     );
     assert_eq!(report.error_code, "LBR-REPO-003");
@@ -656,6 +656,25 @@ async fn test_init_from_git_repository_with_gitlink_entry_succeeds() {
         output.status.success(),
         "libra init should succeed for source repos with gitlink entries; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        libra_dir.join("vendor/sub").is_dir(),
+        "gitlink checkout should materialize an empty directory"
+    );
+
+    let ls_files = libra_command(&libra_dir)
+        .args(["ls-files", "--stage", "vendor/sub"])
+        .output()
+        .expect("failed to inspect converted gitlink index entry");
+    assert!(
+        ls_files.status.success(),
+        "ls-files failed: {}",
+        String::from_utf8_lossy(&ls_files.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ls_files.stdout);
+    assert!(
+        stdout.starts_with(&format!("160000 {sub_head} 0\tvendor/sub")),
+        "converted gitlink should retain mode and object ID, got: {stdout}"
     );
 }
 

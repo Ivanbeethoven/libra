@@ -52,10 +52,13 @@ fn filter_on_untracked_path_is_unspecified() {
 #[test]
 fn all_reports_only_set_attributes() {
     let repo = setup_repo();
-    // Tracked path: filter=lfs is set.
+    // Every explicitly assigned value/state is reported, including `-text`.
     let tracked = run_libra_command(&["check-attr", "--all", "a.bin"], repo.path());
     assert_eq!(tracked.status.code(), Some(0));
-    assert_eq!(stdout_of(&tracked), "a.bin: filter: lfs\n");
+    assert_eq!(
+        stdout_of(&tracked),
+        "a.bin: diff: lfs\na.bin: filter: lfs\na.bin: merge: lfs\na.bin: text: unset\n"
+    );
     // Untracked path: nothing is set.
     let untracked = run_libra_command(&["check-attr", "--all", "a.txt"], repo.path());
     assert_eq!(untracked.status.code(), Some(0));
@@ -80,8 +83,8 @@ fn double_dash_separates_multiple_attributes() {
         "filter set: {stdout}"
     );
     assert!(
-        stdout.contains("a.bin: text: unspecified"),
-        "unknown attr is unspecified: {stdout}"
+        stdout.contains("a.bin: text: unset"),
+        "explicitly unset attr is reported as unset: {stdout}"
     );
 }
 

@@ -2,13 +2,13 @@
 
 ## 命令实现目标
 
-`libra commit` 的目标是把索引快照记录为新的提交，并处理消息来源、作者、签名、Libra 自有 pre-commit hook、结构化输出和兼容拒绝。这里的 hook 只指 `.libra/hooks/pre-commit.*`；Git hooks bridge（`.git/hooks` / `core.hooksPath`，包括 stock `commit-msg` bridge）按 [`_compatibility.md` D3](_compatibility.md#d3git-hooks-bridge-作为核心特性) 拒绝。实现已支持 `--all`、`--author`、`--date`（设置 author date）、`GIT_AUTHOR_*`/`GIT_COMMITTER_*` 身份与日期覆盖（非 `user.useConfigOnly` 时 Git env 优先于 config，`LIBRA_COMMITTER_*` 为后备）、`--cleanup`、`--dry-run`、`--fixup`、`--squash`、`-C/-c`（复用提交消息和 author metadata）、`--trailer`、`--reset-author`、`-e/--edit`（始终开编辑器）、`-v/--verbose`（编辑器模板含 staged diff，经 scissors 剥离）、bare `commit` 在可用编辑器时开编辑器、autosquash、dry-run porcelain、commit trailers 和稳定错误码，`--porcelain`（would-be-committed 状态的 porcelain v1 机器输出，隐含 `--dry-run`，不创建提交）、`--status`/`--no-status`（last-wins 切换：`--status` 把工作树 status 以 `#` 注释行注入编辑器模板，随后被 cleanup 剥离；仅当生效 cleanup 会剥离注释时才注入，`--cleanup=verbatim`/`whitespace` 下省略以免泄漏；默认不含 status 段）、`commit.cleanup`/`commit.verbose` 配置默认（CLI flag 未给时由 `read_cascaded_config_value` 读 local→global 配置：`commit.cleanup` 经 `parse_cleanup_mode` 解析为 `CleanupMode`、`commit.verbose` 经 `parse_git_config_bool` 解析为 bool-or-int（非零即 verbose）；显式 `--cleanup`/`-v` 短路覆盖配置，无效配置值 fatal。**已知限制**：`commit.verbose` 仅 on/off——`=2`/`=1k` 等非零整数等同 `true`（支持 git bool-or-int 的 k/m/g 后缀），无 `-vv`/未暂存 diff 的 level-2 渲染，也无 `--no-verbose` 单次关闭，因 Libra 的 `-v` 本就是 bool；另：present-but-empty 的配置值（如 `commit.verbose =`）经共享 `read_cascaded_config_value` 被规整为 unset（全 diff/config 共有的既有行为），故读作未设置而非 git 的 false）也已支持，`-t/--template`（初始模板，含 `commit.template` 配置回落与 unedited-template 中止）、`--no-gpg-sign`（强制未签名提交，跳过 `vault_sign_commit`，覆盖 `vault.signing=true`；仅当本就不会签名时才是 no-op。Git 正向 `-S`/`--gpg-sign` 未公开）亦已实现。
+`libra commit` 的目标是把索引快照记录为新提交，并处理消息来源、作者/提交者、vault 签名、Libra 自有 pre-commit hook、结构化输出和兼容拒绝。这里的 hook 只指 `.libra/hooks/pre-commit.*`；Git hooks bridge（`.git/hooks` / `core.hooksPath`，包括 stock `commit-msg` bridge）按 [`_compatibility.md` D3](_compatibility.md#d3git-hooks-bridge-作为核心特性) 拒绝。常用 Git commit 表面已经覆盖：消息/模板/复用、amend、auto-stage、author/date/env、cleanup、dry-run/porcelain、trailers、编辑器、verbose diff 与稳定错误码。编辑器模板默认含注释化 status；`commit.status=false` 可关闭，`--status`/`--no-status` 显式覆盖，且仅在 cleanup 会剥离注释时注入。`commit.cleanup`/`commit.verbose` 提供既有 local→global 默认；`commit.gpgSign` 与 `--no-gpg-sign` 控制 vault 签名。Git 正向 `-S`/`--gpg-sign` 尚未公开。
 
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
 
-- 当前矩阵承诺常用 Git commit 子集已支持；`--date`、`GIT_AUTHOR_*`/`GIT_COMMITTER_*`、`--cleanup`、`--dry-run`、`--fixup`、`--squash`、`-C/-c`（消息和 author metadata）、`--trailer`、`--reset-author`、`-e/--edit`、`-v/--verbose`、`--porcelain`、`--status`/`--no-status`（last-wins 切换，`--status` 注入注释化 status 段，仅在 cleanup 会剥离注释时）、`commit.cleanup`/`commit.verbose` 配置默认、`-t/--template`（含 `commit.template` 配置回落）与 `--no-gpg-sign`（抑制 vault 签名，覆盖 `vault.signing=true`）已补齐。新增语义必须同步矩阵、用户文档和测试。
+- 当前矩阵承诺常用 Git commit 子集已支持；`commit.status` 按严格 local→global→system 级联读取，未设置默认 true，`--status`/`--no-status` last-wins 并短路覆盖。`--date`、Git 身份/日期环境变量、cleanup、dry-run/porcelain、fixup/squash、消息复用、trailers、reset-author、编辑器/verbose、template 与 vault 签名配置也已补齐。新增语义必须同步矩阵、用户文档和测试。
 - `--amend` 作者归属与 Git 对齐：默认**保留**被修订提交的原作者（name/email/authored date），只有显式 `--reset-author`、`--author <AUTHOR>`、`--date` 或 `-C/-c` 来源作者才会改写对应 author 字段；committer 始终取当前身份。此前 `--amend` 会静默把作者改成当前身份、使 `--reset-author` 沦为空操作，已修正（见 `src/command/commit.rs` amend 分支）。
 - `--amend --no-edit` 的 clean amend 行为与 Git 对齐：即使 tree、父列表、作者和消息都未变化，也必须生成替换提交并刷新 committer date，避免脚本看到成功摘要但 `HEAD` 未改变。实现点是 `refresh_noop_amend_committer_timestamp`：当新提交除 committer timestamp 外会复用父提交内容，且新 timestamp 不大于父提交时，将 committer timestamp 推进到父提交之后。
 
@@ -38,6 +38,7 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-07-12（plan-20260708 P1-05）：`run_commit` 在 auto-stage、hook、对象与 ref 写入前解析 `commit.status`；严格 local→global→system 级联，未设置默认 true，Git 布尔解析，`--status`/`--no-status` 短路覆盖。无效值 `LBR-CLI-002`、读取失败 `LBR-IO-001`。回归 target：`compat_config_defaults_semantics`。
 - 2026-07-10（plan-20260708 P1-05b）：`run_commit` 在 auto-stage、hook、对象与 ref 写入前严格读取 `commit.gpgSign`。`true` 强制使用仓库 vault key 签名，`false` 禁用签名，未配置时继承 `vault.signing`；`--no-gpg-sign` 优先级最高。无效值 `LBR-CLI-002`、读取失败 `LBR-IO-001`。回归 target：`compat_config_history_defaults`。
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
@@ -63,12 +64,55 @@ flowchart TD
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
 | 兼容矩阵说明 | common Git commit surface plus `--cleanup`, `--dry-run`, `--fixup`, `--squash`, `-C/-c`, `--trailer`, and `--reset-author` supported | 按当前兼容矩阵保留；实现状态变化时同步 `_compatibility.md` 和测试证据。 |
-| ✅ 已实现 | `--porcelain` 机器输出 | 输出 would-be-committed 状态的 porcelain v1（复用 `status::output_porcelain` + 折叠 untracked 目录），替代人类摘要；与 Git 一致 **隐含 `--dry-run`**（不创建提交）；`-a` 仅为预览自动暂存，dry-run 后通过 index 快照还原（不改动 index），`--json` 模式下惰性。带集成测试（`test_commit_porcelain_outputs_status_format`、`test_commit_all_porcelain_shows_autostaged_as_staged`）。 |
-| ✅ 已实现 | `--status` / `--no-status` | last-wins 切换。`--status` 在打开编辑器时把工作树 status（经 `status::execute_to` 长格式）以 `#` 注释行注入模板（`-v` 时置于 scissors 之上），随后被 `cleanup_commit_message` 当作注释行剥离 → 不进入最终消息。**仅当生效的 cleanup 会剥离注释时才注入**（`cleanup_strips_comments = matches!(mode, Strip\|Default)`）：`--cleanup=verbatim`/`whitespace`/`scissors`（保留注释行——显式 scissors 是 whitespace cleanup + 截断，marker 之上的 `#` 行保留）下不注入，故绝不泄漏。`-v` 仅截断附加 diff、不再强制 strip，故 `build_verbose_template` 的 `# Please enter` 帮助注释也仅在 `strips_comments` 时注入（否则非剥离模式会把模板自身的 `#` 行提交进去）。无 `-m`/`-F`（不开编辑器）时无效果。默认与 `--no-status` 不含 status 段。带集成测试（`status_flag_seeds_commented_status_into_template_and_strips_it`、`default_and_no_status_omit_status_from_template`、`status_not_seeded_under_non_comment_stripping_cleanup`）。 |
+| ✅ 已实现 | `--porcelain` 机器输出 | 输出 would-be-committed 状态的 porcelain v1（复用 `status::output_porcelain` + 折叠 untracked 目录），替代人类摘要；与 Git 一致 **隐含 `--dry-run`**（不创建提交）；`-a` 在 task-local 临时 index 中预览自动暂存，live index 从不替换，临时 blob/LFS/tree 也不持久化；`--json` 模式下惰性。带集成测试（`test_commit_porcelain_outputs_status_format`、`test_commit_all_porcelain_shows_autostaged_as_staged`）。 |
+| ✅ 已实现 | `commit.status` / `--status` / `--no-status` | 编辑器模板默认含 status；仅当编辑器会打开且 cleanup 会剥离注释时，`commit.status` 才按严格 local→global→system 级联读取 Git 布尔值，显式 CLI last-wins 且短路覆盖；适用路径中的无效/读取失败在 auto-stage 前返回 `LBR-CLI-002`/`LBR-IO-001`，`-m`、dry-run/porcelain、JSON 与非剥离 cleanup 绕过该键。显式 `--status` + 不可读 store 的回归点名下游 `status.showUntrackedFiles` 且排除 `commit.status`，证明短路边界。启用模板 status 时，`status.*` 先解析一次，auto-stage 后、hook 前以同一 resolved args 采集；配置/采集/渲染错误保留原 `CliError`，不再静默省略。`--dry-run -a` 经 `path::with_index_override` 把整个预览绑定到 task-local 隔离临时 index，live index 从不替换且临时对象不持久化；非 verbose regular blob 用 64 KiB 缓冲流式哈希且不保留载荷。verbose 在读取前统一预算 staged diff 变化两侧的 HEAD、已暂存与 auto-stage blob（未变化对象不计费）：单对象 32 MiB、总计费 64 MiB、最多 4096 对象；auto-stage 在读载荷前先做 provisional 字节/对象预留，再按 hash 去重结算。scratch 位于所有 linked worktree 共用的公共仓库存储 `.libra/tmp/commit-preview`，并发预留总上限 256 MiB，每次最多扫描 256 个 run、清理 32 个超过 24 小时且未持锁的旧 run。HEAD/已暂存对象预检超限固定 exit 128、`LBR-IO-001`、可操作提示、live index/对象库不变；auto-stage cache 与 scratch reserve 写侧失败保持 `LBR-IO-002`；无法有界本地预检的对象（remote-only 或 pack 缺现成 index）在加载前 fail-closed，且预览不重建 pack index。loose 预检常量内存流式校验声明边界与压缩流 EOF；pack/delta 预检完整验证并计费 base/instruction/result 链、限制深度且拒绝非法指令/u64 溢出；批量只枚举 pack 一次、每个现有 index 只打开一次，并保持一次 storage-runtime 往返。auto-stage regular/LFS 读取、LFS 备份、预览缓存与对象持久化均为 `Result`，按读/写返回 `LBR-IO-001`/`LBR-IO-002`，不再经 `BlobExt` panic。真实 `-a` 的 LFS 路径流式写临时快照，从同一字节流计算 OID/size，再原子替换同 OID 的旧备份；`--sync-data` 下持久创建祖先、fsync 临时文件、同步 staging 与目标目录，Windows 因无可靠目录 fsync 等价物而使用 write-through replace。后续采集失败沿用 auto-stage-on-abort 保留语义。真实 persist 失败回归固定 exit 128、`LBR-IO-002`、目标 OID、无 panic 与 live index 不变。dry-run/porcelain 一律跳过 hook、editor、rerere 与 `post_commit` automation；status 注释仅在 `Strip\|Default` cleanup 下注入。回归：`compat_config_defaults_semantics` 与 `default_includes_status_and_no_status_omits_it`。 |
 | ✅ 已实现 | `commit.cleanup`/`commit.verbose` 配置默认（CLI flag 未给时回退到 local→global 配置，flag 优先；`parse_cleanup_mode` + `parse_git_config_bool`）。带集成测试 `test_commit_honors_cleanup_and_verbose_config`（verbatim 保留 `#` 注释、verbose=true 在 `-m` 提交时把 staged diff 打到 stderr）。 | 与 git 一致；经真实 git 对照。 |
 | ✅ 已实现 | `-t/--template <FILE>` 初始模板 | `CommitArgs.template`（短 `-t`）。仅当无显式消息源（`-m`/`-F`/`-C`/`-c`/`--fixup`/`--squash`，即 `base.is_none()`）时经 `resolve_commit_template` 读取：`-t` 文件优先，否则回落 `commit.template` 配置（文件路径，`~/` 展开为 `$HOME`）；读失败→`CommitError::TemplateRead`（`IoReadFailed`）。模板作为 `initial` 缓冲，优先于 amend 父消息。`--no-edit` 时直接用作消息；否则 seed 编辑器，**若编辑后（cleanup 归一）等于 cleanup(template) 则中止**（`CommitError::TemplateUnedited`，与 git "you did not edit the message" 一致；`--no-edit` 不触发）。有显式消息源时 `-t` 不读取也不报错（`-m` 胜，与 git 一致）。带集成测试（`template_t_flag_loads_initial_content`/`template_seeds_editor_and_edited_message_is_committed`/`template_left_unedited_aborts`）。 |
 | ✅ 已实现 | P0-08 身份/日期保真 | `create_commit_signatures` 分离 author/committer 身份；非 `user.useConfigOnly` 下 Git env 覆盖 config，`LIBRA_COMMITTER_*` 为后备；`--date` 与 `GIT_AUTHOR_DATE` 设置 author date，`GIT_COMMITTER_DATE` 设置 committer date，raw `<unix> <tz>` 保留时区；`-C/-c` 复用来源提交 message 与 author metadata；`--reset-author` amend 时重置到当前 author 身份/日期。带 compat 测试 `compat_commit_identity_date`。 |
 | ✅ 已实现 | P0-09 index 对象完整性预检 | `commit` 在加载/刷新 index 后立即调用 `tree_plumbing::validate_index_objects`，确保普通/可执行/symlink 条目指向 blob、tree-mode 条目指向 tree；缺失或错类型返回 `LBR-REPO-002` 并保持 `HEAD` 不变。带 compat 测试 `compat_write_tree_missing_object`。 |
+
+P1-05e R14 补强：verbose preview 的实际对象读取显式调用 local-only
+`get_with_limit`，不依赖 storage 私有 runtime/`spawn_blocking` 无法继承的
+task-local 状态。loose 与非 delta pack 会在 payload 解码前检查声明长度；
+remote-only 对象继续 fail-closed。对应 lower-level 回归先固定“超限声明必须
+在解码前被拒绝”，再验证 bounded load 不读取超限 payload。
+
+P1-05e R15 补强：变化对象总数在 `object_sizes` 前整批预检，4,097 个
+HEAD/staged 对象不会触发 loose/pack sizing；超限 delta instruction 声明在访问
+base 前立即失败；`status.showStash=true` 的 stash log 读取/解析错误以
+`LBR-IO-001` 在 hook/editor/ref 写入前传播。三条回归均先红后绿。
+
+P1-05e R16 补强：stash ref 存在性检查改为 `Result`，只把 `NotFound` 视为
+无 stash，元数据错误和损坏日志在普通与 cached status 中均以 `LBR-IO-001`
+传播；活动 preview run 的 reservation 元数据缺失/不可读时配额扫描
+fail-closed；公开矩阵统一为“常量内存有界本地预检”。完整 config target
+94/94、stash/autostash 56/56 与默认范围 clippy 均通过。
+
+P1-05e R17 补强：已有但非普通文件的 `refs/stash` 不再被当作无 stash，
+普通 commit-status 与 fresh cached-status 都在输出/副作用前返回 `LBR-IO-001`；
+bounded pack read 新增只遍历既有 index 的读取路径，不再调用会为无关 pack
+重建 index 的普通 `get_from_pack`。配置 target 94/94、storage local 11/11。
+
+P1-05e R18 补强：stash ref 检查改用 `symlink_metadata`，符号链接即使指向
+普通文件也按非普通 ref 以 `LBR-IO-001` fail-closed；pack 批量 sizing 贯穿
+preview 剩余聚合预算，首个越界对象完成保守定长后立即停止，不再解压/校验
+后续对象。普通 commit-status、fresh cached-status 与 pack probe 回归均先红后绿。
+
+P1-05e R19 补强：storage sizing 与 preview cache 共享每对象最少 4 KiB
+计费函数，避免 tiny packed objects 在 cache 已越界后仍继续探测；新增回归贯穿
+ClientStorage、tiered、本地 alternate 与 pack，并证明 4,095-byte 剩余预算在
+首个 10-byte packed blob 后立即失败。cached-status 的 symlink 场景局部
+`cfg(unix)`，损坏日志与目录 ref 的跨平台覆盖保留。
+
+P1-05e R20 补强：`commit -a` 在 LFS 判断或普通文件读取前用
+`symlink_metadata` 识别 tracked symlink，包含 dangling link；真实提交、verbose
+与 non-verbose preview 都只使用 link-target bytes 并保持 mode `120000`，命中
+LFS attribute 的 symlink 也不会被当成目标文件内容。Unix 回归均先红后绿。
+
+P1-05e R21 补强：bounded packed-object 读取改走专用 uncached 递归解码，
+不读取/填充 200 MiB 全局 `PACK_OBJ_CACHE`；delta/base/instruction/result 的共存
+仍由 size preflight 的 peak 计费，最终 payload 从 `CacheObject` 直接 move，避免
+返回侧完整克隆。OFS_DELTA 回归固定 delta/base cache key 均保持不存在。
 
 ## 维护要求
 

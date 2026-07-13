@@ -22,6 +22,13 @@ The `<pathspec>` argument is required and accepts one or more file paths or dire
 
 When a source commit contains files that do not exist in the current worktree, those files are created. In the default (`--no-overlay`) mode, when the current worktree contains tracked files that do not exist in the source, those files are deleted so the target matches the source exactly; with `--overlay` those source-absent tracked paths are left in place instead. The output reports both `restored_files` and `deleted_files` separately.
 
+A materialized gitlink is a directory in the worktree. Restore can remove an
+empty materialized gitlink or replace it with a regular file, symlink, or
+deletion. Conflict-marker rebuilds (`--merge`/`--conflict=diff3`) follow the same
+rule when replacing a directory with a regular marker file. A non-empty
+directory is refused before any selected path is changed, so nested repository
+or user data is never recursively deleted.
+
 LFS-managed files are automatically downloaded from the LFS server when restoring from a commit that references LFS pointers.
 
 Tracked symlinks are restored as symlinks on Unix for source tree, index, and

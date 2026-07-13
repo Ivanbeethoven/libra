@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashSet,
-    io::{IsTerminal, Write},
+    io::{IsTerminal, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
     str::FromStr,
@@ -24,11 +24,12 @@ use git_internal::{
         },
     },
 };
+use ring::digest::{Context as DigestContext, SHA256};
 use sea_orm::ConnectionTrait;
 use serde::Serialize;
 
 use crate::{
-    command::{diff, editor, load_object, save_object_to_storage, status},
+    command::{diff, editor, load_object, read_symlink_blob_bytes, save_object_to_storage, status},
     common_utils::{check_conventional_commits_message, format_commit_msg, parse_commit_msg},
     internal::{
         ai::automation::{VCS_EVENT_POST_COMMIT, dispatch_current_repo_vcs_event_to_history},
@@ -43,14 +44,17 @@ use crate::{
         tree_plumbing,
     },
     utils::{
+        atomic_stream::StreamingAtomicFile,
+        atomic_write,
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         lfs,
-        object_ext::BlobExt,
         output::{OutputConfig, emit_json_data},
-        path, util,
+        path, preview_object, preview_scratch, util,
     },
 };
+
+mod config;
 
 /// Create a new commit from staged changes.
 ///
@@ -187,8 +191,8 @@ pub struct CommitArgs {
     pub porcelain: bool,
 
     /// Include the working-tree status as commented lines in the commit-message
-    /// editor template (Git shows this by default; Libra defaults to omitting
-    /// it, so `--status` opts in). The status lines are `#`-commented and so are
+    /// editor template. This is the default unless `commit.status=false` or
+    /// `--no-status` disables it. The status lines are `#`-commented and so are
     /// stripped from the final message — informational only. Seeded only when an
     /// editor opens and the effective cleanup strips comments (`strip`/`default`);
     /// it is omitted under `--cleanup=verbatim`/`whitespace`/`scissors` (which keep
@@ -199,9 +203,9 @@ pub struct CommitArgs {
     #[arg(long = "status", overrides_with = "no_status")]
     pub status: bool,
 
-    /// Do not include the status in the commit-message editor template (Libra's
-    /// default). Accepted for Git parity. Toggle pair with `--status`; the last
-    /// one wins.
+    /// Do not include the status in the commit-message editor template,
+    /// overriding the default and `commit.status`. Toggle pair with `--status`;
+    /// the last one wins.
     #[arg(long = "no-status", overrides_with = "status")]
     pub no_status: bool,
 
@@ -312,6 +316,12 @@ pub enum CommitError {
     #[error("failed to auto-stage tracked changes: {0}")]
     AutoStage(String),
 
+    #[error("failed to read auto-stage source '{path}': {detail}")]
+    AutoStageRead { path: String, detail: String },
+
+    #[error("failed to write auto-stage data '{target}': {detail}")]
+    AutoStageWrite { target: String, detail: String },
+
     #[error("failed to calculate staged changes: {0}")]
     StagedChanges(String),
 
@@ -319,6 +329,11 @@ pub enum CommitError {
     /// preserved instead of being mislabeled as repository corruption.
     #[error("{0}")]
     VerboseDiff(crate::utils::error::CliError),
+
+    /// A status-template preflight/rendering error whose stable code and hints
+    /// must be preserved instead of silently omitting the status section.
+    #[error("{0}")]
+    StatusTemplate(crate::utils::error::CliError),
 
     #[error("{0}")]
     EditorFailed(String),
@@ -328,6 +343,9 @@ pub enum CommitError {
 
     #[error(transparent)]
     HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
+
+    #[error(transparent)]
+    DisplayConfig(#[from] config::CommitDisplayConfigError),
 }
 
 impl From<CommitError> for CliError {
@@ -335,6 +353,7 @@ impl From<CommitError> for CliError {
         match &error {
             CommitError::LockPolicy(inner) => inner.clone(),
             CommitError::VerboseDiff(inner) => inner.clone(),
+            CommitError::StatusTemplate(inner) => inner.clone(),
             CommitError::IndexLoad(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("the index file may be corrupted; try 'libra status' to verify"),
@@ -377,6 +396,14 @@ impl From<CommitError> for CliError {
             ) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("fix the offending value with 'libra config <key> <value>'"),
+            CommitError::DisplayConfig(config::CommitDisplayConfigError::Read { .. }) => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            CommitError::DisplayConfig(config::CommitDisplayConfigError::Invalid { .. }) => {
+                CliError::command_usage(error.to_string())
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint("fix the offending value with 'libra config <key> <value>'")
+            }
             CommitError::MessageFileRead { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -419,6 +446,12 @@ impl From<CommitError> for CliError {
                 .with_hint("check vault configuration with 'libra config --list'"),
             CommitError::AutoStage(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            CommitError::AutoStageRead { .. } => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            CommitError::AutoStageWrite { .. } => {
+                CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
             CommitError::StagedChanges(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
@@ -777,6 +810,88 @@ fn first_message_line(message: &str) -> String {
     message.lines().next().unwrap_or("").trim().to_string()
 }
 
+#[derive(Debug)]
+struct CommitMessageSettings {
+    needs_editor: bool,
+    mode: CleanupMode,
+    verbose: bool,
+    editor_cmd: Option<String>,
+}
+
+impl CommitMessageSettings {
+    fn status_template_applicable(&self) -> bool {
+        self.editor_cmd.is_some() && matches!(self.mode, CleanupMode::Strip | CleanupMode::Default)
+    }
+}
+
+async fn resolve_commit_message_settings(
+    args: &CommitArgs,
+    output: &OutputConfig,
+    dry_run: bool,
+) -> Result<CommitMessageSettings, CommitError> {
+    let has_message_source = args.fixup.is_some()
+        || args.squash.is_some()
+        || args.reuse_message.is_some()
+        || args.reedit_message.is_some()
+        || args.message.is_some()
+        || args.file.is_some();
+    let needs_editor =
+        args.edit || args.reedit_message.is_some() || (!has_message_source && !args.no_edit);
+
+    let mode = match args.cleanup {
+        Some(mode) => mode,
+        None => match read_cascaded_config_value(LocalIdentityTarget::CurrentRepo, "commit.cleanup")
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(value) => parse_cleanup_mode(&value).ok_or_else(|| {
+                CommitError::InvalidConfig(format!(
+                    "invalid commit.cleanup config value '{value}' (expected strip/whitespace/verbatim/scissors/default)"
+                ))
+            })?,
+            None => CleanupMode::Strip,
+        },
+    };
+
+    let verbose = if args.verbose {
+        true
+    } else {
+        match read_cascaded_config_value(LocalIdentityTarget::CurrentRepo, "commit.verbose")
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(value) => parse_git_config_bool(&value).ok_or_else(|| {
+                CommitError::InvalidConfig(format!(
+                    "bad boolean config value '{value}' for 'commit.verbose'"
+                ))
+            })?,
+            None => false,
+        }
+    };
+
+    // A preview never launches an editor subprocess: task-local index/object
+    // overrides cannot cross that process boundary, and Git dry-runs do not ask
+    // the user to author a message.
+    let editor_cmd = if !dry_run && needs_editor && !output.is_json() {
+        match editor::resolve_editor().await {
+            Some(cmd) => Some(cmd),
+            None if std::io::stdin().is_terminal() => Some("vi".to_string()),
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    Ok(CommitMessageSettings {
+        needs_editor,
+        mode,
+        verbose,
+        editor_cmd,
+    })
+}
+
 /// Pure execution entry point. Receives `&OutputConfig` only for hook I/O
 /// control (human mode: inherit, JSON/machine mode: piped). Does NOT render
 /// output — returns [`CommitOutput`] on success for the caller to render.
@@ -784,93 +899,215 @@ pub async fn run_commit(
     args: CommitArgs,
     output: &OutputConfig,
 ) -> Result<CommitOutput, CommitError> {
+    let dry_run = args.dry_run || args.porcelain;
+    let message_settings = resolve_commit_message_settings(&args, output, dry_run).await?;
+    let verbose_preview = dry_run && message_settings.verbose;
+    if dry_run && args.all {
+        let live_index = path::index();
+        let parent = live_index.parent().ok_or_else(|| {
+            CommitError::IndexLoad(format!(
+                "index path '{}' has no parent directory",
+                live_index.display()
+            ))
+        })?;
+        let isolated_index = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| CommitError::IndexSave(error.to_string()))?;
+        let live_index_bytes = std::fs::read(&live_index)
+            .map_err(|error| CommitError::IndexLoad(error.to_string()))?;
+        std::fs::write(isolated_index.path(), live_index_bytes)
+            .map_err(|error| CommitError::IndexSave(error.to_string()))?;
+        let isolated_path = isolated_index.path().to_path_buf();
+        if !verbose_preview {
+            return path::with_index_override(
+                isolated_path,
+                run_commit_with_index(args, output, dry_run, message_settings),
+            )
+            .await;
+        }
+        let scratch_storage =
+            path::try_preview_scratch_storage().map_err(|error| CommitError::AutoStageWrite {
+                target: "shared repository preview scratch".to_string(),
+                detail: error.to_string(),
+            })?;
+        let scratch = preview_scratch::create(&scratch_storage).map_err(|error| {
+            CommitError::AutoStageWrite {
+                target: scratch_storage.display().to_string(),
+                detail: format!("failed to reserve preview scratch space: {error}"),
+            }
+        })?;
+        return path::with_index_override(
+            isolated_path,
+            preview_object::with_objects(
+                scratch.path().join("objects"),
+                run_commit_with_index(args, output, dry_run, message_settings),
+            ),
+        )
+        .await;
+    }
+
+    if verbose_preview {
+        let scratch_storage =
+            path::try_preview_scratch_storage().map_err(|error| CommitError::AutoStageWrite {
+                target: "shared repository preview scratch".to_string(),
+                detail: error.to_string(),
+            })?;
+        let scratch = preview_scratch::create(&scratch_storage).map_err(|error| {
+            CommitError::AutoStageWrite {
+                target: scratch_storage.display().to_string(),
+                detail: format!("failed to reserve preview scratch space: {error}"),
+            }
+        })?;
+        return preview_object::with_objects(
+            scratch.path().join("objects"),
+            run_commit_with_index(args, output, dry_run, message_settings),
+        )
+        .await;
+    }
+
+    run_commit_with_index(args, output, dry_run, message_settings).await
+}
+
+async fn run_commit_with_index(
+    args: CommitArgs,
+    output: &OutputConfig,
+    dry_run: bool,
+    message_settings: CommitMessageSettings,
+) -> Result<CommitOutput, CommitError> {
     let is_amend = args.amend;
     let is_signoff = args.signoff;
     let is_conventional = args.conventional;
     let skip_hooks = args.disable_pre || args.no_verify;
     let skip_conventional_check = args.no_verify;
-    // `--porcelain` is a machine-readable preview and, like Git, implies
-    // `--dry-run`: it prints status and never creates the commit.
-    let dry_run = args.dry_run || args.porcelain;
-    let signing_policy =
-        crate::command::history_config::commit_signing_policy(args.no_gpg_sign).await?;
-
-    // Auto-stage tracked modifications/deletions (git commit -a). For a dry run
-    // this still computes the would-be-committed state, so snapshot the index
-    // first and restore it afterwards, leaving the working state untouched.
-    let index_snapshot = if dry_run && args.all {
-        Some(std::fs::read(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?)
-    } else {
-        None
-    };
-    let auto_stage_applied = if args.all {
-        auto_stage_tracked_changes()?
+    // `commit.status` only controls an editor template. Avoid reading it when no
+    // editor can open or cleanup would retain comments; explicit CLI toggles
+    // still bypass the config reader on applicable paths.
+    let include_status = if message_settings.status_template_applicable() {
+        config::status_in_editor_template(args.status, args.no_status).await?
     } else {
         false
     };
-
-    let index = Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
-    let storage = ClientStorage::init(path::objects());
-    let tracked_entries = index.tracked_entries(0);
-
-    tree_plumbing::validate_index_objects(&index)
-        .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
-
-    // Skip empty commit check for --amend operations
-    if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
-        // No files have ever been staged — distinct from "staged but unchanged"
-        return Err(CommitError::NothingToCommitNoTracked);
-    }
-
-    // Verify staged changes relative to HEAD (skip for --amend)
-    let staged_changes = status::changes_to_be_committed_safe()
-        .await
-        .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
-    if staged_changes.is_empty() && !args.allow_empty && !is_amend {
-        return Err(CommitError::NothingToCommit);
-    }
-
-    // `lfs.lockEnforce` gate (lore.md 2.8): staged new+modified+DELETED
-    // paths (deletions never reach the push-time OID check — this is the
-    // only guard for them). Skipped on dry-run/--porcelain (previews never
-    // touch the network). Runs AFTER `-a` auto-staging, matching the
-    // existing pre-commit-hook-failure semantics (the auto-staged index
-    // mutation persists on abort).
-    if !dry_run {
-        let mut candidates: Vec<String> = Vec::new();
-        for path in staged_changes
-            .new
-            .iter()
-            .chain(staged_changes.modified.iter())
-            .chain(staged_changes.deleted.iter())
-        {
-            candidates.push(path.display().to_string());
-        }
-        crate::command::lfs::enforce_lock_policy(&candidates)
+    // Validate every `status.*` default before `-a` or hooks. The repository
+    // snapshot itself is rendered after auto-stage so the template reflects the
+    // would-be commit, using these already-resolved args without a second read.
+    let status_args = if include_status {
+        Some(
+            status::resolve_config_defaults(status::StatusArgs {
+                long_format: true,
+                ..status::StatusArgs::default()
+            })
             .await
-            .map_err(CommitError::LockPolicy)?;
-    }
-
-    // `--porcelain` snapshot of the would-be-committed state: taken AFTER `-a`
-    // auto-staging and the staged recompute above so it reflects what would be
-    // committed. Inert under `--json`. `.take()` below hands it to whichever
-    // build_commit_output branch (amend/normal dry-run) runs.
-    let mut porcelain_text = if args.porcelain && !output.is_json() {
-        Some(gather_commit_porcelain().await?)
+            .map_err(CommitError::StatusTemplate)?,
+        )
     } else {
         None
     };
+    let signing_policy =
+        crate::command::history_config::commit_signing_policy(args.no_gpg_sign).await?;
 
-    // Restore the pre-`-a` index for dry runs so the preview never mutates the
-    // working state (the snapshot is only taken for `dry_run && args.all`).
-    if let Some(bytes) = index_snapshot {
-        std::fs::write(path::index(), bytes).map_err(|e| CommitError::IndexSave(e.to_string()))?;
+    // Dry-run `-a` reaches this function under a task-local isolated index, so
+    // every nested status/diff/index consumer observes the preview while the live
+    // index remains untouched on success, error, cancellation, or panic.
+    let prepared = async {
+        let original_index =
+            Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        tree_plumbing::validate_index_objects(&original_index)
+            .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
+
+        let auto_stage_applied = if args.all {
+            auto_stage_tracked_changes(!dry_run, dry_run && message_settings.verbose)?
+        } else {
+            false
+        };
+
+        let index =
+            Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        let storage = ClientStorage::init(path::objects());
+        let tracked_entries = index.tracked_entries(0);
+
+        // A real commit persists each auto-staged blob and validates the final
+        // index. Dry-run auto-stage intentionally keeps those blobs ephemeral;
+        // the original index was validated above before its temporary rewrite.
+        if !dry_run {
+            tree_plumbing::validate_index_objects(&index)
+                .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
+        }
+
+        // Skip empty commit check for --amend operations
+        if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
+            // No files have ever been staged — distinct from "staged but unchanged"
+            return Err(CommitError::NothingToCommitNoTracked);
+        }
+
+        // Verify staged changes relative to HEAD (skip for --amend)
+        let staged_changes = status::changes_to_be_committed_safe()
+            .await
+            .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
+        if staged_changes.is_empty() && !args.allow_empty && !is_amend {
+            return Err(CommitError::NothingToCommit);
+        }
+
+        // Complete status collection before the pre-commit hook or commit/tree/ref
+        // writes. A real `-a` has already materialized its staged blobs so the
+        // persisted index never points at missing objects; dry runs keep those
+        // temporary blob/LFS values outside the repository object store. Verbose
+        // previews use a task-local disk cache; non-verbose previews discard blob
+        // content after hashing. Unlike the previous best-effort
+        // path, failures preserve their stable CLI code and abort instead of
+        // silently opening a status-less editor.
+        let status_section = match status_args {
+            Some(status_args) => build_status_section(status_args).await?,
+            None => None,
+        };
+
+        // `lfs.lockEnforce` gate (lore.md 2.8): staged new+modified+DELETED
+        // paths (deletions never reach the push-time OID check — this is the
+        // only guard for them). Skipped on dry-run/--porcelain (previews never
+        // touch the network). Runs AFTER `-a` auto-staging, matching the
+        // existing pre-commit-hook-failure semantics (the auto-staged index
+        // mutation persists on abort).
+        if !dry_run {
+            let mut candidates: Vec<String> = Vec::new();
+            for path in staged_changes
+                .new
+                .iter()
+                .chain(staged_changes.modified.iter())
+                .chain(staged_changes.deleted.iter())
+            {
+                candidates.push(path.display().to_string());
+            }
+            crate::command::lfs::enforce_lock_policy(&candidates)
+                .await
+                .map_err(CommitError::LockPolicy)?;
+        }
+
+        // `--porcelain` snapshot of the would-be-committed state: taken AFTER `-a`
+        // auto-staging and the staged recompute above so it reflects what would be
+        // committed. Inert under `--json`. `.take()` below hands it to whichever
+        // build_commit_output branch (amend/normal dry-run) runs.
+        let porcelain_text = if args.porcelain && !output.is_json() {
+            Some(gather_commit_porcelain().await?)
+        } else {
+            None
+        };
+
+        Ok::<_, CommitError>((
+            index,
+            storage,
+            staged_changes,
+            status_section,
+            porcelain_text,
+        ))
     }
+    .await;
+
+    let (index, storage, staged_changes, status_section, mut porcelain_text) = prepared?;
 
     // INVARIANT: hooks and message validation must run before creating the
     // commit object or updating HEAD; once those writes happen, hook failure can
     // no longer block the commit without explicit rollback logic.
-    if !skip_hooks {
+    // Hooks are subprocesses and cannot inherit the task-local preview index.
+    // Dry-runs therefore skip them entirely, keeping the live index unreachable.
+    if !dry_run && !skip_hooks {
         run_pre_commit_hook(output)?;
     }
 
@@ -879,10 +1116,18 @@ pub async fn run_commit(
     let parents_commit_ids = get_parents_ids().await;
 
     // Resolve the commit message (may open the editor for -e/-v or a bare commit).
-    let message = resolve_final_message(&args, output, &parents_commit_ids).await?;
+    let message = resolve_final_message(
+        &args,
+        output,
+        &parents_commit_ids,
+        message_settings,
+        status_section,
+        dry_run,
+    )
+    .await?;
 
     // Create tree
-    let tree = create_tree(&index, &storage, "".into()).await?;
+    let tree = create_tree_with_persistence(&index, &storage, "".into(), !dry_run).await?;
 
     // Create author and committer signatures
     let reuse_author = load_reused_commit_author(&args).await?;
@@ -1208,7 +1453,16 @@ async fn resolve_final_message(
     args: &CommitArgs,
     output: &OutputConfig,
     parent_ids: &[ObjectHash],
+    settings: CommitMessageSettings,
+    status_section: Option<String>,
+    dry_run: bool,
 ) -> Result<String, CommitError> {
+    let CommitMessageSettings {
+        needs_editor,
+        mode,
+        verbose,
+        editor_cmd,
+    } = settings;
     let base: Option<String> = if let Some(spec) = &args.fixup {
         Some(format!(
             "fixup! {}",
@@ -1233,11 +1487,6 @@ async fn resolve_final_message(
     } else {
         None
     };
-
-    // `-e`/`-c` always edit; otherwise an editor is needed only to author a
-    // message when no source was supplied and `--no-edit` was not given.
-    let needs_editor =
-        args.edit || args.reedit_message.is_some() || (base.is_none() && !args.no_edit);
 
     // `-t`/`--template` (or the `commit.template` config) seeds the message only
     // when no explicit source was supplied (a message source wins, and the
@@ -1264,70 +1513,7 @@ async fn resolve_final_message(
         },
     };
 
-    // The cleanup mode and verbose flag fall back to `commit.cleanup` /
-    // `commit.verbose` config (cascade: local repo, then global) when the CLI flag
-    // is unset — the CLI flag always WINS and short-circuits the config read, so a
-    // bad repo/global config can still be overridden for a single commit. Only when
-    // the flag is unset is the config consulted, and an invalid configured value is
-    // then fatal (Git rejects a bad commit.cleanup mode / commit.verbose value).
-    let mode = match args.cleanup {
-        Some(mode) => mode,
-        None => match read_cascaded_config_value(LocalIdentityTarget::CurrentRepo, "commit.cleanup")
-            .await
-            .ok()
-            .flatten()
-        {
-            Some(value) => parse_cleanup_mode(&value).ok_or_else(|| {
-                CommitError::InvalidConfig(format!(
-                    "invalid commit.cleanup config value '{value}' (expected strip/whitespace/verbatim/scissors/default)"
-                ))
-            })?,
-            None => CleanupMode::Strip,
-        },
-    };
-
-    let verbose = if args.verbose {
-        true
-    } else {
-        match read_cascaded_config_value(LocalIdentityTarget::CurrentRepo, "commit.verbose")
-            .await
-            .ok()
-            .flatten()
-        {
-            Some(value) => parse_git_config_bool(&value).ok_or_else(|| {
-                CommitError::InvalidConfig(format!(
-                    "bad boolean config value '{value}' for 'commit.verbose'"
-                ))
-            })?,
-            None => false,
-        }
-    };
-
-    // Pick the editor: an explicitly configured one runs regardless of TTY; the
-    // `vi` fallback only applies on an interactive terminal.
-    let editor_cmd = if needs_editor && !output.is_json() {
-        match editor::resolve_editor().await {
-            Some(cmd) => Some(cmd),
-            None if std::io::stdin().is_terminal() => Some("vi".to_string()),
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    // `--status`: a `#`-commented status section to seed into the editor
-    // template (informational only). Seed it ONLY when an editor will open AND the
-    // cleanup that will be applied actually strips `#` comments — Strip/Default.
-    // `-v` no longer forces a strip (it only truncates the appended diff, then the
-    // selected mode cleans the message), so under `--cleanup=verbatim`/`whitespace`/
-    // `scissors` (which keep `#` lines above the marker) the status is NOT seeded —
-    // even with `-v` — so it can never leak into the final message (matching Git).
     let cleanup_strips_comments = matches!(mode, CleanupMode::Strip | CleanupMode::Default);
-    let status_section = if args.status && editor_cmd.is_some() && cleanup_strips_comments {
-        build_status_section().await
-    } else {
-        None
-    };
 
     let editor_opened = editor_cmd.is_some();
     let resolved = if let Some(editor_cmd) = editor_cmd {
@@ -1381,7 +1567,7 @@ async fn resolve_final_message(
     //   - the editor was required but none was available → never edited.
     // `--no-edit` (needs_editor == false) bypasses this and uses the template
     // directly.
-    if let Some(template) = &template_content {
+    if !dry_run && let Some(template) = &template_content {
         let unedited = if editor_opened {
             resolved == cleanup_commit_message(template, mode)
         } else {
@@ -1392,7 +1578,7 @@ async fn resolve_final_message(
         }
     }
 
-    if resolved.trim().is_empty() {
+    if !dry_run && resolved.trim().is_empty() {
         return Err(CommitError::EmptyMessage);
     }
 
@@ -1444,7 +1630,7 @@ async fn resolve_commit_template(args: &CommitArgs) -> Result<Option<String>, Co
 }
 
 /// Build the `commit -v` editor template: the initial message, a commented
-/// help header, an optional commented status section (`--status`), the
+/// help header, an optional commented status section, the
 /// Git-standard scissors marker, and the staged diff. Everything from the
 /// scissors line down is stripped by `Scissors` cleanup; the commented header
 /// and status section are stripped as comment lines.
@@ -1470,7 +1656,7 @@ async fn build_verbose_template(
     if strips_comments {
         buffer.push_str("# Please enter the commit message for your changes. Lines starting\n");
         buffer.push_str("# with '#' will be ignored, and an empty message aborts the commit.\n");
-        // `--status`: commented status, above the scissors so it stays visible
+        // Commented status, above the scissors so it stays visible
         // while editing (Git places the status section here too). It is only ever
         // `Some` when the cleanup strips comments, so it is gated here too.
         if let Some(section) = status_section {
@@ -1488,7 +1674,7 @@ async fn build_verbose_template(
     Ok(buffer)
 }
 
-/// Append a `#`-commented status section (`--status`) to a plain (non-verbose)
+/// Append a `#`-commented status section to a plain (non-verbose)
 /// editor buffer. Returns `buffer` unchanged when there is no section.
 fn append_status_section(mut buffer: String, status_section: Option<&str>) -> String {
     if let Some(section) = status_section {
@@ -1502,22 +1688,21 @@ fn append_status_section(mut buffer: String, status_section: Option<&str>) -> St
 }
 
 /// Render the working-tree status as a `#`-commented block for the commit
-/// editor template (`--status`). Each line of the long-format `status` output
+/// editor template. Each line of the long-format `status` output
 /// is prefixed with `# ` so `cleanup_commit_message` strips it from the final
-/// message (informational only). Returns `None` when the status cannot be
-/// rendered or is empty — non-fatal, the template simply omits it.
-async fn build_status_section() -> Option<String> {
+/// message (informational only). Returns `None` only when the rendered status is
+/// empty; collection/config/rendering failures abort with their original stable
+/// CLI error rather than silently omitting the section.
+async fn build_status_section(
+    status_args: status::StatusArgs,
+) -> Result<Option<String>, CommitError> {
     let mut raw: Vec<u8> = Vec::new();
-    // Pin the long format: Git keeps the commit template's status section in
-    // the long format even when `status.short=true` is configured.
-    let status_args = status::StatusArgs {
-        long_format: true,
-        ..status::StatusArgs::default()
-    };
-    status::execute_to(status_args, &mut raw).await.ok()?;
+    status::execute_to_resolved(status_args, &mut raw)
+        .await
+        .map_err(CommitError::StatusTemplate)?;
     let text = String::from_utf8_lossy(&raw);
     if text.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut section = String::new();
     for line in text.lines() {
@@ -1529,7 +1714,7 @@ async fn build_status_section() -> Option<String> {
             section.push('\n');
         }
     }
-    Some(section)
+    Ok(Some(section))
 }
 
 /// Load the commit message of the given commit-ish.
@@ -1884,12 +2069,18 @@ pub async fn execute(args: CommitArgs) {
 /// nothing to commit, identity/signing setup fails, object writes fail, or HEAD
 /// cannot be updated.
 pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<()> {
-    let result = run_commit(args, output).await.map_err(CliError::from)?;
+    let preview = args.dry_run || args.porcelain;
+    // Keep the large commit state machine off callers' stacks. In particular,
+    // direct library consumers and Tokio's default-size worker/test threads
+    // must not have to embed the whole `run_commit` future in their own future.
+    let result = Box::pin(run_commit(args, output))
+        .await
+        .map_err(CliError::from)?;
     // rerere: a commit may have finalized a resolved merge — record the
     // postimage of any tracked conflict now resolved so an identical conflict is
     // auto-resolved next time. A no-op unless `rerere.enabled` and there is a
     // tracked conflict to record (so ordinary commits are unaffected).
-    if let Err(error) = crate::command::rerere::auto_update(false).await {
+    if !preview && let Err(error) = crate::command::rerere::auto_update(false).await {
         tracing::warn!("rerere auto-update after commit failed: {error}");
     }
     // `--porcelain` replaces the human commit summary with `status --porcelain`
@@ -1900,7 +2091,9 @@ pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<
     } else {
         render_commit_output(&result, output)?;
     }
-    dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_COMMIT).await;
+    if !preview {
+        dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_COMMIT).await;
+    }
     Ok(())
 }
 
@@ -2110,6 +2303,15 @@ pub async fn create_tree(
     storage: &ClientStorage,
     current_root: PathBuf,
 ) -> Result<Tree, CommitError> {
+    create_tree_with_persistence(index, storage, current_root, true).await
+}
+
+async fn create_tree_with_persistence(
+    index: &Index,
+    storage: &ClientStorage,
+    current_root: PathBuf,
+    persist: bool,
+) -> Result<Tree, CommitError> {
     // blob created when add file to index
     let get_blob_entry = |path: &PathBuf| -> Result<TreeItem, CommitError> {
         let name = util::path_to_string(path);
@@ -2170,10 +2372,11 @@ pub async fn create_tree(
             }
             processed_path.insert(process_path.to_string());
 
-            let sub_tree = Box::pin(create_tree(
+            let sub_tree = Box::pin(create_tree_with_persistence(
                 index,
                 storage,
                 current_root.clone().join(process_path),
+                persist,
             ))
             .await?;
             tree_items.push(TreeItem {
@@ -2197,13 +2400,17 @@ pub async fn create_tree(
             })?
         }
     };
-    // save
-    save_object_to_storage(storage, &tree, &tree.id)
-        .map_err(|e| CommitError::TreeCreation(format!("failed to save tree object: {}", e)))?;
+    if persist {
+        save_object_to_storage(storage, &tree, &tree.id)
+            .map_err(|e| CommitError::TreeCreation(format!("failed to save tree object: {}", e)))?;
+    }
     Ok(tree)
 }
 
-fn auto_stage_tracked_changes() -> Result<bool, CommitError> {
+fn auto_stage_tracked_changes(
+    persist_objects: bool,
+    cache_preview_objects: bool,
+) -> Result<bool, CommitError> {
     let pending = status::changes_to_be_staged().map_err(|e| {
         CommitError::AutoStage(format!("failed to determine working tree status: {e}"))
     })?;
@@ -2219,12 +2426,31 @@ fn auto_stage_tracked_changes() -> Result<bool, CommitError> {
 
     for file in pending.modified {
         let abs = util::workdir_to_absolute(&file);
-        if !abs.exists() {
-            continue;
+        match std::fs::symlink_metadata(&abs) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(CommitError::AutoStageRead {
+                    path: abs.display().to_string(),
+                    detail: format!("failed to inspect tracked path: {error}"),
+                });
+            }
         }
         // Refresh blob IDs for modified tracked files before updating the index
-        let blob = blob_from_file(&abs);
-        blob.save();
+        let blob = if cache_preview_objects {
+            read_and_cache_preview_blob(&abs)?
+        } else {
+            blob_from_file(&abs, persist_objects, false)?
+        };
+        if persist_objects {
+            let storage = util::objects_storage();
+            save_object_to_storage(&storage, &blob, &blob.id).map_err(|error| {
+                CommitError::AutoStageWrite {
+                    target: format!("blob object {} for '{}'", blob.id, abs.display()),
+                    detail: error.to_string(),
+                }
+            })?;
+        }
         index.update(
             IndexEntry::new_from_file(&file, blob.id, &workdir).map_err(|e| {
                 CommitError::AutoStage(format!("failed to create index entry: {}", e))
@@ -2249,12 +2475,291 @@ fn auto_stage_tracked_changes() -> Result<bool, CommitError> {
     Ok(touched)
 }
 
-fn blob_from_file(path: impl AsRef<std::path::Path>) -> Blob {
-    if lfs::is_lfs_tracked(&path) {
-        Blob::from_lfs_file(path)
+fn blob_from_file(
+    path: impl AsRef<std::path::Path>,
+    persist_lfs: bool,
+    bounded_preview: bool,
+) -> Result<Blob, CommitError> {
+    let path = path.as_ref();
+    if let Some(blob) = read_auto_stage_symlink_blob(path)? {
+        Ok(blob)
+    } else if lfs::is_lfs_tracked(path) {
+        read_lfs_auto_stage_blob(path, persist_lfs)
+    } else if !persist_lfs && !bounded_preview {
+        hash_regular_auto_stage_blob(path)
     } else {
-        Blob::from_file(path)
+        read_regular_auto_stage_blob(path, bounded_preview)
     }
+}
+
+/// Reserve preview capacity before reading an auto-staged payload, then
+/// reconcile the provisional reservation with the content-addressed blob.
+fn read_and_cache_preview_blob(path: &std::path::Path) -> Result<Blob, CommitError> {
+    let (blob, reservation) = if let Some(blob) = read_auto_stage_symlink_blob(path)? {
+        let expected = blob.data.len() as u64;
+        let reservation = preview_object::reserve_pending(expected).map_err(|error| {
+            CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+        (blob, reservation)
+    } else if lfs::is_lfs_tracked(path) {
+        // Git LFS pointers contain a fixed SHA-256 OID and a decimal u64 size;
+        // 256 bytes is a conservative upper bound for the generated pointer.
+        let reservation =
+            preview_object::reserve_pending(256).map_err(|error| CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        (read_lfs_auto_stage_blob(path, false)?, reservation)
+    } else {
+        let file = std::fs::File::open(path).map_err(|error| CommitError::AutoStageRead {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        let expected = file
+            .metadata()
+            .map_err(|error| CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: format!("failed to read file size: {error}"),
+            })?
+            .len();
+        let reservation = preview_object::reserve_pending(expected).map_err(|error| {
+            CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }
+        })?;
+        let capacity = usize::try_from(expected.saturating_add(1)).map_err(|error| {
+            CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: format!("file is too large to preview on this platform: {error}"),
+            }
+        })?;
+        let mut content = Vec::new();
+        content
+            .try_reserve_exact(capacity)
+            .map_err(|error| CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: format!("failed to reserve memory for commit preview: {error}"),
+            })?;
+        file.take(expected.saturating_add(1))
+            .read_to_end(&mut content)
+            .map_err(|error| CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        if content.len() as u64 != expected {
+            return Err(CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: format!(
+                    "file changed while reading it for the commit preview (expected {expected} bytes, read {}); retry the commit preview",
+                    content.len()
+                ),
+            });
+        }
+        (Blob::from_content_bytes(content), reservation)
+    };
+
+    reservation
+        .cache(blob.id, &blob.data)
+        .map_err(|error| CommitError::AutoStageWrite {
+            target: format!("temporary preview blob for '{}'", path.display()),
+            detail: error.to_string(),
+        })?;
+    Ok(blob)
+}
+
+fn read_auto_stage_symlink_blob(path: &std::path::Path) -> Result<Option<Blob>, CommitError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| CommitError::AutoStageRead {
+        path: path.display().to_string(),
+        detail: format!("failed to inspect tracked path: {error}"),
+    })?;
+    if !metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let content = read_symlink_blob_bytes(path).map_err(|error| CommitError::AutoStageRead {
+        path: path.display().to_string(),
+        detail: format!("failed to read symlink target: {error}"),
+    })?;
+    Ok(Some(Blob::from_content_bytes(content)))
+}
+
+enum ObjectHasher {
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+}
+
+impl ObjectHasher {
+    fn new() -> Self {
+        match get_hash_kind() {
+            git_internal::hash::HashKind::Sha1 => {
+                use sha1::Digest as _;
+                Self::Sha1(sha1::Sha1::new())
+            }
+            git_internal::hash::HashKind::Sha256 => {
+                use sha2::Digest as _;
+                Self::Sha256(sha2::Sha256::new())
+            }
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha1(hasher) => {
+                use sha1::Digest as _;
+                hasher.update(bytes);
+            }
+            Self::Sha256(hasher) => {
+                use sha2::Digest as _;
+                hasher.update(bytes);
+            }
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        match self {
+            Self::Sha1(hasher) => {
+                use sha1::Digest as _;
+                hasher.finalize().to_vec()
+            }
+            Self::Sha256(hasher) => {
+                use sha2::Digest as _;
+                hasher.finalize().to_vec()
+            }
+        }
+    }
+}
+
+/// Compute the object ID for a non-verbose dry-run without retaining the file.
+fn hash_regular_auto_stage_blob(path: &std::path::Path) -> Result<Blob, CommitError> {
+    let mut file = std::fs::File::open(path).map_err(|error| CommitError::AutoStageRead {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    let expected = file
+        .metadata()
+        .map_err(|error| CommitError::AutoStageRead {
+            path: path.display().to_string(),
+            detail: format!("failed to read file size: {error}"),
+        })?
+        .len();
+    let mut hasher = ObjectHasher::new();
+    hasher.update(format!("blob {expected}\0").as_bytes());
+    let mut actual = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        actual = actual.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    if actual != expected {
+        return Err(CommitError::AutoStageRead {
+            path: path.display().to_string(),
+            detail: format!(
+                "file changed while computing its preview object ID (expected {expected} bytes, read {actual}); retry the commit preview"
+            ),
+        });
+    }
+    let id =
+        ObjectHash::from_bytes(&hasher.finish()).map_err(|detail| CommitError::AutoStageRead {
+            path: path.display().to_string(),
+            detail: format!("failed to construct preview object ID: {detail}"),
+        })?;
+    Ok(Blob {
+        id,
+        data: Vec::new(),
+    })
+}
+
+fn read_regular_auto_stage_blob(
+    path: &std::path::Path,
+    bounded_preview: bool,
+) -> Result<Blob, CommitError> {
+    let content = if bounded_preview {
+        preview_object::read_file_bounded(path, preview_object::MAX_OBJECT_BYTES)
+    } else {
+        std::fs::read(path)
+    }
+    .map_err(|error| CommitError::AutoStageRead {
+        path: path.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    Ok(Blob::from_content_bytes(content))
+}
+
+fn read_lfs_auto_stage_blob(
+    path: &std::path::Path,
+    persist_lfs: bool,
+) -> Result<Blob, CommitError> {
+    let mut source = std::fs::File::open(path).map_err(|error| CommitError::AutoStageRead {
+        path: path.display().to_string(),
+        detail: format!("failed to open LFS content: {error}"),
+    })?;
+    let mut backup = if persist_lfs {
+        let root = util::storage_path().join("lfs/objects");
+        Some(
+            StreamingAtomicFile::new_in(&root, atomic_write::sync_data_enabled()).map_err(
+                |error| CommitError::AutoStageWrite {
+                    target: root.display().to_string(),
+                    detail: format!("failed to create temporary LFS backup: {error}"),
+                },
+            )?,
+        )
+    } else {
+        None
+    };
+
+    let mut digest = DigestContext::new(&SHA256);
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: format!("failed to read LFS content: {error}"),
+            })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(|| CommitError::AutoStageRead {
+                path: path.display().to_string(),
+                detail: "LFS content size exceeds u64".to_string(),
+            })?;
+        if let Some(backup) = backup.as_mut() {
+            backup
+                .write_all(&buffer[..read])
+                .map_err(|error| CommitError::AutoStageWrite {
+                    target: format!("temporary LFS backup for '{}'", path.display()),
+                    detail: error.to_string(),
+                })?;
+        }
+    }
+    let oid = hex::encode(digest.finish().as_ref());
+
+    if let Some(backup) = backup {
+        let backup_path = lfs::lfs_object_path(&oid);
+        backup
+            .persist(&backup_path)
+            .map_err(|error| CommitError::AutoStageWrite {
+                target: backup_path.display().to_string(),
+                detail: format!("failed to atomically persist LFS backup: {error}"),
+            })?;
+    }
+    Ok(Blob::from_content(&lfs::format_pointer_string(&oid, size)))
 }
 
 /// Get the current HEAD commit ID as parent.
@@ -2340,6 +2845,18 @@ mod test {
     use super::*;
 
     #[test]
+    fn execute_safe_future_fits_default_async_thread_stack() {
+        let output = OutputConfig::default();
+        let future = execute_safe(CommitArgs::default(), &output);
+        let size = std::mem::size_of_val(&future);
+
+        assert!(
+            size <= 128 * 1024,
+            "execute_safe future is {size} bytes; keep the run_commit state machine behind a heap boundary"
+        );
+    }
+
+    #[test]
     fn parse_git_config_bool_handles_bool_int_and_suffixes() {
         // Boolean spellings.
         for t in ["true", "yes", "on", "TRUE", "On"] {
@@ -2391,7 +2908,8 @@ mod test {
     ///
     /// Source-chained / wrapper variants (IndexLoad, IndexSave,
     /// TreeCreation, ObjectStorage, ParentCommitLoad, HeadUpdate,
-    /// PreCommitHook, VaultSign, AutoStage, StagedChanges, VerboseDiff,
+    /// PreCommitHook, VaultSign, AutoStage, AutoStageRead, AutoStageWrite,
+    /// StagedChanges, VerboseDiff,
     /// MessageFileRead) wrap upstream error strings via `{0}` /
     /// `{detail}` and are intentionally skipped — their content is
     /// owned by the wrapped error type.
@@ -2550,6 +3068,84 @@ mod test {
         let err: CliError = CommitError::AutoStage("failed".to_string()).into();
         assert_eq!(err.exit_code(), 128);
         assert_eq!(err.stable_code().as_str(), "LBR-IO-001");
+    }
+
+    #[test]
+    fn test_commit_error_auto_stage_write_maps_to_io_write() {
+        let err: CliError = CommitError::AutoStageWrite {
+            target: "preview object".to_string(),
+            detail: "disk full".to_string(),
+        }
+        .into();
+        assert_eq!(err.exit_code(), 128);
+        assert_eq!(err.stable_code().as_str(), "LBR-IO-002");
+        assert!(err.message().contains("preview object"));
+    }
+
+    #[test]
+    fn auto_stage_blob_io_failures_are_results_with_stable_codes() {
+        let temp = tempdir().expect("create auto-stage test directory");
+        let missing = temp.path().join("missing.bin");
+
+        let regular = read_regular_auto_stage_blob(&missing, false)
+            .expect_err("missing regular file must return an error");
+        let regular: CliError = regular.into();
+        assert_eq!(regular.stable_code().as_str(), "LBR-IO-001");
+        assert!(regular.message().contains("missing.bin"));
+
+        let lfs = read_lfs_auto_stage_blob(&missing, false)
+            .expect_err("missing LFS file must return an error");
+        let lfs: CliError = lfs.into();
+        assert_eq!(lfs.stable_code().as_str(), "LBR-IO-001");
+        assert!(lfs.message().contains("missing.bin"));
+    }
+
+    #[test]
+    fn non_verbose_preview_hashes_regular_blob_without_retaining_payload() {
+        let temp = tempdir().expect("create streamed-hash directory");
+        let path = temp.path().join("tracked.bin");
+        let content = vec![b'x'; 1024 * 1024];
+        std::fs::write(&path, &content).expect("write streamed-hash fixture");
+
+        let streamed = hash_regular_auto_stage_blob(&path).expect("stream regular blob hash");
+        let materialized = Blob::from_content_bytes(content);
+        assert_eq!(streamed.id, materialized.id);
+        assert!(
+            streamed.data.is_empty(),
+            "preview must not retain file bytes"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn lfs_auto_stage_pointer_matches_atomically_replaced_backup() {
+        let temp = tempdir().expect("create LFS auto-stage test directory");
+        setup_with_new_libra_in(temp.path()).await;
+        let _guard = ChangeDirGuard::new(temp.path());
+        let source = temp.path().join("tracked.bin");
+        std::fs::write(&source, b"complete replacement payload").expect("write LFS source");
+        let expected_oid = lfs::calc_lfs_file_hash(&source).expect("hash LFS source");
+        let backup = lfs::lfs_object_path(&expected_oid);
+        std::fs::create_dir_all(backup.parent().expect("backup parent"))
+            .expect("create backup parent");
+        std::fs::write(&backup, b"truncated").expect("seed truncated backup");
+
+        let pointer = read_lfs_auto_stage_blob(&source, true).expect("stage LFS source");
+        let (pointer_oid, pointer_size) = lfs::parse_pointer_data(&pointer.data)
+            .expect("auto-stage must return a valid LFS pointer");
+        assert_eq!(pointer_oid, expected_oid);
+        assert_eq!(
+            pointer_size,
+            std::fs::metadata(&source).expect("source metadata").len()
+        );
+        assert_eq!(
+            lfs::calc_lfs_file_hash(&backup).expect("hash final backup"),
+            pointer_oid
+        );
+        assert_eq!(
+            std::fs::metadata(&backup).expect("backup metadata").len(),
+            pointer_size
+        );
     }
 
     #[test]

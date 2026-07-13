@@ -387,24 +387,32 @@ async fn test_restore_worktree_refuses_ai_managed_current_branch() {
 fn restore_no_progress_flag_is_accepted_noop() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
-    std::fs::write(p.join("r.txt"), "modified\n").unwrap();
+    std::fs::write(p.join("tracked.txt"), "modified\n").unwrap();
     // `--no-progress` is accepted and a no-op: Libra's restore renders no
     // progress meter, so the restore proceeds and reverts the file.
-    let out = run_libra_command(&["restore", "--no-progress", "r.txt"], p);
-    assert_cli_success(&out, "restore --no-progress r.txt");
+    let out = run_libra_command(&["restore", "--no-progress", "tracked.txt"], p);
+    assert_cli_success(&out, "restore --no-progress tracked.txt");
+    assert_eq!(
+        std::fs::read_to_string(p.join("tracked.txt")).unwrap(),
+        "tracked\n"
+    );
 }
 
 #[test]
 fn restore_no_overlay_flag_is_accepted() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
-    std::fs::write(p.join("r.txt"), "modified\n").unwrap();
+    std::fs::write(p.join("tracked.txt"), "modified\n").unwrap();
     // `--no-overlay` selects the default (non-overlay) mode explicitly; restore
     // proceeds normally. (Its real toggle counterpart `--overlay` — which
     // preserves source-absent tracked paths — is covered by the overlay tests
     // below.)
-    let out = run_libra_command(&["restore", "--no-overlay", "r.txt"], p);
-    assert_cli_success(&out, "restore --no-overlay r.txt");
+    let out = run_libra_command(&["restore", "--no-overlay", "tracked.txt"], p);
+    assert_cli_success(&out, "restore --no-overlay tracked.txt");
+    assert_eq!(
+        std::fs::read_to_string(p.join("tracked.txt")).unwrap(),
+        "tracked\n"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +452,59 @@ fn create_conflicted_repo() -> tempfile::TempDir {
     // Conflicting merge leaves tracked.txt unmerged (index stages 1/2/3) and a
     // conflict-marked working tree. The non-zero exit is expected.
     let _ = run_libra_command(&["merge", "feature"], path);
+    repo
+}
+
+fn create_two_path_conflicted_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let path = repo.path();
+    for file in ["a-first.txt", "z-blocked.txt"] {
+        std::fs::write(path.join(file), "base\n").expect("write conflict base");
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "a-first.txt", "z-blocked.txt"], path),
+        "stage conflict bases",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "conflict bases", "--no-verify"], path),
+        "commit conflict bases",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], path),
+        "create feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "feature"], path),
+        "checkout feature",
+    );
+    for file in ["a-first.txt", "z-blocked.txt"] {
+        std::fs::write(path.join(file), "feature change\n").expect("write feature change");
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "a-first.txt", "z-blocked.txt"], path),
+        "stage feature changes",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature changes", "--no-verify"], path),
+        "commit feature changes",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], path),
+        "checkout main",
+    );
+    for file in ["a-first.txt", "z-blocked.txt"] {
+        std::fs::write(path.join(file), "main change\n").expect("write main change");
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "a-first.txt", "z-blocked.txt"], path),
+        "stage main changes",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main changes", "--no-verify"], path),
+        "commit main changes",
+    );
+    let merged = run_libra_command(&["merge", "feature"], path);
+    assert!(!merged.status.success(), "merge must leave two conflicts");
     repo
 }
 
@@ -547,6 +608,44 @@ fn test_restore_theirs_modify_delete_removes_worktree_file() {
     assert!(
         !repo.path().join("tracked.txt").exists(),
         "restoring the deleted side must remove the worktree file"
+    );
+}
+
+#[test]
+#[serial]
+fn test_restore_theirs_modify_delete_removes_empty_worktree_directory() {
+    let repo = create_modify_delete_conflict(true);
+    let path = repo.path().join("tracked.txt");
+    std::fs::remove_file(&path).expect("remove conflicted worktree file");
+    std::fs::create_dir(&path).expect("materialize gitlink-like directory");
+
+    let out = run_libra_command(&["restore", "--theirs", "tracked.txt"], repo.path());
+    assert_cli_success(&out, "restore deleted conflict side over empty directory");
+    assert!(
+        !path.exists(),
+        "restoring a deletion must remove an empty materialized directory"
+    );
+}
+
+#[test]
+#[serial]
+fn test_restore_theirs_modify_delete_refuses_nonempty_worktree_directory() {
+    let repo = create_modify_delete_conflict(true);
+    let path = repo.path().join("tracked.txt");
+    std::fs::remove_file(&path).expect("remove conflicted worktree file");
+    std::fs::create_dir(&path).expect("materialize gitlink-like directory");
+    std::fs::write(path.join("nested.txt"), "user data\n").expect("write nested user data");
+
+    let out = run_libra_command(&["restore", "--theirs", "tracked.txt"], repo.path());
+    assert_eq!(out.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("refusing to replace non-empty worktree directory 'tracked.txt'"),
+        "unexpected stderr: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("nested.txt")).expect("nested data survives"),
+        "user data\n"
     );
 }
 
@@ -818,6 +917,174 @@ fn test_restore_default_removes_files_absent_from_source() {
     );
 }
 
+const TEST_GITLINK_OID: &str = "1111111111111111111111111111111111111111";
+
+fn commit_gitlink(repo: &Path) {
+    let spec = format!("160000,{TEST_GITLINK_OID},vendor/sub");
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--cacheinfo", &spec], repo),
+        "stage gitlink",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                "add gitlink",
+            ],
+            repo,
+        ),
+        "commit gitlink",
+    );
+}
+
+fn restore_index_and_worktree(repo: &Path, source: &str) -> std::process::Output {
+    run_libra_command(
+        &["restore", "--source", source, "--staged", "--worktree", "."],
+        repo,
+    )
+}
+
+#[test]
+#[serial]
+fn test_restore_removes_empty_materialized_gitlink_directory() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_gitlink(p);
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--remove", "vendor/sub"], p),
+        "remove gitlink from index",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                "remove gitlink",
+            ],
+            p,
+        ),
+        "commit gitlink removal",
+    );
+
+    assert_cli_success(
+        &restore_index_and_worktree(p, "HEAD~1"),
+        "restore gitlink commit",
+    );
+    assert!(p.join("vendor/sub").is_dir());
+
+    let removed = restore_index_and_worktree(p, "HEAD");
+    assert_cli_success(&removed, "restore commit without gitlink");
+    assert!(
+        !p.join("vendor/sub").exists(),
+        "an empty materialized gitlink directory must be removed"
+    );
+}
+
+#[test]
+#[serial]
+fn test_restore_replaces_empty_materialized_gitlink_with_blob() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_gitlink(p);
+
+    std::fs::write(p.join("replacement-source.txt"), "replacement\n")
+        .expect("write replacement source");
+    let hashed = run_libra_command(&["hash-object", "-w", "replacement-source.txt"], p);
+    assert_cli_success(&hashed, "hash replacement blob");
+    let oid = String::from_utf8_lossy(&hashed.stdout).trim().to_string();
+    let spec = format!("100644,{oid},vendor/sub");
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--cacheinfo", &spec], p),
+        "replace gitlink index entry with blob",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                "replace gitlink",
+            ],
+            p,
+        ),
+        "commit gitlink replacement",
+    );
+
+    assert_cli_success(
+        &restore_index_and_worktree(p, "HEAD~1"),
+        "restore gitlink commit",
+    );
+    assert!(p.join("vendor/sub").is_dir());
+
+    let replaced = restore_index_and_worktree(p, "HEAD");
+    assert_cli_success(&replaced, "restore blob replacing gitlink");
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor/sub")).expect("read replacement blob"),
+        "replacement\n"
+    );
+}
+
+#[test]
+#[serial]
+fn test_restore_refuses_nonempty_gitlink_before_mutating_other_paths() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    commit_gitlink(p);
+    std::fs::write(p.join("tracked.txt"), "next\n").expect("update tracked file");
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--add", "tracked.txt"], p),
+        "stage tracked update",
+    );
+    assert_cli_success(
+        &run_libra_command(&["update-index", "--remove", "vendor/sub"], p),
+        "remove gitlink from index",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--no-gpg-sign",
+                "--no-verify",
+                "-m",
+                "remove gitlink and update tracked file",
+            ],
+            p,
+        ),
+        "commit transition away from gitlink",
+    );
+
+    assert_cli_success(
+        &restore_index_and_worktree(p, "HEAD~1"),
+        "restore gitlink commit",
+    );
+    std::fs::write(p.join("vendor/sub/local.txt"), "nested user data\n")
+        .expect("write nested gitlink content");
+    assert_eq!(
+        std::fs::read_to_string(p.join("tracked.txt")).expect("read old tracked content"),
+        "tracked\n"
+    );
+
+    let rejected = restore_index_and_worktree(p, "HEAD");
+    assert_eq!(rejected.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("refusing to replace non-empty worktree directory 'vendor/sub'"),
+        "{stderr}"
+    );
+    assert!(p.join("vendor/sub/local.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(p.join("tracked.txt")).expect("read untouched tracked content"),
+        "tracked\n",
+        "preflight must reject before restoring an earlier path"
+    );
+}
+
 #[test]
 #[serial]
 fn test_restore_overlay_no_overlay_toggle_last_wins() {
@@ -1051,5 +1318,57 @@ fn test_restore_merge_rewrites_conflict_markers() {
     assert!(
         human.contains("unsupported conflict style"),
         "stderr should name the unsupported style: {human}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_restore_merge_replaces_empty_worktree_directory() {
+    let repo = create_conflicted_repo();
+    let path = repo.path().join("tracked.txt");
+    std::fs::remove_file(&path).expect("remove conflict marker file");
+    std::fs::create_dir(&path).expect("create empty materialized directory");
+
+    let output = run_libra_command(&["restore", "--merge", "tracked.txt"], repo.path());
+    assert_cli_success(&output, "restore --merge over empty directory");
+    let content = std::fs::read_to_string(path).expect("read rebuilt markers");
+    assert!(content.contains("<<<<<<< ours"), "{content}");
+    assert!(content.contains(">>>>>>> theirs"), "{content}");
+}
+
+#[test]
+#[serial]
+fn test_restore_diff3_rejects_nonempty_directory_before_mutating_any_path() {
+    let repo = create_two_path_conflicted_repo();
+    let first = repo.path().join("a-first.txt");
+    let blocked = repo.path().join("z-blocked.txt");
+    std::fs::write(&first, "must remain untouched\n").expect("write first sentinel");
+    std::fs::remove_file(&blocked).expect("remove second conflict marker file");
+    std::fs::create_dir(&blocked).expect("create blocked directory");
+    std::fs::write(blocked.join("nested.txt"), "nested user data\n")
+        .expect("write nested user data");
+
+    let output = run_libra_command(
+        &[
+            "restore",
+            "--conflict=diff3",
+            "a-first.txt",
+            "z-blocked.txt",
+        ],
+        repo.path(),
+    );
+    assert_eq!(output.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to replace non-empty worktree directory 'z-blocked.txt'"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(first).expect("read untouched first path"),
+        "must remain untouched\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(blocked.join("nested.txt")).expect("read nested data"),
+        "nested user data\n"
     );
 }

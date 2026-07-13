@@ -251,8 +251,13 @@ fn run_ls_files(
                 }
                 let exists = fs::symlink_metadata(&worktree_path).is_ok();
                 let is_deleted = !exists;
-                let is_modified =
-                    exists && entry_modified(&worktree_path, &entry.name, &entry.hash.to_string())?;
+                let is_modified = exists
+                    && entry_modified(
+                        &worktree_path,
+                        &entry.name,
+                        &entry.hash.to_string(),
+                        entry.mode,
+                    )?;
 
                 if _args.deleted && !is_deleted {
                     continue;
@@ -415,7 +420,22 @@ fn pathspec_error_to_cli(error: PathspecError) -> CliError {
     }
 }
 
-fn entry_modified(worktree_path: &Path, display_path: &str, indexed_hash: &str) -> CliResult<bool> {
+fn entry_modified(
+    worktree_path: &Path,
+    display_path: &str,
+    indexed_hash: &str,
+    indexed_mode: u32,
+) -> CliResult<bool> {
+    if indexed_mode == 0o160000 {
+        let metadata = fs::symlink_metadata(worktree_path).map_err(|source| {
+            CliError::fatal(format!(
+                "failed to inspect gitlink working tree path '{display_path}': {source}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        return Ok(!metadata.is_dir() || metadata.file_type().is_symlink());
+    }
+
     let data = match read_worktree_blob_bytes(worktree_path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),

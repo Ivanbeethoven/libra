@@ -22,6 +22,8 @@ libra restore --ignore-unmerged [--source <tree-ish>] <pathspec>...
 
 当来源提交包含当前工作树中不存在的文件时，这些文件会被创建。在默认（`--no-overlay`）模式下，当当前工作树包含来源中不存在的已跟踪文件时，这些文件会被删除以使目标与来源完全一致；使用 `--overlay` 时则保留这些来源中缺失的已跟踪路径。输出会分别报告 `restored_files` 和 `deleted_files`。
 
+已物化的 gitlink 在工作树中表现为目录。restore 可以删除空的 gitlink 目录，或把它替换为普通文件、符号链接或删除结果；`--merge` / `--conflict=diff3` 把目录替换为普通冲突标记文件时也遵循同一规则。若目录非空，则会在修改任何已选路径前拒绝操作，绝不递归删除嵌套仓库或用户数据。
+
 从引用 LFS 指针的提交恢复时，LFS 管理的文件会自动从 LFS 服务器下载。
 
 从来源 tree、索引或冲突 stage 恢复符号链接时，Libra 会在支持 symlink 的平台上创建真正的 symlink，并把链接 blob 字节作为目标路径。恢复过程不会跟随或打开目标路径，因此指向仓库外部的 symlink 也只会被恢复为链接本身。`--merge` 重建冲突标记时也会先替换工作树中的既有 symlink，再写入普通冲突标记文件。不支持 symlink 的平台会返回明确诊断，而不是把链接目标写成普通文件内容。

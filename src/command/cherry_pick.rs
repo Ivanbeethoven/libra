@@ -2034,4 +2034,12 @@ mod tests {
         assert_eq!(rebuilt.cleanup.as_deref(), Some("strip"));
         assert_eq!(rebuilt.empty.as_deref(), Some("drop"));
     }
+
+    #[test]
+    fn short_gpg_sign_flag_parses_as_enabled() {
+        let args = CherryPickArgs::try_parse_from(["cherry-pick", "-S", "deadbeef"])
+            .expect("valid cherry-pick arguments should parse");
+        assert!(args.gpg_sign);
+        assert!(!args.no_gpg_sign);
+    }
 }

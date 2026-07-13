@@ -120,6 +120,14 @@ libra commit --disable-pre -m "Quick fix"
 libra commit --no-verify -m "WIP: work in progress"
 ```
 
+### `--dry-run`
+
+只显示将生成的提交摘要，不创建提交。预览不会运行 pre-commit hook，也不会打开提交消息编辑器，因此无需提供消息；这样子进程不会在 `-a` 预览期间观察或修改 live index。`-v` 仍会直接打印 staged 预览 diff。
+
+```bash
+libra commit --dry-run -a
+```
+
 ### `--author <AUTHOR>`
 
 覆盖提交作者。必须使用标准 `A U Thor <author@example.com>` 格式。
@@ -166,12 +174,18 @@ libra commit --amend --reset-author --no-edit
 
 ### `--status` / `--no-status`
 
-`--status` 把工作树状态以 `#` 注释行注入提交消息编辑器模板（Git 默认显示；Libra 默认省略，故用 `--status` 主动开启）。由于是注释行，消息 cleanup 会将其剥离——仅供参考，不进入最终提交消息。未打开编辑器时（例如带 `-m`）无效果。在保留注释行的 cleanup 模式下也会省略（`--cleanup=verbatim`、`--cleanup=whitespace` 与 `--cleanup=scissors`——显式 scissors 保留 marker 之上的 `#` 行），从而绝不泄漏进消息；仅当打开编辑器且生效的 cleanup 会剥离注释（`strip`/`default`）时才注入。`-v` 仅截断附加的 diff，不强制 strip，故上述模式下即便加 `-v` 也不注入 status。`--no-status`（默认）不含 status 段。两者构成 last-wins 切换。
+提交消息编辑器模板默认把工作树状态以 `#` 注释行注入。`commit.status=false` 可关闭；`--status` / `--no-status` 显式覆盖该配置，最后一个 flag 胜出。由于是注释行，消息 cleanup 会将其剥离——仅供参考，不进入最终提交消息。未打开编辑器时（例如带 `-m`）无效果。在保留注释行的 cleanup 模式下也会省略（`--cleanup=verbatim`、`--cleanup=whitespace` 与 `--cleanup=scissors`——显式 scissors 保留 marker 之上的 `#` 行），从而绝不泄漏进消息；仅当打开编辑器且生效的 cleanup 会剥离注释（`strip`/`default`）时才注入。`-v` 仅截断附加的 diff，不强制 strip，故上述模式下即便加 `-v` 也不注入 status。
+
+`commit.status` 按严格 local -> global -> system 级联读取，接受 Git 布尔值（包括 `0k`、`2` 等数值形式）。仅在确实能生成编辑器 status 模板时，无效值才会在 `-a`、hook、对象或历史写入前以 `LBR-CLI-002` 失败；local/global 配置库不可读时以 `LBR-IO-001` 失败。`-m`、dry-run/porcelain、JSON 与不剥离注释的 cleanup 因不存在模板而绕过该键；显式 `--status` / `--no-status` 在适用路径中短路并覆盖配置。启用模板 status 时，`status.*` 配置、状态采集或渲染错误保留原稳定错误码，并在 pre-commit hook、编辑器、commit/tree 对象或 ref 写入前中止；`status.showStash=true` 下不可读的 stash ref 或不可读/损坏的 stash log 也会以 `LBR-IO-001` 在这些副作用前中止，而不是静默显示为 0，fresh `status --cached` 同样 fail-closed。因此不可读 store 下的显式 `--status` 会点名首个必需的 `status.*` 键而非 `commit.status`，证明后者已被短路；`--no-status` 绕过整条模板状态路径。`--dry-run -a` 的整个预览使用 task-local 隔离临时 index，live index 从不被替换，临时 auto-stage blob、LFS 备份和 tree 对象也不持久化：非 verbose regular blob 用 64 KiB 缓冲流式计算对象 ID，不保留文件载荷；auto-stage 对 tracked symlink（包括 dangling link 和命中 LFS attribute 的路径）始终读取链接目标字节而不跟随链接，并在真实提交与预览中保持 mode `120000`；verbose 在读取前把 staged diff 变化两侧的 HEAD、已暂存和新 auto-stage 唯一 blob 纳入同一预算（未变化的大 blob 不计费），限制为单 blob 32 MiB、总计费 64 MiB、最多 4096 个对象；完整变化对象数会在任何 storage sizing、loose 解码或 pack index 扫描前先拒绝。auto-stage 会在读取工作区载荷前先预留字节与对象槽，再按对象 ID 去重结算，因此预先暂存和哈希去重都不能绕过限制。scratch 位于所有 linked worktree 共用的公共仓库存储 `.libra/tmp/commit-preview`，并发运行总预留上限 256 MiB；每次启动最多扫描 256 个 run、清理 32 个超过 24 小时且未持锁的旧 run；run 的 reservation 元数据缺失或不可读时会 fail-closed，不会按 0 字节计费。超限保持 live index/对象库不变并提示关闭 verbose；若变化对象不能完成有界本地预检（例如仅在 remote，或 pack 缺少现成 index），也会在加载前 fail-closed；预览绝不重建 pack index。实际预览读取显式调用仅本地的有界加载 API，不依赖 storage runtime 内部的 task-local 状态；loose 与非 delta pack 对象会在解码载荷前拒绝超限声明长度，loose 对象随后流式校验到声明边界并拒绝长度不符和 zlib 流后的尾随字节；超限 delta instruction 声明会在访问 base 链前拒绝，预算内 packed delta 才对完整 base/instruction/result 链计费并校验，有界深度且非法指令 fail-closed，一次批量只枚举 pack 一次并各打开现有 index 一次；后续 bounded pack read 使用专用 uncached delta decoder 并 move 最终 payload，不进入 200 MiB 全局 pack cache，也不产生额外完整 payload 返回克隆。关闭 verbose 可避免无上限加载。dry-run/porcelain 同时跳过 hook、编辑器、rerere 更新与 `post_commit` automation，因为没有真实提交。auto-stage 文件/LFS pointer 读取失败返回 `LBR-IO-001`，LFS 备份、预览缓存或对象写入失败返回 `LBR-IO-002`，均不再 panic。真实 `-a` 为保证落盘 index 不引用缺失对象，会把 LFS 源流式复制到临时快照、从该快照的精确字节生成 pointer，并原子替换同 OID 路径上可能截断/损坏的旧备份；启用 `--sync-data` 时会持久创建 shard 祖先目录、fsync 临时载荷，并同步 staging 与目标目录；Windows 因无可靠目录 fsync 等价物而使用 write-through 原子替换。若之后 status 采集中止，这些对象与已暂存 index 按既有 auto-stage-on-abort 语义保留。
 
 ```bash
-libra commit --status          # 打开编辑器，模板中含注释化的状态
-libra commit --no-status -m "message"
+libra commit                   # 编辑器模板默认包含注释化状态
+libra config commit.status false
+libra commit --status          # 本次覆盖 commit.status=false
+libra commit --no-status       # 本次省略状态段
 ```
+
+补充的 fail-closed 边界：`refs/stash` 已存在但不是普通文件（包括指向普通文件的符号链接）时，普通与 fresh cached status 都返回 `LBR-IO-001`；verbose preview 的 bounded pack 读取只使用既有 index，不会为无关 pack 重建缺失 index，并携带剩余 64 MiB 聚合预算、沿用 cache 的每对象最少 4 KiB 计费，越界后不再探测后续 pack 对象载荷。
 
 ### `--no-gpg-sign`
 
@@ -354,6 +368,7 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 | 复用消息和 author | `git commit -C/-c <commit>` | N/A | `libra commit -C/-c <commit>` |
 | 交互式消息 | `git commit`（打开编辑器） | `jj commit`（打开编辑器） | `libra commit`（无 -m/-F 时打开编辑器）/ `-e` |
 | 编辑器中 verbose diff | `git commit -v` | N/A | `libra commit -v` |
+| 编辑器模板 status | 默认开启；`commit.status` / `--[no-]status` | N/A | 默认开启；`commit.status` / `--[no-]status` |
 | verbose 配置默认 | `commit.verbose`（未给 `-v` 时回退；CLI flag 优先） | N/A | `libra config commit.verbose true` |
 | 重置作者日期 | `git commit --reset-author` | N/A | `libra commit --reset-author` |
 | Cleanup 模式 | `git commit --cleanup=<mode>` | N/A | `libra commit --cleanup=<mode>` |
@@ -387,8 +402,11 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 | Pre-commit hook 失败 | `LBR-REPO-003` | 128 | "use --no-verify to bypass the hook" |
 | Conventional commit 无效 | `LBR-CLI-002` | 129 | "see https://www.conventionalcommits.org for format rules" |
 | Vault signing 失败 | `LBR-AUTH-001` | 128 | "check vault configuration with 'libra config --list'" |
-| Auto-stage 失败 | `LBR-IO-001` | 128 | -- |
+| Auto-stage 源文件读取/hash 失败 | `LBR-IO-001` | 128 | 检查报错中点名的工作树文件 |
+| Auto-stage 预览/对象/LFS 写入失败 | `LBR-IO-002` | 128 | 检查报错中点名目标的空间与权限 |
 | 暂存更改计算 | `LBR-REPO-002` | 128 | "failed to compute staged changes" |
+| `commit.status` 无效 | `LBR-CLI-002` | 129 | 修正配置值 |
+| `commit.status` 配置不可读 | `LBR-IO-001` | 128 | 修复 local/global 配置库 |
 
 ## 兼容性说明
 

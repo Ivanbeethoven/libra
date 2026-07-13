@@ -420,6 +420,11 @@ impl ClientStorage {
         ClientStorage { storage, base_path }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_storage(storage: Arc<dyn Storage>, base_path: PathBuf) -> Self {
+        Self { storage, base_path }
+    }
+
     /// Create a storage backend.
     ///
     /// # Remote Storage
@@ -749,6 +754,49 @@ impl ClientStorage {
         let storage = self.storage.clone();
         let hash = *object_id;
         self.block_on_storage(async move { storage.get(&hash).await.map(|(data, _)| data) })
+    }
+
+    /// Read an object only when the backend can enforce `limit` before
+    /// materializing its payload.
+    pub fn get_with_limit(&self, object_id: &ObjectHash, limit: u64) -> Result<Vec<u8>, GitError> {
+        let storage = self.storage.clone();
+        let hash = *object_id;
+        self.block_on_storage(async move {
+            storage
+                .get_with_limit(&hash, limit)
+                .await
+                .map(|(data, _)| data)
+        })
+    }
+
+    /// Compute a conservative bounded load cost without materializing its payload.
+    pub fn object_size(&self, object_id: &ObjectHash) -> Result<Option<u64>, GitError> {
+        let storage = self.storage.clone();
+        let hash = *object_id;
+        self.block_on_storage(async move { storage.object_size(&hash).await })
+    }
+
+    /// Batch bounded load-cost preflight with one storage-runtime round trip.
+    pub fn object_sizes(&self, object_ids: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
+        let storage = self.storage.clone();
+        let hashes = object_ids.to_vec();
+        self.block_on_storage(async move { storage.object_sizes(&hashes).await })
+    }
+
+    /// Batch bounded load-cost preflight that stops when `aggregate_limit`
+    /// would be exceeded.
+    pub fn object_sizes_with_total_limit(
+        &self,
+        object_ids: &[ObjectHash],
+        aggregate_limit: u64,
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        let storage = self.storage.clone();
+        let hashes = object_ids.to_vec();
+        self.block_on_storage(async move {
+            storage
+                .object_sizes_with_total_limit(&hashes, aggregate_limit)
+                .await
+        })
     }
 
     /// Attempt to repair a missing or corrupted object from the durable tier
@@ -1268,6 +1316,16 @@ impl Storage for ClientStorage {
         self.block_on_storage(async move { storage.get(&hash).await })
     }
 
+    async fn get_with_limit(
+        &self,
+        hash: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        let storage = self.storage.clone();
+        let hash = *hash;
+        self.block_on_storage(async move { storage.get_with_limit(&hash, limit).await })
+    }
+
     async fn put(
         &self,
         hash: &ObjectHash,
@@ -1279,6 +1337,22 @@ impl Storage for ClientStorage {
 
     async fn exist(&self, hash: &ObjectHash) -> bool {
         ClientStorage::exist(self, hash)
+    }
+
+    async fn object_size(&self, hash: &ObjectHash) -> Result<Option<u64>, GitError> {
+        ClientStorage::object_size(self, hash)
+    }
+
+    async fn object_sizes(&self, hashes: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
+        ClientStorage::object_sizes(self, hashes)
+    }
+
+    async fn object_sizes_with_total_limit(
+        &self,
+        hashes: &[ObjectHash],
+        aggregate_limit: u64,
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        ClientStorage::object_sizes_with_total_limit(self, hashes, aggregate_limit)
     }
 
     async fn search(&self, prefix: &str) -> Vec<ObjectHash> {

@@ -5,6 +5,7 @@ pub mod error;
 pub mod fuse;
 pub mod output;
 
+pub(crate) mod atomic_stream;
 pub mod atomic_write;
 pub mod attributes;
 pub mod backoff;
@@ -23,6 +24,8 @@ pub mod path;
 pub mod path_case;
 pub mod path_ext;
 pub mod pathspec;
+pub(crate) mod preview_object;
+pub(crate) mod preview_scratch;
 pub mod read_policy;
 pub mod redact;
 pub mod resource_limits;

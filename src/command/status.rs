@@ -297,6 +297,14 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// Resolve and validate all `status.*` defaults without collecting repository
+/// state or producing output. Embedded consumers use this before side effects,
+/// then pass the returned arguments to [`execute_to_resolved`].
+pub(crate) async fn resolve_config_defaults(mut args: StatusArgs) -> CliResult<StatusArgs> {
+    apply_status_config_defaults(&mut args).await?;
+    Ok(args)
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum PorcelainVersion {
     #[clap(name = "v1")]
@@ -572,7 +580,11 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
     }
 
     let stash_count = if args.show_stash {
-        Some(stash::get_stash_num().unwrap_or(0))
+        Some(stash::get_stash_num().map_err(|detail| {
+            CliError::fatal(format!("failed to read stash state for status: {detail}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("repair or remove the corrupt stash log, then retry")
+        })?)
     } else {
         None
     };
@@ -1313,7 +1325,11 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         unstaged.new.clear();
     }
     let stash_count = if args.show_stash {
-        Some(stash::get_stash_num().unwrap_or(0))
+        Some(stash::get_stash_num().map_err(|detail| {
+            CliError::fatal(format!("failed to read stash state for status: {detail}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("repair or remove the corrupt stash log, then retry")
+        })?)
     } else {
         None
     };
@@ -1391,7 +1407,18 @@ pub async fn execute_to(mut args: StatusArgs, writer: &mut impl Write) -> CliRes
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
     apply_status_config_defaults(&mut args).await?;
-    let args = args;
+    execute_to_resolved(args, writer).await
+}
+
+/// Collect and render status from arguments whose config defaults were already
+/// resolved by [`resolve_config_defaults`]. This avoids a second, potentially
+/// inconsistent config read after an embedded caller has crossed a side-effect
+/// boundary.
+pub(crate) async fn execute_to_resolved(
+    args: StatusArgs,
+    writer: &mut impl Write,
+) -> CliResult<()> {
+    util::require_repo().map_err(|_| CliError::repo_not_found())?;
     let data = collect_status_data(&args).await?;
     let output = OutputConfig::default();
     render_status_to_writer(&data, &args, &output, writer).await

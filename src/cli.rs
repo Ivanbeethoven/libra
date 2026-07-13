@@ -1996,6 +1996,17 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    #[test]
+    fn cherry_pick_short_gpg_sign_survives_root_cli_parsing() {
+        let cli = Cli::try_parse_from(["libra", "cherry-pick", "-S", "deadbeef"])
+            .expect("valid cherry-pick arguments should parse");
+        let Commands::CherryPick(args) = cli.command else {
+            panic!("expected cherry-pick command");
+        };
+        assert!(args.gpg_sign);
+        assert!(!args.no_gpg_sign);
+    }
     use crate::utils::{output, test};
 
     fn apply_runtime_flags_for_test(argv: &[&str]) -> CliResult<()> {

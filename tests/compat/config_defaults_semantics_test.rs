@@ -13,6 +13,28 @@ use libra::internal::{config::Config, db::get_db_conn_instance_for_path};
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
+#[cfg(unix)]
+#[path = "config_defaults_commit_status_auto_stage_limits.rs"]
+mod commit_status_auto_stage_limit_defaults;
+#[cfg(unix)]
+#[path = "config_defaults_commit_status.rs"]
+mod commit_status_defaults;
+#[cfg(unix)]
+#[path = "config_defaults_commit_status_failures.rs"]
+mod commit_status_failure_defaults;
+#[path = "config_defaults_commit_status_io.rs"]
+mod commit_status_io_defaults;
+#[cfg(unix)]
+#[path = "config_defaults_commit_status_limits.rs"]
+mod commit_status_limit_defaults;
+#[cfg(unix)]
+#[path = "config_defaults_commit_status_recovery.rs"]
+mod commit_status_recovery_defaults;
+#[path = "config_defaults_commit_status_side_effects.rs"]
+mod commit_status_side_effect_defaults;
+#[cfg(unix)]
+#[path = "config_defaults_commit_status_verbose.rs"]
+mod commit_status_verbose_defaults;
 #[path = "config_defaults_diff.rs"]
 mod diff_defaults;
 #[path = "config_defaults_diff_prefix.rs"]
@@ -1080,6 +1102,70 @@ fn status_show_stash_config_adds_hint_and_cli_negation_wins() {
 
     let suppressed = fixture.success(&repo, &["status", "--no-show-stash"]);
     assert!(!stdout_trim(&suppressed).contains("stash currently has"));
+}
+
+#[test]
+fn cached_status_propagates_corrupt_stash_log_without_output() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("status-cached-corrupt-stash");
+    fixture.init_repo(&repo);
+    fixture.commit_file(&repo, "base.txt", "base\n", "base");
+    fs::write(repo.join("base.txt"), "stash me\n").expect("modify for stash");
+    fixture.success(&repo, &["stash", "push"]);
+    fs::write(repo.join("base.txt"), "cached dirty state\n").expect("modify after stash");
+    fixture.success(&repo, &["status", "--scan"]);
+    fixture.success(&repo, &["config", "status.showStash", "true"]);
+    fs::write(
+        repo.join(".libra/logs/refs/stash"),
+        "corrupted entry without hash\n",
+    )
+    .expect("corrupt stash log after cache creation");
+
+    let rejected = fixture.run(&repo, &["status", "--cached"]);
+    assert_eq!(rejected.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("LBR-IO-001"), "{stderr}");
+    assert!(stderr.contains("stash"), "{stderr}");
+    assert!(
+        rejected.stdout.is_empty(),
+        "cached status must fail before emitting output: {}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
+
+    fs::remove_file(repo.join(".libra/logs/refs/stash")).expect("remove corrupt stash log");
+    fs::remove_file(repo.join(".libra/refs/stash")).expect("remove regular stash ref");
+    #[cfg(unix)]
+    {
+        fs::write(repo.join(".libra/refs/stash-target"), "invalid-ref\n")
+            .expect("create regular symlink target");
+        std::os::unix::fs::symlink("stash-target", repo.join(".libra/refs/stash"))
+            .expect("create stash ref symlink to a regular file");
+        let rejected = fixture.run(&repo, &["status", "--cached"]);
+        assert_eq!(rejected.status.code(), Some(128));
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains("LBR-IO-001"), "{stderr}");
+        assert!(stderr.contains("stash"), "{stderr}");
+        assert!(
+            rejected.stdout.is_empty(),
+            "cached status must reject a symlink stash ref before output: {}",
+            String::from_utf8_lossy(&rejected.stdout)
+        );
+
+        fs::remove_file(repo.join(".libra/refs/stash")).expect("remove stash ref symlink");
+        fs::remove_file(repo.join(".libra/refs/stash-target"))
+            .expect("remove regular symlink target");
+    }
+    fs::create_dir(repo.join(".libra/refs/stash")).expect("create invalid stash ref directory");
+    let rejected = fixture.run(&repo, &["status", "--cached"]);
+    assert_eq!(rejected.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("LBR-IO-001"), "{stderr}");
+    assert!(stderr.contains("stash"), "{stderr}");
+    assert!(
+        rejected.stdout.is_empty(),
+        "cached status must reject a non-file stash ref before output: {}",
+        String::from_utf8_lossy(&rejected.stdout)
+    );
 }
 
 #[test]

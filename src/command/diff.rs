@@ -21,7 +21,7 @@ use git_internal::{
     hash::ObjectHash,
     internal::{
         index::{Index, IndexEntry, Time},
-        object::{blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
+        object::{ObjectTrait, blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
         pack::utils::calculate_object_hash,
     },
 };
@@ -40,6 +40,7 @@ use crate::{
     internal::{config::ConfigKv, head::Head},
     utils::{
         attributes,
+        client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         ignore::{self, IgnorePolicy},
         object_ext::TreeExt,
@@ -47,7 +48,7 @@ use crate::{
         pager::Pager,
         path,
         pathspec::{PathspecError, PathspecSet},
-        util,
+        preview_object, util,
     },
 };
 
@@ -1383,6 +1384,38 @@ async fn run_diff(
     // post-pass can look up each file's old/new content from the caches.
     let first_map: HashMap<PathBuf, ObjectHash> = first_blobs.iter().cloned().collect();
     let second_map: HashMap<PathBuf, ObjectHash> = second_blobs.iter().cloned().collect();
+    if preview_object::is_active() {
+        let storage = ClientStorage::init(path::objects());
+        let mut hashes = HashSet::new();
+        for (path, hash) in &first_map {
+            if second_map.get(path) != Some(hash) {
+                hashes.insert(*hash);
+            }
+        }
+        for (path, hash) in &second_map {
+            if first_map.get(path) != Some(hash) {
+                hashes.insert(*hash);
+            }
+        }
+        let hashes: Vec<ObjectHash> = hashes
+            .into_iter()
+            .filter(|hash| !preview_object::contains(hash))
+            .collect();
+        let remaining =
+            preview_object::remaining_cache_bytes().map_err(|error| DiffError::FileRead {
+                path: "commit preview object batch".to_string(),
+                detail: error.to_string(),
+            })?;
+        let sized = preflight_preview_object_sizes(hashes, |hashes| {
+            storage.object_sizes_with_total_limit(hashes, remaining)
+        })?;
+        for (hash, size) in sized {
+            preview_object::reserve(hash, size).map_err(|error| DiffError::FileRead {
+                path: format!("commit preview object {hash}"),
+                detail: error.to_string(),
+            })?;
+        }
+    }
     let diff_output = Diff::diff(first_blobs, second_blobs, paths, move |path, hash| {
         if worktree_entries.get(path) == Some(hash) {
             if let Some(data) = worktree_cache_in.borrow().get(hash).cloned() {
@@ -1773,6 +1806,41 @@ async fn run_diff(
     })
 }
 
+fn preflight_preview_object_sizes(
+    hashes: Vec<ObjectHash>,
+    size_batch: impl FnOnce(&[ObjectHash]) -> Result<Vec<Option<u64>>, git_internal::errors::GitError>,
+) -> Result<Vec<(ObjectHash, u64)>, DiffError> {
+    preview_object::ensure_object_capacity(hashes.len()).map_err(|error| DiffError::FileRead {
+        path: "commit preview object batch".to_string(),
+        detail: error.to_string(),
+    })?;
+    let sizes = size_batch(&hashes).map_err(|error| DiffError::FileRead {
+        path: "commit preview object batch".to_string(),
+        detail: format!(
+            "failed to size commit preview objects before loading them: {error}; rerun without --verbose"
+        ),
+    })?;
+    if sizes.len() != hashes.len() {
+        return Err(DiffError::FileRead {
+            path: "commit preview object batch".to_string(),
+            detail:
+                "the storage backend returned an incomplete size batch; rerun without --verbose"
+                    .to_string(),
+        });
+    }
+    hashes
+        .into_iter()
+        .zip(sizes)
+        .map(|(hash, size)| {
+            size.map(|size| (hash, size)).ok_or_else(|| DiffError::FileRead {
+                path: format!("commit preview object {hash}"),
+                detail: "the storage backend cannot safely size this object before loading it; rerun without --verbose"
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
 fn pathspec_error_to_diff(error: PathspecError) -> DiffError {
     match error {
         PathspecError::OutsideRepository { .. }
@@ -2117,6 +2185,29 @@ pub(crate) async fn diff_stat_between_commits(
 }
 
 fn load_repo_blob_content(hash: &ObjectHash) -> Result<Vec<u8>, DiffError> {
+    if let Some(content) = preview_object::read(hash).map_err(|error| DiffError::FileRead {
+        path: format!("temporary preview object {hash}"),
+        detail: error.to_string(),
+    })? {
+        return Ok(content);
+    }
+    if preview_object::is_active() {
+        let storage = ClientStorage::init(path::objects());
+        let data = storage
+            .get_with_limit(hash, preview_object::MAX_OBJECT_BYTES)
+            .map_err(|error| DiffError::ObjectLoad {
+                kind: "blob",
+                object_id: hash.to_string(),
+                detail: format!("bounded commit preview read failed: {error}"),
+            })?;
+        return Blob::from_bytes(&data, *hash)
+            .map(|blob| blob.data)
+            .map_err(|error| DiffError::ObjectLoad {
+                kind: "blob",
+                object_id: hash.to_string(),
+                detail: error.to_string(),
+            });
+    }
     let blob = load_object::<Blob>(hash).map_err(|e| DiffError::ObjectLoad {
         kind: "blob",
         object_id: hash.to_string(),
@@ -4739,13 +4830,35 @@ fn colorize_diff(diff_text: &str, color_moved: bool) -> String {
 
 #[cfg(test)]
 mod test {
-    use std::{fs, io::Write};
+    use std::{cell::Cell, fs, io::Write};
 
     use serial_test::serial;
     use tempfile::tempdir;
 
     use super::*;
     use crate::utils::test;
+
+    #[tokio::test]
+    async fn preview_object_count_is_rejected_before_batch_sizing() {
+        let temp = tempfile::tempdir().expect("create preview-count fixture");
+        crate::utils::preview_object::with_objects(temp.path().join("objects"), async {
+            let hashes = (0..=4_096u32)
+                .map(|number| {
+                    ObjectHash::from_type_and_data(ObjectType::Blob, &number.to_be_bytes())
+                })
+                .collect::<Vec<_>>();
+            let sizing_called = Cell::new(false);
+            let error = preflight_preview_object_sizes(hashes, |_| {
+                sizing_called.set(true);
+                Ok(Vec::new())
+            })
+            .expect_err("4,097 changed objects must fail before storage sizing");
+
+            assert!(error.to_string().contains("object count exceeds 4096"));
+            assert!(!sizing_called.get(), "storage sizing must not be invoked");
+        })
+        .await;
+    }
 
     #[test]
     fn parse_rename_score_matches_git_semantics() {

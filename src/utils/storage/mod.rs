@@ -5,6 +5,7 @@
 //! implement the Git-only `Storage` trait below so callers cannot
 //! accidentally route publish JSON / bytes through Git zlib/header
 //! packing.
+mod load_cost;
 pub mod local;
 pub mod publish_storage;
 pub mod remote;
@@ -21,6 +22,19 @@ pub trait Storage: Send + Sync {
     /// If the object is not found, returns `GitError::ObjectNotFound`.
     async fn get(&self, hash: &ObjectHash) -> Result<(Vec<u8>, ObjectType), GitError>;
 
+    /// Retrieve an object while enforcing a conservative maximum load cost
+    /// before materializing it. Backends that cannot enforce the bound fail
+    /// closed instead of downloading or decoding an unbounded payload.
+    async fn get_with_limit(
+        &self,
+        _hash: &ObjectHash,
+        limit: u64,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
+        Err(GitError::InvalidObjectInfo(format!(
+            "storage backend cannot enforce a {limit}-byte bounded object read"
+        )))
+    }
+
     /// Store an object
     /// Takes the object hash, raw decompressed data, and object type.
     /// Returns the storage path or identifier.
@@ -35,6 +49,54 @@ pub trait Storage: Send + Sync {
     /// Check if an object exists
     /// Returns true if the object exists in storage.
     async fn exist(&self, hash: &ObjectHash) -> bool;
+
+    /// Return a conservative upper bound for bytes required to load the object
+    /// without materializing it. Packed deltas include their instruction and
+    /// base-chain reconstruction cost. `None` means this backend cannot provide
+    /// a bounded local answer.
+    async fn object_size(&self, _hash: &ObjectHash) -> Result<Option<u64>, GitError> {
+        Ok(None)
+    }
+
+    /// Batch form of [`Self::object_size`], preserving input order.
+    async fn object_sizes(&self, hashes: &[ObjectHash]) -> Result<Vec<Option<u64>>, GitError> {
+        let mut sizes = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            sizes.push(self.object_size(hash).await?);
+        }
+        Ok(sizes)
+    }
+
+    /// Batch bounded-load preflight that stops once the sum of discovered load
+    /// costs exceeds `aggregate_limit`. Implementations should avoid probing
+    /// later payloads after the limit is crossed.
+    async fn object_sizes_with_total_limit(
+        &self,
+        hashes: &[ObjectHash],
+        aggregate_limit: u64,
+    ) -> Result<Vec<Option<u64>>, GitError> {
+        let mut sizes = Vec::with_capacity(hashes.len());
+        let mut total = 0u64;
+        for hash in hashes {
+            let size = self.object_size(hash).await?;
+            if let Some(size) = size {
+                total = total
+                    .checked_add(crate::utils::preview_object::charged_bytes(size))
+                    .ok_or_else(|| {
+                        GitError::InvalidObjectInfo(
+                            "preview aggregate cache load cost exceeds u64".to_string(),
+                        )
+                    })?;
+                if total > aggregate_limit {
+                    return Err(GitError::InvalidObjectInfo(format!(
+                        "preview aggregate cache load cost exceeds {aggregate_limit} bytes"
+                    )));
+                }
+            }
+            sizes.push(size);
+        }
+        Ok(sizes)
+    }
 
     /// Search for objects by hash prefix
     /// Returns a list of object hashes that match the given prefix.

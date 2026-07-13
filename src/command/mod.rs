@@ -293,7 +293,7 @@ pub fn read_worktree_blob_bytes(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     fs::read(path)
 }
 
-fn read_symlink_blob_bytes(path: &Path) -> io::Result<Vec<u8>> {
+pub(crate) fn read_symlink_blob_bytes(path: &Path) -> io::Result<Vec<u8>> {
     Ok(symlink_target_blob_bytes(&fs::read_link(path)?))
 }
 

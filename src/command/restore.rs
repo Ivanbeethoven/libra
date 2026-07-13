@@ -74,6 +74,8 @@ pub enum RestoreError {
     InvalidPathEncoding,
     #[error("failed to write worktree file")]
     WriteWorktree,
+    #[error("refusing to replace non-empty worktree directory '{0}'")]
+    NonEmptyWorktreeDirectory(String),
     #[error("failed to download LFS content")]
     LfsDownload,
     /// Refused to restore from a Libra-managed locked branch (`intent`,
@@ -130,6 +132,7 @@ impl RestoreError {
             Self::ReadWorktree => StableErrorCode::IoReadFailed,
             Self::InvalidPathEncoding => StableErrorCode::CliInvalidArguments,
             Self::WriteWorktree => StableErrorCode::IoWriteFailed,
+            Self::NonEmptyWorktreeDirectory(_) => StableErrorCode::ConflictOperationBlocked,
             Self::LfsDownload => StableErrorCode::NetworkUnavailable,
             Self::LockedSource(_) => StableErrorCode::CliInvalidTarget,
             Self::LockedCurrentBranch(_) => StableErrorCode::ConflictOperationBlocked,
@@ -189,6 +192,9 @@ impl From<RestoreError> for CliError {
             RestoreError::InvalidPathspec(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob"),
+            RestoreError::NonEmptyWorktreeDirectory(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("move or remove nested files before restoring across the gitlink"),
             _ => CliError::fatal(message).with_stable_code(stable_code),
         }
     }
@@ -610,6 +616,7 @@ async fn restore_worktree_tracked(
     let index = Index::load(path::index()).map_err(|_| RestoreError::ReadIndex)?;
     let file_paths =
         collect_restore_worktree_paths(pathspecs, &target_map, &index, allowed_unmatched)?;
+    preflight_worktree_directory_transitions(&file_paths, &target_map, &index, overlay)?;
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
 
@@ -625,15 +632,24 @@ async fn restore_worktree_tracked(
                 return Err(pathspec_not_matched(path_wd));
             }
         } else if let Some(target) = target_map.get(path_wd) {
-            let hash = calc_file_blob_hash(&path_abs).map_err(|_| RestoreError::ReadObject)?;
-            if hash != target.hash || !worktree_mode_matches(&path_abs, target.mode)? {
+            let mode_matches = worktree_mode_matches(&path_abs, target.mode)?;
+            let content_matches = if matches!(target.mode, Some(TreeItemMode::Commit)) {
+                // Gitlink commits live in the nested repository, so there is no
+                // parent-repository blob to hash or load here.
+                true
+            } else if !mode_matches {
+                false
+            } else {
+                calc_file_blob_hash(&path_abs).map_err(|_| RestoreError::ReadObject)? == target.hash
+            };
+            if !content_matches || !mode_matches {
                 restore_target_to_file_typed(*target, path_wd).await?;
                 restored.push(path_wd.display().to_string());
             } else {
                 apply_worktree_target_mode(&path_abs, target.mode)?;
             }
         } else if !overlay && tracked {
-            fs::remove_file(&path_abs).map_err(|_| RestoreError::WriteWorktree)?;
+            remove_worktree_path_for_restore(&path_abs)?;
             util::clear_empty_dir(&path_abs);
             deleted.push(path_wd.display().to_string());
         }
@@ -673,12 +689,10 @@ fn restore_index_tracked(
         let path_str = path_to_utf8_typed(path)?;
         if !index.tracked(path_str, 0) {
             if let Some(target) = target_map.get(path) {
-                let blob =
-                    load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
                 index.add(index_entry_from_target(
                     path_str.to_string(),
                     *target,
-                    blob.data.len() as u32,
+                    restore_target_index_size(*target)?,
                 ));
                 restored.push(path.display().to_string());
             } else {
@@ -690,12 +704,10 @@ fn restore_index_tracked(
                 .map(|entry| entry.mode == target.index_mode())
                 .unwrap_or(false);
             if !index.verify_hash(path_str, 0, &target.hash) || !mode_matches {
-                let blob =
-                    load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
                 index.update(index_entry_from_target(
                     path_str.to_string(),
                     *target,
-                    blob.data.len() as u32,
+                    restore_target_index_size(*target)?,
                 ));
                 restored.push(path.display().to_string());
             }
@@ -1046,6 +1058,13 @@ where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
 {
+    // A full-tree restore is also valid when both the source tree and index
+    // are empty. There is no individual pathname to satisfy the usual
+    // positive-pathspec check, but switching between empty-tree commits is a
+    // legitimate no-op for the worktree and index.
+    if pathspecs.is_full_tree_match() {
+        return Ok(());
+    }
     if let Some(unmatched) = pathspecs.unmatched_positive(candidates) {
         return Err(RestoreError::PathspecNotMatched(unmatched.to_string()));
     }
@@ -1090,8 +1109,12 @@ fn worktree_mode_matches(path: &Path, mode: Option<TreeItemMode>) -> Result<bool
     let file_type = metadata.file_type();
     Ok(match mode {
         TreeItemMode::Link => file_type.is_symlink(),
-        TreeItemMode::Blob | TreeItemMode::BlobExecutable => !file_type.is_symlink(),
-        TreeItemMode::Commit | TreeItemMode::Tree => true,
+        TreeItemMode::Blob | TreeItemMode::BlobExecutable => file_type.is_file(),
+        // A gitlink is represented by a directory in the working tree. Its
+        // commit belongs to the nested repository and is intentionally not a
+        // blob in the parent repository's object store.
+        TreeItemMode::Commit => file_type.is_dir() && !file_type.is_symlink(),
+        TreeItemMode::Tree => true,
     })
 }
 
@@ -1174,6 +1197,47 @@ fn stage_target(index: &Index, path: &str, stage: u8) -> Option<RestoreTarget> {
         .map(|entry| RestoreTarget::new(entry.hash, index_mode_to_tree_item_mode(entry.mode)))
 }
 
+fn preflight_conflict_stage_worktree(
+    paths: &[PathBuf],
+    index: &Index,
+    stage: u8,
+    overlay: bool,
+) -> Result<(), RestoreError> {
+    for path in paths {
+        let path_str = path_to_utf8_typed(path)?;
+        let target = stage_target(index, path_str, stage);
+        if target.is_none() && overlay {
+            return Err(RestoreError::MissingStageVersion {
+                path: path_str.to_string(),
+                stage,
+            });
+        }
+
+        let absolute = util::workdir_to_absolute(path);
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(RestoreError::ReadWorktree),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if target.is_some_and(|target| matches!(target.mode, Some(TreeItemMode::Commit))) {
+            continue;
+        }
+        if fs::read_dir(&absolute)
+            .map_err(|_| RestoreError::ReadWorktree)?
+            .next()
+            .is_some()
+        {
+            return Err(RestoreError::NonEmptyWorktreeDirectory(
+                path.display().to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Blob OID for `path` at conflict `stage` (2 = ours, 3 = theirs).
 fn stage_blob(index: &Index, path: &str, stage: u8) -> Option<ObjectHash> {
     stage_target(index, path, stage).map(|target| target.hash)
@@ -1207,6 +1271,7 @@ async fn restore_conflict_stage(
         }
         return Err(RestoreError::PathspecNotMatched(String::new()));
     }
+    preflight_conflict_stage_worktree(&matched, &index, stage, overlay)?;
 
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
@@ -1230,7 +1295,7 @@ async fn restore_conflict_stage(
                 // already-absent file is fine (Git exits 0 either way).
                 let path_abs = util::workdir_to_absolute(path);
                 if worktree_path_exists(&path_abs) {
-                    fs::remove_file(&path_abs).map_err(|_| RestoreError::WriteWorktree)?;
+                    remove_worktree_path_for_restore(&path_abs)?;
                     util::clear_empty_dir(&path_abs);
                 }
                 deleted.push(path.display().to_string());
@@ -1261,6 +1326,7 @@ async fn restore_conflict_merge(
         }
         return Err(RestoreError::PathspecNotMatched(String::new()));
     }
+    preflight_conflict_merge_worktree(&matched)?;
 
     let eol = if cfg!(windows) { "\r\n" } else { "\n" };
     let mut restored = Vec::new();
@@ -1279,11 +1345,36 @@ async fn restore_conflict_merge(
         if let Some(parent) = path_abs.parent() {
             fs::create_dir_all(parent).map_err(|_| RestoreError::WriteWorktree)?;
         }
+        remove_existing_empty_directory(&path_abs)?;
         remove_existing_symlink(&path_abs)?;
         util::write_file(content.as_bytes(), &path_abs).map_err(|_| RestoreError::WriteWorktree)?;
         restored.push(path.display().to_string());
     }
     Ok(restored)
+}
+
+fn preflight_conflict_merge_worktree(paths: &[PathBuf]) -> Result<(), RestoreError> {
+    for path in paths {
+        let absolute = util::workdir_to_absolute(path);
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(RestoreError::ReadWorktree),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if fs::read_dir(&absolute)
+            .map_err(|_| RestoreError::ReadWorktree)?
+            .next()
+            .is_some()
+        {
+            return Err(RestoreError::NonEmptyWorktreeDirectory(
+                path.display().to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Load the blob content for a conflict stage, rendered for inclusion in a
@@ -1341,11 +1432,27 @@ async fn restore_target_to_file_typed(
     target: RestoreTarget,
     path: &PathBuf,
 ) -> Result<(), RestoreError> {
-    let blob = load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
     let path_abs = util::workdir_to_absolute(path);
+
+    if matches!(target.mode, Some(TreeItemMode::Commit)) {
+        match fs::symlink_metadata(&path_abs) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                return Ok(());
+            }
+            Ok(_) => fs::remove_file(&path_abs).map_err(|_| RestoreError::WriteWorktree)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(RestoreError::ReadWorktree),
+        }
+        fs::create_dir_all(&path_abs).map_err(|_| RestoreError::WriteWorktree)?;
+        return Ok(());
+    }
+
+    let blob = load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
     if let Some(parent) = path_abs.parent() {
         fs::create_dir_all(parent).map_err(|_| RestoreError::WriteWorktree)?;
     }
+
+    remove_existing_empty_directory(&path_abs)?;
 
     if matches!(target.mode, Some(TreeItemMode::Link)) {
         return write_worktree_symlink(&path_abs, &blob.data);
@@ -1373,6 +1480,76 @@ async fn restore_target_to_file_typed(
     }
 
     Ok(())
+}
+
+fn preflight_worktree_directory_transitions(
+    paths: &[PathBuf],
+    targets: &HashMap<PathBuf, RestoreTarget>,
+    index: &Index,
+    overlay: bool,
+) -> Result<(), RestoreError> {
+    for path in paths {
+        let absolute = util::workdir_to_absolute(path);
+        let metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(RestoreError::ReadWorktree),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let target_is_gitlink = targets
+            .get(path)
+            .is_some_and(|target| matches!(target.mode, Some(TreeItemMode::Commit)));
+        if target_is_gitlink {
+            continue;
+        }
+        let path_str = path_to_utf8_typed(path)?;
+        let will_replace = targets.contains_key(path) || (!overlay && index.tracked(path_str, 0));
+        if will_replace
+            && fs::read_dir(&absolute)
+                .map_err(|_| RestoreError::ReadWorktree)?
+                .next()
+                .is_some()
+        {
+            return Err(RestoreError::NonEmptyWorktreeDirectory(
+                path.display().to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_existing_empty_directory(path: &Path) -> Result<(), RestoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir(path).map_err(|_| RestoreError::WriteWorktree)
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(RestoreError::ReadWorktree),
+    }
+}
+
+fn remove_worktree_path_for_restore(path: &Path) -> Result<(), RestoreError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(RestoreError::ReadWorktree),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        fs::remove_dir(path).map_err(|_| RestoreError::WriteWorktree)
+    } else {
+        fs::remove_file(path).map_err(|_| RestoreError::WriteWorktree)
+    }
+}
+
+fn restore_target_index_size(target: RestoreTarget) -> Result<u32, RestoreError> {
+    if matches!(target.mode, Some(TreeItemMode::Commit)) {
+        return Ok(0);
+    }
+    let blob = load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
+    u32::try_from(blob.data.len()).map_err(|_| RestoreError::ReadObject)
 }
 
 fn remove_existing_symlink(path: &Path) -> Result<(), RestoreError> {
