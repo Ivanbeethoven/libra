@@ -1,7 +1,6 @@
 //! Fetch command to negotiate with remotes, download pack data, update
-//! remote-tracking refs, and honor `--depth` shallow options and `--tags` /
-//! `--no-tags`. (Prune is not yet implemented — see
-//! `docs/development/commands/fetch.md`.)
+//! mapped local refs, and honor refspec configuration, `--depth`, tag policy,
+//! and transactional prune/update semantics.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -20,8 +19,8 @@ use git_internal::{
 };
 use indicatif::ProgressBar;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionError,
-    TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set,
+    TransactionError, TransactionTrait,
 };
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -603,7 +602,7 @@ pub struct FetchArgs {
     /// Repository to fetch from
     pub repository: Option<String>,
 
-    /// Refspec to fetch, usually a branch name
+    /// Source ref or `<src>:<dst>` mapping to fetch
     #[clap(requires("repository"))]
     pub refspec: Option<String>,
 
@@ -729,6 +728,16 @@ pub struct FetchRepositoryResult {
     /// original JSON shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pruned: Vec<FetchPruneEntry>,
+    /// Every selected remote ref, including refs that were already up to date.
+    /// Git records these in FETCH_HEAD even when no local destination moved.
+    #[serde(skip)]
+    fetch_head_records: Vec<FetchHeadRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FetchHeadRecord {
+    oid: String,
+    source_ref: String,
 }
 
 /// A remote-tracking ref removed (or, in `--dry-run`, slated for removal) by
@@ -750,6 +759,20 @@ pub struct FetchOutput {
     pub requested_remote: Option<String>,
     pub refspec: Option<String>,
     pub remotes: Vec<FetchRepositoryResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FetchRefspec {
+    source: String,
+    destination: String,
+    force: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FetchRefPlan {
+    reference: DiscRef,
+    destination: String,
+    force: bool,
 }
 
 /// Typed classification for [`FetchError::InvalidRemoteSpec`] so that callers
@@ -781,6 +804,10 @@ pub enum FetchError {
     ObjectFormatMismatch { remote: HashKind, local: HashKind },
     #[error("remote branch {branch} not found in upstream {remote}")]
     RemoteBranchNotFound { branch: String, remote: String },
+    #[error("invalid fetch refspec '{refspec}': {reason}")]
+    InvalidRefspec { refspec: String, reason: String },
+    #[error("failed to read fetch configuration '{key}': {message}")]
+    ConfigRead { key: String, message: String },
     #[error("failed to fetch objects from '{remote}': {source}")]
     FetchObjects { remote: String, source: io::Error },
     #[error("failed to read fetch stream: {source}")]
@@ -805,6 +832,8 @@ pub enum FetchError {
     IndexPack { path: String, source: GitError },
     #[error("failed to update references after fetch: {message}")]
     UpdateRefs { message: String },
+    #[error("fetch destination update rejected: {message}")]
+    RefUpdateRejected { message: String },
     #[error(
         "local Libra remotes do not support --depth yet because they cannot advertise shallow boundaries"
     )]
@@ -848,6 +877,14 @@ impl From<FetchError> for CliError {
             FetchError::RemoteBranchNotFound { .. } => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("verify the remote branch name and try again"),
+            FetchError::InvalidRefspec { .. } => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint(
+                    "use '<src>:<dst>' with full refs, for example \
+                     'refs/heads/main:refs/remotes/origin/main'",
+                ),
+            FetchError::ConfigRead { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::IoReadFailed),
             FetchError::ObjectFormatMismatch { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid),
             FetchError::IncompletePack { .. } => CliError::fatal(error.to_string())
@@ -866,6 +903,9 @@ impl From<FetchError> for CliError {
             | FetchError::UpdateRefs { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            FetchError::RefUpdateRejected { .. } => CliError::conflict(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("adjust the destination refspec or use --force for an intentional non-fast-forward update"),
             FetchError::UnsupportedShallowLocalLibra => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint(
@@ -1095,6 +1135,9 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         let mut prune_modes = Vec::with_capacity(remotes.len());
         for remote in &remotes {
             prune_modes.push(resolve_prune_mode(&remote.name, prune_cli).await?);
+            validate_configured_fetch_refspecs(&remote.name)
+                .await
+                .map_err(CliError::from)?;
         }
 
         let mut results = Vec::with_capacity(remotes.len());
@@ -1154,6 +1197,14 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                 .with_hint("use 'libra remote -v' to inspect configured remotes")
         })?;
 
+    if let Some(requested) = refspec.as_deref() {
+        parse_fetch_refspec(requested, &remote_config.name).map_err(CliError::from)?;
+    } else {
+        validate_configured_fetch_refspecs(&remote_config.name)
+            .await
+            .map_err(CliError::from)?;
+    }
+
     if verbose {
         eprintln!(
             "Fetching {} from {}",
@@ -1166,7 +1217,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     let result = fetch_repository_with_result(
         remote_config,
         refspec.clone(),
-        false,
+        refspec.is_some(),
         depth,
         dry_run,
         tag_cli,
@@ -1348,6 +1399,288 @@ pub(crate) fn normalize_branch_ref(branch: &str) -> String {
     }
 }
 
+fn refspec_ref_is_valid(value: &str) -> bool {
+    let wildcard_count = value.matches('*').count();
+    wildcard_count <= 1 && util::is_valid_refname(&value.replace('*', "wildcard"))
+}
+
+fn default_fetch_destination(remote: &str, source: &str) -> Result<String, FetchError> {
+    if let Some(branch) = source.strip_prefix("refs/heads/") {
+        return Ok(format!("refs/remotes/{remote}/{branch}"));
+    }
+    if let Some(mr) = source.strip_prefix("refs/mr/") {
+        return Ok(format!("refs/remotes/{remote}/mr/{mr}"));
+    }
+    Err(FetchError::InvalidRefspec {
+        refspec: source.to_string(),
+        reason: "a source without an explicit destination must name refs/heads/* or refs/mr/*"
+            .to_string(),
+    })
+}
+
+fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), FetchError> {
+    if destination.starts_with("refs/tags/") {
+        return Err(FetchError::InvalidRefspec {
+            refspec: refspec.to_string(),
+            reason: "tag destinations are not supported by fetch refspecs; use --tags".to_string(),
+        });
+    }
+    let supported = destination
+        .strip_prefix("refs/heads/")
+        .is_some_and(|branch| !branch.is_empty() && branch != "HEAD")
+        || destination
+            .strip_prefix("refs/remotes/")
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(remote, branch)| {
+                !remote.is_empty() && !branch.is_empty() && branch != "HEAD"
+            });
+    if supported {
+        Ok(())
+    } else {
+        Err(FetchError::InvalidRefspec {
+            refspec: refspec.to_string(),
+            reason: "destination must be under refs/heads/* or refs/remotes/<remote>/* and must not be a reserved HEAD ref".to_string(),
+        })
+    }
+}
+
+fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchError> {
+    if raw.is_empty() || raw.matches(':').count() > 1 {
+        return Err(FetchError::InvalidRefspec {
+            refspec: raw.to_string(),
+            reason: "expected one source and at most one destination".to_string(),
+        });
+    }
+
+    let (force, body) = match raw.strip_prefix('+') {
+        Some(body) => (true, body),
+        None => (false, raw),
+    };
+    if body.is_empty() {
+        return Err(FetchError::InvalidRefspec {
+            refspec: raw.to_string(),
+            reason: "source ref must not be empty".to_string(),
+        });
+    }
+
+    let (source_raw, destination_raw) = match body.split_once(':') {
+        Some((source, destination)) if !source.is_empty() && !destination.is_empty() => {
+            (source, Some(destination))
+        }
+        Some(_) => {
+            return Err(FetchError::InvalidRefspec {
+                refspec: raw.to_string(),
+                reason: "both source and destination refs are required".to_string(),
+            });
+        }
+        None => (body, None),
+    };
+    let source = normalize_branch_ref(source_raw);
+    let destination = match destination_raw {
+        Some(destination) => destination.to_string(),
+        None => default_fetch_destination(remote, &source)?,
+    };
+
+    let source_wildcards = source.matches('*').count();
+    let destination_wildcards = destination.matches('*').count();
+    if !refspec_ref_is_valid(&source)
+        || !refspec_ref_is_valid(&destination)
+        || source_wildcards != destination_wildcards
+    {
+        return Err(FetchError::InvalidRefspec {
+            refspec: raw.to_string(),
+            reason:
+                "source/destination must be valid full refs with matching optional '*' wildcards"
+                    .to_string(),
+        });
+    }
+    validate_fetch_destination(&destination, raw)?;
+
+    Ok(FetchRefspec {
+        source,
+        destination,
+        force,
+    })
+}
+
+async fn configured_fetch_refspecs(remote: &str) -> Result<Vec<FetchRefspec>, FetchError> {
+    let prefix = format!("remote.{remote}.");
+    let key = format!("{prefix}fetch");
+    let entries = ConfigKv::get_var_all_case_insensitive(&prefix, "fetch")
+        .await
+        .map_err(|error| FetchError::ConfigRead {
+            key: key.clone(),
+            message: error.to_string(),
+        })?;
+    entries
+        .into_iter()
+        .map(|entry| parse_fetch_refspec(&entry.value, remote))
+        .collect()
+}
+
+pub(crate) async fn validate_configured_fetch_refspecs(remote: &str) -> Result<(), FetchError> {
+    configured_fetch_refspecs(remote).await.map(|_| ())
+}
+
+fn expand_refspec(
+    spec: &FetchRefspec,
+    refs: &[DiscRef],
+    remote: &str,
+) -> Result<Vec<FetchRefPlan>, FetchError> {
+    let mut plans = Vec::new();
+    if let Some((source_prefix, source_suffix)) = spec.source.split_once('*') {
+        let (destination_prefix, destination_suffix) = spec
+            .destination
+            .split_once('*')
+            .ok_or_else(|| FetchError::InvalidRefspec {
+                refspec: format!("{}:{}", spec.source, spec.destination),
+                reason: "destination wildcard is missing".to_string(),
+            })?;
+        for reference in refs {
+            if reference._ref.ends_with("^{}") {
+                continue;
+            }
+            if let Some(middle) = reference
+                ._ref
+                .strip_prefix(source_prefix)
+                .and_then(|value| value.strip_suffix(source_suffix))
+            {
+                let destination = format!("{destination_prefix}{middle}{destination_suffix}");
+                if !refspec_ref_is_valid(&destination) {
+                    return Err(FetchError::InvalidRefspec {
+                        refspec: format!("{}:{}", spec.source, spec.destination),
+                        reason: format!(
+                            "wildcard expansion produced invalid destination '{destination}'"
+                        ),
+                    });
+                }
+                validate_fetch_destination(
+                    &destination,
+                    &format!("{}:{}", spec.source, spec.destination),
+                )?;
+                plans.push(FetchRefPlan {
+                    reference: reference.clone(),
+                    destination,
+                    force: spec.force,
+                });
+            }
+        }
+    } else if let Some(reference) = refs.iter().find(|reference| reference._ref == spec.source) {
+        plans.push(FetchRefPlan {
+            reference: reference.clone(),
+            destination: spec.destination.clone(),
+            force: spec.force,
+        });
+    } else {
+        return Err(FetchError::RemoteBranchNotFound {
+            branch: spec.source.clone(),
+            remote: remote.to_string(),
+        });
+    }
+    Ok(plans)
+}
+
+async fn build_fetch_ref_plans(
+    remote: &str,
+    refs: &[DiscRef],
+    branch: Option<&str>,
+    single_branch: bool,
+) -> Result<Vec<FetchRefPlan>, FetchError> {
+    let specs = if single_branch {
+        branch
+            .map(|branch| parse_fetch_refspec(branch, remote).map(|spec| vec![spec]))
+            .transpose()?
+            .unwrap_or_default()
+    } else if branch.is_some() {
+        Vec::new()
+    } else {
+        configured_fetch_refspecs(remote).await?
+    };
+
+    let plans = if specs.is_empty() {
+        refs.iter()
+            .filter_map(|reference| {
+                default_fetch_destination(remote, &reference._ref)
+                    .ok()
+                    .map(|destination| FetchRefPlan {
+                        reference: reference.clone(),
+                        destination,
+                        force: true,
+                    })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let mut expanded = Vec::new();
+        for spec in &specs {
+            expanded.extend(expand_refspec(spec, refs, remote)?);
+        }
+        expanded
+    };
+
+    deduplicate_fetch_ref_plans(plans)
+}
+
+fn deduplicate_fetch_ref_plans(plans: Vec<FetchRefPlan>) -> Result<Vec<FetchRefPlan>, FetchError> {
+    let mut deduplicated = Vec::<FetchRefPlan>::new();
+    for plan in plans {
+        if let Some(index) = deduplicated
+            .iter()
+            .position(|existing| existing.destination == plan.destination)
+        {
+            let existing = &mut deduplicated[index];
+            if existing.reference._ref == plan.reference._ref {
+                existing.force |= plan.force;
+                continue;
+            }
+            return Err(FetchError::InvalidRefspec {
+                refspec: plan.destination.clone(),
+                reason: "multiple source refs map to the same destination".to_string(),
+            });
+        }
+        deduplicated.push(plan);
+    }
+    Ok(deduplicated)
+}
+
+fn mapped_remote_tracking_branch_names(remote: &str, plans: &[FetchRefPlan]) -> HashSet<String> {
+    let prefix = format!("refs/remotes/{remote}/");
+    plans
+        .iter()
+        .filter_map(|plan| plan.destination.strip_prefix(&prefix).map(str::to_owned))
+        .collect()
+}
+
+pub(crate) async fn configured_remote_tracking_branch_names(
+    remote: &str,
+    refs: &[DiscRef],
+) -> Result<HashSet<String>, FetchError> {
+    let specs = configured_fetch_refspecs(remote).await?;
+    let plans = if specs.is_empty() {
+        refs.iter()
+            .filter_map(|reference| {
+                default_fetch_destination(remote, &reference._ref)
+                    .ok()
+                    .map(|destination| FetchRefPlan {
+                        reference: reference.clone(),
+                        destination,
+                        force: true,
+                    })
+            })
+            .collect()
+    } else {
+        let mut plans = Vec::new();
+        for spec in &specs {
+            match expand_refspec(spec, refs, remote) {
+                Ok(expanded) => plans.extend(expanded),
+                Err(FetchError::RemoteBranchNotFound { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        deduplicate_fetch_ref_plans(plans)?
+    };
+    Ok(mapped_remote_tracking_branch_names(remote, &plans))
+}
+
 pub(crate) fn remote_has_branch(refs: &[DiscRef], branch: &str) -> bool {
     let normalized = normalize_branch_ref(branch);
     refs.iter().any(|reference| reference._ref == normalized)
@@ -1423,6 +1756,13 @@ pub(crate) async fn fetch_repository_with_result(
     notes: bool,
     output: &OutputConfig,
 ) -> Result<FetchRepositoryResult, FetchError> {
+    if single_branch {
+        if let Some(requested) = branch.as_deref() {
+            parse_fetch_refspec(requested, &remote_config.name)?;
+        }
+    } else if branch.is_none() {
+        validate_configured_fetch_refspecs(&remote_config.name).await?;
+    }
     let (remote_client, discovery) =
         discover_remote_with_name(&remote_config.url, Some(&remote_config.name)).await?;
     // Redact credentials from the URL before storing it in the result to
@@ -1443,17 +1783,7 @@ pub(crate) async fn fetch_repository_with_result(
     }
     set_wire_hash_kind(discovery.hash_kind);
 
-    if let Some(branch_name) = &branch
-        && !remote_has_branch(&discovery.refs, branch_name)
-    {
-        return Err(FetchError::RemoteBranchNotFound {
-            branch: branch_name.clone(),
-            remote: remote_config.name.clone(),
-        });
-    }
-
-    let mut refs = discovery.refs.clone();
-    if refs.is_empty() {
+    if discovery.refs.is_empty() {
         tracing::debug!("fetch skipped because remote has no refs");
         // Conservatively skip pruning when the remote advertises no refs at all
         // (a transient/broken advertisement) so a single empty response cannot
@@ -1465,18 +1795,39 @@ pub(crate) async fn fetch_repository_with_result(
             objects_fetched: 0,
             bytes_received: 0,
             pruned: Vec::new(),
+            fetch_head_records: Vec::new(),
         });
     }
 
-    let remote_head = refs
+    let remote_head = discovery
+        .refs
         .iter()
         .find(|reference| reference._ref == HEAD)
         .cloned();
-    let ref_heads = refs
+    let ref_heads = discovery
+        .refs
         .iter()
         .filter(|reference| reference._ref.starts_with("refs/heads/"))
         .cloned()
         .collect::<Vec<_>>();
+    let ref_plans = build_fetch_ref_plans(
+        &remote_config.name,
+        &discovery.refs,
+        branch.as_deref(),
+        single_branch,
+    )
+    .await?;
+    let mut prune_branch_names =
+        mapped_remote_tracking_branch_names(&remote_config.name, &ref_plans);
+    if single_branch {
+        // An explicit refspec narrows this fetch, not the remote's prune
+        // scope. Preserve ordinary and configured tracking destinations while
+        // also retaining any custom destination updated by this fetch.
+        prune_branch_names.extend(remote_advertised_branch_names(&discovery.refs));
+        prune_branch_names.extend(
+            configured_remote_tracking_branch_names(&remote_config.name, &discovery.refs).await?,
+        );
+    }
 
     // Resolve tag handling for this remote (CLI > `remote.<name>.tagOpt` > auto).
     let tag_mode = resolve_tag_mode(&remote_config.name, tag_cli).await;
@@ -1489,28 +1840,22 @@ pub(crate) async fn fetch_repository_with_result(
         .cloned()
         .collect();
 
-    // Only request refs we will actually persist. `update_references` saves
-    // `refs/heads/*` and `refs/mr/*`; with `--tags` (`All`) we also explicitly
-    // `want` `refs/tags/*`. Asking for anything else (HEAD symref, `refs/pull/*`)
-    // makes the server include unreachable objects that the next fetch's `have`
-    // cannot cover, forcing the same pack to be re-downloaded every time. Tags
-    // are safe to keep because `current_have_safe` seeds `have` from local
-    // `refs/tags/*` (peeling annotated tags). Auto-followed tags are NOT wanted
-    // here — they arrive via the `include-tag` capability and are persisted
-    // post-fetch only when their object/target is present.
-    refs.retain(|reference| {
-        reference._ref.starts_with("refs/heads/")
-            || reference._ref.starts_with("refs/mr/")
-            || (tag_mode == TagFetchMode::All
-                && reference._ref.starts_with("refs/tags/")
-                && !reference._ref.ends_with("^{}"))
-    });
-
-    if let Some(branch_name) = &branch
-        && single_branch
-    {
-        let normalized = normalize_branch_ref(branch_name);
-        refs.retain(|reference| reference._ref == normalized);
+    // Only request refs selected by the explicit/configured mapping. `--tags`
+    // adds tag objects without changing the branch mapping plan.
+    let mut refs = ref_plans
+        .iter()
+        .map(|plan| plan.reference.clone())
+        .collect::<Vec<_>>();
+    if tag_mode == TagFetchMode::All {
+        refs.extend(
+            discovery
+                .refs
+                .iter()
+                .filter(|reference| {
+                    reference._ref.starts_with("refs/tags/") && !reference._ref.ends_with("^{}")
+                })
+                .cloned(),
+        );
     }
 
     // `--dry-run`: compute the would-be remote-tracking ref updates from the
@@ -1518,16 +1863,35 @@ pub(crate) async fn fetch_repository_with_result(
     // anything (no `.pack`/`.idx`, no shallow update, no ref/reflog writes, no
     // FETCH_HEAD).
     if dry_run {
-        let refs_updated = compute_fetch_ref_preview(&remote_config, &refs).await?;
+        let mut refs_updated = compute_fetch_ref_preview(&remote_config, &ref_plans, force).await?;
+        if tag_mode == TagFetchMode::All {
+            for reference in &discovered_tags {
+                let Some(tag_name) = reference._ref.strip_prefix("refs/tags/") else {
+                    continue;
+                };
+                let existing =
+                    tag::find_tag_ref(tag_name)
+                        .await
+                        .map_err(|error| FetchError::UpdateRefs {
+                            message: format!(
+                                "failed to inspect existing tag '{}': {error}",
+                                reference._ref
+                            ),
+                        })?;
+                if existing.is_none() {
+                    refs_updated.push(FetchRefUpdate {
+                        remote_ref: reference._ref.clone(),
+                        old_oid: None,
+                        new_oid: reference._hash.clone(),
+                        forced: false,
+                    });
+                }
+            }
+        }
         // `--dry-run --prune`: report the stale refs that would be removed, but
         // write nothing.
         let pruned = if prune {
-            prune_stale_remote_refs(
-                &remote_config.name,
-                &remote_advertised_branch_names(&discovery.refs),
-                true,
-            )
-            .await?
+            prune_stale_remote_refs(&remote_config.name, &prune_branch_names, true).await?
         } else {
             Vec::new()
         };
@@ -1538,6 +1902,34 @@ pub(crate) async fn fetch_repository_with_result(
             objects_fetched: 0,
             bytes_received: 0,
             pruned,
+            fetch_head_records: Vec::new(),
+        });
+    }
+
+    if refs.is_empty() {
+        let refs_updated = update_references(
+            &remote_config,
+            &ref_plans,
+            &ref_heads,
+            remote_head,
+            branch,
+            discovery.capabilities.clone(),
+            force,
+        )
+        .await?;
+        let pruned = if prune {
+            prune_stale_remote_refs(&remote_config.name, &prune_branch_names, false).await?
+        } else {
+            Vec::new()
+        };
+        return Ok(FetchRepositoryResult {
+            remote: remote_config.name,
+            url: normalized_url,
+            refs_updated,
+            objects_fetched: 0,
+            bytes_received: 0,
+            pruned,
+            fetch_head_records: Vec::new(),
         });
     }
 
@@ -1585,11 +1977,12 @@ pub(crate) async fn fetch_repository_with_result(
 
     let mut refs_updated = update_references(
         &remote_config,
-        &refs,
+        &ref_plans,
         &ref_heads,
         remote_head,
         branch,
         discovery.capabilities.clone(),
+        force,
     )
     .await?;
 
@@ -1612,6 +2005,17 @@ pub(crate) async fn fetch_repository_with_result(
                 .collect()
         }
     };
+    let mut fetch_head_records = ref_plans
+        .iter()
+        .map(|plan| FetchHeadRecord {
+            oid: plan.reference._hash.clone(),
+            source_ref: plan.reference._ref.clone(),
+        })
+        .collect::<Vec<_>>();
+    fetch_head_records.extend(tags_to_persist.iter().map(|tag| FetchHeadRecord {
+        oid: tag._hash.clone(),
+        source_ref: tag._ref.clone(),
+    }));
     refs_updated.extend(persist_fetched_tags(&tags_to_persist, force).await?);
 
     // Dependency-graph notes (`refs/notes/deps`, lore.md 3.2). When `--notes` (or
@@ -1634,12 +2038,7 @@ pub(crate) async fn fetch_repository_with_result(
     // with an audit reflog entry). Only stale tracking refs for *this* remote
     // are touched.
     let pruned = if prune {
-        prune_stale_remote_refs(
-            &remote_config.name,
-            &remote_advertised_branch_names(&discovery.refs),
-            false,
-        )
-        .await?
+        prune_stale_remote_refs(&remote_config.name, &prune_branch_names, false).await?
     } else {
         Vec::new()
     };
@@ -1651,6 +2050,7 @@ pub(crate) async fn fetch_repository_with_result(
         objects_fetched,
         bytes_received,
         pruned,
+        fetch_head_records,
     })
 }
 
@@ -2318,65 +2718,110 @@ fn apply_shallow_updates(shallow: &[String], unshallow: &[String]) -> Result<(),
 /// database writes.
 async fn compute_fetch_ref_preview(
     remote_config: &RemoteConfig,
-    refs: &[DiscRef],
+    plans: &[FetchRefPlan],
+    force_override: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let mut updates = Vec::new();
-    for reference in refs {
-        // `--tags --dry-run`: preview only the tags that would be newly created
-        // (absent locally). Up-to-date and conflicting tags are not previewed as
-        // updates because fetch never clobbers them.
-        if let Some(tag_name) = reference._ref.strip_prefix("refs/tags/") {
-            if reference._ref.ends_with("^{}") {
-                continue;
-            }
-            let existing =
-                tag::find_tag_ref(tag_name)
-                    .await
-                    .map_err(|error| FetchError::UpdateRefs {
-                        message: format!(
-                            "failed to inspect existing tag '{}': {error}",
-                            reference._ref
-                        ),
-                    })?;
-            if existing.is_none() {
-                updates.push(FetchRefUpdate {
-                    remote_ref: reference._ref.clone(),
-                    old_oid: None,
-                    new_oid: reference._hash.clone(),
-                    forced: false,
-                });
-            }
-            continue;
-        }
-
-        let full_ref_name = if let Some(branch_name) = reference._ref.strip_prefix("refs/heads/") {
-            format!("refs/remotes/{}/{}", remote_config.name, branch_name)
-        } else if let Some(mr_name) = reference._ref.strip_prefix("refs/mr/") {
-            format!("refs/remotes/{}/mr/{}", remote_config.name, mr_name)
-        } else {
-            continue;
-        };
-
-        let old_oid = Branch::find_branch_result(&full_ref_name, Some(&remote_config.name))
+    let db = get_db_conn_instance().await;
+    let checked_out_branches = checked_out_local_branches_with_conn(&db).await?;
+    for plan in plans {
+        let (storage_name, remote_scope) =
+            fetch_destination_storage(&plan.destination, &remote_config.name)?;
+        let old_oid = Branch::find_branch_result(&storage_name, remote_scope.as_deref())
             .await
             .map_err(|error| FetchError::UpdateRefs {
                 message: format!(
-                    "failed to inspect existing remote-tracking ref '{full_ref_name}': {error}"
+                    "failed to inspect fetch destination '{}': {error}",
+                    plan.destination
                 ),
             })?
             .map(|branch| branch.commit.to_string());
 
-        if old_oid.as_deref() == Some(reference._hash.as_str()) {
+        reject_checked_out_destination(plan, remote_scope.as_deref(), &checked_out_branches)?;
+        if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
             continue;
         }
+        let forced =
+            fetch_update_force_status(old_oid.as_deref(), &plan.reference._hash).unwrap_or(false);
+        if forced && !force_override && !plan.force {
+            return Err(FetchError::RefUpdateRejected {
+                message: format!(
+                    "non-fast-forward update to '{}' requires '+' in the refspec or --force",
+                    plan.destination
+                ),
+            });
+        }
         updates.push(FetchRefUpdate {
-            remote_ref: full_ref_name,
+            remote_ref: plan.destination.clone(),
             old_oid,
-            new_oid: reference._hash.clone(),
-            forced: false,
+            new_oid: plan.reference._hash.clone(),
+            forced,
         });
     }
     Ok(updates)
+}
+
+async fn checked_out_local_branches_with_conn<C: ConnectionTrait>(
+    db: &C,
+) -> Result<HashSet<String>, FetchError> {
+    ref_model::Entity::find()
+        .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
+        .filter(ref_model::Column::Remote.is_null())
+        .all(db)
+        .await
+        .map_err(|error| FetchError::UpdateRefs {
+            message: format!(
+                "failed to inspect branches checked out by repository worktrees: {error}"
+            ),
+        })
+        .map(|heads| {
+            heads
+                .into_iter()
+                .filter_map(|head| head.name)
+                .collect::<HashSet<_>>()
+        })
+}
+
+fn reject_checked_out_destination(
+    plan: &FetchRefPlan,
+    remote_scope: Option<&str>,
+    checked_out_branches: &HashSet<String>,
+) -> Result<(), FetchError> {
+    if remote_scope.is_none()
+        && let Some(local_branch) = plan.destination.strip_prefix("refs/heads/")
+        && checked_out_branches.contains(local_branch)
+    {
+        return Err(FetchError::RefUpdateRejected {
+            message: format!(
+                "refusing to fetch into checked-out branch '{}'",
+                plan.destination
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn fetch_destination_storage(
+    destination: &str,
+    fetched_remote: &str,
+) -> Result<(String, Option<String>), FetchError> {
+    if let Some(branch) = destination.strip_prefix("refs/heads/") {
+        return Ok((branch.to_string(), None));
+    }
+    if let Some(rest) = destination.strip_prefix("refs/remotes/") {
+        let remote = rest
+            .strip_prefix(fetched_remote)
+            .filter(|suffix| suffix.starts_with('/'))
+            .map(|_| fetched_remote.to_string())
+            .or_else(|| rest.split_once('/').map(|(remote, _)| remote.to_string()));
+        if let Some(remote) = remote {
+            return Ok((destination.to_string(), Some(remote)));
+        }
+    }
+    Err(FetchError::InvalidRefspec {
+        refspec: destination.to_string(),
+        reason: "destination must be under refs/heads/* or refs/remotes/<remote>/*".to_string(),
+    })
 }
 
 fn fetch_head_path() -> Result<PathBuf, FetchError> {
@@ -2393,22 +2838,22 @@ fn fetch_head_path() -> Result<PathBuf, FetchError> {
 fn format_fetch_head(result: &FetchOutput) -> String {
     let mut lines = Vec::new();
     for remote in &result.remotes {
-        let tracking_prefix = format!("refs/remotes/{}/", remote.remote);
-        for update in &remote.refs_updated {
-            if let Some(tag_name) = update.remote_ref.strip_prefix("refs/tags/") {
+        for record in &remote.fetch_head_records {
+            if let Some(tag_name) = record.source_ref.strip_prefix("refs/tags/") {
                 lines.push(format!(
                     "{}\tnot-for-merge\ttag '{}' of {}",
-                    update.new_oid, tag_name, remote.url
+                    record.oid, tag_name, remote.url
                 ));
                 continue;
             }
-            let branch = update
-                .remote_ref
-                .strip_prefix(&tracking_prefix)
-                .unwrap_or(&update.remote_ref);
+            let branch = record
+                .source_ref
+                .strip_prefix("refs/heads/")
+                .or_else(|| record.source_ref.strip_prefix("refs/mr/"))
+                .unwrap_or(&record.source_ref);
             lines.push(format!(
                 "{}\tnot-for-merge\tbranch '{}' of {}",
-                update.new_oid, branch, remote.url
+                record.oid, branch, remote.url
             ));
         }
     }
@@ -2594,67 +3039,69 @@ async fn prune_stale_remote_refs(
 
 async fn update_references(
     remote_config: &RemoteConfig,
-    refs: &[DiscRef],
+    plans: &[FetchRefPlan],
     ref_heads: &[DiscRef],
     remote_head: Option<DiscRef>,
     branch: Option<String>,
     capabilities: Vec<String>,
+    force_override: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let db = get_db_conn_instance().await;
     let remote_config = remote_config.clone();
-    let refs = refs.to_vec();
+    let plans = plans.to_vec();
     let ref_heads = ref_heads.to_vec();
     db.transaction(|txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
-            for reference in &refs {
-                // Tags are persisted separately by `persist_fetched_tags` (they
-                // live in the shared `refs/tags/*` namespace and have their own
-                // create/skip/clobber policy).
-                if reference._ref.starts_with("refs/tags/") {
-                    continue;
-                }
-
-                let full_ref_name: String;
-                if let Some(branch_name) = reference._ref.strip_prefix("refs/heads/") {
-                    full_ref_name = format!("refs/remotes/{}/{}", remote_config.name, branch_name);
-                } else if let Some(mr_name) = reference._ref.strip_prefix("refs/mr/") {
-                    full_ref_name = format!("refs/remotes/{}/mr/{}", remote_config.name, mr_name);
-                } else {
-                    tracing::debug!(
-                        "Skipping unsupported ref type during fetch: {}",
-                        reference._ref
-                    );
-                    continue;
-                }
-
+            let checked_out_branches = checked_out_local_branches_with_conn(txn).await?;
+            for plan in &plans {
+                let (storage_name, remote_scope) =
+                    fetch_destination_storage(&plan.destination, &remote_config.name)?;
                 let old_oid = Branch::find_branch_result_with_conn(
                     txn,
-                    &full_ref_name,
-                    Some(&remote_config.name),
+                    &storage_name,
+                    remote_scope.as_deref(),
                 )
                 .await
                 .map_err(|error| FetchError::UpdateRefs {
                     message: format!(
-                        "failed to inspect existing remote-tracking ref '{full_ref_name}': {error}"
+                        "failed to inspect fetch destination '{}': {error}",
+                        plan.destination
                     ),
                 })?
                 .map(|branch| branch.commit.to_string());
 
-                if old_oid.as_deref() == Some(reference._hash.as_str()) {
+                reject_checked_out_destination(
+                    plan,
+                    remote_scope.as_deref(),
+                    &checked_out_branches,
+                )?;
+                if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
                     continue;
+                }
+
+                let forced =
+                    fetch_update_is_forced(old_oid.as_deref(), &plan.reference._hash);
+                if forced && !force_override && !plan.force {
+                    return Err(FetchError::RefUpdateRejected {
+                        message: format!(
+                            "non-fast-forward update to '{}' requires '+' in the refspec or --force",
+                            plan.destination
+                        ),
+                    });
                 }
 
                 Branch::update_branch_with_conn(
                     txn,
-                    &full_ref_name,
-                    &reference._hash,
-                    Some(&remote_config.name),
+                    &storage_name,
+                    &plan.reference._hash,
+                    remote_scope.as_deref(),
                 )
                 .await
                 .map_err(|source| FetchError::UpdateRefs {
                     message: format!(
-                        "failed to persist remote-tracking ref '{full_ref_name}': {source}"
+                        "failed to persist fetch destination '{}': {source}",
+                        plan.destination
                     ),
                 })?;
 
@@ -2662,33 +3109,68 @@ async fn update_references(
                     old_oid: old_oid
                         .clone()
                         .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string()),
-                    new_oid: reference._hash.clone(),
+                    new_oid: plan.reference._hash.clone(),
                     action: ReflogAction::Fetch,
                 };
-                Reflog::insert_single_entry(txn, &context, &full_ref_name)
+                Reflog::insert_single_entry(txn, &context, &plan.destination)
                     .await
                     .map_err(|source| FetchError::UpdateRefs {
                         message: format!(
-                            "failed to record reflog for remote-tracking ref '{full_ref_name}': {source}"
+                            "failed to record reflog for fetch destination '{}': {source}",
+                            plan.destination
                         ),
                     })?;
                 updates.push(FetchRefUpdate {
-                    remote_ref: full_ref_name,
-                    forced: fetch_update_is_forced(old_oid.as_deref(), &reference._hash),
+                    remote_ref: plan.destination.clone(),
+                    forced,
                     old_oid,
-                    new_oid: reference._hash.clone(),
+                    new_oid: plan.reference._hash.clone(),
                 });
             }
 
             // Update the cached remote HEAD to the branch it points at, resolved
             // via the shared helper (symref capability, else OID match, else
-            // main/master/first).
+            // main/master/first). The symbolic target must be the mapped local
+            // tracking destination, not blindly the remote source branch: an
+            // explicit/configured refspec may rename it or omit it entirely.
             let remote_default_branch =
                 resolve_remote_default_branch(&capabilities, &ref_heads, remote_head.as_ref());
-            if let Some(branch_name) = remote_default_branch {
-                Head::update_with_conn(txn, Head::Branch(branch_name), Some(&remote_config.name))
-                    .await;
-            } else if branch.is_none() && remote_head.is_some() {
+            let tracking_prefix = format!("refs/remotes/{}/", remote_config.name);
+            let mapped_branch = remote_default_branch.as_ref().and_then(|branch_name| {
+                let source_ref = format!("refs/heads/{branch_name}");
+                plans.iter().find_map(|plan| {
+                    (plan.reference._ref == source_ref)
+                        .then(|| plan.destination.strip_prefix(&tracking_prefix))
+                        .flatten()
+                })
+            });
+            if let Some(mapped_branch) = mapped_branch {
+                Head::update_result_with_conn(
+                    txn,
+                    Head::Branch(mapped_branch.to_string()),
+                    Some(&remote_config.name),
+                )
+                .await
+                .map_err(|error| FetchError::UpdateRefs {
+                    message: format!(
+                        "failed to update refs/remotes/{}/HEAD: {error}",
+                        remote_config.name
+                    ),
+                })?;
+            } else if branch.is_none() {
+                ref_model::Entity::delete_many()
+                    .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
+                    .filter(ref_model::Column::Remote.eq(&remote_config.name))
+                    .exec(txn)
+                    .await
+                    .map_err(|error| FetchError::UpdateRefs {
+                        message: format!(
+                            "failed to remove stale refs/remotes/{}/HEAD: {error}",
+                            remote_config.name
+                        ),
+                    })?;
+            }
+            if remote_default_branch.is_none() && branch.is_none() && remote_head.is_some() {
                 tracing::debug!("remote HEAD does not point to a branch ref");
             }
 
@@ -2696,52 +3178,58 @@ async fn update_references(
         })
     })
     .await
-    .map_err(|source| FetchError::UpdateRefs {
-        message: match source {
-            TransactionError::Connection(error) => error.to_string(),
-            TransactionError::Transaction(error) => error.to_string(),
+    .map_err(|source| match source {
+        TransactionError::Connection(error) => FetchError::UpdateRefs {
+            message: error.to_string(),
         },
+        TransactionError::Transaction(error) => error,
     })
 }
 
 /// Whether `new_oid` updating `old_oid` is a forced (non-fast-forward) change.
-/// Best-effort: `false` for a new ref or when ancestry cannot be computed.
+/// A new ref is not forced; missing/corrupt ancestry fails closed as forced on
+/// the real update path.
 fn fetch_update_is_forced(old_oid: Option<&str>, new_oid: &str) -> bool {
-    let Some(old_str) = old_oid else {
-        return false;
-    };
-    let (Ok(old), Ok(new)) = (ObjectHash::from_str(old_str), ObjectHash::from_str(new_oid)) else {
-        return false;
-    };
-    if old == new {
-        return false;
-    }
-    !commit_is_ancestor(&old, &new)
+    fetch_update_force_status(old_oid, new_oid).unwrap_or(true)
 }
 
-/// True when `ancestor` is reachable from `descendant` by walking parents.
-fn commit_is_ancestor(ancestor: &ObjectHash, descendant: &ObjectHash) -> bool {
+/// Return whether an update is non-fast-forward when all commits needed for
+/// the ancestry walk are locally available. `None` means the answer is not yet
+/// knowable, which is expected during `--dry-run` before the remote tip has
+/// been downloaded.
+fn fetch_update_force_status(old_oid: Option<&str>, new_oid: &str) -> Option<bool> {
+    let Some(old_str) = old_oid else {
+        return Some(false);
+    };
+    let (Ok(old), Ok(new)) = (ObjectHash::from_str(old_str), ObjectHash::from_str(new_oid)) else {
+        return None;
+    };
+    if old == new {
+        return Some(false);
+    }
+    commit_is_ancestor_if_known(&old, &new).map(|is_ancestor| !is_ancestor)
+}
+
+fn commit_is_ancestor_if_known(ancestor: &ObjectHash, descendant: &ObjectHash) -> Option<bool> {
     if ancestor == descendant {
-        return true;
+        return Some(true);
     }
     let mut queue = std::collections::VecDeque::new();
     let mut visited = HashSet::new();
     queue.push_back(*descendant);
     visited.insert(*descendant);
     while let Some(id) = queue.pop_front() {
-        let Ok(commit) = load_object::<Commit>(&id) else {
-            continue;
-        };
+        let commit = load_object::<Commit>(&id).ok()?;
         for parent in &commit.parent_commit_ids {
             if parent == ancestor {
-                return true;
+                return Some(true);
             }
             if visited.insert(*parent) {
                 queue.push_back(*parent);
             }
         }
     }
-    false
+    Some(false)
 }
 
 /// Resolve the effective prune mode for `remote_name`: an explicit CLI choice
@@ -3258,6 +3746,7 @@ mod tests {
                     },
                 ],
                 pruned: Vec::new(),
+                fetch_head_records: Vec::new(),
             }],
         };
 
@@ -3281,7 +3770,9 @@ mod tests {
 
     #[test]
     fn format_fetch_head_marks_every_ref_not_for_merge() {
-        use super::{FetchOutput, FetchRefUpdate, FetchRepositoryResult, format_fetch_head};
+        use super::{
+            FetchHeadRecord, FetchOutput, FetchRefUpdate, FetchRepositoryResult, format_fetch_head,
+        };
 
         let output = FetchOutput {
             all: false,
@@ -3299,6 +3790,10 @@ mod tests {
                     forced: false,
                 }],
                 pruned: Vec::new(),
+                fetch_head_records: vec![FetchHeadRecord {
+                    oid: "d".repeat(40),
+                    source_ref: "refs/heads/main".to_string(),
+                }],
             }],
         };
 
@@ -3334,6 +3829,7 @@ mod tests {
                     branch: "origin/gone".to_string(),
                     old_oid: Some("e".repeat(40)),
                 }],
+                fetch_head_records: Vec::new(),
             }],
         };
 
@@ -3385,6 +3881,7 @@ mod tests {
                     branch: "origin/gone".to_string(),
                     old_oid: None,
                 }],
+                fetch_head_records: Vec::new(),
             }],
         };
         let porcelain = format_fetch_porcelain(&output);
@@ -3435,6 +3932,22 @@ mod tests {
             "remote branch feature not found in upstream origin",
         );
         assert_eq!(
+            FetchError::InvalidRefspec {
+                refspec: "refs/heads/main:HEAD".to_string(),
+                reason: "unsupported destination".to_string(),
+            }
+            .to_string(),
+            "invalid fetch refspec 'refs/heads/main:HEAD': unsupported destination",
+        );
+        assert_eq!(
+            FetchError::ConfigRead {
+                key: "remote.origin.fetch".to_string(),
+                message: "database is locked".to_string(),
+            }
+            .to_string(),
+            "failed to read fetch configuration 'remote.origin.fetch': database is locked",
+        );
+        assert_eq!(
             FetchError::InvalidPktHeader {
                 header: "zzzz".to_string(),
             }
@@ -3458,6 +3971,13 @@ mod tests {
             }
             .to_string(),
             "failed to update references after fetch: ref database is read-only",
+        );
+        assert_eq!(
+            FetchError::RefUpdateRejected {
+                message: "destination is checked out".to_string(),
+            }
+            .to_string(),
+            "fetch destination update rejected: destination is checked out",
         );
         assert_eq!(
             FetchError::LocalState {

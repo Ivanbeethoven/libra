@@ -6,8 +6,9 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。`add`/`remove`/`rename`/`-v`/`show`/`get-url`/`set-url`/`prune` 加上 `set-branches [--add]`（重写 `remote.<name>.fetch`）、`set-head <branch>`/`-d`/`--delete`/`--auto`（写入/删除 `refs/remotes/<name>/HEAD`；`--auto` 向远端查询 HEAD）与详细 `remote show <name>` 已支持。`remote show <name>` 默认**在线**：通过 `fetch::discover_remote_with_name` 拉取远端 HEAD/ref，把分支分类为 `tracked`/`new`/`stale`，`queried = true`；`--no-query` 走离线缓存路径（状态 `cached`，`queried = false`）。`remote update [<group>|<remote>...]` 已支持：无参数时 fetch 所有配置远端，否则 fetch 指定远端；名称命中 `remotes.<group>` 配置时展开为该组成员（`resolve_update_remotes`），每个远端经共享 `fetch_remote_by_name` 调用 `fetch::fetch_repository_safe`。`remote add -f`/`--fetch` 已支持：注册 url 后立即对新远端调用同一 `fetch_remote_by_name`；fetch 失败时远端仍保留注册。`remote update -p`/`--prune` 已支持（两段式）：先 fetch 全部 resolved 远端，全部成功后再逐个复用 `run_prune_remote(name, dry_run=false)`，把其 `RemoteOutput::Prune.stale_branches` 汇总到 `RemoteOutput::Update.pruned`（`#[serde(default, skip_serializing_if = "Vec::is_empty")]` 加性字段），并以 `* [pruned] <name>/<branch>` 行报告；某个远端 fetch 失败时在任何 prune 之前即中止，不会遗留已删除的 ref。`remote add` 的冷配置标志 `-t <branch>`（可重复，按 `+refs/heads/<branch>:refs/remotes/<name>/<branch>` 写入逐分支 fetch refspec，复用 set-branches 的格式）、`-m <branch>`（无条件写入 `refs/remotes/<name>/HEAD` 的 `Head` 行 — 与 `set-head` 不同，add 时跟踪 ref 尚不存在，与 Git `remote add -m` 一致）、`--tags`/`--no-tags`（互斥，写入 `remote.<name>.tagOpt`）已支持。`add --mirror`（clap `conflicts_with = "track"`）写入信息性 `remote.<name>.mirror=true` 标记 —— 与 `clone --mirror` 一致，**不**写 `+refs/*:refs/*` refspec（`libra fetch` 尚不感知镜像）—— 已支持。
+- 兼容级别：`partial`。`add`/`remove`/`rename`/`-v`/`show`/`get-url`/`set-url`/`prune` 加上 `set-branches [--add]`（重写 `remote.<name>.fetch`）、`set-head <branch>`/`-d`/`--delete`/`--auto`（写入/删除 `refs/remotes/<name>/HEAD`；`--auto` 向远端查询 HEAD）与详细 `remote show <name>` 已支持。`remote show <name>` 默认**在线**：通过 `fetch::discover_remote_with_name` 拉取远端 HEAD/ref，把分支分类为 `tracked`/`new`/`stale`，`queried = true`；`--no-query` 走离线缓存路径（状态 `cached`，`queried = false`）。`remote update [<group>|<remote>...]` 已支持：无参数时先读取 `remotes.default`，其中的 remote 或 `remotes.<group>` 均经统一 group resolver 展开；只有该键为空时才 fetch 所有配置远端。显式名称同样可命中 `remotes.<group>` 并展开为成员。`remote add -f`/`--fetch` 已支持；`remote update -p`/`--prune` 采用先 fetch 全部 resolved 远端、全部成功后再按有效 fetch destination 映射 prune 的两段式，因此失败不会遗留已删除 ref。`remote add` 的冷配置标志 `-t <branch>`（可重复，按 `+refs/heads/<branch>:refs/remotes/<name>/<branch>` 写入逐分支 fetch refspec）、`-m <branch>`（无条件写入 `refs/remotes/<name>/HEAD`）、`--tags`/`--no-tags`（互斥，写入 `remote.<name>.tagOpt`）与信息性 `add --mirror` 标记均已支持；镜像不写 `+refs/*:refs/*` refspec（fetch 尚不感知镜像）。
 
+- P1-06 refspec 精确性：`set-branches` / `remote add -t` 写入的 `remote.<name>.fetch` 已由 `fetch` / `remote update` / `remote prune` 消费（prune 按映射后的 destination 判断存活）；`remote update` 无参数时先解析 `remotes.default`，未配置再枚举全部远程；`remote rename` 在单事务内迁移 config（含大小写不敏感的 fetch 变量目标）、branch upstream、SSH namespace、tracking refs、remote HEAD 与 tracking reflog，remote/SSH subsection 按完整远程名精确匹配，目标 namespace 冲突时完整回滚。
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
 
@@ -41,6 +42,7 @@ flowchart TD
 - 2026-06-06 `586231c0`（`feat(remote): add set-branches and set-head subcommands (#1392)`）：引入 set-branches / set-head 子命令。其内容曾被一次 reconcile 丢失，已于 2026-06-18 恢复到当前代码：`set-branches [--add]` 在单个 `ConfigKv` 事务内重写 `remote.<name>.fetch`，`set-head <branch>`/`-d`/`--delete` 写入/删除 `refs/remotes/<name>/HEAD`（`Head` 行），`--auto` 在 `validate_remote_usage` 中按 129 拒绝（deferred），新增 `RemoteError::RemoteTrackingBranchNotFound`。
 - 2026-06-19（PR-11）：补齐 `remote show <name>` 在线发现与 `set-head --auto`。抽出 `fetch::resolve_remote_default_branch(capabilities, ref_heads, remote_head)`（symref capability > HEAD OID 匹配 > main/master/first），由 fetch 缓存 remote HEAD、`remote show`/`set-head --auto` 复用。`run_show_remote` 默认在线（`discover_remote_refs` + `classify_remote_branches_online` 给出 `tracked`/`new`/`stale`，`queried = true`），`--no-query` 保留离线 `cached` 路径；`set-head --auto` 解析远端默认分支后校验本地跟踪 ref 再写入。新增 `RemoteError::Discovery`（带 `--no-query` 提示）与 `NoRemoteHead`。
 - 2026-05-29 `a22d3b4b`（`fix(remote): guard ssh key namespace rename`）：实现修正：guard ssh key namespace rename；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
+- 2026-07-13（plan-20260708 P1-06）：补齐 `remotes.default`、配置 refspec consumer 与 remote rename tracking namespace 事务迁移；新增 `compat_fetch_remote_refspec` 覆盖默认组、分支限制、HEAD/refspec/reflog namespace 与回滚。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
@@ -48,6 +50,8 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/remote.md`。
 - Synopsis：`libra remote <subcommand> [OPTIONS] [ARGS]`。
+- `remote update` 无参数时优先使用非空 `remotes.default`，否则更新全部配置远程；联网前先校验整批远程存在性与 `remote.<name>.fetch` 语法。
+- `remote rename` 把配置与 `refs/remotes/<old>/*`、remote HEAD、对应 reflog 一起事务迁移到新 namespace，不再只改配置名。
 - 公开参数/子命令包括：`add [-f/--fetch] [-t/--track <branch>]... [-m/--master <branch>] [--tags|--no-tags] [--mirror] <name> <url>`、`remove <name>`、`rename <old> <new>`、`-v`（verbose 列表）、`show [-n/--no-query] [-v/--verbose] [<name>]`、`get-url [--push] [--all] <name>`、`set-url [--add] [--delete] [--push] [--all] <name> <value>`、`prune [--dry-run] <name>`、`update [-p/--prune] [<group>|<remote>...]`、`set-branches [--add] <name> <branch>...`、`set-head [-a/--auto] [-d/--delete] <name> [<branch>]`。
 
 

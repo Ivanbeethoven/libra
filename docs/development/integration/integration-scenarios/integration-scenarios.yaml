@@ -221,7 +221,7 @@ scenarios:
   - id: cli.restore-reset-diff
     wave: 1
     group: working_tree
-    purpose: "Cover diff (unstaged/staged/old-new/name/status/stat/numstat/output/algorithm), restore --staged/--worktree/--source plus the real --overlay/--no-overlay toggle, reset --soft/--mixed/--hard and path-level reset. Negative checks document currently unsupported reset --keep/--merge, restore --pathspec-from-file (missing pathspec file), and diff algorithm variants."
+    purpose: "Cover diff (unstaged/staged/old-new/name/status/stat/numstat/output/algorithm), restore --staged/--worktree/--source plus the real --overlay/--no-overlay toggle, and reset --soft/--mixed/--hard/--merge/--keep plus path-level reset. The deeper reset preservation/refusal/rollback matrix is owned by compat_noninteractive_history_controls; negative checks cover missing pathspec files and diff algorithm variants."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, negative_exit]
@@ -257,7 +257,7 @@ scenarios:
   - id: cli.merge-conflict-continue
     wave: 1
     group: history_edit
-    purpose: "Merge conflict + resolve + add + merge --continue success path; --continue/--abort without session must fail. Verifies merge_state in --json status."
+    purpose: "Merge conflict + resolve + add + merge --continue success path; --continue/--abort without session must fail. Verifies merge_state in --json status. P1-07b strategy/favor/unrelated-history/shortlog matrices live in the registered offline Cargo target compat_noninteractive_history_controls."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, conflict_markers, negative_exit]
@@ -266,7 +266,7 @@ scenarios:
   - id: cli.rebase-conflict-continue
     wave: 1
     group: history_edit
-    purpose: "Rebase conflict + resolve + add + rebase --continue; equivalent negative cases."
+    purpose: "Rebase conflict + resolve + add + rebase --continue; equivalent negative cases. P1-07a autostash/exec/update-refs/fork-point history matrices are intentionally kept in the registered offline Cargo target compat_noninteractive_history_controls rather than duplicated in this shell runner."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, conflict_markers, negative_exit]
@@ -339,7 +339,7 @@ scenarios:
   - id: cli.clone-fetch-pull-local
     wave: 2
     group: protocol_local
-    purpose: "Local-path Git remote interop for current clone/remote/ls-remote/fetch/pull surfaces, including local clone content, remote get/set/show/prune basics, ls-remote heads/tags/refs/get-url/sort/exit-code and --symref (local Git remote via git-upload-pack advertises symref=HEAD → prints the `ref:` line), fetch --all/--depth, pull --ff-only/--rebase basics, and negative checks for unsupported remote/fetch/pull flags. Uses gitfix() for fixtures."
+    purpose: "Local-path Git remote interop for current clone/remote/ls-remote/fetch/pull surfaces, including local clone content, remote get/set/show/prune basics, remote update remotes.default, remote rename tracking namespace migration, ls-remote heads/tags/refs/get-url/sort/exit-code and --symref (local Git remote via git-upload-pack advertises symref=HEAD → prints the ref line), explicit/configured fetch refspec mapping with atomic multi-ref rollback and FETCH_HEAD metadata, fetch --all/--depth, pull --ff-only/--rebase basics, and negative checks for unsupported remote/fetch/pull flags. Uses gitfix() for fixtures."
     gh_required: false
     requires_git: true
     key_assertion_categories: [json_envelope, fsck, gitfix_isolation]

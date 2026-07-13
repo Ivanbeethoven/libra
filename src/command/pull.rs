@@ -438,6 +438,11 @@ pub(crate) async fn run_pull(
             merge::PullMergeOptions {
                 ff_only: effective.ff_only,
                 no_ff: effective.no_ff,
+                // `pull` does not expose merge strategies, strategy options,
+                // or unrelated-history override controls.
+                strategy: None,
+                favor: None,
+                allow_unrelated_histories: false,
                 message: None,
                 squash: args.squash,
                 no_commit: args.no_commit,
@@ -864,6 +869,11 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("verify the remote branch name and try again")
         }
+        fetch::FetchError::InvalidRefspec { .. } => CliError::command_usage(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
+        fetch::FetchError::ConfigRead { .. } => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        }
         fetch::FetchError::ObjectFormatMismatch { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
         }
@@ -884,6 +894,8 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         | fetch::FetchError::UpdateRefs { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
         }
+        fetch::FetchError::RefUpdateRejected { .. } => CliError::conflict(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked),
         fetch::FetchError::UnsupportedShallowLocalLibra => CliError::fatal(error.to_string())
             .with_stable_code(StableErrorCode::RepoCorrupt)
             .with_hint(

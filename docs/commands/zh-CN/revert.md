@@ -5,7 +5,9 @@
 ## 概要
 
 ```
-libra revert [-n | --no-commit] [-m | --mainline <parent-number>] [-s | --signoff] [-e | --edit] [--no-edit] [--no-rerere-autoupdate] [--json] [--quiet] <commit>...
+libra revert [-n | --no-commit] [-m | --mainline <parent-number>] [-s | --signoff]
+             [-e | --edit] [--no-edit] [-X <ours|theirs>] [--cleanup=<mode>]
+             [--no-rerere-autoupdate] [--json] [--quiet] <commit>...
 libra revert --continue
 libra revert --skip
 libra revert --abort
@@ -75,6 +77,14 @@ libra revert HEAD --edit
 
 接受自动生成的 revert 消息（`Revert "<subject>"`）而不启动编辑器——这是 Libra 的默认行为，故为对齐 Git 接受的 no-op。要在提交前编辑消息，请用 `-e`/`--edit`（与本标志互斥）。
 
+### `-X <ours|theirs>`、`--strategy-option=<ours|theirs>`
+
+仅对反向三方合并中重叠的冲突 hunk 选择一侧：`ours` 为当前 HEAD，`theirs` 为被 revert 提交选定的父提交（期望的 inverse 侧）；clean inverse hunk 仍会应用。该参数可重复，最后一个值生效；add/add 与 modify/delete 冲突选择对应整侧。有效值会随冲突 sequencer 状态保存。
+
+### `--cleanup=<mode>`
+
+用 `strip`、`whitespace`、`verbatim`、`scissors` 或 `default` 清理生成的（或经 `--edit` 修改的）revert 消息。无编辑器时 `default`/`scissors` 按 `whitespace` 处理；有编辑器时按所选模式执行注释清理或 scissors 截断。非法 mode 会在任何 sequencer action 前以 `LBR-CLI-002`（退出 129）拒绝。mode 会写入 `revert-state.json`，因此 conflict → `--continue` 保持相同策略。
+
 ### `--no-rerere-autoupdate`
 
 不更新 rerere（reuse recorded resolution）索引。为对齐 Git 而接受的 no-op：Libra 无 rerere，无可更新。（Git 的 `--rerere-autoupdate` 未公开。）
@@ -90,6 +100,9 @@ libra revert abc1234
 
 # 回滚但不自动提交（用于编辑或组合）
 libra revert -n HEAD
+
+# 保留当前冲突 hunk，同时应用其余 clean inverse hunk
+libra revert -X ours abc1234
 
 # 为 AI 代理或脚本输出 JSON
 libra revert --json HEAD
@@ -177,7 +190,8 @@ Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时
 | 中止进行中操作 | `--abort` | N/A | `--abort`（恢复 revert 前状态） |
 | 跳过当前提交 | `--skip` | N/A | `--skip`（丢弃冲突提交，继续序列） |
 | 策略 | `--strategy <s>` | N/A | 不支持 |
-| 策略选项 | `-X <option>` | N/A | 不支持 |
+| 策略选项 | `-X <option>` | N/A | `-X ours/theirs`（可重复，last-wins，仅偏向冲突 hunk） |
+| 消息清理 | `--cleanup=<mode>` | N/A | `strip`/`whitespace`/`verbatim`/`scissors`/`default`；跨冲突续作保存 |
 | GPG 签名 | `--gpg-sign` / `-S` | N/A | 不支持（计划中） |
 | JSON 输出 | N/A | N/A | `--json` |
 | Quiet 模式 | `--quiet` | N/A | `--quiet` |
@@ -192,7 +206,8 @@ Libra 的 revert 以路径级三方合并应用逆向更改。结果无歧义时
 | `LBR-REPO-001` | 不在 libra 仓库内 | 使用 `libra init` 初始化或进入仓库 |
 | `LBR-REPO-003` | HEAD detached（不在分支上） | 使用 `libra switch <branch>` 切换到分支 |
 | `LBR-CLI-003` | 无法解析提交引用 | 使用 `libra log` 查找有效提交引用 |
-| `LBR-CLI-002` | 合并提交缺 `-m`、对非合并提交传 `-m`，或父编号越界（exit 128）；或在 `-e`/`--edit` 下未配置编辑器、编辑器中止或消息为空（exit 129） | 合并提交传有效 `-m <父编号>`（非合并提交省略）；`--edit` 需设置 `$GIT_EDITOR`/`core.editor` 并保存非空消息 |
+| `LBR-CLI-002` | 合并提交缺 `-m`、对非合并提交传 `-m`、父编号越界、非法 `--cleanup`，或 `-e`/`--edit` 下未配置编辑器、编辑器中止或消息为空 | 合并提交传有效 `-m <父编号>`；cleanup 使用 `strip`/`whitespace`/`verbatim`/`scissors`/`default`；`--edit` 需配置编辑器并保存非空消息 |
 | `LBR-CONFLICT-001` | 文件已被后续提交修改，产生冲突 | 解决冲突后 `libra revert --continue`、用 `libra revert --skip` 跳过当前提交，或 `libra revert --abort` 取消 |
+| `LBR-REPO-002` | apply/continue/skip/abort 期间索引损坏或不可读 | 修复或恢复 `.libra/index`；revert state 会保留以便重试恢复 |
 | `LBR-IO-001` | 无法加载对象（提交、树、blob） | 检查仓库完整性 |
 | `LBR-IO-002` | 无法保存对象、索引或更新 HEAD | 检查文件系统权限和仓库可写性 |

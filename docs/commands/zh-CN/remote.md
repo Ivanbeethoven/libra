@@ -65,7 +65,7 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 
 ### 子命令：`rename`
 
-重命名已有远程。
+重命名已有远程。该操作在一个事务中迁移 `remote.<old>.*` 配置（包括 fetch refspec 的目标）、`branch.*.remote` 值、SSH 密钥命名空间、所有 `refs/remotes/<old>/*` tracking ref、remote HEAD 以及对应 reflog。目标命名空间冲突时失败且不留下部分迁移。remote 与 SSH subsection 按完整远程名精确匹配，因此重命名 `corp` 不会捕获独立的 `corp.prod` 远程。
 
 | 参数 | 说明 | 示例 |
 |----------|-------------|---------|
@@ -97,7 +97,7 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 
 ### 子命令：`prune`
 
-删除远程上已不存在的本地远程跟踪分支。
+删除不再是该远程有效 `remote.<name>.fetch` 映射目标的本地远程跟踪分支；只要映射 source 仍存在，自定义 destination namespace 就会保留。
 
 | 标志 / 参数 | 说明 | 示例 |
 |-----------------|-------------|---------|
@@ -106,14 +106,35 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 
 ### 子命令：`update`
 
-从一个或多个远程 fetch。无参数时 fetch 所有配置的远程；否则每个参数是一个远程名，或一个 `remotes.<group>` 配置项（展开为该组的成员远程）。
+从一个或多个远程 fetch。无参数且 `remotes.default` 非空时只 fetch 其中列出的成员，否则 fetch 所有配置远程；显式参数是远程名，或一个 `remotes.<group>` 配置项（展开为该组成员）。每个解析出的远程都会遵守自己的 `remote.<name>.fetch` 映射。
 
 | 标志 / 参数 | 说明 | 示例 |
 |-----------------|-------------|---------|
 | `-p`, `--prune` | fetch 之后，修剪远端已不存在的远程跟踪分支（对应 Git 的 `remote update -p`） | `libra remote update -p` |
-| `[<group> \| <remote>...]` | 要 fetch 的远程或远程组（默认：全部） | `libra remote update origin upstream` |
+| `[<group> \| <remote>...]` | 要 fetch 的远程或远程组（默认：先 `remotes.default`，再全部） | `libra remote update origin upstream` |
 
 > `-p` / `--prune` 运行与 `libra remote prune <name>` 相同的修剪逻辑，但仅在所有 resolved 远端都 fetch 成功后才执行（两段式：先 fetch 全部，再统一 prune，因此后面的远端 fetch 失败不会遗留前面已删除的 ref），并以 `* [pruned] <name>/<branch>` 形式报告被删除的 ref。
+
+### 子命令：`set-branches`
+
+重写远程的 `remote.<name>.fetch` refspec。每个分支会变成 `+refs/heads/<branch>:refs/remotes/<name>/<branch>`；后续 `fetch` 与 `remote update` 只更新这些映射分支。
+
+| 标志 / 参数 | 说明 | 示例 |
+|-----------------|-------------|---------|
+| `<name>` | 远程名称 | `origin` |
+| `<branch>...` | 要跟踪的一个或多个分支（必需） | `libra remote set-branches origin main dev` |
+| `--add` | 追加分支，不替换既有映射 | `libra remote set-branches --add origin dev` |
+
+### 子命令：`set-head`
+
+设置或删除远程默认分支指针 `refs/remotes/<name>/HEAD`。
+
+| 标志 / 参数 | 说明 | 示例 |
+|-----------------|-------------|---------|
+| `<name>` | 远程名称 | `origin` |
+| `<branch>` | 要设置的分支（对应 tracking ref 必须已存在） | `libra remote set-head origin main` |
+| `-a`, `--auto` | 查询远程 HEAD 并自动选择分支 | `libra remote set-head --auto origin` |
+| `-d`, `--delete` | 删除 remote HEAD（幂等） | `libra remote set-head --delete origin` |
 
 ## 常用命令
 

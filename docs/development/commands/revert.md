@@ -2,11 +2,11 @@
 
 ## 命令实现目标
 
-`libra revert` 的目标是生成抵消已有提交的反向变更，并保留冲突处理和提交控制的清晰边界。当前实现支持单父提交的反向变更、merge commit mainline revert（`-m/--mainline`）、no-commit 流程、`--continue`/`--abort` 冲突恢复和稳定错误输出，`--skip` 与多提交冲突的自动续作（剩余提交队列）也已实现。自动创建的 revert commit 使用当前 author/committer 身份（含 `GIT_AUTHOR_*`/`GIT_COMMITTER_*` 日期覆盖），默认消息从被 revert 提交的去签名正文中取 subject，避免从 `gpgsig` 块派生错误标题。仅自定义策略（strategy）列为未完成。
+`libra revert` 的目标是生成抵消已有提交的反向变更，并保留冲突处理和提交控制的清晰边界。当前实现支持单/多提交、mainline、no-commit、冲突 sequencer、可重复 last-wins 的 `-X/--strategy-option ours|theirs`，以及 `--cleanup=<strip|whitespace|verbatim|scissors|default>`。`-X` 复用 merge 的 hunk resolver，只偏向重叠 region并保留 clean inverse hunk；cleanup 与 favor 都进入 `RevertState`，可跨 conflict→continue。自动提交使用当前 author/committer，并从去签名正文生成 subject。自定义 `--strategy` 仍未实现。
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。单/多提交 revert、`-n/--no-commit`、`-m/--mainline`（merge commit revert）、`-s/--signoff`（Signed-off-by trailer）、`-e/--edit`（在生成的 revert 消息上打开编辑器，复用 commit 的编辑器级联 `$GIT_EDITOR`/`core.editor`/`$VISUAL`/`$EDITOR`；与 git 不同，Libra revert 默认**不**打开编辑器，需显式 `--edit` 选用，与 `--no-edit` 互斥）、`--no-edit`（接受式 no-op，即默认行为）、`--no-rerere-autoupdate`（接受式 no-op，Libra 无 rerere）与冲突 sequencer（`--continue`/`--abort`/`--skip`，3-way 冲突标记 + `revert-state.json`；`--edit` 经 `RevertState.edit` 串到 `--continue`/`--skip`；冲突时把剩余提交队列存入 `RevertState.remaining`，`--continue`/`--skip` 自动续作其余提交）已支持；`--rerere-autoupdate`、strategy surface 尚未公开。
+- 兼容级别：`partial`。既有 revert surface、`-X ours/theirs`、`--cleanup=<mode>` 与冲突 sequencer 已支持；favor/cleanup/edit/remaining 队列均在 fsynced `RevertState` 中向后兼容持久化。`--rerere-autoupdate` 与自定义 `--strategy` 尚未公开。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -45,9 +45,10 @@ flowchart TD
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/revert.md`。
-- Synopsis：`libra revert [-n | --no-commit] [-m | --mainline <parent-number>] [-s | --signoff] [-e | --edit] [--no-edit] [--no-rerere-autoupdate] [--json] [--quiet] <commit>...` ｜ `libra revert --continue` ｜ `libra revert --skip` ｜ `libra revert --abort`。
-- 公开参数/子命令包括：`<commit>...`（位置参数，`--continue`/`--skip`/`--abort` 时可省略）、`-n, --no-commit`、`-m, --mainline <parent-number>`、`-s, --signoff`、`-e, --edit`（在默认 `Revert "<subject>"` 消息上打开编辑器，经 `edit_revert_message`→`editor::resolve_editor`/`edit_message`；编辑后剥离 `#` 注释行并 trim，空消息报错 `EmptyMessage`；与 `--no-edit` 互斥）、`--no-edit`（接受式 no-op：即 Libra 默认的非交互行为）、`--no-rerere-autoupdate`（接受式 no-op：Libra 无 rerere，无可更新；`no_rerere_autoupdate` 字段解析后不被读取。Git 的反向 `--rerere-autoupdate` 未公开）、`--continue`、`--skip`、`--abort`、`--json`、`--quiet`。多个 commit 按给定顺序依次 revert，每个相对前一次产生的 HEAD 各自生成一个 revert commit；中途冲突即停止并把剩余 commit 存入 `RevertState.remaining`，已完成的保留，`--continue`/`--skip` 自动续作其余。`-n/--no-commit` 与 `-m/--mainline` 与多 commit 互斥（映射 `RevertError::MultiCommitUnsupported`）。`-s/--signoff` 经 `signoff_trailer` 追加 `Signed-off-by`。
-- **冲突 sequencer**：当某文件自被 revert 的提交后又被改动且 revert 与之重叠时，`three_way_revert_blob`（`diffy::merge_bytes`，base=被 revert 提交的 blob / ours=当前 / theirs=父提交）写入冲突标记到 index+worktree，并把 `RevertState`（orig_head/reverted_commit/signoff/conflicted_paths）经 `utils::atomic_write::write_atomic`（临时文件 → fsync → rename → fsync 父目录，`lore.md` §7.7）原子且 fsync 持久化到 `.libra/revert-state.json`——崩溃只会留下完整或缺失的 state，绝不残留半截文件破坏 `--continue`/`--abort` 恢复；revert 以 exit 1 暂停（`RevertError::Conflicts`）。冲突时把序列中尚未处理的提交存入 `RevertState.remaining`（`#[serde(default)]`，JSON state，无需 DB 迁移）。`--continue` 拒绝 index 中仍含 `<<<<<<<` 标记（`UnresolvedConflicts`），否则从已解决的 index 构建单亲 revert commit，随即清理当前冲突的 state（在续作前清，避免续作中途的非冲突错误留下指向已完成提交的陈旧 state），再经共享的 `revert_sequence` 续作 `remaining` 队列（队列中再冲突则 `revert_sequence` 重存新 state）；`--skip` 经 `restore_to_orig_head` 丢弃当前冲突提交的改动（恢复到 `orig_head` 的树，HEAD 在冲突时已等于 `orig_head`）后同样先清理 state、再续作 `remaining`；`--abort` reset 到 `orig_head` 并清理 state。开始新 revert 前若已有进行中的 revert 会报 `RevertInProgress`。（区别于 cherry-pick 的 SQLite stage-1/2/3 模型：revert 用 JSON state + stage-0 标记。）
+- Synopsis 在既有 surface 上新增 `[-X <ours|theirs>] [--cleanup=<mode>]`。
+- 公开参数新增可重复 `-X/--strategy-option <ours|theirs>`（last-wins）与 `--cleanup=<mode>`；前者经 `merge::merge_bytes_with_favor` 做 hunk-level 偏向，后者复用 commit cleanup parser，并在任何 sequencer action 前校验。两者随 `RevertState` 续作。
+- **冲突 sequencer**：`three_way_revert_blob` 使用 base=被 revert blob / ours=当前 / theirs=选定 parent；无 `-X` 时重叠区域写 marker，有 `-X` 时共享 hunk resolver。`RevertState` 通过 atomic+fsynced JSON 保存 orig/reverted/signoff/edit/cleanup/strategy_option/remaining/conflicted paths；`--continue`/`--skip` 续作保持相同策略。
+- apply、root revert、`--skip`/`--abort` 恢复路径都对不可读/损坏的 index fail-closed（`LBR-REPO-002`），不会再把 load failure 当作空 index 后覆盖工作树；state 保留供修复后重试。
 
 
 ## 还未实现的功能
@@ -59,6 +60,8 @@ flowchart TD
 | ✅ 已实现 | 编辑消息 `-e`/`--edit` | 见上方 `-e`/`--edit` 与 `--no-edit` 行：在生成消息上打开编辑器（opt-in，与 git 默认不同）。 |
 | ✅ 已实现 | Skip 当前 commit | `--skip`：`run_revert_skip` 经 `restore_to_orig_head` 丢弃当前冲突提交后用 `revert_sequence` 续作 `RevertState.remaining`；剩余为空时清理 state 不建提交。与 `--continue`/`--abort` 互斥。带回归测试 `test_revert_skip_continues_with_remaining` / `test_revert_skip_with_nothing_remaining`。 |
 | ✅ 已实现 | 多提交冲突自动续作 | 冲突时把剩余提交队列存入 `RevertState.remaining`；`--continue`/`--skip` 经共享 `revert_sequence` 自动续作其余提交（此前剩余提交会被静默丢弃）。带回归测试 `test_revert_continue_drains_remaining_commits`。 |
+| ✅ 已实现 | `-X ours/theirs` | 可重复且 last-wins；modify/modify 只偏向冲突 hunk，add/add 与 modify/delete 选择整侧；effective favor 随 `RevertState.strategy_option` 持久化。E2E `revert_strategy_option_is_hunk_level_and_last_wins` 固定 parent/tree。 |
+| ✅ 已实现 | `--cleanup=<mode>` | 复用 commit cleanup modes；无 editor 时 default/scissors→whitespace，有 editor 时按 mode 清理；非法值在 control action 前失败；`RevertState.cleanup` 保证 conflict→continue round-trip。E2E `revert_cleanup_survives_conflict_continue` 固定 scissors 截断、parent 与 state cleanup。 |
 | ✅ 已实现 | P0-08 identity/subject 保真 | `create_revert_commit` / `create_empty_revert_commit` 不再使用 `Commit::from_tree_id` 的固定 `mega <admin@mega.org>` 身份，而是走 `commit::create_commit_signatures(None, None)`；`build_revert_message` 使用 `parse_commit_msg` 后的首行作为 `Revert "<subject>"`。带 compat 测试 `compat_sequencer_message_author::revert_uses_current_identity_and_strips_signed_subject`。 |
 | 兼容差异项 | 策略 | 原始对照：--strategy <s>；相关参数/替代：不适用；当前说明：不支持。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
 

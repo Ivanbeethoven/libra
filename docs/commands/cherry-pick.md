@@ -9,6 +9,7 @@ Apply the changes introduced by some existing commits.
 ```
 libra cherry-pick [-n|--no-commit] [-x] [-s|--signoff] [-e|--edit]
                   [-m <n>|--mainline <n>] [--ff] [-S|--gpg-sign]
+                  [-X <ours|theirs>]
                   [--allow-empty] [--allow-empty-message] [--keep-redundant-commits]
                   [--empty=<mode>] [--cleanup=<mode>] [--json] [--quiet] <commit>...
 libra cherry-pick (--continue | --skip | --abort | --quit)
@@ -27,7 +28,7 @@ author date, and timezone). The committer is the current identity/date, honoring
 `GIT_COMMITTER_*` overrides. Signed source messages are de-signed before message
 cleanup/trailer handling, so `gpgsig` blocks never become the replayed subject.
 
-When a commit cannot be applied cleanly, Libra performs a three-way apply (base = parent tree, ours = current index, theirs = picked tree) and writes any divergent path to the index (stages 1/2/3) and the working tree (line-level conflict markers, matching Git). The in-progress sequence is persisted in the SQLite `cherry_pick_state` table, so you can resolve the conflict and continue with `--continue`, drop the conflicted commit with `--skip`, or undo the whole sequence with `--abort`/`--quit`. While a cherry-pick sequence is in progress, `merge` and `rebase` are blocked (`LBR-CONFLICT-002`).
+When a commit cannot be applied cleanly, Libra performs a three-way apply (base = parent tree, ours = current index, theirs = picked tree) and writes any unresolved divergent path to the index (stages 1/2/3) and the working tree (line-level conflict markers, matching Git). `-X ours/theirs` can resolve only the overlapping hunks while retaining clean changes. The in-progress sequence is persisted in the unified SQLite `sequence_state` table, so you can resolve a remaining conflict and continue with `--continue`, drop the conflicted commit with `--skip`, or undo the whole sequence with `--abort`/`--quit`. While a cherry-pick sequence is in progress, other sequencer operations are blocked (`LBR-CONFLICT-002`).
 
 ## Options
 
@@ -99,6 +100,10 @@ How to handle a pick whose change set becomes redundant against HEAD after repla
 ### `--cleanup=<mode>`
 
 Clean up the replayed commit message. `<mode>` is `strip`/`whitespace`/`verbatim`/`scissors`/`default`. The picked body — and any `-e` edited buffer — is cleaned first, then the generated `-x`/`Signed-off-by` trailers are appended (so their separator is preserved). `default` and `scissors` fall back to `whitespace` when no editor opens (matching Git's "if the message is to be edited" clause). An unrecognized mode is a usage error (`LBR-CLI-002`, exit 129), validated before any commit (and before `--continue`/`--skip`/`--abort`/`--quit`). When omitted, the message is trim-only, as before.
+
+### `-X <ours|theirs>`, `--strategy-option=<ours|theirs>`
+
+Resolve only overlapping three-way-apply hunks in favor of the selected side: `ours` is the current index/HEAD side and `theirs` is the commit being picked. Clean hunks from both sides are still applied. The option is repeatable and the last value wins; add/add and modify/delete conflicts select the requested whole side. The effective value is persisted for a resumed multi-commit sequence.
 
 ## Conflict Sequencer
 
@@ -235,7 +240,7 @@ When `--no-commit` is used, `new_commit` and `short_new` are `null`:
 
 ### Sequencer state lives in SQLite, not dotfiles
 
-Git maintains `.git/CHERRY_PICK_HEAD` and sequencer state files. Libra persists the in-progress sequence in the SQLite `cherry_pick_state` table instead, matching the repository's metadata-in-SQLite convention: the `DELETE`+`INSERT` save runs in a single transaction so a sequencer write is never left half-applied, and there is no loose dotfile that can drift from the refs. The AI-agent protocol is the same as Git's: detect the conflict code (`LBR-CONFLICT-001`), resolve, `libra add`, then `--continue` (or `--skip`/`--abort`/`--quit`).
+Git maintains `.git/CHERRY_PICK_HEAD` and sequencer state files. Libra persists the in-progress sequence in the unified SQLite `sequence_state` table, matching the repository's metadata-in-SQLite convention and the cross-operation sequencer mutex. The save is transactional, so state is never left half-applied and no loose dotfile can drift from refs. The AI-agent protocol is the same as Git's: detect the conflict code (`LBR-CONFLICT-001`), resolve, `libra add`, then `--continue` (or `--skip`/`--abort`/`--quit`).
 
 ### Line-level conflict hunks
 
@@ -243,9 +248,9 @@ A divergent path is surfaced with line-level conflict markers, matching Git: a t
 
 The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge`: `diff3` additionally emits the common-ancestor content between a `||||||| base` marker and the `=======` separator; an unsupported value (e.g. `zdiff3`) is a hard error when a conflict must be rendered. See the [merge documentation](merge.md#conflict-style-mergeconflictstyle).
 
-### Unsupported Git options are rejected, not silently ignored
+### Custom strategies remain explicit
 
-`--cleanup=<mode>` (`strip`/`whitespace`/`verbatim`/`scissors`/`default`) cleans up the replayed commit message: the picked body (and any `-e` edited buffer) is cleaned first, then the generated `-x`/`Signed-off-by` trailers are appended (so their blank-line separator is preserved). `default`/`scissors` fall back to `whitespace` when no editor opens, matching Git's "if the message is to be edited" clause; an unrecognized mode is a usage error (`LBR-CLI-002`, exit 129). `--strategy`, `-X/--strategy-option`, and `--rerere-autoupdate` are explicitly rejected with `LBR-UNSUPPORTED-001` (exit 128) rather than silently ignored, so a script never assumes an unimplemented behavior took effect. Libra uses a single built-in three-way merge; custom merge strategies are out of scope.
+`-X ours/theirs` is supported by Libra's built-in three-way apply and resolves only conflict regions. `--rerere-autoupdate` is honored when rerere is enabled. `--strategy <name>` remains explicitly rejected with `LBR-UNSUPPORTED-001` (exit 128), because external/custom merge strategies are still out of scope.
 
 ## Parameter Comparison: Libra vs Git vs jj
 
@@ -268,7 +273,7 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 | Keep redundant | `--keep-redundant-commits` | N/A | `--keep-redundant-commits` |
 | Cleanup mode | `--cleanup=<mode>` | N/A | `--cleanup=<mode>` (`strip`/`whitespace`/`verbatim`/`scissors`/`default`; cleans the body/edited buffer, then appends trailers) |
 | Strategy | `--strategy <s>` | N/A | Rejected (`LBR-UNSUPPORTED-001`) |
-| Strategy option | `-X <option>` | N/A | Rejected (`LBR-UNSUPPORTED-001`) |
+| Strategy option | `-X <option>` | N/A | `-X ours/theirs` (repeatable; last wins; conflict hunks only) |
 | Empty mode | `--empty=<mode>` | N/A | `--empty=<mode>` (`stop`/`drop`/`keep`) |
 | JSON output | N/A | N/A | `--json` |
 | Quiet mode | `--quiet` | `--quiet` | `--quiet` |
@@ -283,7 +288,7 @@ The Git-compatible `merge.conflictStyle` config is honored, same as `libra merge
 | `LBR-REPO-003` | HEAD detached, no cherry-pick in progress for `--continue`/`--skip`/`--abort`/`--quit`, or `--continue` on the wrong branch | Switch to a branch / start a pick first / switch back to the sequence branch |
 | `LBR-CLI-003` | Cannot resolve a commit reference | Use `libra log` to find valid commit references |
 | `LBR-CLI-002` | Merge commit without `-m`, invalid/out-of-range `-m`, an invalid `--cleanup` or `--empty` mode, empty commit without `--allow-empty`, redundant commit without `--keep-redundant-commits`/`--empty=drop`/`--empty=keep`, or empty message without `--allow-empty-message` | Use the flag named in the hint |
-| `LBR-UNSUPPORTED-001` | An unsupported Git option (`--strategy`, `-X`, `--rerere-autoupdate`) was passed | Drop the option; it is not supported by libra cherry-pick |
+| `LBR-UNSUPPORTED-001` | An unsupported custom `--strategy` was passed | Drop `--strategy`; Libra's built-in apply supports `-X ours/theirs` but not custom strategies |
 | `LBR-CONFLICT-001` | Conflict during cherry-pick (three-way conflict, or untracked file would be overwritten) | Resolve and `libra add`, then `libra cherry-pick --continue` (or `--skip`/`--abort`/`--quit`) |
 | `LBR-CONFLICT-002` | `merge`/`rebase` started while a cherry-pick is in progress, or a new pick started over an in-progress sequence | Finish or cancel the cherry-pick first |
 | `LBR-IO-001` | Failed to load an object or cherry-pick state | Check repository integrity and retry |

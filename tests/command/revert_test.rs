@@ -176,6 +176,8 @@ async fn test_basic_revert() {
         skip: false,
         edit: false,
         no_edit: false,
+        cleanup: None,
+        strategy_option: Vec::new(),
     })
     .await;
 
@@ -307,6 +309,8 @@ async fn test_revert_no_commit() {
         skip: false,
         edit: false,
         no_edit: false,
+        cleanup: None,
+        strategy_option: Vec::new(),
     })
     .await;
 
@@ -398,6 +402,8 @@ async fn test_revert_root_commit() {
         skip: false,
         edit: false,
         no_edit: false,
+        cleanup: None,
+        strategy_option: Vec::new(),
     })
     .await;
 
@@ -490,6 +496,8 @@ async fn test_revert_root_commit_creates_empty_tree_commit() {
             skip: false,
             edit: false,
             no_edit: false,
+            cleanup: None,
+            strategy_option: Vec::new(),
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -833,6 +841,8 @@ async fn test_revert_errors() {
         skip: false,
         edit: false,
         no_edit: false,
+        cleanup: None,
+        strategy_option: Vec::new(),
     })
     .await;
 

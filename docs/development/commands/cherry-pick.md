@@ -2,11 +2,11 @@
 
 ## 命令实现目标
 
-`libra cherry-pick` 的目标是把一个或多个已有提交引入当前分支。当前实现支持按顺序重放多个提交、`-n, --no-commit`（暂存而不自动提交，已支持多提交）、`-x`（记录来源提交行）、`-s/--signoff`（追加 Signed-off-by）、`-e/--edit`（交互式编辑提交消息，非 TTY/机器模式下自动降级）、`-m/--mainline <n>`（沿指定父提交 cherry-pick 合并提交）、`--ff`（直接快进而不重写提交）、`-S/--gpg-sign`（通过 libra vault 签名）、空提交策略 `--allow-empty`/`--allow-empty-message`/`--keep-redundant-commits`/`--empty=<mode>`（`stop`/`drop`/`keep`），以及 `--cleanup=<mode>`（`strip`/`whitespace`/`verbatim`/`scissors`/`default`：先清理被 pick 的消息正文与 `-e` 编辑后的缓冲，再追加 `-x`/`Signed-off-by` trailer，从而保留 trailer 分隔空行；无 editor 时 `default`/`scissors` 回退为 `whitespace`；非法 mode 报 `LBR-CLI-002`/退出 129，且在 sequencer 控制分发之前校验）。自动提交路径保留源提交 author metadata（name/email/date/timezone），committer 取当前身份并遵循 `GIT_COMMITTER_*`；消息正文先经 `parse_commit_msg` 剥离签名块，避免 `gpgsig` 成为 replay subject。冲突走统一 sequencer（lore.md 2.6：状态存于 owner 模块 `internal::sequencer` 独占的单表 `sequence_state`，取代命令内 `cherry_pick_state` 懒建 DDL；对用户透明）：三方冲突写入索引 stage 1/2/3 与工作树冲突标记（modify/modify 经共享的 `merge::render_line_level_conflict` 以行级 hunk 呈现，与 Git 一致；删除/修改或二进制回退整文件），并支持 `--continue`/`--skip`/`--abort`/`--quit`，同时与 merge/revert/rebase **对称**互斥（任一序列 in-progress 时启动另一种序列以 LBR-CONFLICT-002 拒绝，反向亦然）。`--strategy`、`-X/--strategy-option`、`--rerere-autoupdate` 被显式拒绝（见“还未实现的功能”）。
+`libra cherry-pick` 的目标是把一个或多个已有提交引入当前分支。当前实现支持按顺序重放多个提交、`-n, --no-commit`（暂存而不自动提交，已支持多提交）、`-x`、`-s/--signoff`、`-e/--edit`、`-m/--mainline <n>`、`--ff`、`-S/--gpg-sign`、空提交策略、`--cleanup=<mode>`，以及可重复且 last-wins 的 `-X/--strategy-option ours|theirs`。`-X` 复用 merge 的 hunk resolver，只偏向真正冲突 region，保留同文件 clean hunk；add/add 与 modify/delete 选择整侧。有效值经 `CherryPickOpts.strategy_option` 随统一 `sequence_state` 持久化。自动提交保留源 author metadata，committer 取当前身份；消息先去签名。未解决冲突写 index stage 1/2/3 与工作树标记，并支持 `--continue`/`--skip`/`--abort`/`--quit` 及跨操作对称 mutex。自定义 `--strategy` 仍显式拒绝；`--rerere-autoupdate` 在 rerere 启用时生效。
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。提交 replay、`-n/--no-commit`（含多提交）、`-x`、`-s/--signoff`、`-e/--edit`、`-m/--mainline`、`--ff`、`-S/--gpg-sign`、`--allow-empty`/`--allow-empty-message`/`--keep-redundant-commits`/`--empty=<stop|drop|keep>` 以及 `--continue`/`--skip`/`--abort`/`--quit` sequencer 已支持；行级冲突 hunk 已实现（modify/modify 仅把发散行包在标记内，与 Git 一致；删除/修改与二进制回退整文件）；自定义合并策略（`--strategy`/`-X`）仍不完整。
+- 兼容级别：`partial`。提交 replay、消息/空提交控制、`-X ours/theirs` 与 sequencer 已支持；`-X` 可重复且最后一个值生效，modify/modify 只偏向冲突 hunk，add/add 与 modify/delete 选择整侧。自定义 `--strategy <name>` 仍未实现。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -48,8 +48,8 @@ flowchart TD
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/cherry-pick.md`。
-- Synopsis：`libra cherry-pick [-n|--no-commit] [-x] [-s|--signoff] [-e|--edit] [-m <n>|--mainline <n>] [--ff] [-S|--gpg-sign] [--allow-empty] [--allow-empty-message] [--keep-redundant-commits] [--empty=<mode>] [--cleanup=<mode>] [--json] [--quiet] <commit>...` 或 `libra cherry-pick (--continue|--skip|--abort|--quit)`。
-- 公开参数/子命令包括：`<commit>...`（位置参数，sequencer 控制下非必填）、`-n, --no-commit`、`-x`、`-s/--signoff`、`-e/--edit`、`-m/--mainline <n>`、`--ff`、`-S/--gpg-sign`、`--allow-empty`、`--allow-empty-message`、`--keep-redundant-commits`、`--empty=<mode>`（stop/drop/keep）、`--cleanup=<mode>`（strip/whitespace/verbatim/scissors/default）、sequencer 控制 `--continue`/`--skip`/`--abort`/`--quit`、`--json`、`--quiet`。
+- Synopsis：`libra cherry-pick ... [-X <ours|theirs>] [--cleanup=<mode>] <commit>...` 或 `libra cherry-pick (--continue|--skip|--abort|--quit)`。
+- 公开参数在既有 surface 上新增 `-X/--strategy-option <ours|theirs>`（可重复，last-wins）；其余包括消息/空提交控制、sequencer 控制、JSON 与 quiet。
 
 
 ## 还未实现的功能
@@ -57,7 +57,7 @@ flowchart TD
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
 | 兼容差异项 | 自定义合并策略 | 原始对照：--strategy <s>；相关参数/替代：单一内置三方合并；当前说明：显式拒绝（LBR-UNSUPPORTED-001 / 128）。后续实现时需要补对应回归测试并同步兼容矩阵。 |
-| 兼容差异项 | 策略选项 | 原始对照：-X / --strategy-option；相关参数/替代：不适用；当前说明：显式拒绝（LBR-UNSUPPORTED-001 / 128）。后续实现时需要补对应回归测试并同步兼容矩阵。 |
+| ✅ 已实现 | 策略选项 | `-X/--strategy-option ours|theirs` 可重复且 last-wins；共享 `merge::merge_bytes_with_favor` 仅选择冲突 hunk，clean hunk 保留；整路径冲突选择对应侧；`CherryPickOpts` round-trip；`compat_noninteractive_history_controls::cherry_pick_strategy_option_is_hunk_level_and_last_wins` 固定 tree 与 parent。 |
 | ✅ 已实现 | 空提交模式 | 原始对照：`--empty=<how>`；当前说明：`--empty=stop`（默认，halt）/`drop`（跳过冗余提交，HEAD 不前进，打印 `dropping <sha> <subject> -- patch contents already upstream`）/`keep`（保留空提交，等价 `--keep-redundant-commits`）已支持。`effective_empty_mode`：`--empty` 优先，否则 `--keep-redundant-commits`→keep，缺省→stop。在任何 sequencer 分发之前校验（非法 mode → `invalid value for '--empty'`，`LBR-CLI-002`/退出 129，与 `--cleanup` 同样早校验），随 `CherryPickOpts.empty` round-trip 到 `--continue`/`--skip`。`PickOutcome{Committed,Staged,Dropped}` + `PickAccumulator{picked,dropped}` 驱动主循环与 `resume_picks`；`drop` 的 subject 经 `parse_commit_msg` 去签名取首行。带集成测试 `test_cherry_pick_empty_modes`。 |
 | ✅ 已实现 | 消息清理 `--cleanup=<mode>` | 已公开：`strip`/`whitespace`/`verbatim`/`scissors`/`default`，复用 commit 的 `parse_cleanup_mode` + `cleanup_commit_message`（已改为 `pub(crate)`）。`build_cherry_pick_message` 先清理被 pick 的正文（`-e` 时再清理编辑后的缓冲），再追加 `-x`/`Signed-off-by` trailer，从而不会塌陷 trailer 分隔空行；仅在显式给出时生效（默认仍为 trim，行为不变）。无 editor 时 `default`/`scissors` 回退为 `whitespace`（同 commit / git 的“若消息将被编辑”语义）。mode 在 sequencer 控制分发之前即校验，非法值报 `InvalidCleanup` → `LBR-CLI-002`/退出 129（`--continue --cleanup=bogus` 亦快速失败）。通过 `CherryPickOpts.cleanup`（原始字符串）round-trip 到 `--continue`/`--skip`。带集成测试 `cherry_pick_cleanup_strip_then_verbatim`、`cherry_pick_cleanup_survives_conflict_resume`、`cherry_pick_invalid_cleanup_mode_rejected` 与单元 round-trip 守卫。 |
 | 兼容差异项 | rerere 自动更新 | 原始对照：--rerere-autoupdate；相关参数/替代：不适用；当前说明：显式拒绝（LBR-UNSUPPORTED-001 / 128）。后续实现时需要补对应回归测试并同步兼容矩阵。 |

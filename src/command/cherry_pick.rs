@@ -13,7 +13,7 @@ use git_internal::{
     hash::ObjectHash,
     internal::{
         index::{Index, IndexEntry},
-        object::{ObjectTrait, commit::Commit, tree::Tree, types::ObjectType},
+        object::{ObjectTrait, blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
     },
 };
 use sea_orm::ConnectionTrait;
@@ -24,7 +24,9 @@ use crate::{
         commit::{
             CleanupMode, cleanup_commit_message, create_committer_signature, parse_cleanup_mode,
         },
-        load_object, merge, save_object,
+        load_object,
+        merge::{self, MergeFavor},
+        save_object,
     },
     common_utils::{format_commit_msg, parse_commit_msg},
     internal::{
@@ -63,6 +65,7 @@ EXAMPLES:
     libra cherry-pick -x abc1234           Append a '(cherry picked from ...)' line
     libra cherry-pick -s abc1234           Add a Signed-off-by trailer
     libra cherry-pick -m 1 <merge>         Cherry-pick a merge commit along parent 1
+    libra cherry-pick -X ours abc1234      Favor current-side conflicting hunks
     libra cherry-pick --cleanup=strip abc1234  Clean up the replayed commit message
     libra cherry-pick --empty=drop abc1234  Skip the pick if it is already upstream
     libra cherry-pick --continue           Resume after resolving conflicts
@@ -289,6 +292,10 @@ struct CherryPickOpts {
     /// redundant commit in the sequence is handled the same way. Raw mode string.
     #[serde(default)]
     empty: Option<String>,
+    /// Effective (last supplied) `-X` side preference. Later commits in a
+    /// resumed sequence must resolve overlapping hunks the same way.
+    #[serde(default)]
+    strategy_option: Option<MergeFavor>,
 }
 
 impl CherryPickOpts {
@@ -305,6 +312,7 @@ impl CherryPickOpts {
             mainline: args.mainline,
             cleanup: args.cleanup.clone(),
             empty: args.empty.clone(),
+            strategy_option: args.strategy_option.last().copied(),
         }
     }
 
@@ -326,6 +334,7 @@ impl CherryPickOpts {
             mainline: self.mainline,
             cleanup: self.cleanup,
             empty: self.empty,
+            strategy_option: self.strategy_option.into_iter().collect(),
             ..Default::default()
         }
     }
@@ -544,6 +553,17 @@ pub struct CherryPickArgs {
     #[clap(long = "empty", value_name = "mode")]
     pub empty: Option<String>,
 
+    /// Resolve only overlapping three-way merge hunks in favor of the selected
+    /// side. Repeatable; the last value wins.
+    #[clap(
+        short = 'X',
+        long = "strategy-option",
+        value_name = "option",
+        value_enum,
+        action = clap::ArgAction::Append
+    )]
+    pub strategy_option: Vec<MergeFavor>,
+
     // ── Unsupported Git options captured for explicit rejection ──
     #[clap(long = "strategy", value_name = "name", hide = true)]
     pub strategy: Option<String>,
@@ -561,13 +581,6 @@ pub struct CherryPickArgs {
     pub no_rerere_autoupdate: bool,
     #[clap(long = "commit", hide = true)]
     pub commit: bool,
-    #[clap(
-        short = 'X',
-        long = "strategy-option",
-        value_name = "option",
-        hide = true
-    )]
-    pub strategy_option: Option<String>,
 }
 
 pub async fn execute(args: CherryPickArgs) {
@@ -604,9 +617,6 @@ fn reject_unsupported_options(args: &CherryPickArgs) -> Option<&'static str> {
     // harmless no-op, matching Git's behaviour when rerere is off.
     if args.commit {
         return Some("--commit (auto-commit is the default; use -n to stage only)");
-    }
-    if args.strategy_option.is_some() {
-        return Some("-X / --strategy-option");
     }
     if args.strategy.is_some() {
         return Some("--strategy (custom merge strategies are not supported)");
@@ -707,6 +717,8 @@ async fn reset_hard(target: &str, output: &OutputConfig) -> Result<(), CherryPic
             soft: false,
             mixed: false,
             hard: true,
+            merge: false,
+            keep: false,
             pathspecs: Vec::new(),
             pathspec_separator: false,
             pathspec_from_file: None,
@@ -1178,6 +1190,10 @@ async fn cherry_pick_single_commit(
             }
         } else if ours_hash == their_hash {
             // Both sides already converged on the same content — nothing to do.
+        } else if let Some(favor) = args.strategy_option.last().copied() {
+            apply_favored_pick_resolution(
+                &mut index, &path, base_hash, ours_hash, their_hash, favor,
+            )?;
         } else {
             index.remove(path_to_utf8(&path)?, 0);
             if let Some(b) = base_hash {
@@ -1523,6 +1539,50 @@ fn diff_trees(
         }
     }
     diffs
+}
+
+/// Resolve a divergent cherry-pick path using the same hunk-level side
+/// preference as merge. A true three-sided content conflict preserves clean
+/// ranges; add/add and modify/delete conflicts select the requested whole side.
+fn apply_favored_pick_resolution(
+    index: &mut Index,
+    path: &Path,
+    base_hash: Option<ObjectHash>,
+    ours_hash: Option<ObjectHash>,
+    theirs_hash: Option<ObjectHash>,
+    favor: MergeFavor,
+) -> Result<(), CherryPickSingleError> {
+    let selected_hash = match (base_hash, ours_hash, theirs_hash) {
+        (Some(base_hash), Some(ours_hash), Some(theirs_hash)) => {
+            let base: Blob = load_object(&base_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            let ours: Blob = load_object(&ours_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            let theirs: Blob = load_object(&theirs_hash)
+                .map_err(|error| CherryPickSingleError::LoadObject(error.to_string()))?;
+            let merged = merge::merge_bytes_with_favor(&base.data, &ours.data, &theirs.data, favor)
+                .map_err(CherryPickSingleError::SaveFailed)?;
+            let blob = Blob::from_content_bytes(merged);
+            save_object(&blob, &blob.id).map_err(|error| {
+                CherryPickSingleError::SaveFailed(format!(
+                    "failed to save favored merge result for '{}': {error}",
+                    path.display()
+                ))
+            })?;
+            Some(blob.id)
+        }
+        _ => match favor {
+            MergeFavor::Ours => ours_hash,
+            MergeFavor::Theirs => theirs_hash,
+        },
+    };
+
+    let path_str = path_to_utf8(path)?;
+    index.remove(path_str, 0);
+    if let Some(hash) = selected_hash {
+        update_index_entry(index, path, hash)?;
+    }
+    Ok(())
 }
 
 fn update_index_entry(
@@ -2017,6 +2077,7 @@ mod tests {
             mainline: Some(2),
             cleanup: Some("strip".to_string()),
             empty: Some("drop".to_string()),
+            strategy_option: vec![MergeFavor::Theirs, MergeFavor::Ours],
             ..Default::default()
         };
         let json = serde_json::to_string(&CherryPickOpts::from_args(&args)).unwrap();
@@ -2033,6 +2094,7 @@ mod tests {
         assert_eq!(rebuilt.mainline, Some(2));
         assert_eq!(rebuilt.cleanup.as_deref(), Some("strip"));
         assert_eq!(rebuilt.empty.as_deref(), Some("drop"));
+        assert_eq!(rebuilt.strategy_option, vec![MergeFavor::Ours]);
     }
 
     #[test]

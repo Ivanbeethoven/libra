@@ -2,11 +2,11 @@
 
 ## 命令实现目标
 
-`libra reset` 的目标是移动 HEAD、索引和工作区到指定状态，覆盖 hard/mixed/soft 与 pathspec reset（含 `--pathspec-from-file` / `--pathspec-file-nul` / `--no-refresh`），并提供结构化输出，同时把 merge/keep reset 作为未完成兼容差异。
+`libra reset` 的目标是移动 HEAD、索引和工作区到指定状态，覆盖 hard/mixed/soft/merge/keep 与 pathspec reset（含 `--pathspec-from-file` / `--pathspec-file-nul` / `--no-refresh`），并提供结构化输出。`--merge`/`--keep` 以完整预检与精确 snapshot rollback 保护本地变更。
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。`--soft` / `--mixed` / `--hard` 和路径 reset 已支持；`--pathspec-from-file` / `--pathspec-file-nul`（批量/标准输入路径，按字面取值，不做 Git 默认的 C 风格引号解码）和 `--no-refresh`（accepted as a no-op，Libra 的 reset 从不刷新索引）也已支持；`--merge`、`--keep` 仍未公开。
+- 兼容级别：`partial`。`--soft` / `--mixed` / `--hard` / `--merge` / `--keep` 和路径 reset 已支持；`--pathspec-from-file` / `--pathspec-file-nul` 与 `--no-refresh` 也已支持。`--merge` 保护 unstaged 变化并 carry unmerged stages；`--keep` 对 target-vs-HEAD 变化路径上的任何 local change fail-closed。
 
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
@@ -40,23 +40,26 @@ flowchart TD
 - 2026-05-24 `2827b6e3`（`fix(reset): skip traversing ignored directories in reset --hard and bump version to 0.17.946`）：实现修正：skip traversing ignored directories in reset --hard and bump version to 0.17.946；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 2026-05-21 `1fa9973e`（`test(reset): pin ResetError stable_code 19-variant mapping (v0.17.706)`）：测试契约：pin ResetError stable_code 19-variant mapping (v0.17.706)；相关行为已有回归守卫，后续变更需要继续满足。
 - 2026-07-09（plan-20260708 P0-11）：源码核对确认 `reset --hard` 旧工作树恢复只写普通文件，tree 中 mode `120000` 的 symlink 会变成普通文件；pathspec reset 也曾用默认 blob mode 写回 index，可能丢失 `120000`。当前 hard reset 按 `TreeItemMode` 写工作树：symlink 用 blob 字节创建真实 symlink，普通文件写入前移除同名 symlink；pathspec reset 写 index 时保留 tree item mode；不支持平台明确报错。回归守卫：`compat_symlink_basic`。
+- 2026-07-13（plan-20260708 P1-07c）：公开 `--merge`/`--keep`。两者先加载 HEAD/target/current index，逐路径比较 tree/index/worktree 并在覆盖风险时以 `LBR-CONFLICT-002` 拒绝；写入前保存原 index 原始字节、目录/缺失状态与 clean tracked entry 的对象/mode 引用（避免把大文件无界缓冲到内存），任何 worktree/ref 失败均精确 rollback。路径验证拒绝 `..`/absolute/`.libra` 元数据目标；ancestor 检查全程 `symlink_metadata` no-follow，ignored symlink 也不能把 write/rollback 导向仓库外。`--merge` carry stage 1/2/3 unmerged entries。E2E 固定 preservation、tracked/untracked refusal、file/directory 双向 transition 与外部 sentinel no-follow；unit rollback 回归固定两类 transition 的精确恢复。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/reset.md`。
-- Synopsis：`libra reset [--soft | --mixed | --hard] [<target>]`；`libra reset <pathspec>...`；`libra reset [<target>] [--] <pathspec>...`；`libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]`。
-- 公开参数/子命令包括：`[<target>]`、`--soft`、`--mixed`、`--hard`、`[<pathspec>...]`、`--pathspec-from-file=<file>`、`--pathspec-file-nul`、`--no-refresh`。裸路径兼容 Git：`libra reset <path>` 以 `HEAD` 为目标取消暂存；`libra reset -- <path>` 强制按路径解释 revision-like 文件名；同一 token 同时是 revision 和文件名时返回歧义错误 `LBR-CLI-002`。
+- Synopsis：`libra reset [--soft | --mixed | --hard | --merge | --keep] [<target>]`；其余 pathspec forms 不变。
+- 公开参数在既有 surface 上新增 `--merge` 与 `--keep`，均属于 Clap `mode` 互斥组且拒绝 pathspec。
 - `--hard` 工作树恢复保留 tree item mode：普通文件、可执行文件和 symlink 分别按 mode 写入；mode `120000` 的 symlink 不跟随目标、不解析目标路径，只把 blob 字节作为链接目标。Pathspec reset 只改 index，但同样保留目标 tree 的 mode，因此 symlink reset 回 index 后仍是 `120000`。
 
 
-## 还未实现的功能
+## P1-07c 保留模式
 
-| 类别 | 未完成项 | 当前处理 |
+| 模式 | 预检 | 成功行为 |
 |---|---|---|
-| 兼容差异项 | merge reset | 原始对照：git reset --merge <target>；相关参数/替代：不支持；当前说明：不适用。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
-| 兼容差异项 | keep reset | 原始对照：git reset --keep <target>；相关参数/替代：不支持；当前说明：不适用。 后续实现时需要补对应回归测试并同步兼容矩阵。 |
+| `--merge` | `target != index && worktree != index` 时拒绝 | index→target；仅更新 target-vs-HEAD 且 worktree clean 的路径；保留 unstaged 与 unmerged stages |
+| `--keep` | target-vs-HEAD 路径存在 staged/unstaged local change 时拒绝 | index→target；更新 target-vs-HEAD 路径；保留不受影响路径 local change |
+
+`perform_guarded_reset` 对 index/worktree 做精确 snapshot；side effect 或 `with_reflog` ref transaction 失败时恢复 snapshot。路径级拒绝在任何 index/worktree/ref mutation 前完成。
 
 ## 维护要求
 

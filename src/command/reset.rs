@@ -1,10 +1,10 @@
-//! Reset command covering soft/mixed/hard behaviors to move HEAD and align the index or working tree to a chosen commit.
+//! Reset command covering soft/mixed/hard/merge/keep behaviors to move HEAD and align the index or working tree to a chosen commit.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashMap, HashSet},
     fs, io,
     io::{BufRead, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use clap::Parser;
@@ -35,7 +35,7 @@ use crate::{
         output::{OutputConfig, emit_json_data},
         path,
         text::short_display_hash,
-        util,
+        util, worktree,
     },
 };
 
@@ -44,6 +44,8 @@ EXAMPLES:
     libra reset HEAD~1                    Move HEAD and reset index to the previous commit
     libra reset --soft HEAD~2             Move HEAD only, keep index and worktree
     libra reset --hard main               Reset HEAD, index, and worktree to branch 'main'
+    libra reset --merge HEAD~1            Preserve safe unstaged worktree changes
+    libra reset --keep HEAD~1             Refuse if affected paths have local changes
     libra reset src/lib.rs                 Unstage a path back to HEAD
     libra reset HEAD -- src/lib.rs        Unstage a path back to HEAD
     libra reset --pathspec-from-file=paths.txt   Unstage paths read from a file ('-' for stdin)
@@ -69,6 +71,16 @@ pub struct ResetArgs {
     /// Hard reset: move HEAD, reset index and working directory
     #[clap(long, group = "mode")]
     pub hard: bool,
+
+    /// Reset HEAD/index and update only safely replaceable working-tree paths,
+    /// preserving unstaged changes.
+    #[clap(long, group = "mode")]
+    pub merge: bool,
+
+    /// Reset HEAD/index while preserving local changes on paths changed between
+    /// HEAD and the target.
+    #[clap(long, group = "mode")]
+    pub keep: bool,
 
     /// Pathspecs to reset specific files
     #[clap(value_name = "PATH")]
@@ -102,6 +114,8 @@ enum ResetMode {
     Soft,
     Mixed,
     Hard,
+    Merge,
+    Keep,
 }
 
 impl ResetMode {
@@ -110,6 +124,8 @@ impl ResetMode {
             Self::Soft => "soft",
             Self::Mixed => "mixed",
             Self::Hard => "hard",
+            Self::Merge => "merge",
+            Self::Keep => "keep",
         }
     }
 }
@@ -228,6 +244,12 @@ enum ResetError {
     #[error("Cannot do hard reset with paths.")]
     PathspecWithHard,
 
+    #[error("Cannot do {0} reset with paths.")]
+    PathspecWithPreservingMode(&'static str),
+
+    #[error("local changes to '{path}' would be overwritten by reset --{mode}")]
+    LocalChangesWouldBeOverwritten { mode: &'static str, path: String },
+
     #[error("pathspec '{0}' did not match any file(s) known to libra")]
     PathspecNotMatched(String),
 
@@ -282,6 +304,10 @@ impl ResetError {
             Self::InvalidPathspecEncoding(_) => StableErrorCode::CliInvalidArguments,
             Self::PathspecWithSoft(_) => StableErrorCode::CliInvalidArguments,
             Self::PathspecWithHard => StableErrorCode::CliInvalidArguments,
+            Self::PathspecWithPreservingMode(_) => StableErrorCode::CliInvalidArguments,
+            Self::LocalChangesWouldBeOverwritten { .. } => {
+                StableErrorCode::ConflictOperationBlocked
+            }
             Self::PathspecNotMatched(_) => StableErrorCode::CliInvalidTarget,
             Self::PathspecSourceConflict => StableErrorCode::CliInvalidArguments,
             Self::PathspecOutsideWorkdir(_) => StableErrorCode::CliInvalidArguments,
@@ -315,6 +341,12 @@ impl ResetError {
             Self::PathspecWithHard => Some(
                 "--hard updates the working tree; omit pathspecs or use --mixed for specific paths.",
             ),
+            Self::PathspecWithPreservingMode(_) => Some(
+                "--merge/--keep operate on the whole tree; omit pathspecs or use --mixed for specific paths.",
+            ),
+            Self::LocalChangesWouldBeOverwritten { .. } => {
+                Some("commit or stash the local changes, then retry the reset.")
+            }
             Self::PathspecNotMatched(_) => Some("check the path and try again."),
             Self::PathspecSourceConflict => Some(
                 "provide pathspecs either on the command line or via --pathspec-from-file, not both.",
@@ -348,6 +380,7 @@ impl ResetError {
             Self::AmbiguousRevisionPath(_)
             | Self::PathspecWithSoft(_)
             | Self::PathspecWithHard
+            | Self::PathspecWithPreservingMode(_)
             | Self::PathspecSourceConflict
             | Self::PathspecOutsideWorkdir(_) => true,
             Self::Rollback { primary, .. } => primary.is_command_usage(),
@@ -431,6 +464,10 @@ async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
         ResetMode::Soft
     } else if args.hard {
         ResetMode::Hard
+    } else if args.merge {
+        ResetMode::Merge
+    } else if args.keep {
+        ResetMode::Keep
     } else {
         ResetMode::Mixed
     };
@@ -442,6 +479,9 @@ async fn run_reset(args: ResetArgs) -> Result<ResetExecution, ResetError> {
         }
         if matches!(mode, ResetMode::Hard) {
             return Err(ResetError::PathspecWithHard);
+        }
+        if matches!(mode, ResetMode::Merge | ResetMode::Keep) {
+            return Err(ResetError::PathspecWithPreservingMode(mode.as_str()));
         }
 
         let target_commit_id = resolve_commit(&request.target).await?;
@@ -748,6 +788,634 @@ fn read_pathspec_from_file(path: &str, nul: bool) -> Result<Vec<String>, ResetEr
     Ok(items)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResetIndexValue {
+    hash: ObjectHash,
+    mode: u32,
+}
+
+struct GuardedResetPlan {
+    target_index: Index,
+    worktree_updates: Vec<(PathBuf, Option<ResetIndexValue>)>,
+}
+
+#[derive(Debug)]
+struct IndexSnapshot {
+    existed: bool,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum WorktreeSnapshotKind {
+    Missing,
+    Directory,
+    /// Guarded modes only replace paths whose worktree entry matches stage 0,
+    /// so the existing object is an exact, bounded rollback source. Keeping its
+    /// object reference avoids buffering arbitrarily large tracked files in RAM.
+    Tracked(ResetIndexValue),
+}
+
+#[derive(Debug)]
+struct WorktreePathSnapshot {
+    path: PathBuf,
+    kind: WorktreeSnapshotKind,
+}
+
+fn validate_guarded_relative_path(path: &Path) -> Result<(), ResetError> {
+    let mut components = path.components();
+    let first = components.next();
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || !matches!(first, Some(Component::Normal(_)))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ResetError::RevisionCorrupt(format!(
+            "unsafe path '{}' in reset index/tree",
+            path.display()
+        )));
+    }
+    if matches!(first, Some(Component::Normal(name)) if name == ".libra") {
+        return Err(ResetError::RevisionCorrupt(format!(
+            "reset index/tree path '{}' targets repository metadata",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Return the first existing non-directory or symlink ancestor without ever
+/// following it. A missing ancestor is safe: guarded writes may create it.
+fn blocking_worktree_ancestor(relative_path: &Path) -> Result<Option<PathBuf>, ResetError> {
+    validate_guarded_relative_path(relative_path)?;
+    let mut cursor = util::working_dir();
+    let component_count = relative_path.components().count();
+    for component in relative_path
+        .components()
+        .take(component_count.saturating_sub(1))
+    {
+        cursor.push(component.as_os_str());
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Ok(Some(cursor));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(ResetError::WorktreeRead(format!(
+                    "failed to inspect ancestor {}: {error}",
+                    cursor.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn index_for_commit(commit_id: &ObjectHash) -> Result<Index, ResetError> {
+    let commit: Commit = load_object(commit_id)
+        .map_err(|error| object_load_error("commit", commit_id.to_string(), error.to_string()))?;
+    let tree: Tree = load_object(&commit.tree_id).map_err(|error| {
+        object_load_error("tree", commit.tree_id.to_string(), error.to_string())
+    })?;
+    let mut index = Index::new();
+    rebuild_index_from_tree_typed(&tree, &mut index, "")?;
+    Ok(index)
+}
+
+fn stage_zero_values(index: &Index) -> Result<HashMap<PathBuf, ResetIndexValue>, ResetError> {
+    let mut values = HashMap::new();
+    for path in index.tracked_files() {
+        validate_guarded_relative_path(&path)?;
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| ResetError::InvalidPathspecEncoding(path.display().to_string()))?;
+        let entry = index.get(path_str, 0).ok_or_else(|| {
+            ResetError::IndexLoad(format!(
+                "stage-0 entry disappeared for '{}'",
+                path.display()
+            ))
+        })?;
+        values.insert(
+            path,
+            ResetIndexValue {
+                hash: entry.hash,
+                mode: entry.mode,
+            },
+        );
+    }
+    Ok(values)
+}
+
+fn index_mode_to_tree_mode(mode: u32) -> Result<TreeItemMode, ResetError> {
+    match mode & 0o170000 {
+        0o100000 if mode & 0o111 != 0 => Ok(TreeItemMode::BlobExecutable),
+        0o100000 => Ok(TreeItemMode::Blob),
+        0o120000 => Ok(TreeItemMode::Link),
+        0o160000 => Ok(TreeItemMode::Commit),
+        _ => Err(ResetError::RevisionCorrupt(format!(
+            "unsupported index mode {mode:o}"
+        ))),
+    }
+}
+
+fn worktree_matches_value(
+    relative_path: &Path,
+    value: Option<ResetIndexValue>,
+) -> Result<bool, ResetError> {
+    if blocking_worktree_ancestor(relative_path)?.is_some() {
+        return Ok(value.is_none());
+    }
+    let full_path = util::working_dir().join(relative_path);
+    let Some(value) = value else {
+        return match fs::symlink_metadata(&full_path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+            Ok(_) => Ok(false),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(error) => Err(ResetError::WorktreeRead(format!(
+                "failed to inspect {}: {error}",
+                full_path.display()
+            ))),
+        };
+    };
+    if (value.mode & 0o170000) == 0o160000 {
+        return Err(ResetError::WorktreeRead(format!(
+            "submodule worktree entry '{}' is not supported by reset --merge/--keep",
+            relative_path.display()
+        )));
+    }
+    let blob: git_internal::internal::object::blob::Blob = load_object(&value.hash)
+        .map_err(|error| object_load_error("blob", value.hash.to_string(), error.to_string()))?;
+    worktree_entry_matches(&full_path, index_mode_to_tree_mode(value.mode)?, &blob.data)
+}
+
+fn unmerged_paths(index: &Index) -> HashSet<PathBuf> {
+    (1..=3)
+        .flat_map(|stage| index.tracked_entries(stage))
+        .map(|entry| PathBuf::from(&entry.name))
+        .collect()
+}
+
+fn carry_unmerged_entries(source: &Index, target: &mut Index) -> Result<(), ResetError> {
+    let paths = unmerged_paths(source);
+    for path in &paths {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| ResetError::InvalidPathspecEncoding(path.display().to_string()))?;
+        target.remove(path_str, 0);
+    }
+    for stage in 1..=3 {
+        for entry in source.tracked_entries(stage) {
+            let mut carried = IndexEntry::new_from_blob(entry.name.clone(), entry.hash, entry.size);
+            carried.mode = entry.mode;
+            carried.flags.stage = stage;
+            target.add(carried);
+        }
+    }
+    Ok(())
+}
+
+fn build_guarded_reset_plan(
+    mode: ResetMode,
+    current_index: &Index,
+    head_index: &Index,
+    mut target_index: Index,
+) -> Result<GuardedResetPlan, ResetError> {
+    let current = stage_zero_values(current_index)?;
+    let head = stage_zero_values(head_index)?;
+    let target = stage_zero_values(&target_index)?;
+    let unmerged = unmerged_paths(current_index);
+    for path in &unmerged {
+        validate_guarded_relative_path(path)?;
+    }
+    let mut paths = BTreeSet::new();
+    paths.extend(current.keys().cloned());
+    paths.extend(head.keys().cloned());
+    paths.extend(target.keys().cloned());
+
+    let untracked =
+        worktree::untracked_workdir_paths(current_index).map_err(ResetError::WorktreeRead)?;
+    let mut worktree_updates = Vec::new();
+    for path in paths {
+        if matches!(mode, ResetMode::Merge) && unmerged.contains(&path) {
+            continue;
+        }
+        if let Some(blocker) = blocking_worktree_ancestor(&path)? {
+            let blocker_path = blocker.strip_prefix(util::working_dir()).map_err(|error| {
+                ResetError::WorktreeRead(format!(
+                    "failed to normalize blocking ancestor {}: {error}",
+                    blocker.display()
+                ))
+            })?;
+            let blocker_current = current.get(blocker_path).copied();
+            let tracked_blocker_is_safely_removed = blocker_current.is_some()
+                && !target.contains_key(blocker_path)
+                && worktree_matches_value(blocker_path, blocker_current)?;
+            if !tracked_blocker_is_safely_removed {
+                return Err(ResetError::LocalChangesWouldBeOverwritten {
+                    mode: mode.as_str(),
+                    path: blocker_path.display().to_string(),
+                });
+            }
+        }
+        let current_value = current.get(&path).copied();
+        let head_value = head.get(&path).copied();
+        let target_value = target.get(&path).copied();
+        let worktree_matches_index = worktree_matches_value(&path, current_value)?;
+        let target_changes_head = target_value != head_value;
+        let should_update = match mode {
+            ResetMode::Merge => {
+                if target_value != current_value && !worktree_matches_index {
+                    return Err(ResetError::LocalChangesWouldBeOverwritten {
+                        mode: mode.as_str(),
+                        path: path.display().to_string(),
+                    });
+                }
+                target_value != current_value && worktree_matches_index
+            }
+            ResetMode::Keep => {
+                let has_local_changes = current_value != head_value || !worktree_matches_index;
+                if target_changes_head && has_local_changes {
+                    return Err(ResetError::LocalChangesWouldBeOverwritten {
+                        mode: mode.as_str(),
+                        path: path.display().to_string(),
+                    });
+                }
+                target_changes_head
+            }
+            _ => false,
+        };
+        if should_update {
+            if target_value.is_some()
+                && let Some(conflict) = untracked
+                    .iter()
+                    .find(|untracked_path| worktree::paths_conflict(untracked_path, &path))
+            {
+                return Err(ResetError::LocalChangesWouldBeOverwritten {
+                    mode: mode.as_str(),
+                    path: conflict.display().to_string(),
+                });
+            }
+            if let Some(value) = target_value {
+                let _: git_internal::internal::object::blob::Blob = load_object(&value.hash)
+                    .map_err(|error| {
+                        object_load_error("blob", value.hash.to_string(), error.to_string())
+                    })?;
+            }
+            worktree_updates.push((path, target_value));
+        }
+    }
+
+    if matches!(mode, ResetMode::Merge) {
+        carry_unmerged_entries(current_index, &mut target_index)?;
+    }
+    Ok(GuardedResetPlan {
+        target_index,
+        worktree_updates,
+    })
+}
+
+fn capture_index_snapshot() -> Result<IndexSnapshot, ResetError> {
+    let index_path = path::index();
+    match fs::read(&index_path) {
+        Ok(bytes) => Ok(IndexSnapshot {
+            existed: true,
+            bytes,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(IndexSnapshot {
+            existed: false,
+            bytes: Vec::new(),
+        }),
+        Err(error) => Err(ResetError::IndexLoad(error.to_string())),
+    }
+}
+
+fn capture_worktree_snapshot(
+    relative_path: &Path,
+    original_value: Option<ResetIndexValue>,
+) -> Result<WorktreePathSnapshot, ResetError> {
+    if let Some(blocker) = blocking_worktree_ancestor(relative_path)? {
+        if original_value.is_none() {
+            return Ok(WorktreePathSnapshot {
+                path: relative_path.to_path_buf(),
+                kind: WorktreeSnapshotKind::Missing,
+            });
+        }
+        return Err(ResetError::WorktreeRead(format!(
+            "tracked path '{}' is blocked by ancestor '{}'",
+            relative_path.display(),
+            blocker.display()
+        )));
+    }
+    let full_path = util::working_dir().join(relative_path);
+    let kind = match fs::symlink_metadata(&full_path) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            WorktreeSnapshotKind::Missing
+        }
+        Err(error) => {
+            return Err(ResetError::WorktreeRead(format!(
+                "failed to inspect {}: {error}",
+                full_path.display()
+            )));
+        }
+        Ok(metadata) if metadata.is_dir() => WorktreeSnapshotKind::Directory,
+        Ok(_) => WorktreeSnapshotKind::Tracked(original_value.ok_or_else(|| {
+            ResetError::WorktreeRead(format!(
+                "cannot snapshot untracked path '{}' for guarded reset",
+                relative_path.display()
+            ))
+        })?),
+    };
+    Ok(WorktreePathSnapshot {
+        path: relative_path.to_path_buf(),
+        kind,
+    })
+}
+
+fn remove_worktree_path(relative_path: &Path) -> Result<(), ResetError> {
+    let full_path = util::working_dir().join(relative_path);
+    match fs::symlink_metadata(&full_path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => fs::remove_file(&full_path).map_err(|error| {
+            ResetError::WorktreeRestore(format!(
+                "failed to remove {}: {error}",
+                full_path.display()
+            ))
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ResetError::WorktreeRead(format!(
+            "failed to inspect {}: {error}",
+            full_path.display()
+        ))),
+    }
+}
+
+fn write_guarded_worktree_value(
+    relative_path: &Path,
+    value: ResetIndexValue,
+) -> Result<(), ResetError> {
+    if let Some(blocker) = blocking_worktree_ancestor(relative_path)? {
+        return Err(ResetError::WorktreeRestore(format!(
+            "refusing to write '{}' through non-directory or symlink ancestor '{}'",
+            relative_path.display(),
+            blocker.display()
+        )));
+    }
+    let full_path = util::working_dir().join(relative_path);
+    let blob: git_internal::internal::object::blob::Blob = load_object(&value.hash)
+        .map_err(|error| object_load_error("blob", value.hash.to_string(), error.to_string()))?;
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            ResetError::WorktreeRestore(format!(
+                "failed to create directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    if full_path.is_dir() {
+        fs::remove_dir(&full_path).map_err(|error| {
+            ResetError::WorktreeRestore(format!(
+                "failed to replace directory {}: {error}",
+                full_path.display()
+            ))
+        })?;
+    }
+    let mode = index_mode_to_tree_mode(value.mode)?;
+    write_worktree_entry(&full_path, mode, &blob.data)?;
+    apply_worktree_blob_mode(&full_path, mode)
+}
+
+fn apply_guarded_worktree_updates(
+    updates: &[(PathBuf, Option<ResetIndexValue>)],
+) -> Result<ResetStats, ResetError> {
+    let mut deletions: Vec<_> = updates
+        .iter()
+        .filter(|(_, value)| value.is_none())
+        .map(|(path, _)| path)
+        .collect();
+    deletions.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in &deletions {
+        remove_worktree_path(path)?;
+    }
+    let warnings = remove_empty_parents_after_guarded_delete(&deletions);
+
+    let mut writes: Vec<_> = updates
+        .iter()
+        .filter_map(|(path, value)| value.map(|value| (path, value)))
+        .collect();
+    writes.sort_by_key(|(path, _)| path.components().count());
+    for (path, value) in writes {
+        write_guarded_worktree_value(path, value)?;
+    }
+    Ok(ResetStats {
+        files_restored: updates.len(),
+        warnings,
+    })
+}
+
+fn remove_empty_parents_after_guarded_delete(paths: &[&PathBuf]) -> Vec<String> {
+    let workdir = util::working_dir();
+    let mut parents: Vec<PathBuf> = paths
+        .iter()
+        .filter_map(|path| workdir.join(path).parent().map(Path::to_path_buf))
+        .collect();
+    parents.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    parents.dedup();
+
+    let mut warnings = Vec::new();
+    for mut parent in parents {
+        while parent != workdir && parent.starts_with(&workdir) {
+            if parent.file_name().and_then(|name| name.to_str()) == Some(".libra")
+                || util::check_gitignore(&workdir, &parent)
+            {
+                break;
+            }
+            match fs::remove_dir(&parent) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "failed to remove empty directory {}: {error}",
+                        parent.display()
+                    ));
+                    break;
+                }
+            }
+            let Some(next) = parent.parent() else {
+                break;
+            };
+            parent = next.to_path_buf();
+        }
+    }
+    warnings
+}
+
+fn restore_index_snapshot(snapshot: &IndexSnapshot) -> Result<(), ResetError> {
+    let index_path = path::index();
+    if snapshot.existed {
+        crate::utils::atomic_write::write_atomic(&index_path, &snapshot.bytes, true)
+            .map_err(|error| ResetError::IndexSave(error.to_string()))
+    } else if index_path.exists() {
+        fs::remove_file(&index_path).map_err(|error| ResetError::IndexSave(error.to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+fn restore_worktree_snapshots(snapshots: &[WorktreePathSnapshot]) -> Result<(), ResetError> {
+    let mut ordered: Vec<_> = snapshots.iter().collect();
+    ordered.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.path.components().count()));
+    for snapshot in &ordered {
+        if blocking_worktree_ancestor(&snapshot.path)?.is_some() {
+            // The path cannot exist without following the blocker. A shallower
+            // snapshot will clear/restore that ancestor before the write pass.
+            continue;
+        }
+        let full_path = util::working_dir().join(&snapshot.path);
+        match fs::symlink_metadata(&full_path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                if !matches!(snapshot.kind, WorktreeSnapshotKind::Directory) {
+                    fs::remove_dir(&full_path).map_err(|error| {
+                        ResetError::WorktreeRestore(format!(
+                            "failed to clear directory {} during rollback: {error}",
+                            full_path.display()
+                        ))
+                    })?;
+                }
+            }
+            Ok(_) => fs::remove_file(&full_path).map_err(|error| {
+                ResetError::WorktreeRestore(format!(
+                    "failed to clear {} during rollback: {error}",
+                    full_path.display()
+                ))
+            })?,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(error) => {
+                return Err(ResetError::WorktreeRead(format!(
+                    "failed to inspect {} during rollback: {error}",
+                    full_path.display()
+                )));
+            }
+        }
+    }
+    ordered.sort_by_key(|snapshot| snapshot.path.components().count());
+    for snapshot in ordered {
+        if let Some(blocker) = blocking_worktree_ancestor(&snapshot.path)? {
+            if matches!(snapshot.kind, WorktreeSnapshotKind::Missing) {
+                continue;
+            }
+            return Err(ResetError::WorktreeRestore(format!(
+                "refusing to restore '{}' through non-directory or symlink ancestor '{}'",
+                snapshot.path.display(),
+                blocker.display()
+            )));
+        }
+        let full_path = util::working_dir().join(&snapshot.path);
+        match &snapshot.kind {
+            WorktreeSnapshotKind::Missing => {}
+            WorktreeSnapshotKind::Directory => fs::create_dir_all(&full_path).map_err(|error| {
+                ResetError::WorktreeRestore(format!(
+                    "failed to restore directory {}: {error}",
+                    full_path.display()
+                ))
+            })?,
+            WorktreeSnapshotKind::Tracked(value) => {
+                if let Some(parent) = full_path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        ResetError::WorktreeRestore(format!(
+                            "failed to restore directory {}: {error}",
+                            parent.display()
+                        ))
+                    })?;
+                }
+                let blob: git_internal::internal::object::blob::Blob = load_object(&value.hash)
+                    .map_err(|error| {
+                        object_load_error("blob", value.hash.to_string(), error.to_string())
+                    })?;
+                let mode = index_mode_to_tree_mode(value.mode)?;
+                write_worktree_entry(&full_path, mode, &blob.data)?;
+                apply_worktree_blob_mode(&full_path, mode)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn perform_guarded_reset(
+    target_commit_id: ObjectHash,
+    old_oid: ObjectHash,
+    current_head_state: Option<Head>,
+    mode: ResetMode,
+    target_ref_str: &str,
+) -> Result<ResetStats, ResetError> {
+    let current_index =
+        Index::load(path::index()).map_err(|error| ResetError::IndexLoad(error.to_string()))?;
+    let head_index = index_for_commit(&old_oid)?;
+    let target_index = index_for_commit(&target_commit_id)?;
+    let plan = build_guarded_reset_plan(mode, &current_index, &head_index, target_index)?;
+    let index_snapshot = capture_index_snapshot()?;
+    let current_values = stage_zero_values(&current_index)?;
+    let worktree_snapshots = plan
+        .worktree_updates
+        .iter()
+        .map(|(path, _)| capture_worktree_snapshot(path, current_values.get(path).copied()))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let apply_result = (|| {
+        plan.target_index
+            .save(path::index())
+            .map_err(|error| ResetError::IndexSave(error.to_string()))?;
+        apply_guarded_worktree_updates(&plan.worktree_updates)
+    })();
+    let stats = match apply_result {
+        Ok(stats) => stats,
+        Err(error) => {
+            let worktree_rollback = restore_worktree_snapshots(&worktree_snapshots);
+            let index_rollback = restore_index_snapshot(&index_snapshot);
+            let rollback = worktree_rollback.and(index_rollback);
+            return Err(merge_reset_failure(error, rollback));
+        }
+    };
+
+    if let Some(current_head_state) = current_head_state
+        && let Err(error) = update_reset_reference(
+            current_head_state,
+            old_oid,
+            target_commit_id,
+            target_ref_str,
+        )
+        .await
+    {
+        let worktree_rollback = restore_worktree_snapshots(&worktree_snapshots);
+        let index_rollback = restore_index_snapshot(&index_snapshot);
+        let rollback = worktree_rollback.and(index_rollback);
+        return Err(merge_reset_failure(error, rollback));
+    }
+    Ok(stats)
+}
+
 /// Perform the actual reset operation based on the specified mode.
 /// Updates HEAD pointer and optionally resets index and working directory.
 async fn perform_reset(
@@ -766,6 +1434,16 @@ async fn perform_reset(
     } else {
         None
     };
+    if matches!(mode, ResetMode::Merge | ResetMode::Keep) {
+        return perform_guarded_reset(
+            target_commit_id,
+            old_oid,
+            current_head_state,
+            mode,
+            target_ref_str,
+        )
+        .await;
+    }
     let previously_tracked_paths = if matches!(mode, ResetMode::Hard) {
         tracked_paths_for_hard_reset(&old_oid)?
     } else {
@@ -821,6 +1499,11 @@ async fn apply_reset_side_effects(
             stats.files_restored = worktree_stats.files_restored;
             stats.warnings = worktree_stats.warnings;
         }
+        ResetMode::Merge | ResetMode::Keep => {
+            return Err(ResetError::WorktreeRestore(
+                "internal reset mode dispatch failure".to_string(),
+            ));
+        }
     }
     Ok(stats)
 }
@@ -846,6 +1529,9 @@ async fn rollback_reset_side_effects(
             }
             Ok(())
         }
+        ResetMode::Merge | ResetMode::Keep => Err(ResetError::WorktreeRestore(
+            "internal reset rollback mode dispatch failure".to_string(),
+        )),
     }
 }
 
@@ -1143,6 +1829,16 @@ fn worktree_entry_matches(
 
     if mode == TreeItemMode::Link {
         return Ok(false);
+    }
+
+    #[cfg(unix)]
+    if matches!(mode, TreeItemMode::Blob | TreeItemMode::BlobExecutable) {
+        use std::os::unix::fs::PermissionsExt;
+        let actual_executable = metadata.permissions().mode() & 0o111 != 0;
+        let expected_executable = mode == TreeItemMode::BlobExecutable;
+        if actual_executable != expected_executable {
+            return Ok(false);
+        }
     }
 
     match fs::read(path) {
@@ -1486,6 +2182,73 @@ fn find_tree_item_recursive(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn guarded_worktree_snapshots_restore_file_directory_transitions() {
+        let temp = tempfile::tempdir().expect("create reset snapshot test directory");
+        let _guard = crate::utils::test::ChangeDirGuard::new(temp.path());
+        crate::utils::test::setup_with_new_libra_in(temp.path()).await;
+
+        let file_data = b"original file\n".to_vec();
+        let file_blob =
+            git_internal::internal::object::blob::Blob::from_content_bytes(file_data.clone());
+        crate::command::save_object(&file_blob, &file_blob.id).expect("save rollback source blob");
+        let file_value = ResetIndexValue {
+            hash: file_blob.id,
+            mode: 0o100644,
+        };
+
+        fs::write("node", &file_data).expect("write file-form snapshot source");
+        let file_snapshots = vec![
+            capture_worktree_snapshot(Path::new("node"), Some(file_value))
+                .expect("capture tracked file"),
+            capture_worktree_snapshot(Path::new("node/child"), None)
+                .expect("a child below a file is missing, not an I/O failure"),
+        ];
+        fs::remove_file("node").expect("remove file-form source");
+        fs::create_dir("node").expect("create replacement directory");
+        fs::write("node/child", "replacement\n").expect("write replacement child");
+        restore_worktree_snapshots(&file_snapshots).expect("roll back directory to file");
+        assert_eq!(fs::read("node").expect("read restored file"), file_data);
+
+        let child_data = b"original child\n".to_vec();
+        let child_blob =
+            git_internal::internal::object::blob::Blob::from_content_bytes(child_data.clone());
+        crate::command::save_object(&child_blob, &child_blob.id)
+            .expect("save child rollback source blob");
+        let child_value = ResetIndexValue {
+            hash: child_blob.id,
+            mode: 0o100644,
+        };
+
+        fs::remove_file("node").expect("remove restored file");
+        fs::create_dir("node").expect("create directory-form source");
+        fs::write("node/child", &child_data).expect("write child-form snapshot source");
+        let directory_snapshots = vec![
+            capture_worktree_snapshot(Path::new("node"), None).expect("capture tracked directory"),
+            capture_worktree_snapshot(Path::new("node/child"), Some(child_value))
+                .expect("capture tracked child"),
+        ];
+        fs::remove_file("node/child").expect("remove child-form source");
+        fs::remove_dir("node").expect("remove source directory");
+        fs::write("node", "replacement file\n").expect("write replacement file");
+        restore_worktree_snapshots(&directory_snapshots).expect("roll back file to directory");
+        assert!(Path::new("node").is_dir());
+        assert_eq!(
+            fs::read("node/child").expect("read restored child"),
+            child_data
+        );
+    }
+
+    #[test]
+    fn guarded_reset_rejects_escaping_and_metadata_paths() {
+        assert!(validate_guarded_relative_path(Path::new("src/lib.rs")).is_ok());
+        assert!(validate_guarded_relative_path(Path::new("../outside")).is_err());
+        assert!(validate_guarded_relative_path(Path::new("./alias")).is_err());
+        assert!(validate_guarded_relative_path(Path::new(".libra/index")).is_err());
+        assert!(validate_guarded_relative_path(Path::new("/absolute")).is_err());
+    }
+
     #[test]
     fn test_reset_args_parse() {
         let args = ResetArgs::try_parse_from(["reset", "--hard", "HEAD~1"]).unwrap();
@@ -1514,6 +2277,18 @@ mod tests {
         assert_eq!(
             ResetError::PathspecWithHard.to_string(),
             "Cannot do hard reset with paths.",
+        );
+        assert_eq!(
+            ResetError::PathspecWithPreservingMode("merge").to_string(),
+            "Cannot do merge reset with paths.",
+        );
+        assert_eq!(
+            ResetError::LocalChangesWouldBeOverwritten {
+                mode: "keep",
+                path: "tracked.txt".to_string(),
+            }
+            .to_string(),
+            "local changes to 'tracked.txt' would be overwritten by reset --keep",
         );
         // {0}-prefixed variants where the inner string IS the message.
         assert_eq!(
@@ -1656,6 +2431,18 @@ mod tests {
             StableErrorCode::CliInvalidArguments,
         );
         assert_eq!(
+            ResetError::PathspecWithPreservingMode("merge").stable_code(),
+            StableErrorCode::CliInvalidArguments,
+        );
+        assert_eq!(
+            ResetError::LocalChangesWouldBeOverwritten {
+                mode: "keep",
+                path: "ignored".to_string(),
+            }
+            .stable_code(),
+            StableErrorCode::ConflictOperationBlocked,
+        );
+        assert_eq!(
             ResetError::PathspecNotMatched("ignored".to_string()).stable_code(),
             StableErrorCode::CliInvalidTarget,
         );
@@ -1700,7 +2487,13 @@ mod tests {
         assert!(args.soft);
 
         let args = ResetArgs::try_parse_from(["reset"]).unwrap();
-        assert!(!args.soft && !args.hard);
+        assert!(!args.soft && !args.hard && !args.merge && !args.keep);
+
+        let args = ResetArgs::try_parse_from(["reset", "--merge"]).unwrap();
+        assert!(args.merge);
+
+        let args = ResetArgs::try_parse_from(["reset", "--keep"]).unwrap();
+        assert!(args.keep);
     }
 
     #[test]
