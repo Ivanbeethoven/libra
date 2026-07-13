@@ -48,13 +48,54 @@ pub const TRANSCRIPT_READ_HARD_CAP_BYTES: u64 = 16 * 1024 * 1024;
 pub struct ProviderRootAuthorized(());
 
 /// Proof token that a [`TranscriptSource::Bytes`] payload came from this
-/// process's own trusted export bridge (DR-04b). Constructed only by the
-/// bridge; the writer validates the tag is bound to the session it is writing.
+/// process's own trusted export bridge (DR-04b). Fields are private and the
+/// only constructor is crate-scoped [`ExportAuthorized::issue`], which binds
+/// the tag to the exact bytes via SHA-256 — so no caller outside this crate
+/// can mint a tag, and a tag cannot be re-attached to different bytes: the
+/// writer re-verifies with [`ExportAuthorized::matches`].
 #[derive(Debug, Clone)]
 pub struct ExportAuthorized {
-    pub agent_kind: String,
-    pub session_id: String,
-    pub content_digest: String,
+    agent_kind: String,
+    session_id: String,
+    content_digest: String,
+}
+
+impl ExportAuthorized {
+    /// Mint an authorization tag for freshly exported `bytes`. Crate-scoped:
+    /// only the verified export bridge (DR-04b) may issue tags.
+    // Production caller lands with the DR-04b export bridge (M3); the digest
+    // binding is unit-tested until then.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn issue(agent_kind: &str, session_id: &str, bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            agent_kind: agent_kind.to_string(),
+            session_id: session_id.to_string(),
+            content_digest: hex::encode(Sha256::digest(bytes)),
+        }
+    }
+
+    /// Verify the tag is bound to this session AND to these exact bytes
+    /// (recomputes the SHA-256). The writer must reject the source when this
+    /// returns false.
+    pub fn matches(&self, agent_kind: &str, session_id: &str, bytes: &[u8]) -> bool {
+        use sha2::{Digest, Sha256};
+        self.agent_kind == agent_kind
+            && self.session_id == session_id
+            && self.content_digest == hex::encode(Sha256::digest(bytes))
+    }
+
+    pub fn agent_kind(&self) -> &str {
+        &self.agent_kind
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
 }
 
 /// A transcript file that has already been safely opened inside the provider
@@ -339,22 +380,26 @@ mod tests {
     }
 
     #[test]
-    fn bytes_source_carries_export_tag() {
-        // The `Bytes` variant cannot be constructed without an `ExportAuthorized`
-        // tag — there is no way to forge a trusted byte source.
-        let src = TranscriptSource::Bytes {
-            bytes: b"exported".to_vec(),
-            auth: ExportAuthorized {
-                agent_kind: "opencode".into(),
-                session_id: "opencode__abc".into(),
-                content_digest: "deadbeef".into(),
-            },
-        };
+    fn bytes_source_carries_digest_bound_export_tag() {
+        // `ExportAuthorized` can only be minted crate-side via `issue`, which
+        // binds the tag to the exact bytes; `matches` re-verifies session AND
+        // digest, so a tag cannot authorize different bytes.
+        let bytes = b"exported".to_vec();
+        let auth = ExportAuthorized::issue("opencode", "opencode__abc", &bytes);
+        assert!(auth.matches("opencode", "opencode__abc", &bytes));
+        assert!(
+            !auth.matches("opencode", "opencode__abc", b"tampered"),
+            "digest binding must reject different bytes"
+        );
+        assert!(
+            !auth.matches("opencode", "opencode__other", &bytes),
+            "session binding must reject a different session"
+        );
+        let src = TranscriptSource::Bytes { bytes, auth };
         match src {
             TranscriptSource::Bytes { bytes, auth } => {
-                assert_eq!(bytes, b"exported");
-                assert_eq!(auth.agent_kind, "opencode");
-                assert_eq!(auth.session_id, "opencode__abc");
+                assert!(auth.matches("opencode", "opencode__abc", &bytes));
+                assert_eq!(auth.agent_kind(), "opencode");
             }
             _ => panic!("expected Bytes source"),
         }

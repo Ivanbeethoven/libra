@@ -1004,9 +1004,10 @@ async fn write_committed_checkpoint(
                     Some(file.read_bounded(TRANSCRIPT_READ_HARD_CAP_BYTES))
                 }
                 Ok(Some(TranscriptSource::Bytes { bytes, auth })) => {
-                    // Only trust export bytes whose tag is bound to the session
-                    // being written; a mismatched tag is treated as no source.
-                    if auth.session_id == libra_session_id && auth.agent_kind == agent_kind {
+                    // Only trust export bytes whose tag is bound to BOTH the
+                    // session being written and these exact bytes (SHA-256
+                    // recheck); anything else is treated as no source.
+                    if auth.matches(agent_kind, libra_session_id, &bytes) {
                         Some(Ok(bytes))
                     } else {
                         Some(Ok(Vec::new()))
@@ -1058,7 +1059,11 @@ async fn write_committed_checkpoint(
     if agent_kind == "claude_code"
         && let Some(raw) = transcript_raw_for_extraction.as_deref()
     {
-        let turns = normalize_claude_transcript(raw);
+        let mut turns = normalize_claude_transcript(raw);
+        // coverage-v1 §1 pipeline order: typed normalize → typed-field
+        // redact → canonicalize/digest. Claims must never hash (or store
+        // digests of) unredacted content.
+        crate::internal::ai::observed_agents::coverage::redact_turns(&mut turns);
         if !turns.is_empty() {
             let owner = format!("live:{}:{}", std::process::id(), uuid::Uuid::new_v4());
             let now_ms = Utc::now().timestamp_millis();

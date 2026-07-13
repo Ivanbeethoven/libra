@@ -1397,12 +1397,33 @@ async fn build_class2_plan(
         .clone()
         .or_else(|| rc.scope_trailer.clone())
         .unwrap_or_else(|| "committed".to_string());
-    if scope != "committed" && scope != "subagent" {
-        return Ok((
-            format!("{base}; scope '{scope}' is not auto-repairable — manual review"),
-            RepairPlan::Manual,
-        ));
-    }
+    // Shared classification boundary (plan-20260713 DR-05c-0): doctor and
+    // claim recovery both rebuild catalog rows through
+    // `rebuild_catalog_row_from_traces_ref`, so an unknown scope fails
+    // closed identically everywhere.
+    let rebuilt = history::rebuild_catalog_row_from_traces_ref(history::RebuildCatalogRowInputs {
+        scope: scope.clone(),
+        checkpoint_id: checkpoint_id.to_string(),
+        session_id: metadata.session_id.clone(),
+        parent_commit: rc.parent_commit_trailer.clone(),
+        parent_checkpoint_id: metadata.parent_checkpoint_id.clone(),
+        subagent_session_id: metadata.subagent_session_id.clone(),
+        tool_use_id: metadata.tool_use_id.clone(),
+        description: metadata.description.clone(),
+        tree_oid: rc.root_tree.clone(),
+        metadata_blob_oid: metadata_blob.to_string(),
+        traces_commit: rc.commit.clone(),
+        created_at: metadata.created_at,
+    });
+    let rebuilt = match rebuilt {
+        Ok(rebuilt) => rebuilt,
+        Err(_) => {
+            return Ok((
+                format!("{base}; scope '{scope}' is not auto-repairable — manual review"),
+                RepairPlan::Manual,
+            ));
+        }
+    };
     if !session_exists(conn, &metadata.session_id).await? {
         return Ok((
             format!(
@@ -1412,36 +1433,56 @@ async fn build_class2_plan(
             RepairPlan::Manual,
         ));
     }
-    if scope == "subagent" {
-        return Ok((
+    match rebuilt {
+        history::RebuiltCatalogRow::Subagent {
+            checkpoint_id,
+            session_id,
+            parent_commit,
+            parent_checkpoint_id,
+            subagent_session_id,
+            tool_use_id,
+            description,
+            tree_oid,
+            metadata_blob_oid,
+            traces_commit,
+            created_at,
+        } => Ok((
             format!("{base}; scope='subagent' row can be rebuilt from the commit's metadata.json"),
             RepairPlan::InsertSubagentCatalogRow {
-                checkpoint_id: checkpoint_id.to_string(),
-                session_id: metadata.session_id,
-                parent_commit: rc.parent_commit_trailer.clone(),
-                parent_checkpoint_id: metadata.parent_checkpoint_id,
-                subagent_session_id: metadata.subagent_session_id,
-                tool_use_id: metadata.tool_use_id,
-                description: metadata.description,
-                tree_oid: rc.root_tree.clone(),
-                metadata_blob_oid: metadata_blob.to_string(),
-                traces_commit: rc.commit.clone(),
-                created_at: metadata.created_at,
+                checkpoint_id,
+                session_id,
+                parent_commit,
+                parent_checkpoint_id,
+                subagent_session_id,
+                tool_use_id,
+                description,
+                tree_oid,
+                metadata_blob_oid,
+                traces_commit,
+                created_at,
             },
-        ));
+        )),
+        history::RebuiltCatalogRow::Committed {
+            checkpoint_id,
+            session_id,
+            parent_commit,
+            tree_oid,
+            metadata_blob_oid,
+            traces_commit,
+            created_at,
+        } => Ok((
+            format!("{base}; row can be rebuilt from the commit's metadata.json"),
+            RepairPlan::InsertCatalogRow {
+                checkpoint_id,
+                session_id,
+                parent_commit,
+                tree_oid,
+                metadata_blob_oid,
+                traces_commit,
+                created_at,
+            },
+        )),
     }
-    Ok((
-        format!("{base}; row can be rebuilt from the commit's metadata.json"),
-        RepairPlan::InsertCatalogRow {
-            checkpoint_id: checkpoint_id.to_string(),
-            session_id: metadata.session_id,
-            parent_commit: rc.parent_commit_trailer.clone(),
-            tree_oid: rc.root_tree.clone(),
-            metadata_blob_oid: metadata_blob.to_string(),
-            traces_commit: rc.commit.clone(),
-            created_at: metadata.created_at,
-        },
-    ))
 }
 
 /// Walk `refs/libra/traces` first-parent and return checkpoint_id →

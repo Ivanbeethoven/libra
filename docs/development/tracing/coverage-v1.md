@@ -25,10 +25,17 @@ bounded raw read / export pipe
   → persist
 ```
 
-Raw bytes are parsed but never persisted; only the typed, redacted, allowlist
-projection may be re-encoded into storage. **Redaction runs before
+Raw bytes are parsed but never persisted un-redacted; **redaction runs before
 canonicalization**, so the digest is computed over the redacted content — the
 same secret-free bytes every path can reproduce.
+
+Persistence scope note (plan ADR-DR-04/DR-12): the allowlist-only re-encoding
+rule governs (a) coverage digests/claims on every path, and (b) the per-turn
+projections persisted by the import (M4) and export (M3) writers. The LIVE
+checkpoint blob keeps its pre-existing baseline — the whole transcript passed
+through the generic redactor (unknown fields retained in redacted form) — an
+explicitly granted compatibility exception, accounted in the plan's risk
+register; removing it is out of scope for this plan.
 
 ## 2. Turn grouping and `logical_turn_key`
 
@@ -67,8 +74,11 @@ source order. Exactly four record shapes exist in v1:
   file paths, session/agent identifiers, cwd. Different sources expose these
   with different fidelity; including them would create false conflicts
   (ADR-DR-12).
-- **Unknown fields are dropped**, both from the digest and from persistence.
-  No "raw fragment" passthrough.
+- **Unknown fields are dropped** from the digest (all paths) and from the
+  per-turn projections persisted by the import (M4) and export (M3) writers.
+  No "raw fragment" passthrough in either. The LIVE whole-blob baseline is
+  the one documented exception (§1 persistence scope note): unknown fields
+  survive there in generically-redacted form.
 
 ## 4. Canonical JSON form (JCS-equivalent for the v1 value domain)
 

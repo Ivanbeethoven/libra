@@ -8,10 +8,13 @@
 //! idempotence the `agent_coverage_claim` gate depends on.
 //!
 //! Strictness notes:
-//! - [`CanonValue`] parsing rejects duplicate object keys and non-integer
-//!   numbers (coverage-v1.md §4.5/§4.6) instead of silently last-wins /
-//!   lossy-float behavior — different producers would otherwise disagree on
-//!   the digest for the same malformed source.
+//! - [`CanonValue`] parsing rejects duplicate object keys (coverage-v1.md
+//!   §4.6) instead of silent last-wins — different producers would otherwise
+//!   disagree on the digest for the same malformed source. Non-integer
+//!   numbers parse as [`CanonValue::Float`] so PROVENANCE fields (timestamps,
+//!   usage) never poison a turn; a float in a SEMANTIC position (tool input)
+//!   marks the turn `incomplete` and is sanitized before canonicalization
+//!   (coverage-v1.md §4.5).
 //! - Canonical bytes use minimal escaping, raw UTF-8 and recursive key
 //!   sorting by Unicode code point (coverage-v1.md §4).
 
@@ -31,6 +34,13 @@ pub enum CanonValue {
     Null,
     Bool(bool),
     Int(i64),
+    /// Fractional / beyond-i64 number, stored as raw `f64` bits. Tolerated in
+    /// PROVENANCE positions (timestamps, usage counters in the line envelope)
+    /// so a harmless non-integer field never poisons a turn; a `Float` inside
+    /// a SEMANTIC position (tool input) marks the turn `incomplete` and is
+    /// sanitized to `Null` before canonicalization (coverage-v1.md §4.5 —
+    /// non-integers never enter a digest as numbers).
+    Float(u64),
     Str(String),
     Array(Vec<CanonValue>),
     Object(BTreeMap<String, CanonValue>),
@@ -90,15 +100,13 @@ impl<'de> Deserialize<'de> for CanonValue {
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<CanonValue, E> {
-                i64::try_from(v)
+                Ok(i64::try_from(v)
                     .map(CanonValue::Int)
-                    .map_err(|_| E::custom("coverage v1 rejects integers beyond i64 range"))
+                    .unwrap_or_else(|_| CanonValue::Float((v as f64).to_bits())))
             }
 
-            fn visit_f64<E: de::Error>(self, _v: f64) -> Result<CanonValue, E> {
-                Err(E::custom(
-                    "coverage v1 rejects non-integer numbers in semantic positions",
-                ))
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<CanonValue, E> {
+                Ok(CanonValue::Float(v.to_bits()))
             }
 
             fn visit_str<E>(self, v: &str) -> Result<CanonValue, E> {
@@ -172,6 +180,11 @@ fn write_canon_value(out: &mut Vec<u8>, value: &CanonValue) {
         CanonValue::Bool(true) => out.extend_from_slice(b"true"),
         CanonValue::Bool(false) => out.extend_from_slice(b"false"),
         CanonValue::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
+        // Defensive: semantic positions are float-sanitized before
+        // canonicalization (splitter marks the turn incomplete and nulls the
+        // value); an unexpected leftover serializes as null, never as a
+        // platform-dependent decimal rendering.
+        CanonValue::Float(_) => out.extend_from_slice(b"null"),
         CanonValue::Str(s) => write_canon_string(out, s),
         CanonValue::Array(items) => {
             out.push(b'[');
@@ -324,6 +337,27 @@ impl NormalizedTurn {
     }
 }
 
+/// Does this (semantic-position) value contain any fractional number?
+fn contains_float(value: &CanonValue) -> bool {
+    match value {
+        CanonValue::Float(_) => true,
+        CanonValue::Array(items) => items.iter().any(contains_float),
+        CanonValue::Object(map) => map.values().any(contains_float),
+        _ => false,
+    }
+}
+
+/// Replace every `Float` with `Null` so canonical bytes stay well-defined
+/// (the enclosing turn is already marked `incomplete` by the caller).
+fn sanitize_floats(value: &mut CanonValue) {
+    match value {
+        CanonValue::Float(_) => *value = CanonValue::Null,
+        CanonValue::Array(items) => items.iter_mut().for_each(sanitize_floats),
+        CanonValue::Object(map) => map.values_mut().for_each(sanitize_floats),
+        _ => {}
+    }
+}
+
 /// Validate a provider-supplied turn/message id for use as a
 /// `logical_turn_key` (coverage-v1.md §2): non-empty, ≤ 64 chars, restricted
 /// alphabet. Anything else falls back to the ordinal key.
@@ -342,21 +376,49 @@ fn ordinal_key(ordinal: usize) -> String {
 /// Extract plain text out of a strict message `content` value (string form or
 /// the block-array form with `{"type":"text","text":…}` entries), joining
 /// multiple text blocks with `\n` in source order (coverage-v1.md §3).
-fn canon_content_text(content: &CanonValue) -> String {
+/// Text extraction WITH semantic type validation (coverage-v1.md §3/§4.5):
+/// a semantic text position holding a non-string (number, float, object, …)
+/// is a faithfulness failure — the caller must mark the turn `incomplete`
+/// instead of silently defaulting the value away.
+struct ExtractedText {
+    text: String,
+    type_violation: bool,
+}
+
+fn extract_content_text(content: &CanonValue) -> ExtractedText {
     match content {
-        CanonValue::Str(text) => text.clone(),
-        CanonValue::Array(blocks) => blocks
-            .iter()
-            .filter_map(|block| {
+        CanonValue::Str(text) => ExtractedText {
+            text: text.clone(),
+            type_violation: false,
+        },
+        CanonValue::Array(blocks) => {
+            let mut parts: Vec<&str> = Vec::new();
+            let mut type_violation = false;
+            for block in blocks {
                 if block.get("type").and_then(CanonValue::as_str) == Some("text") {
-                    block.get("text").and_then(CanonValue::as_str)
-                } else {
-                    None
+                    match block.get("text") {
+                        Some(CanonValue::Str(text)) => parts.push(text),
+                        // A `text` block whose payload is not a string —
+                        // wrong-typed semantic content.
+                        Some(_) | None => type_violation = true,
+                    }
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+            }
+            ExtractedText {
+                text: parts.join("\n"),
+                type_violation,
+            }
+        }
+        // Content that is neither a string nor a block array is wrong-typed
+        // semantic content, not merely "no text".
+        CanonValue::Null => ExtractedText {
+            text: String::new(),
+            type_violation: false,
+        },
+        _ => ExtractedText {
+            text: String::new(),
+            type_violation: true,
+        },
     }
 }
 
@@ -429,59 +491,105 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
         let Some(content) = message.get("content") else {
             continue;
         };
+        // "Present but wrong-typed" optional string field (call_id / name /
+        // tool_use_id): a semantic type violation, distinct from absent.
+        fn opt_str_field(block: &CanonValue, key: &str, violation: &mut bool) -> Option<String> {
+            match block.get(key) {
+                Some(CanonValue::Str(s)) => Some(s.clone()),
+                Some(CanonValue::Null) | None => None,
+                Some(_) => {
+                    *violation = true;
+                    None
+                }
+            }
+        }
+
         match entry_type {
             "user" => {
                 if user_content_has_human_text(content) {
+                    let extracted = extract_content_text(content);
                     let turn = open_turn(&mut turns, uuid);
+                    if extracted.type_violation {
+                        turn.completeness = Completeness::Incomplete;
+                    }
                     turn.records.push(SemanticRecord::User {
-                        text: canon_content_text(content),
+                        text: extracted.text,
                     });
                     // Rare but possible: the same user line also carries
                     // tool_result blocks; fall through to collect them below.
+                } else if extract_content_text(content).type_violation {
+                    // Wrong-typed user content (e.g. a number where text
+                    // belongs): poison rather than silently dropping the
+                    // record.
+                    current_or_open(&mut turns).completeness = Completeness::Incomplete;
                 }
                 if let CanonValue::Array(blocks) = content {
                     for block in blocks {
                         if block.get("type").and_then(CanonValue::as_str) == Some("tool_result") {
-                            let call_id = block
-                                .get("tool_use_id")
-                                .and_then(CanonValue::as_str)
-                                .map(str::to_string);
+                            let mut violation = false;
+                            let call_id = opt_str_field(block, "tool_use_id", &mut violation);
                             let result_content = block
                                 .get("content")
-                                .map(canon_content_text)
+                                .map(|content| {
+                                    let extracted = extract_content_text(content);
+                                    violation |= extracted.type_violation;
+                                    extracted.text
+                                })
                                 .unwrap_or_default();
-                            let is_error =
-                                block.get("is_error").and_then(CanonValue::as_bool) == Some(true);
-                            current_or_open(&mut turns)
-                                .records
-                                .push(SemanticRecord::ToolResult {
-                                    call_id,
-                                    content: result_content,
-                                    is_error,
-                                });
+                            let is_error = match block.get("is_error") {
+                                Some(CanonValue::Bool(b)) => *b,
+                                Some(CanonValue::Null) | None => false,
+                                Some(_) => {
+                                    // Present but not a bool — wrong-typed
+                                    // semantic field.
+                                    violation = true;
+                                    false
+                                }
+                            };
+                            let turn = current_or_open(&mut turns);
+                            if violation {
+                                turn.completeness = Completeness::Incomplete;
+                            }
+                            turn.records.push(SemanticRecord::ToolResult {
+                                call_id,
+                                content: result_content,
+                                is_error,
+                            });
                         }
                     }
                 }
             }
             "assistant" => {
                 let turn = current_or_open(&mut turns);
-                let text = canon_content_text(content);
-                if !text.is_empty() {
-                    turn.records.push(SemanticRecord::Assistant { text });
+                let extracted = extract_content_text(content);
+                if extracted.type_violation {
+                    turn.completeness = Completeness::Incomplete;
+                }
+                if !extracted.text.is_empty() {
+                    turn.records.push(SemanticRecord::Assistant {
+                        text: extracted.text,
+                    });
                 }
                 if let CanonValue::Array(blocks) = content {
                     for block in blocks {
                         if block.get("type").and_then(CanonValue::as_str) == Some("tool_use") {
-                            let name = block
-                                .get("name")
-                                .and_then(CanonValue::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            let call_id = block
-                                .get("id")
-                                .and_then(CanonValue::as_str)
-                                .map(str::to_string);
-                            let input = block.get("input").cloned().unwrap_or(CanonValue::Null);
+                            let mut violation = false;
+                            let name =
+                                opt_str_field(block, "name", &mut violation).unwrap_or_default();
+                            let call_id = opt_str_field(block, "id", &mut violation);
+                            let mut input = block.get("input").cloned().unwrap_or(CanonValue::Null);
+                            // coverage-v1.md §4.5: fractional numbers in a
+                            // SEMANTIC position never enter a digest — the
+                            // turn fails closed to `incomplete` and the value
+                            // is sanitized so canonical bytes stay defined.
+                            if contains_float(&input) {
+                                violation = true;
+                                sanitize_floats(&mut input);
+                            }
+                            let turn = current_or_open(&mut turns);
+                            if violation {
+                                turn.completeness = Completeness::Incomplete;
+                            }
                             turn.records.push(SemanticRecord::ToolCall {
                                 call_id,
                                 input,
@@ -510,6 +618,50 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
         }
     }
     turns
+}
+
+/// Redact every allowlisted string field of the normalized turns IN PLACE —
+/// coverage-v1.md §1 pins the order: typed normalize → **typed-field redact**
+/// → canonicalize/digest. Digests are therefore always computed over
+/// secret-free content, and every path (live/import/export) applying the
+/// same default redactor reproduces the same digest.
+pub fn redact_turns(turns: &mut [NormalizedTurn]) {
+    let redactor = crate::internal::ai::observed_agents::Redactor::new_default();
+    let redact_string = |s: &mut String| {
+        let (bytes, _report) = redactor.redact(s.as_bytes());
+        *s = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+    };
+    fn redact_value(value: &mut CanonValue, redact_string: &impl Fn(&mut String)) {
+        match value {
+            CanonValue::Str(s) => redact_string(s),
+            CanonValue::Array(items) => {
+                for item in items {
+                    redact_value(item, redact_string);
+                }
+            }
+            CanonValue::Object(map) => {
+                for item in map.values_mut() {
+                    redact_value(item, redact_string);
+                }
+            }
+            _ => {}
+        }
+    }
+    for turn in turns {
+        for record in &mut turn.records {
+            match record {
+                SemanticRecord::User { text } | SemanticRecord::Assistant { text } => {
+                    redact_string(text);
+                }
+                SemanticRecord::ToolCall { input, .. } => {
+                    redact_value(input, &redact_string);
+                }
+                SemanticRecord::ToolResult { content, .. } => {
+                    redact_string(content);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -583,15 +735,146 @@ mod tests {
         );
     }
 
+    /// Codex M1 R2 blocker 1: wrong-typed SEMANTIC fields (assistant text
+    /// block carrying a number, tool_result is_error as a string, wrong-typed
+    /// user content) must mark the turn `incomplete`, never silently default
+    /// to a complete digest.
+    #[test]
+    fn wrong_typed_semantic_fields_fail_the_turn_closed() {
+        // Assistant text block whose payload is a float.
+        let t = concat!(
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":1.5}]}}"#,
+        );
+        let turns = normalize_claude_transcript(t.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].completeness, Completeness::Incomplete);
+
+        // tool_result is_error present but not a bool.
+        let t = concat!(
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"go"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"x","input":{}}]}}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"ok","is_error":"yes"}]}}"#,
+        );
+        let turns = normalize_claude_transcript(t.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].completeness, Completeness::Incomplete);
+
+        // Wrong-typed user content (number instead of text/blocks).
+        let t = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":42}}"#;
+        let turns = normalize_claude_transcript(t.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].completeness, Completeness::Incomplete);
+
+        // tool_use name wrong-typed.
+        let t = concat!(
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"go"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":7,"input":{}}]}}"#,
+        );
+        let turns = normalize_claude_transcript(t.as_bytes());
+        assert_eq!(turns[0].completeness, Completeness::Incomplete);
+    }
+
+    /// Codex M1 R2: redact-before-digest proof. Two transcripts identical
+    /// except for DIFFERENT embedded secrets must redact to the same
+    /// projection and therefore the same digest; and that digest must differ
+    /// from the digest of the unredacted turns (the secret never reaches the
+    /// digest input).
+    #[test]
+    fn different_secrets_redact_to_same_digest() {
+        let make = |key: &str| {
+            format!(
+                concat!(
+                    r#"{{"type":"user","uuid":"u1","message":{{"role":"user","content":"use {}"}}}}"#,
+                    "\n",
+                    r#"{{"type":"assistant","uuid":"a1","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}]}}}}"#,
+                ),
+                key
+            )
+        };
+        // Two distinct AWS-style access key ids (redactor family AKIA…).
+        let a = make("AKIAAAAAAAAAAAAAAAAA");
+        let b = make("AKIABBBBBBBBBBBBBBBB");
+
+        let mut turns_a = normalize_claude_transcript(a.as_bytes());
+        let unredacted_digest = turns_a[0].digest_hex();
+        redact_turns(&mut turns_a);
+        let mut turns_b = normalize_claude_transcript(b.as_bytes());
+        redact_turns(&mut turns_b);
+
+        assert_eq!(
+            turns_a[0].digest_hex(),
+            turns_b[0].digest_hex(),
+            "different secrets must redact to the same digest"
+        );
+        assert_ne!(
+            turns_a[0].digest_hex(),
+            unredacted_digest,
+            "the secret must never reach the digest input"
+        );
+        // And the redacted text no longer contains either key.
+        match &turns_a[0].records[0] {
+            SemanticRecord::User { text } => {
+                assert!(!text.contains("AKIAAAAAAAAAAAAAAAAA"), "got: {text}");
+            }
+            other => panic!("expected user record, got {other:?}"),
+        }
+    }
+
     #[test]
     fn canon_parse_rejects_duplicate_keys() {
         assert!(parse_canon_value(br#"{"a":1,"a":2}"#).is_err());
     }
 
     #[test]
-    fn canon_parse_rejects_floats() {
-        assert!(parse_canon_value(br#"{"a":1.5}"#).is_err());
-        assert!(parse_canon_value(br#"{"a":18446744073709551615}"#).is_err());
+    fn canon_parse_tolerates_floats_as_provenance() {
+        // Floats parse (they are legal in provenance positions) …
+        let v = parse_canon_value(br#"{"a":1.5}"#).expect("floats parse");
+        assert!(contains_float(&v));
+        let big = parse_canon_value(br#"{"a":18446744073709551615}"#).expect("big ints parse");
+        assert!(contains_float(&big));
+    }
+
+    /// A fractional number in a PROVENANCE position (line envelope, e.g. a
+    /// summary timestamp) must NOT poison the turn; one in a SEMANTIC
+    /// position (tool input) fails that turn closed to `incomplete`.
+    #[test]
+    fn float_positions_provenance_tolerated_semantic_fails_closed() {
+        let transcript = [
+            r#"{"type":"summary","timestamp":1.5,"summary":"ignored"}"#,
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"hi"},"cost":0.25}"#,
+            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"usage":{"cost":1.5}}"#,
+        ]
+        .join("\n");
+        let turns = normalize_claude_transcript(transcript.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].completeness,
+            Completeness::Complete,
+            "provenance floats must not poison the turn"
+        );
+        // Identical semantic content → golden vector 1 digest.
+        assert_eq!(
+            turns[0].digest_hex(),
+            "df991cd9a1ac5c12c32b8cdf0254c3dfbbf26485b505a5afc83a90d1128ebc54"
+        );
+
+        let semantic_float = concat!(
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"calc","input":{"x":1.5}}]}}"#,
+        );
+        let turns = normalize_claude_transcript(semantic_float.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].completeness,
+            Completeness::Incomplete,
+            "semantic floats fail the turn closed"
+        );
     }
 
     #[test]
