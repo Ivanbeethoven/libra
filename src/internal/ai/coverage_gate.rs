@@ -530,3 +530,235 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::Database;
+
+    use super::*;
+    use crate::internal::{
+        ai::observed_agents::SemanticRecord, db::migration::run_builtin_migrations,
+    };
+
+    async fn gate_db() -> DatabaseConnection {
+        let conn = Database::connect("sqlite::memory:").await.expect("mem db");
+        // The migration set assumes the bootstrap schema (ai_thread etc.)
+        // exists; this unit fixture only needs the capture/coverage tables,
+        // so relax FK enforcement instead of replaying the full bootstrap.
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "PRAGMA foreign_keys = OFF".to_string(),
+        ))
+        .await
+        .expect("pragma");
+        run_builtin_migrations(&conn).await.expect("migrations");
+        // FK target for claims.
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, redaction_report, started_at, last_event_at, schema_version
+             ) VALUES ('claude_code__s1', 'claude_code', 's1', 'active', '/tmp',
+                       '{}', '{}', 0, 0, 1)"
+                .to_string(),
+        ))
+        .await
+        .expect("seed session");
+        conn
+    }
+
+    fn turn(key: &str, text: &str, completeness: Completeness) -> NormalizedTurn {
+        NormalizedTurn {
+            logical_turn_key: key.to_string(),
+            ordinal: 0,
+            completeness,
+            records: vec![SemanticRecord::User {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    async fn claim_row(conn: &DatabaseConnection, key: &str) -> (String, i64, Option<i64>) {
+        let row = conn
+            .query_one(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT state, revision, fence_token FROM agent_coverage_claim \
+                 WHERE logical_turn_key = ?",
+                [key.into()],
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        (
+            row.try_get_by("state").unwrap(),
+            row.try_get_by("revision").unwrap(),
+            row.try_get_by("fence_token").ok().flatten(),
+        )
+    }
+
+    /// Simulate the in-transaction commit of a reservation (what
+    /// `LiveClaimCommitPlan::apply` does), without building objects.
+    async fn commit_reserved(
+        conn: &DatabaseConnection,
+        session_id: &str,
+        owner: &str,
+        claim: &ReservedTurnClaim,
+        checkpoint_id: &str,
+    ) -> Result<()> {
+        let txn = sea_orm::TransactionTrait::begin(conn).await?;
+        txn.execute(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "INSERT OR IGNORE INTO agent_checkpoint (
+                checkpoint_id, session_id, scope, parent_commit, tree_oid,
+                metadata_blob_oid, traces_commit, created_at
+             ) VALUES (?, ?, 'committed', NULL, 't', 'm', ?, 0)",
+            [
+                checkpoint_id.into(),
+                session_id.into(),
+                format!("commit-{checkpoint_id}").into(),
+            ],
+        ))
+        .await?;
+        let plan = LiveClaimCommitPlan {
+            session_id: session_id.to_string(),
+            checkpoint_id: checkpoint_id.to_string(),
+            owner: owner.to_string(),
+            parent_commit: None,
+            created_at: 0,
+            now_ms: 1,
+            claims: vec![claim.clone()],
+        };
+        let ctx = TracesCommitCtx {
+            commit_hash: format!("commit-{checkpoint_id}"),
+            tree_oid: "t".to_string(),
+            metadata_blob_oid: "m".to_string(),
+        };
+        plan.apply(&txn, &ctx).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// live_takeover_increments_fence_and_blocks_(import|stale)_ref_cas:
+    /// an expired reservation is taken over with a HIGHER fence; the stale
+    /// holder's commit then fails its fence check and must roll back.
+    #[tokio::test]
+    async fn live_takeover_increments_fence_and_blocks_stale_commit() {
+        let conn = gate_db().await;
+        let session = "claude_code__s1";
+        let t = turn("u1", "hi", Completeness::Complete);
+
+        // Stale writer reserves at now=0 (lease expires at 60_000).
+        let stale = reserve_live_turn_claims(&conn, session, &[t.clone()], "stale-owner", 0)
+            .await
+            .expect("reserve");
+        assert_eq!(stale.reserved.len(), 1);
+        let stale_claim = stale.reserved[0].clone();
+        assert_eq!(stale_claim.fence_token, 1);
+
+        // Lease expired: a new writer takes over with fence 2.
+        let fresh = reserve_live_turn_claims(&conn, session, &[t.clone()], "fresh-owner", 100_000)
+            .await
+            .expect("takeover");
+        assert_eq!(fresh.reserved.len(), 1);
+        assert_eq!(fresh.reserved[0].fence_token, 2);
+
+        // The stale holder's commit must fail closed (fence mismatch).
+        let err = commit_reserved(&conn, session, "stale-owner", &stale_claim, "cp-stale")
+            .await
+            .expect_err("stale fence must be rejected");
+        assert!(err.to_string().contains("fenced out"), "got: {err:#}");
+        let (state, revision, fence) = claim_row(&conn, "u1").await;
+        assert_eq!(state, "reserved_live");
+        assert_eq!(revision, 0, "stale commit must not advance the claim");
+        assert_eq!(fence, Some(2));
+
+        // The fresh holder commits fine.
+        commit_reserved(
+            &conn,
+            session,
+            "fresh-owner",
+            &fresh.reserved[0],
+            "cp-fresh",
+        )
+        .await
+        .expect("fresh commit");
+        let (state, revision, _) = claim_row(&conn, "u1").await;
+        assert_eq!(state, "catalog_committed");
+        assert_eq!(revision, 1);
+    }
+
+    /// ordinal_source_reorder_conflicts: a committed complete turn whose
+    /// content changes (e.g. source reorder under an ordinal key) parks the
+    /// claim as `conflicted` — never silently re-covered.
+    #[tokio::test]
+    async fn committed_complete_content_change_conflicts() {
+        let conn = gate_db().await;
+        let session = "claude_code__s1";
+        let original = turn("ordinal:0", "first", Completeness::Complete);
+        let reserved = reserve_live_turn_claims(&conn, session, &[original], "w1", 0)
+            .await
+            .expect("reserve");
+        commit_reserved(&conn, session, "w1", &reserved.reserved[0], "cp1")
+            .await
+            .expect("commit");
+
+        // Reordered/rewritten source: same logical key, different complete
+        // content.
+        let reordered = turn("ordinal:0", "second", Completeness::Complete);
+        let outcome = reserve_live_turn_claims(&conn, session, &[reordered], "w2", 1_000)
+            .await
+            .expect("reserve conflict");
+        assert!(outcome.reserved.is_empty());
+        assert_eq!(outcome.conflicted, 1);
+        let (state, revision, _) = claim_row(&conn, "ordinal:0").await;
+        assert_eq!(state, "conflicted");
+        assert_eq!(revision, 1, "committed revision is preserved for doctor");
+    }
+
+    /// shared_live_snapshot_upgrade_keeps_other_turns_visible (claim level):
+    /// upgrading ONE turn of a multi-turn snapshot leaves the other turns'
+    /// committed claims and revisions untouched.
+    #[tokio::test]
+    async fn upgrading_one_turn_leaves_other_claims_untouched() {
+        let conn = gate_db().await;
+        let session = "claude_code__s1";
+        let t1 = turn("u1", "one", Completeness::Complete);
+        let t2 = turn("u2", "two", Completeness::Incomplete);
+
+        let first = reserve_live_turn_claims(&conn, session, &[t1.clone(), t2], "w1", 0)
+            .await
+            .expect("reserve both");
+        assert_eq!(first.reserved.len(), 2);
+        for claim in &first.reserved {
+            commit_reserved(&conn, session, "w1", claim, "cp1")
+                .await
+                .expect("commit");
+        }
+
+        // Second snapshot: t1 unchanged (skip), t2 now complete (upgrade).
+        let t2_complete = turn("u2", "two done", Completeness::Complete);
+        let second = reserve_live_turn_claims(&conn, session, &[t1, t2_complete], "w2", 1_000)
+            .await
+            .expect("reserve upgrade");
+        assert_eq!(second.skipped_covered, 1, "t1 already covered");
+        assert_eq!(second.reserved.len(), 1, "only t2 upgrades");
+        commit_reserved(&conn, session, "w2", &second.reserved[0], "cp2")
+            .await
+            .expect("commit upgrade");
+
+        let (s1, r1, _) = claim_row(&conn, "u1").await;
+        assert_eq!((s1.as_str(), r1), ("catalog_committed", 1), "t1 untouched");
+        let (s2, r2, _) = claim_row(&conn, "u2").await;
+        assert_eq!((s2.as_str(), r2), ("catalog_committed", 2), "t2 advanced");
+        // Both checkpoints remain in the catalog — no checkpoint-level
+        // supersede (ADR-DR-16).
+        let rows = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT checkpoint_id FROM agent_checkpoint".to_string(),
+            ))
+            .await
+            .expect("checkpoints");
+        assert_eq!(rows.len(), 2);
+    }
+}
