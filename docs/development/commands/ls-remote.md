@@ -8,6 +8,7 @@
 
 - 兼容级别：`partial`。heads/tags/refs filtering、patterns、`--get-url`、`--sort=refname` / `--sort=version:refname`、`--exit-code` 和 `--symref` 已支持。`--symref` 从 discovery capabilities（`symref=<from>:<to>`，通常为 `HEAD`）解析；Git 远端与本地 Git 仓库（`git-upload-pack`）会通告 `symref=HEAD`，故输出 `ref:` 行；本地 **Libra** 仓库不通告该 capability，故不输出（有意与 Git 不同，Libra 从不基于本地 `HEAD` 合成 symref）。
 
+- P1-06 现状复核确认 `--symref` 已正确从 Git upload-pack capability 输出 `ref: refs/heads/<branch>\tHEAD`，无需重写；`compat_fetch_remote_refspec::ls_remote_symref_matches_git_advertised_head_shape` 以真实本地 Git bare remote 固定该契约。
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
 

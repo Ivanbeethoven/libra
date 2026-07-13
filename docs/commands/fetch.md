@@ -17,8 +17,10 @@ tree or the current branch -- use `libra pull` or `libra merge` for that.
 
 When invoked with no arguments, it fetches from the current branch's configured upstream.
 When `--all` is given, every configured remote is fetched in sequence. When a specific
-`<repository>` is named, only that remote is contacted. An optional `<refspec>` narrows
-the fetch to a single branch.
+`<repository>` is named, only that remote is contacted. An optional `<refspec>` selects
+one source ref and may map it to an exact local destination (`<src>:<dst>`). When no
+explicit refspec is given, `remote.<name>.fetch` entries are honored; if none exist,
+all advertised branches use the default `refs/remotes/<name>/*` mapping.
 
 Fetch supports SSH, HTTPS, local file, and `git://` transports. Vault-backed SSH keys
 are loaded automatically when configured via `vault.ssh.<remote>.privkey`.
@@ -53,6 +55,31 @@ scope with `LBR-IO-001`, in both cases **before the fetch touches the network**
 so a bad config can never produce a fetch whose prune semantics silently
 diverge from what was configured.
 
+### Fetch refspecs
+
+Short source names such as `main` mean `refs/heads/main` and default to
+`refs/remotes/<remote>/main`. Full mappings and the common wildcard form are supported:
+
+```bash
+libra fetch origin refs/heads/main:refs/remotes/origin/release
+libra config set --add remote.origin.fetch \
+  +refs/heads/*:refs/remotes/origin/*
+```
+
+Explicit refspecs override configured mappings. `remote add -t` and `remote
+set-branches` write concrete `remote.<name>.fetch` values that later fetches now enforce.
+Config variable names are case-insensitive, so spellings such as
+`remote.origin.Fetch` are honored. Destinations are currently limited to
+`refs/heads/*` and `refs/remotes/<remote>/*`; the reserved `HEAD` destination in
+either namespace, and every other namespace, fail before any write.
+Multiple destination updates, their reflogs, and `refs/remotes/<name>/HEAD` are committed
+in one SQLite transaction; any rejected destination rolls back the complete ref update.
+Non-fast-forward updates require `+` on that mapping or `--force`. Fetching into the
+local branch checked out by any linked worktree is rejected. On a full fetch, a cached
+remote HEAD is removed when the effective mapping no longer includes the remote's default
+source branch. Tag destinations remain controlled by `--tags` / `--no-tags`, not fetch
+refspec mappings.
+
 ```bash
 libra config fetch.prune true           # prune on every fetch
 libra config remote.origin.prune false  # but never for origin
@@ -63,14 +90,14 @@ libra config remote.origin.prune false  # but never for origin
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
 | `<repository>` | Remote name or URL to fetch from. When omitted, uses the current branch's upstream remote. | `libra fetch origin` |
-| `<refspec>` | Branch name to fetch. Requires `<repository>`. When omitted, all branches from the remote are fetched. | `libra fetch origin main` |
+| `<refspec>` | Source ref or exact `<src>:<dst>` mapping. Requires `<repository>`. When omitted, `remote.<name>.fetch` mappings are used, falling back to all remote branches. | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | Fetch from every configured remote. Conflicts with `<repository>`. | `libra fetch --all` |
 | `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Supported for Git remotes that advertise shallow boundaries. Local Libra remotes fail closed with `LBR-REPO-002` until that transport can advertise shallow metadata. | `libra fetch origin --depth 1` |
 | `--tags` | Fetch every tag from the remote into the local `refs/tags/*` (overrides the default auto-follow and `remote.<name>.tagOpt`). | `libra fetch origin --tags` |
 | `--no-tags` | Fetch no tags at all, not even tags reachable from fetched commits (overrides the default auto-follow). | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | Do not run a repacking/gc pass after fetching. Accepted no-op for Git parity: Libra's fetch never triggers an automatic gc, so there is nothing to disable. | `libra fetch origin --no-auto-gc` |
 | `--no-progress` | Do not show the progress meter (the "Receiving objects" spinner / remote progress) on stderr, matching `git fetch --no-progress`. | `libra fetch origin --no-progress` |
-| `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` whose branch the remote no longer advertises as a `refs/heads/*` or `refs/mr/*` ref (reusing `remote prune`'s stale classification). Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched. With `--dry-run`, the stale refs are reported but not deleted. Overrides the `remote.<name>.prune` / `fetch.prune` config defaults. | `libra fetch origin -p` |
+| `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` that are not live destinations of the effective configured refspec mapping. A one-off explicit refspec retains the configured mapped destinations, ordinary advertised scope, and its selected destination. Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched. With `--dry-run`, stale refs are reported but not deleted. Overrides the `remote.<name>.prune` / `fetch.prune` config defaults. | `libra fetch origin -p` |
 | `--no-prune` | Do not prune remote-tracking refs, overriding the `remote.<name>.prune` / `fetch.prune` config defaults (the built-in default is no pruning). `--prune`/`--no-prune` form a last-one-wins toggle: when both are given, the last on the command line wins (Git semantics). | `libra fetch origin --no-prune` |
 | `--notes` | Also import the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from the remote over a dedicated side-channel. Default OFF (Git never auto-fetches notes). v1 travels notes only from a **local Libra source**; a network or plain-Git remote emits an honest "not supported yet" warning and imports no graph (deferred, D17). Import union-merges into any local edges and re-validates every endpoint, and is per-note fault-tolerant (a malformed note, or one whose commit is absent locally, is skipped with a warning, never aborting the fetch). Persist the opt-in per remote with `remote.<name>.fetchNotesDeps=true`. | `libra fetch origin --notes` |
 | `-f`, `--force` | Allow non-fast-forward updates and overwrite (clobber) a local tag that points elsewhere. Forced updates are marked `+` in `--porcelain` / `(forced update)` in human output. | `libra fetch origin --tags --force` |
@@ -89,6 +116,7 @@ libra config remote.origin.prune false  # but never for origin
 libra fetch
 libra fetch origin
 libra fetch origin main
+libra fetch origin refs/heads/main:refs/remotes/origin/release
 libra fetch --all
 libra fetch origin --depth 1               # shallow fetch
 libra fetch origin --tags                  # also fetch all tags into refs/tags/*
@@ -150,7 +178,8 @@ Every successful fetch records the fetched refs in `.libra/FETCH_HEAD`, one
 `<oid>\tnot-for-merge\ttag '<name>' of <url>` line per fetched tag. Libra never
 designates a merge target (merge with `libra pull`), so every line is marked
 `not-for-merge`. `--append` accumulates into the file instead of overwriting it;
-`--dry-run` writes nothing.
+`--dry-run` writes nothing. Selected refs are recorded even when their local destination
+was already up to date. Plain fetch does not create or modify `ORIG_HEAD`.
 
 ## Human Output
 
@@ -186,17 +215,17 @@ Already up to date with 'origin'
 
 - `remote`: logical remote name
 - `url`: normalized remote URL/path
-- `refs_updated[]`: updated remote-tracking refs
+- `refs_updated[]`: local destination refs that changed
 - `objects_fetched`: object count parsed from the received pack
 - `bytes_received`: byte size of the received pack stream (0 when nothing was transferred)
 - `pruned[]`: stale remote-tracking refs removed by pruning (`{remote_ref, branch, old_oid}`); present only when pruning removed at least one ref
 
 ### Refs Updated Schema
 
-- `remote_ref`: fully qualified local remote-tracking ref, e.g. `refs/remotes/origin/main`
+- `remote_ref`: fully qualified local destination ref, e.g. `refs/remotes/origin/main`
 - `old_oid`: previous object id, or `null` when the ref is new
 - `new_oid`: fetched object id
-- `forced`: `true` when the update was not a fast-forward — a branch that moved non-linearly (recorded regardless of `--force`; tracking branches are always updated), or a tag clobbered under `--force`
+- `forced`: `true` when the update was not a fast-forward and was allowed by a leading `+` mapping or `--force`, or when a tag was clobbered under `--force`
 
 Example (single remote):
 
@@ -272,15 +301,14 @@ deliberate choice. Pruning is opt-in via `--prune`/`-p`, the `fetch.prune` /
 form a last-one-wins toggle and always override the config, matching Git.
 
 When pruning is enabled (flag or config), after the fetch completes Libra removes every
-`refs/remotes/<remote>/*` ref the remote no longer advertises, classified by the same rule
-`remote prune` uses. The deletions and a non-lossy audit reflog entry (`<old> -> 0…0`) run
-in a single transaction, so a mid-prune failure rolls back every deletion. `--dry-run`
-reports the stale refs without writing. Documented narrowings versus Git: pruning is
-**full-remote scoped** (it cleans every stale tracking ref for the remote, like
-`remote prune`, rather than restricting to an explicit refspec), it is **skipped entirely
-when the remote advertises no refs at all** (so a transient empty advertisement cannot wipe
-every tracking ref), and pruned refs never appear in `FETCH_HEAD` (which records only
-fetched refs).
+`refs/remotes/<remote>/*` ref that is not a live destination of the effective configured
+refspec mapping, using the same destination-aware rule as `remote prune`. A one-off
+explicit refspec preserves configured mapped destinations, the ordinary full-remote
+advertised scope, and its selected destination. The deletions and a non-lossy audit reflog entry (`<old> -> 0…0`) run in a
+single transaction, so a mid-prune failure rolls back every deletion. `--dry-run` reports
+the stale refs without writing. Pruning is skipped entirely when the remote advertises no
+refs at all (so a transient empty advertisement cannot wipe every tracking ref), and
+pruned refs never appear in `FETCH_HEAD` (which records only fetched refs).
 
 ### Shallow fetch (`--depth`) is exposed as a stable flag
 
@@ -323,6 +351,8 @@ by default for maximum script friendliness.
 | Fetch upstream | `libra fetch` | `git fetch` | `jj git fetch` |
 | Named remote | `libra fetch origin` | `git fetch origin` | `jj git fetch --remote origin` |
 | Single branch | `libra fetch origin main` | `git fetch origin main` | `jj git fetch --remote origin --branch main` |
+| Exact ref mapping | `libra fetch origin <src>:<dst>` | `git fetch origin <src>:<dst>` | Not supported |
+| Configured mappings | `remote.<name>.fetch` (including one `*` wildcard per side) | Same | Not supported |
 | All remotes | `libra fetch --all` | `git fetch --all` | `jj git fetch --all-remotes` |
 | Prune stale refs | `libra fetch -p` / `fetch.prune`, `remote.<name>.prune` config / `libra remote prune <name>` | `git fetch --prune` / same config keys | Automatic |
 | Shallow fetch | `libra fetch --depth N` | `git fetch --depth N` | Not supported |
@@ -344,6 +374,9 @@ by default for maximum script friendliness.
 | No configured upstream / detached HEAD | `LBR-REPO-003` | 128 | "checkout a branch or specify a remote" |
 | Remote not found | `LBR-CLI-003` | 129 | "use 'libra remote -v' to see configured remotes" |
 | Remote branch not found | `LBR-CLI-003` | 129 | "verify the remote branch name and try again" |
+| Invalid/mismatched fetch refspec | `LBR-CLI-002` | 129 | Use a valid `<src>:<dst>` mapping with matching optional wildcards |
+| Configured refspec read failure | `LBR-IO-001` | 128 | Inspect `remote.<name>.fetch` configuration |
+| Checked-out destination / non-fast-forward without force | `LBR-CONFLICT-002` | 128 | Change the destination, add `+`, or use `--force` intentionally |
 | Invalid remote spec (missing repo, malformed URL, unsupported scheme) | `LBR-CLI-003` or `LBR-REPO-001` | 129 / 128 | Varies by cause |
 | Authentication failure during discovery | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
 | Network timeout / transport failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |

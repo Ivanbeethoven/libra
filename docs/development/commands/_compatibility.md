@@ -38,6 +38,7 @@ flowchart TD
 - symlink 基础兼容契约（plan-20260708 P0-11）：`add` / `update-index --add` 必须把 symlink 作为 mode `120000` 和 link target blob bytes 暂存；`checkout` / `restore` / `reset --hard` 必须在支持平台恢复真实 symlink，且不跟随目标路径；`status` / `diff` / `ls-files` 必须按 symlink 自身比较 target bytes，dangling symlink 不得误报为删除。不支持 symlink 的平台必须显式 fail-closed/skip 诊断，而不是写普通文件。由 `compat_symlink_basic` 守卫。
 - config defaults 契约（plan-20260708 P1-05a）：新仓库的 `init.defaultBranch` 与 `pull` 的 `branch.<name>.rebase`/`pull.rebase`/`pull.ff` 按 local → global → system 读取，section/variable 名按 Git 规则大小写不敏感；local/global 加密值先解密，legacy `config` 行仍可读取，system scope 读取失败或不支持时跳过。空值/非法值在副作用前 fail-closed；`pull.rebase=merges|interactive`（及短写）返回明确 unsupported 的 `LBR-CLI-002`。Git 转换使用并报告源 `HEAD` 分支。由 `compat_config_defaults_semantics` 与 `compat_config_defaults_edge_cases` 守卫。
 - history config defaults 契约（plan-20260708 P1-05b）：`merge.ff`/`merge.log`/`merge.verifySignatures` 与 `commit.gpgSign` 使用同一严格级联；CLI override 优先，无效 local/global 值在任何历史写入前失败。由 `compat_config_history_defaults` 守卫。
+- fetch/remote refspec 契约（plan-20260708 P1-06）：显式 `<src>:<dst>` 精确映射并覆盖 `remote.<name>.fetch`，配置支持精确/单通配符映射；多 ref + reflog + remote HEAD 在一个 SQLite 事务内。`remote update` 遵守 `remotes.default`，`remote rename` 同事务迁移配置、tracking refs、remote HEAD 与对应 reflog；`ls-remote --symref` 由真实 Git capability 对照守卫。由 `compat_fetch_remote_refspec` 固定。
 - 副作用边界：本文件解释“为什么这样兼容”，不替代 `COMPATIBILITY.md` 的用户承诺；新增命令或参数时必须同时给出 tier、测试证据和未完成项处理方式。
 
 ## 当前状态

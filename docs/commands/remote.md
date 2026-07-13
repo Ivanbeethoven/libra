@@ -88,7 +88,12 @@ Delete a remote and all its configuration keys.
 
 ### Subcommand: `rename`
 
-Rename an existing remote.
+Rename an existing remote. The operation atomically migrates `remote.<old>.*`
+configuration (including fetch-refspec destinations), `branch.*.remote` values,
+the SSH key namespace, every `refs/remotes/<old>/*` tracking ref, the remote HEAD,
+and matching tracking-ref reflogs. A conflicting target namespace fails without
+leaving a partial rename. Remote and SSH subsections are matched by exact remote
+name, so renaming `corp` cannot capture a separate `corp.prod` remote.
 
 | Argument | Description | Example |
 |----------|-------------|---------|
@@ -120,7 +125,9 @@ Add, replace, or delete URLs for a remote.
 
 ### Subcommand: `prune`
 
-Delete local remote-tracking branches that no longer exist on the remote.
+Delete local remote-tracking branches that are no longer live destinations of
+the remote's effective `remote.<name>.fetch` mappings. Custom destination
+namespaces are therefore retained while their mapped source refs still exist.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
@@ -129,14 +136,16 @@ Delete local remote-tracking branches that no longer exist on the remote.
 
 ### Subcommand: `update`
 
-Fetch from one or more remotes. With no arguments, every configured remote is
-fetched; otherwise each argument is a remote name, or a `remotes.<group>`
-config entry that expands to that group's member remotes.
+Fetch from one or more remotes. With no arguments, members listed by
+`remotes.default` are fetched when that config is non-empty; otherwise every
+configured remote is fetched. Each explicit argument is a remote name, or a
+`remotes.<group>` config entry that expands to that group's member remotes.
+Every resolved remote honors its `remote.<name>.fetch` mappings.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
 | `-p`, `--prune` | After fetching, prune remote-tracking branches that no longer exist on the remote (Git's `remote update -p`) | `libra remote update -p` |
-| `[<group> \| <remote>...]` | Remotes or remote groups to fetch (default: all) | `libra remote update origin upstream` |
+| `[<group> \| <remote>...]` | Remotes or remote groups to fetch (default: `remotes.default`, then all) | `libra remote update origin upstream` |
 
 > `-p` / `--prune` runs the same prune logic as `libra remote prune <name>`, but
 > only after every resolved remote has fetched successfully (a two-pass
@@ -146,7 +155,8 @@ config entry that expands to that group's member remotes.
 ### Subcommand: `set-branches`
 
 Set the branches tracked by a remote by rewriting its `remote.<name>.fetch`
-refspecs. Each branch becomes `+refs/heads/<branch>:refs/remotes/<name>/<branch>`.
+refspecs. Each branch becomes `+refs/heads/<branch>:refs/remotes/<name>/<branch>`;
+subsequent `fetch` and `remote update` operations update only those mapped branches.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|

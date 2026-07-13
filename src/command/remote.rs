@@ -8,7 +8,10 @@ use std::{
 
 use clap::Subcommand;
 use git_internal::hash::get_hash_kind;
-use sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter,
+    TransactionTrait,
+};
 use serde::Serialize;
 
 use crate::{
@@ -18,7 +21,7 @@ use crate::{
         config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
-        model::reference,
+        model::{reference, reflog},
         protocol::{DiscRef, set_wire_hash_kind},
     },
     utils::{
@@ -66,8 +69,8 @@ impl std::fmt::Display for SetUrlMode {
 /// `--help` examples shown in `libra remote --help` output (attached
 /// in `src/cli.rs` via `after_help` on the `Remote` subcommand).
 ///
-/// `remote` exposes eight sub-commands (`add` / `remove` / `rename`
-/// / `-v` / `show` / `get-url` / `set-url` / `prune`); the banner pins
+/// `remote` exposes configuration, inspection, update, and ref-management
+/// subcommands; the banner pins
 /// the most common invocation per sub-command (where it carries enough
 /// signal beyond the sub-command name) plus a JSON variant so users can
 /// map intent to invocation without reading the design doc. Cross-cutting
@@ -732,8 +735,59 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
         return Err(RemoteError::SshKeyNamespaceExists { name: new });
     }
 
+    let db = get_db_conn_instance().await;
+    let old_for_txn = old.clone();
+    let new_for_txn = new.clone();
     let new_for_error = new.clone();
-    ConfigKv::rename_remote(&old, &new).await.map_err(|error| {
+    db.transaction::<_, (), anyhow::Error>(move |txn| {
+        Box::pin(async move {
+            let target_rows = reference::Entity::find()
+                .filter(reference::Column::Remote.eq(&new_for_txn))
+                .all(txn)
+                .await?;
+            if !target_rows.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "tracking reference namespace for remote '{}' already exists",
+                    new_for_txn
+                ));
+            }
+
+            ConfigKv::rename_remote_with_conn(txn, &old_for_txn, &new_for_txn).await?;
+
+            let old_tracking_prefix = format!("refs/remotes/{old_for_txn}/");
+            let new_tracking_prefix = format!("refs/remotes/{new_for_txn}/");
+            let rows = reference::Entity::find()
+                .filter(reference::Column::Remote.eq(&old_for_txn))
+                .all(txn)
+                .await?;
+            for row in rows {
+                let mut active: reference::ActiveModel = row.into();
+                active.remote = Set(Some(new_for_txn.clone()));
+                if let Some(name) = active.name.as_ref()
+                    && let Some(suffix) = name.strip_prefix(&old_tracking_prefix)
+                {
+                    active.name = Set(Some(format!("{new_tracking_prefix}{suffix}")));
+                }
+                active.update(txn).await?;
+            }
+
+            let reflog_rows = reflog::Entity::find()
+                .filter(reflog::Column::RefName.starts_with(&old_tracking_prefix))
+                .all(txn)
+                .await?;
+            for row in reflog_rows {
+                let new_ref_name =
+                    row.ref_name
+                        .replacen(&old_tracking_prefix, &new_tracking_prefix, 1);
+                let mut active: reflog::ActiveModel = row.into();
+                active.ref_name = Set(new_ref_name);
+                active.update(txn).await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| {
         let detail = error.to_string();
         if detail.contains("SSH key namespace for remote") {
             RemoteError::SshKeyNamespaceExists {
@@ -906,14 +960,34 @@ async fn run_set_url(
     })
 }
 
-/// Resolve the set of remotes for `remote update`: with no arguments, every
-/// configured remote (in config order); otherwise each argument is either a
+/// Resolve the set of remotes for `remote update`: with no arguments, use
+/// `remotes.default` when non-empty and otherwise every configured remote;
+/// each explicit argument is either a
 /// `remotes.<group>` config (expanded to its space-separated members) or a
 /// single remote name. The result preserves first-seen order and de-duplicates.
 async fn resolve_update_remotes(groups: Vec<String>) -> Result<Vec<String>, RemoteError> {
-    if groups.is_empty() {
-        return list_remote_names().await;
-    }
+    let groups = if groups.is_empty() {
+        let defaults = ConfigKv::get_all("remotes.default")
+            .await
+            .map_err(|error| RemoteError::ConfigRead {
+                detail: error.to_string(),
+            })?;
+        let mut default_entries = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in defaults {
+            for name in entry.value.split_whitespace().map(String::from) {
+                if seen.insert(name.clone()) {
+                    default_entries.push(name);
+                }
+            }
+        }
+        if default_entries.is_empty() {
+            return list_remote_names().await;
+        }
+        default_entries
+    } else {
+        groups
+    };
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
     for entry in groups {
@@ -944,13 +1018,19 @@ async fn run_remote_update(
     output: &OutputConfig,
 ) -> Result<RemoteOutput, RemoteError> {
     let remotes = resolve_update_remotes(groups).await?;
+    // Validate the full batch before the first remote is contacted. A typo in
+    // remotes.default or an invalid remote.<name>.fetch refspec must not leave
+    // an earlier remote updated behind a deterministic configuration error.
+    for name in &remotes {
+        ensure_remote_exists(name).await?;
+        fetch::validate_configured_fetch_refspecs(name).await?;
+    }
     // First pass: fetch every resolved remote. A fetch failure aborts the run
     // HERE, before any tracking ref is deleted, so `-p` can never delete refs
     // for an early remote and then strand that destructive side effect behind
     // an error raised while fetching a later remote.
     let mut updated = Vec::new();
     for name in &remotes {
-        ensure_remote_exists(name).await?;
         fetch_remote_by_name(name, output).await?;
         updated.push(name.clone());
     }
@@ -1064,7 +1144,8 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
 
     set_wire_hash_kind(discovery.hash_kind);
 
-    let remote_branch_names = remote_advertised_branch_names(&discovery.refs);
+    let remote_branch_names =
+        fetch::configured_remote_tracking_branch_names(&name, &discovery.refs).await?;
 
     let local_remote_branches =
         Branch::list_branches_result(Some(&name))
@@ -1138,7 +1219,15 @@ async fn ssh_key_namespace_exists(name: &str) -> Result<bool, RemoteError> {
     let prefix = format!("vault.ssh.{name}.");
     ConfigKv::get_by_prefix(&prefix)
         .await
-        .map(|entries| !entries.is_empty())
+        .map(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .key
+                    .strip_prefix("vault.ssh.")
+                    .and_then(|rest| rest.rsplit_once('.'))
+                    .is_some_and(|(parsed_name, _)| parsed_name == name)
+            })
+        })
         .map_err(|error| RemoteError::ConfigRead {
             detail: error.to_string(),
         })
