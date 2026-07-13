@@ -50,7 +50,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
-            2026070802, 2026070803
+            2026070802, 2026070803, 2026071301
         ]
     );
     assert_eq!(
@@ -79,13 +79,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "worktree_isolation",
             "agent_checkpoint_paging",
             "agent_audit_log",
+            "agent_coverage_gate",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 23);
-    assert_eq!(runner.max_registered_version(), Some(2026070803));
+    assert_eq!(runner.len(), 24);
+    assert_eq!(runner.max_registered_version(), Some(2026071301));
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,7 +1064,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
-            2026070802, 2026070803
+            2026070802, 2026070803, 2026071301
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1103,6 +1104,13 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     assert!(table_exists(&conn, "sequence_state").await);
     assert!(table_exists(&conn, "notes").await);
     assert!(index_exists(&conn, "idx_notes_ref").await);
+    // plan-20260713 DR-05c-0: per-turn coverage claim/revision gate.
+    assert!(table_exists(&conn, "agent_coverage_claim").await);
+    assert!(table_exists(&conn, "agent_coverage_revision").await);
+    assert!(index_exists(&conn, "idx_agent_coverage_claim_logical_key").await);
+    assert!(index_exists(&conn, "idx_agent_coverage_claim_session_state").await);
+    assert!(index_exists(&conn, "idx_agent_coverage_claim_checkpoint_id").await);
+    assert!(index_exists(&conn, "idx_agent_coverage_revision_checkpoint_id").await);
 }
 
 /// OC-Phase 2 P2.5 regression guard: `approved_permission` survives an
@@ -1132,9 +1140,9 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401,
-            2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401,
-            2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
+            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
+            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -1160,7 +1168,7 @@ async fn approved_permission_up_down_up_round_trip() {
         vec![
             2026050601, 2026050801, 2026052301, 2026053101, 2026060201, 2026060401, 2026060801,
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
-            2026070601, 2026070701, 2026070801, 2026070802, 2026070803
+            2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);

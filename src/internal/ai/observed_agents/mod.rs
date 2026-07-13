@@ -30,6 +30,7 @@ pub mod adapter;
 pub mod builtin;
 pub mod capability;
 pub mod compliance;
+pub mod coverage;
 pub mod derived;
 pub mod extract;
 pub mod preview;
@@ -57,6 +58,10 @@ pub use capability::{
     SkillEvent, SkillEventExtractor, SkillEventSignal, SkillEventSource, SkillEventType, SkillRef,
     SubagentAwareExtractor, TextGenerator, TokenCalculator, TranscriptAnalyzer,
     TranscriptCompactor, TranscriptPreparer,
+};
+pub use coverage::{
+    COVERAGE_SCHEMA_VERSION, CanonValue, Completeness, NormalizedTurn, SemanticRecord,
+    canonical_turn_bytes, coverage_digest_hex, normalize_claude_transcript, parse_canon_value,
 };
 pub use derived::derive_tool_call_records;
 pub use preview::{PREVIEW_SPECS, PreviewAgent, PreviewSpec, is_preview, preview_spec_for};
