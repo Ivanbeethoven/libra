@@ -397,6 +397,10 @@ path = "tests/compat/noninteractive_history_controls_test.rs"
 name = "compat_diff_review_options"
 path = "tests/compat/diff_review_options_test.rs"
 
+[[test]]
+name = "compat_rev_parse_peel_selectors"
+path = "tests/compat/rev_parse_peel_selectors_test.rs"
+
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).
 [[test]]
