@@ -227,7 +227,7 @@ pub async fn run_export_subprocess_sandboxed(
         let bwrap = std::env::var_os("LIBRA_LINUX_SANDBOX_EXE")
             .map(std::path::PathBuf::from)
             .filter(|p| p.is_absolute() && p.is_file())
-            .or_else(|| which_bwrap())
+            .or_else(which_bwrap)
             .ok_or_else(|| {
                 anyhow!(
                     "bubblewrap (bwrap) is required for the OpenCode export sandbox and was \
