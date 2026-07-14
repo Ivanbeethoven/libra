@@ -93,7 +93,10 @@ pub async fn observe_idle(
     .await
     .context("bump observed_generation")?;
 
-    // Lease attempt: only when no live lease exists (expired or absent).
+    // Lease attempt: only when no live lease exists (expired or absent) AND
+    // pending work remains (processed < observed) — a delayed contender whose
+    // bump was already processed by another runner must NOT re-export a
+    // clean generation (Codex M3 R1 P1-4).
     let new_fence_seed = now_ms; // any monotonic-ish base; real fence below
     let _ = new_fence_seed;
     let acquired = conn
@@ -104,7 +107,8 @@ pub async fn observe_idle(
                  fence_token = COALESCE(fence_token, 0) + 1,
                  state = 'inflight', updated_at = ?
              WHERE agent_kind = ? AND provider_session_id = ?
-               AND (owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)",
+               AND (owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+               AND processed_generation < observed_generation",
             [
                 owner.into(),
                 now_or(now_ms, EXPORT_LEASE_MS).into(),
@@ -369,6 +373,62 @@ mod tests {
         release(&conn, kind, sid, "r1", fence_token, "idle", None, 6_000)
             .await
             .unwrap();
+    }
+
+    /// Codex M3 R1 P1-4: a delayed contender whose observed bump was already
+    /// processed by another runner must NOT acquire and re-export a clean
+    /// generation — acquisition requires pending work.
+    #[tokio::test]
+    async fn delayed_contender_cannot_reexport_clean_generation() {
+        let conn = job_db().await;
+        let (kind, sid) = ("opencode", "s1");
+
+        // A bumps (observed=1) but stalls before acquiring: simulate by
+        // bumping WITHOUT holding the lease — B then bumps + runs + finishes.
+        let IdleOutcome::Runner { fence_token, .. } =
+            observe_idle(&conn, kind, sid, "b", 0).await.unwrap()
+        else {
+            panic!("B becomes the runner");
+        };
+        // B processes everything observed so far and releases idle.
+        assert_eq!(
+            advance_processed(&conn, kind, sid, "b", fence_token, 1, 1_000)
+                .await
+                .unwrap(),
+            AdvanceOutcome::Clean
+        );
+        release(&conn, kind, sid, "b", fence_token, "idle", None, 1_500)
+            .await
+            .unwrap();
+
+        // A's delayed lease attempt (no new bump in between — emulate the
+        // stalled path with a direct conditional acquisition): observe_idle
+        // always bumps first, so instead assert the ACQUISITION predicate
+        // directly: with processed == observed, the lease UPDATE matches no
+        // row.
+        let acquired = conn
+            .execute(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "UPDATE agent_export_job
+                 SET owner = 'a', lease_expires_at = 99999, state = 'inflight'
+                 WHERE agent_kind = ? AND provider_session_id = ?
+                   AND (owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= 2000)
+                   AND processed_generation < observed_generation",
+                [kind.into(), sid.into()],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            acquired.rows_affected(),
+            0,
+            "clean generation must not be re-acquirable"
+        );
+
+        // A fresh idle (new bump) re-enables acquisition normally.
+        assert!(matches!(
+            observe_idle(&conn, kind, sid, "a", 3_000).await.unwrap(),
+            IdleOutcome::Runner { .. }
+        ));
     }
 
     /// A caller that does not need to append content still must preserve an

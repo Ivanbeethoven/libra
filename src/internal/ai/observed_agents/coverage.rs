@@ -647,6 +647,15 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
         return turns;
     };
     let Some(messages) = document.get("messages").and_then(CanonValue::as_array) else {
+        // Valid JSON but structurally NOT an export document (missing or
+        // wrong-typed `messages`): poison, never "no work" — advancing the
+        // job on this would silently drop capture (Codex M3 R1 P1-5).
+        turns.push(NormalizedTurn {
+            logical_turn_key: ordinal_key(0),
+            ordinal: 0,
+            completeness: Completeness::Incomplete,
+            records: Vec::new(),
+        });
         return turns;
     };
 
@@ -677,24 +686,50 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
     }
 
     for message in messages {
+        // Structural validation: a message must be an object with an object
+        // `info` carrying a string `role`, and an array `parts`. Anything
+        // else poisons the enclosing turn instead of defaulting away
+        // (Codex M3 R1 P1-5).
+        let mut structural_violation = false;
         let info = message.get("info");
-        let role = info
-            .and_then(|i| i.get("role"))
-            .and_then(CanonValue::as_str)
-            .unwrap_or("");
-        let msg_id = info
-            .and_then(|i| i.get("id"))
-            .and_then(CanonValue::as_str)
-            .map(str::to_string);
-        let parts = message
-            .get("parts")
-            .and_then(CanonValue::as_array)
-            .unwrap_or(&[]);
-
-        // Joined text parts with semantic type validation.
+        if !matches!(message, CanonValue::Object(_)) || !matches!(info, Some(CanonValue::Object(_)))
+        {
+            structural_violation = true;
+        }
+        let role = match info.and_then(|i| i.get("role")) {
+            Some(CanonValue::Str(role)) => role.as_str(),
+            _ => {
+                structural_violation = true;
+                ""
+            }
+        };
+        let msg_id = match info.and_then(|i| i.get("id")) {
+            Some(CanonValue::Str(id)) => Some(id.clone()),
+            Some(CanonValue::Null) | None => None,
+            Some(_) => {
+                structural_violation = true;
+                None
+            }
+        };
+        let parts: &[CanonValue] = match message.get("parts") {
+            Some(CanonValue::Array(parts)) => parts,
+            _ => {
+                structural_violation = true;
+                &[]
+            }
+        };
+        // A structural violation poisons THIS message's own turn (Codex M3 R2
+        // P1-3), never a neighbor — fold it into the per-turn `violation` flag
+        // that is applied at role dispatch below.
         let mut text_fragments: Vec<&str> = Vec::new();
-        let mut violation = false;
+        let mut violation = structural_violation;
         for part in parts {
+            // A part that is not even an object is itself malformed — poison
+            // the turn rather than silently skipping it (Codex M3 R2 P1-3).
+            if !matches!(part, CanonValue::Object(_)) {
+                violation = true;
+                continue;
+            }
             if part.get("type").and_then(CanonValue::as_str) == Some("text") {
                 match part.get("text") {
                     Some(CanonValue::Str(t)) => text_fragments.push(t),
@@ -785,7 +820,15 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
                     }
                 }
             }
-            _ => {}
+            // Unreadable / unsupported role. A structural violation must still
+            // surface as an incomplete turn of its OWN (Codex M3 R2 P1-3)
+            // rather than vanishing into a neighbor; a clean unknown role is
+            // simply skipped.
+            _ => {
+                if violation {
+                    open_turn(&mut turns, msg_id).completeness = Completeness::Incomplete;
+                }
+            }
         }
     }
 
@@ -1083,6 +1126,54 @@ mod tests {
         let turns = normalize_opencode_export(br#"{"info": {"id": "ses_x"}, "mess"#);
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].completeness, Completeness::Incomplete);
+    }
+
+    /// Codex M3 R2 P1-3: a structurally malformed message poisons ITS OWN turn
+    /// (never a healthy neighbor), and a malformed element inside an otherwise
+    /// valid `parts` array poisons that turn too — no silent skip.
+    #[test]
+    fn opencode_normalizer_poisons_malformed_message_own_turn() {
+        // A clean user turn followed by a user message with a non-string `id`:
+        // the first turn stays Complete, the malformed message's own (new)
+        // turn is Incomplete — not the reverse.
+        let export = br#"{
+            "info": {"id": "ses_x"},
+            "messages": [
+                {"info": {"role": "user", "id": "msg_ok"},
+                 "parts": [{"type": "text", "text": "clean"}]},
+                {"info": {"role": "user", "id": 7},
+                 "parts": [{"type": "text", "text": "malformed id"}]}
+            ]
+        }"#;
+        let turns = normalize_opencode_export(export);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].logical_turn_key, "msg_ok");
+        assert_eq!(
+            turns[0].completeness,
+            Completeness::Complete,
+            "healthy neighbor must stay complete"
+        );
+        assert_eq!(
+            turns[1].completeness,
+            Completeness::Incomplete,
+            "malformed message's own turn must be poisoned"
+        );
+
+        // A non-object element inside a valid parts array poisons that turn.
+        let export = br#"{
+            "info": {"id": "ses_x"},
+            "messages": [
+                {"info": {"role": "user", "id": "msg_u"},
+                 "parts": ["not-an-object", {"type": "text", "text": "ok"}]}
+            ]
+        }"#;
+        let turns = normalize_opencode_export(export);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].completeness,
+            Completeness::Incomplete,
+            "malformed part entry must poison the turn"
+        );
     }
 
     #[test]

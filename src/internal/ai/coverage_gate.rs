@@ -63,6 +63,16 @@ impl LiveReservationOutcome {
     pub fn is_noop(&self) -> bool {
         self.reserved.is_empty()
     }
+
+    /// Codex M3 R2 P1-2: this pass reserved nothing to append, yet at least
+    /// one turn is held by another LIVE writer (unexpired lease). The export
+    /// job must then be released `dirty` (retryable) rather than advanced
+    /// clean — if that writer crashes, its claim lease expires and only a
+    /// dirty job lets a later idle recapture the transcript. A genuine
+    /// all-covered no-op (nothing in flight) is NOT this case.
+    pub fn is_inflight_only_skip(&self) -> bool {
+        self.reserved.is_empty() && self.skipped_inflight > 0
+    }
 }
 
 struct ExistingClaim {
@@ -606,6 +616,29 @@ mod tests {
     use crate::internal::{
         ai::observed_agents::SemanticRecord, db::migration::run_builtin_migrations,
     };
+
+    /// Codex M3 R2 P1-2: the export path must release DIRTY (retryable) only
+    /// when it reserved nothing yet turns are held in flight by another writer,
+    /// and must NOT confuse that with a genuine all-covered no-op.
+    #[test]
+    fn inflight_only_skip_distinguishes_foreign_hold_from_covered_noop() {
+        // Nothing reserved, one turn held by another live writer → retry dirty.
+        let foreign_hold = LiveReservationOutcome {
+            skipped_inflight: 1,
+            ..Default::default()
+        };
+        assert!(foreign_hold.is_inflight_only_skip());
+
+        // Genuine all-covered no-op (nothing in flight) → advance honestly.
+        let all_covered = LiveReservationOutcome {
+            skipped_covered: 3,
+            ..Default::default()
+        };
+        assert!(!all_covered.is_inflight_only_skip());
+
+        // A fully empty outcome is not an in-flight skip either.
+        assert!(!LiveReservationOutcome::default().is_inflight_only_skip());
+    }
 
     async fn gate_db() -> DatabaseConnection {
         let conn = Database::connect("sqlite::memory:").await.expect("mem db");
