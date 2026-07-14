@@ -29,6 +29,11 @@ Raw bytes are parsed but never persisted un-redacted; **redaction runs before
 canonicalization**, so the digest is computed over the redacted content — the
 same secret-free bytes every path can reproduce.
 
+Typed-field redaction covers every allowlisted string value: user/assistant
+text, tool-call `call_id`, `name`, recursively nested string values in `input`,
+and tool-result `call_id` / `content`. A newly allowlisted string field must be
+added to this redaction pass before it may enter canonical bytes.
+
 Persistence scope note (plan ADR-DR-04/DR-12): the allowlist-only re-encoding
 rule governs (a) coverage digests/claims on every path, and (b) the per-turn
 projections persisted by the import (M4) and export (M3) writers. The LIVE

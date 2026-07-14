@@ -90,13 +90,14 @@ const NO_CAPS: DeclaredAgentCaps = DeclaredAgentCaps {
     subagent_aware_extractor: false,
 };
 
-/// Claude Code capability set (AG-19 hooks + AG-21 transcript
-/// intelligence: analyzer, token calculator, subagent-aware extractor;
-/// prompt extraction rides the analyzer gate, model/skill extraction are
-/// deliberately outside the 8-bool set).
+/// Claude Code capability set (AG-19 hooks, AG-21 transcript intelligence,
+/// and M2 transcript flush preparation: analyzer, preparer, token calculator,
+/// subagent-aware extractor; prompt extraction rides the analyzer gate,
+/// model/skill extraction are deliberately outside the 8-bool set).
 const CLAUDE_CODE_CAPS: DeclaredAgentCaps = DeclaredAgentCaps {
     hooks: true,
     transcript_analyzer: true,
+    transcript_preparer: true,
     token_calculator: true,
     subagent_aware_extractor: true,
     ..NO_CAPS

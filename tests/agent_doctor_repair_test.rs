@@ -1104,19 +1104,6 @@ async fn seed_v1_rows(repo: &DoctorRepo, seed: &V1Seed) {
 /// and ref all unchanged).
 #[tokio::test]
 async fn legacy_v1_fixture_classified_and_never_repaired() {
-    // The v1 fixture blobs are pinned to exact OIDs and were captured on
-    // another machine; they are not in this repository's HEAD. Missing
-    // preconditions print "skipped" and never fail (docs/tests.md gating
-    // convention) — restoring the fixture re-enables the test unchanged.
-    let fixture_probe = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-        "tests/fixtures/agent_checkpoints/v1_claude_code/85/ae75d2-4c53-465a-b890-a9f861a50cc7/metadata.json",
-    );
-    if !fixture_probe.is_file() {
-        eprintln!(
-            "skipped (fixture tests/fixtures/agent_checkpoints/v1_claude_code missing from checkout)"
-        );
-        return;
-    }
     let repo = DoctorRepo::init();
     let seed = seed_v1_fixture(&repo);
     seed_v1_rows(&repo, &seed).await;

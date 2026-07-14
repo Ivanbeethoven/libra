@@ -170,29 +170,21 @@ fn test_diff_progress_none_suppresses_scan_progress() {
 }
 
 #[test]
-fn test_diff_non_default_algorithm_fails_instead_of_silent_noop() {
+fn test_diff_non_default_algorithm_executes() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("tracked.txt"), "tracked\nupdated\n").unwrap();
 
-    let output = run_libra_command(&["diff", "--algorithm", "myers"], repo.path());
-    assert_eq!(output.status.code(), Some(129));
+    let output = run_libra_command(&["diff", "--algorithm", "patience"], repo.path());
+    assert_cli_success(&output, "diff --algorithm patience");
     assert!(
-        output.stdout.is_empty(),
-        "unsupported algorithm must not emit a best-effort diff to stdout: {}",
+        String::from_utf8_lossy(&output.stdout).contains("diff --git"),
+        "non-default algorithm should emit a patch: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("diff --algorithm=myers is not supported yet"),
-        "unsupported algorithm should be explicit, stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("Error-Code: LBR-CLI-002"),
-        "unsupported algorithm should carry a stable CLI error code, stderr={stderr}"
-    );
-    assert!(
-        !stderr.contains("Scanning working tree"),
-        "algorithm validation should fail before the worktree scan, stderr={stderr}"
+        stderr.contains("Scanning working tree"),
+        "algorithm should reach the normal worktree scan, stderr={stderr}"
     );
 }
 
@@ -947,7 +939,7 @@ async fn test_diff_algorithms() {
     // Create a file with some content to make a non-trivial diff
     create_file(
         "file1.txt",
-        "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6\nLine 7\n",
+        "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n",
     );
 
     add::execute(AddArgs {
@@ -986,59 +978,46 @@ async fn test_diff_algorithms() {
     // Make complex changes to test different algorithms
     modify_file(
         "file1.txt",
-        "Line 1\nModified Line\nLine 3\nNew Line\nLine 5\nLine 6\nDeleted Line 7\n",
+        "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n",
     );
 
-    // Test histogram algorithm
-    let histogram_file = output_dir.path().join("histogram_diff.txt");
-    let histogram_str = histogram_file.to_str().unwrap();
-    let args = DiffArgs::parse_from([
-        "diff",
-        "--algorithm",
-        "histogram",
-        "--output",
-        histogram_str,
-    ]);
-    diff::execute(args).await;
-
-    // Non-default algorithms are accepted by clap for forward
-    // compatibility but fail closed until the backend is actually wired.
+    // Every named backend must execute, and the readability-oriented Patience
+    // backend must not silently reuse Myers on this reordered-function fixture.
     let myers_file = output_dir.path().join("myers_diff.txt");
     let myers_str = myers_file.to_str().unwrap();
     let args = DiffArgs::parse_from(["diff", "--algorithm", "myers", "--output", myers_str]);
-    let myers_result = diff::execute_safe(args, &OutputConfig::default()).await;
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("Myers backend should execute");
 
     let myers_min_file = output_dir.path().join("myersMinimal_diff.txt");
     let myers_min_str = myers_min_file.to_str().unwrap();
-    let args = DiffArgs::parse_from([
-        "diff",
-        "--algorithm",
-        "myersMinimal",
-        "--output",
-        myers_min_str,
-    ]);
-    let myers_min_result = diff::execute_safe(args, &OutputConfig::default()).await;
+    let args = DiffArgs::parse_from(["diff", "--minimal", "--output", myers_min_str]);
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("minimal Myers backend should execute");
 
-    assert!(
-        fs::metadata(&histogram_file).is_ok(),
-        "Histogram output file should exist"
-    );
-    assert!(
-        myers_result.is_err(),
-        "Myers should fail closed until a real backend is wired"
-    );
-    assert!(
-        myers_min_result.is_err(),
-        "MyersMinimal should fail closed until a real backend is wired"
-    );
-    assert!(
-        !myers_file.exists(),
-        "unsupported Myers should not write a default diff to the output file"
-    );
-    assert!(
-        !myers_min_file.exists(),
-        "unsupported MyersMinimal should not write a default diff to the output file"
-    );
+    let patience_file = output_dir.path().join("patience_diff.txt");
+    let patience_str = patience_file.to_str().unwrap();
+    let args = DiffArgs::parse_from(["diff", "--patience", "--output", patience_str]);
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("Patience backend should execute");
+
+    let histogram_file = output_dir.path().join("histogram_diff.txt");
+    let histogram_str = histogram_file.to_str().unwrap();
+    let args = DiffArgs::parse_from(["diff", "--histogram", "--output", histogram_str]);
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("Histogram backend should execute");
+
+    let myers = fs::read_to_string(&myers_file).unwrap();
+    let myers_min = fs::read_to_string(&myers_min_file).unwrap();
+    let patience = fs::read_to_string(&patience_file).unwrap();
+    let histogram = fs::read_to_string(&histogram_file).unwrap();
+    assert_eq!(myers_min, myers, "minimal uses the exact Myers edit script");
+    assert_ne!(patience, myers, "Patience must use different anchors here");
+    assert!(histogram.contains("diff --git"), "Histogram emits a patch");
 }
 
 #[test]

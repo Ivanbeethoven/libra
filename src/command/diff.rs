@@ -75,6 +75,7 @@ EXAMPLES:
     libra diff --word-diff                   Word-level diff ([-removed-]{+added+} inline)
     libra diff --word-diff-regex='[A-Za-z]+' Compare custom regex-defined words
     libra diff --color-words                 Word-level diff with colored changes
+    libra diff --patience                    Use unique-line anchors for reordered code
     libra diff -U0                          Patch with no surrounding context (default is 3)
     libra diff -w                           Ignore whitespace-only changes
     libra diff -b                           Ignore changes in the amount of whitespace
@@ -111,14 +112,35 @@ pub struct DiffArgs {
     #[clap(last = true, value_name = "PATH")]
     after_dashdash: Vec<String>,
 
-    /// Diff algorithm. `histogram` is currently the only implemented backend.
+    /// Select the diff algorithm. Myers is the default; `myersMinimal` uses the
+    /// same shortest-edit implementation without a deadline, while `patience`
+    /// and `histogram` prefer readability-oriented anchors.
     #[clap(
         long,
-        default_value = "histogram",
         value_name = "NAME",
-        value_parser = ["histogram", "myers", "myersMinimal"],
+        overrides_with_all = ["patience", "histogram"],
     )]
     pub algorithm: Option<String>,
+
+    /// Request the smallest Myers edit script. Libra's Myers
+    /// backend already runs without a deadline, so this selects its guaranteed
+    /// shortest-edit mode and is output-equivalent to `--algorithm=myersMinimal`.
+    #[clap(long)]
+    pub minimal: bool,
+
+    /// Generate a diff using the patience algorithm.
+    #[clap(
+        long,
+        overrides_with_all = ["algorithm", "histogram"],
+    )]
+    pub patience: bool,
+
+    /// Generate a diff using the histogram algorithm.
+    #[clap(
+        long,
+        overrides_with_all = ["algorithm", "patience"],
+    )]
+    pub histogram: bool,
 
     /// Write the diff to `FILENAME` instead of stdout
     #[clap(long, value_name = "FILENAME")]
@@ -499,10 +521,8 @@ pub(crate) enum DiffError {
     #[error("failed to write output file '{path}': {detail}")]
     OutputWrite { path: String, detail: String },
 
-    #[error(
-        "diff --algorithm={0} is not supported yet; only --algorithm=histogram is currently implemented"
-    )]
-    UnsupportedAlgorithm(String),
+    #[error("invalid diff algorithm '{0}'; expected myers, myersMinimal, patience, or histogram")]
+    InvalidAlgorithm(String),
 
     #[error("invalid argument to find-renames: '{0}'")]
     InvalidRenameScore(String),
@@ -574,11 +594,9 @@ impl From<DiffError> for CliError {
             DiffError::OutputWrite { .. } => {
                 CliError::fatal(message).with_stable_code(StableErrorCode::IoWriteFailed)
             }
-            DiffError::UnsupportedAlgorithm(_) => CliError::fatal(message)
+            DiffError::InvalidAlgorithm(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint(
-                    "omit --algorithm or use --algorithm=histogram until alternate diff backends are available",
-                ),
+                .with_hint("choose --minimal, --patience, --histogram, or a supported --algorithm value"),
             DiffError::InvalidRenameScore(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint(
@@ -643,13 +661,13 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     resolve_positional_revisions(&mut args)
         .await
         .map_err(CliError::from)?;
-    validate_diff_algorithm(&args).map_err(CliError::from)?;
+    let diff_algorithm = resolve_diff_algorithm(&args).map_err(CliError::from)?;
     parse_diff_filter(args.diff_filter.as_deref()).map_err(CliError::from)?;
     let pickaxe = parse_diff_pickaxe(&args).map_err(CliError::from)?;
     let word_diff = resolve_word_diff_options(&args)?;
     let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
-    let mut result = run_diff(&args, output, &config, pickaxe.as_ref())
+    let mut result = run_diff(&args, output, &config, pickaxe.as_ref(), diff_algorithm)
         .await
         .map_err(CliError::from)?;
     // lore.md 2.2: read-only sparse view — scope ONLY the working-tree diff
@@ -1360,25 +1378,24 @@ fn render_word_diff(
     color: bool,
     regex: Option<&regex::Regex>,
 ) -> String {
-    let owned_changes;
-    let changes: Vec<(ChangeTag, &str)> = if let Some(regex) = regex {
-        owned_changes = regex_word_changes(old, new, regex);
-        owned_changes
+    if let Some(regex) = regex {
+        let owned_changes = regex_word_changes(old, new, regex);
+        let changes = owned_changes
             .iter()
             .map(|(tag, text)| (*tag, text.as_str()))
-            .collect()
+            .collect::<Vec<_>>();
+        render_word_changes(&changes, mode, color)
     } else {
         let old_toks = word_tokens(old);
         let new_toks = word_tokens(new);
         let diff = TextDiff::from_slices(&old_toks, &new_toks);
-        normalize_word_changes(
+        let changes = normalize_word_changes(
             diff.iter_all_changes()
                 .map(|change| (change.tag(), change.value()))
                 .collect(),
-        )
-    };
-
-    render_word_changes(&changes, mode, color)
+        );
+        render_word_changes(&changes, mode, color)
+    }
 }
 
 fn render_word_changes(changes: &[(ChangeTag, &str)], mode: WordDiffMode, color: bool) -> String {
@@ -1711,11 +1728,49 @@ async fn resolve_positional_revisions(args: &mut DiffArgs) -> Result<(), DiffErr
     Ok(())
 }
 
-fn validate_diff_algorithm(args: &DiffArgs) -> Result<(), DiffError> {
-    match args.algorithm.as_deref().unwrap_or("histogram") {
-        "histogram" => Ok(()),
-        unsupported => Err(DiffError::UnsupportedAlgorithm(unsupported.to_string())),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffAlgorithm {
+    Myers,
+    MyersMinimal,
+    Patience,
+    Histogram,
+}
+
+impl DiffAlgorithm {
+    fn backend(self) -> Algorithm {
+        match self {
+            Self::Myers | Self::MyersMinimal => Algorithm::Myers,
+            Self::Patience => Algorithm::Patience,
+            Self::Histogram => Algorithm::Histogram,
+        }
     }
+
+    /// git_internal already renders Myers with the same dependency backend.
+    /// Other algorithms must replace that initial body in the post-pass.
+    fn needs_backend_rediff(self) -> bool {
+        matches!(self, Self::Patience | Self::Histogram)
+    }
+}
+
+fn resolve_diff_algorithm(args: &DiffArgs) -> Result<DiffAlgorithm, DiffError> {
+    let selected = if args.patience {
+        DiffAlgorithm::Patience
+    } else if args.histogram {
+        DiffAlgorithm::Histogram
+    } else {
+        match args.algorithm.as_deref() {
+            None | Some("myers") => DiffAlgorithm::Myers,
+            Some("myersMinimal") => DiffAlgorithm::MyersMinimal,
+            Some("patience") => DiffAlgorithm::Patience,
+            Some("histogram") => DiffAlgorithm::Histogram,
+            Some(value) => return Err(DiffError::InvalidAlgorithm(value.to_string())),
+        }
+    };
+    Ok(if args.minimal && selected == DiffAlgorithm::Myers {
+        DiffAlgorithm::MyersMinimal
+    } else {
+        selected
+    })
 }
 
 #[derive(Debug)]
@@ -1962,6 +2017,7 @@ async fn run_diff(
     output: &OutputConfig,
     config: &ResolvedDiffConfig,
     pickaxe: Option<&DiffPickaxe>,
+    diff_algorithm: DiffAlgorithm,
 ) -> Result<DiffOutput, DiffError> {
     util::require_repo().map_err(|_| DiffError::NotInRepo)?;
     tracing::debug!("diff args: {:?}", args);
@@ -2142,6 +2198,9 @@ async fn run_diff(
     //     +/- counts (so stat/name/numstat/JSON all reflect the result).
     //   * `--ignore-blank-lines` re-diffs ignoring blank-only changes (drops files
     //     whose only change is blank lines, recomputes counts).
+    //   * Patience/Histogram replaces git_internal's initial Myers body and
+    //     recomputes +/- counts; the same backend flows through the two filtered
+    //     paths above, rename/textconv bodies, and forced-text rendering.
     //   * `-U<n>` (when `n != 3`, git_internal's hard-coded default) regenerates
     //     hunk bodies at `n` context lines; +/- lines are unchanged so counts are
     //     untouched — only the surrounding context (and re-parsed `hunks`) change.
@@ -2150,7 +2209,7 @@ async fn run_diff(
     // `--ignore-blank-lines` COMPOSES with a whitespace flag: the diff and the
     // blank classification both run through the normalizer (matching Git).
     let regen_context = config.context;
-    let ws_normalize: Option<fn(&str) -> String> = if args.ignore_all_space {
+    let requested_ws_normalize: Option<fn(&str) -> String> = if args.ignore_all_space {
         Some(normalize_ignore_all_space)
     } else if args.ignore_space_change {
         Some(normalize_ignore_space_change)
@@ -2161,7 +2220,16 @@ async fn run_diff(
     } else {
         None
     };
-    let rediffs = ws_normalize.is_some() || args.ignore_blank_lines;
+    // `--check` ignores comparison filters but still honors an explicitly
+    // selected diff backend because ambiguous repeated lines can change which
+    // physical lines are classified as additions.
+    let ws_normalize = if args.check {
+        None
+    } else {
+        requested_ws_normalize
+    };
+    let ignore_blank = !args.check && args.ignore_blank_lines;
+    let rediffs = ws_normalize.is_some() || ignore_blank || diff_algorithm.needs_backend_rediff();
 
     // `--relative` restricts WHICH files are diffed; apply that restriction now —
     // before rename detection — so a rename pair is only formed when BOTH sides
@@ -2180,11 +2248,6 @@ async fn run_diff(
     if let Some(threshold) = config.rename_threshold {
         // `--check` scans added lines for whitespace errors and ignores the
         // whitespace-ignore flags, so the rename body must stay unfiltered.
-        let (rn_ws, rn_blank) = if args.check {
-            (None, false)
-        } else {
-            (ws_normalize, args.ignore_blank_lines)
-        };
         let inexact_rename_skipped = apply_rename_detection(
             &mut files,
             &first_map,
@@ -2194,8 +2257,9 @@ async fn run_diff(
             &ext_worktree_entries,
             threshold,
             regen_context,
-            rn_ws,
-            rn_blank,
+            ws_normalize,
+            ignore_blank,
+            diff_algorithm,
         );
         if inexact_rename_skipped {
             crate::utils::error::emit_legacy_stderr(
@@ -2260,7 +2324,8 @@ async fn run_diff(
                 &ext_worktree_entries,
                 regen_context,
                 ws_normalize,
-                args.ignore_blank_lines,
+                ignore_blank,
+                diff_algorithm,
                 match pickaxe {
                     Some(DiffPickaxe::StringCount(needle)) => Some(needle.as_slice()),
                     _ => None,
@@ -2296,6 +2361,7 @@ async fn run_diff(
             &second_map,
             &ext_worktree_entries,
             regen_context,
+            diff_algorithm,
         )?;
     }
 
@@ -2330,12 +2396,10 @@ async fn run_diff(
         }
     }
 
-    // `--check` (whitespace-error scan) ignores the whitespace-ignore flags and
-    // operates on git_internal's original diff — matching Git, where
-    // `diff --check -w`/`-b`/`--ignore-space-at-eol` still reports trailing-
-    // whitespace errors. It replaces the patch output, so the post-pass (which
-    // only rewrites the patch/stat/counts) is skipped entirely when `--check`.
-    if external_command.is_none() && !args.check && (rediffs || regen_context != 3) {
+    // `--check` ignores whitespace/blank-line filters, matching Git, but an
+    // explicitly selected Patience/Histogram backend still regenerates the
+    // body before the added-line scan.
+    if external_command.is_none() && (rediffs || (!args.check && regen_context != 3)) {
         let blob_text = |map: &HashMap<PathBuf, ObjectHash>, path: &Path| -> String {
             let Some(hash) = map.get(path) else {
                 return String::new();
@@ -2367,22 +2431,32 @@ async fn run_diff(
                 let new_text = blob_text(&second_map, &path);
                 // `--ignore-blank-lines` composes with a whitespace normalizer when
                 // both are given (matching `git diff -w --ignore-blank-lines`).
-                let body = if args.ignore_blank_lines {
+                let body = if ignore_blank {
                     match ws_normalize {
                         Some(normalize) => compute_unified_hunks_ignore_blank_normalized(
                             &old_text,
                             &new_text,
                             regen_context,
+                            diff_algorithm,
                             normalize,
                         ),
-                        None => {
-                            compute_unified_hunks_ignore_blank(&old_text, &new_text, regen_context)
-                        }
+                        None => compute_unified_hunks_ignore_blank(
+                            &old_text,
+                            &new_text,
+                            regen_context,
+                            diff_algorithm,
+                        ),
                     }
                 } else if let Some(normalize) = ws_normalize {
-                    compute_unified_hunks_normalized(&old_text, &new_text, regen_context, normalize)
+                    compute_unified_hunks_normalized(
+                        &old_text,
+                        &new_text,
+                        regen_context,
+                        diff_algorithm,
+                        normalize,
+                    )
                 } else {
-                    compute_unified_hunks(&old_text, &new_text, regen_context)
+                    compute_unified_hunks(&old_text, &new_text, regen_context, diff_algorithm)
                 };
                 // No change survives the rule. Git still reports an added/deleted
                 // filepair or mode change (header, zero counts, no hunk) even when
@@ -2436,6 +2510,7 @@ async fn run_diff(
                     &old_text,
                     &new_text,
                     regen_context,
+                    diff_algorithm,
                 );
                 file.hunks = parse_diff_hunks(&file.raw_diff);
             }
@@ -3442,6 +3517,7 @@ fn apply_rename_detection(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
+    diff_algorithm: DiffAlgorithm,
 ) -> bool {
     let same_file_type = |old_path: &str, new_path: &str| {
         let old_type = first_modes
@@ -3618,6 +3694,7 @@ fn apply_rename_detection(
             context,
             ws_normalize,
             ignore_blank,
+            diff_algorithm,
         );
         // Insert at the added entry's position so output order stays stable.
         renames.insert(*ai, entry);
@@ -3658,6 +3735,7 @@ fn build_rename_entry(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
+    diff_algorithm: DiffAlgorithm,
 ) -> DiffFileStat {
     let mut raw = format!(
         "diff --git a/{old_path} b/{new_path}\nsimilarity index {percent}%\nrename from {old_path}\nrename to {new_path}\n"
@@ -3674,14 +3752,29 @@ fn build_rename_entry(
         let hunks = if ignore_blank {
             match ws_normalize {
                 Some(normalize) => compute_unified_hunks_ignore_blank_normalized(
-                    &old_text, &new_text, context, normalize,
+                    &old_text,
+                    &new_text,
+                    context,
+                    diff_algorithm,
+                    normalize,
                 ),
-                None => compute_unified_hunks_ignore_blank(&old_text, &new_text, context),
+                None => compute_unified_hunks_ignore_blank(
+                    &old_text,
+                    &new_text,
+                    context,
+                    diff_algorithm,
+                ),
             }
         } else if let Some(normalize) = ws_normalize {
-            compute_unified_hunks_normalized(&old_text, &new_text, context, normalize)
+            compute_unified_hunks_normalized(
+                &old_text,
+                &new_text,
+                context,
+                diff_algorithm,
+                normalize,
+            )
         } else {
-            compute_unified_hunks(&old_text, &new_text, context)
+            compute_unified_hunks(&old_text, &new_text, context, diff_algorithm)
         };
         // A rename that differs only in ignored whitespace/blank lines has an
         // empty body: emit just the rename headers (no `index`/`---`/`+++`).
@@ -3806,6 +3899,7 @@ fn apply_textconv(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
+    diff_algorithm: DiffAlgorithm,
     pickaxe_needle: Option<&[u8]>,
 ) -> Result<TextconvOutcome, DiffError> {
     // `None` = the side is absent from its map (a created/deleted side) and must
@@ -3836,13 +3930,19 @@ fn apply_textconv(
     let regen = |old: &str, new: &str| -> String {
         if ignore_blank {
             match ws_normalize {
-                Some(n) => compute_unified_hunks_ignore_blank_normalized(old, new, context, n),
-                None => compute_unified_hunks_ignore_blank(old, new, context),
+                Some(n) => compute_unified_hunks_ignore_blank_normalized(
+                    old,
+                    new,
+                    context,
+                    diff_algorithm,
+                    n,
+                ),
+                None => compute_unified_hunks_ignore_blank(old, new, context, diff_algorithm),
             }
         } else if let Some(n) = ws_normalize {
-            compute_unified_hunks_normalized(old, new, context, n)
+            compute_unified_hunks_normalized(old, new, context, diff_algorithm, n)
         } else {
-            compute_unified_hunks(old, new, context)
+            compute_unified_hunks(old, new, context, diff_algorithm)
         }
     };
 
@@ -4063,6 +4163,7 @@ fn force_text_for_bare_binary(
     second_map: &HashMap<PathBuf, ObjectHash>,
     worktree_entries: &HashMap<PathBuf, ObjectHash>,
     context: usize,
+    diff_algorithm: DiffAlgorithm,
 ) -> Result<(), DiffError> {
     let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Result<Vec<u8>, DiffError> {
         let pb = PathBuf::from(path);
@@ -4088,7 +4189,7 @@ fn force_text_for_bare_binary(
         let old_path = file.rename_from.as_deref().unwrap_or(&file.path);
         let old_text = String::from_utf8_lossy(&load(old_path, first_map)?).into_owned();
         let new_text = String::from_utf8_lossy(&load(&file.path, second_map)?).into_owned();
-        let hunks = compute_unified_hunks(&old_text, &new_text, context);
+        let hunks = compute_unified_hunks(&old_text, &new_text, context, diff_algorithm);
         if hunks.trim().is_empty() {
             continue;
         }
@@ -4908,10 +5009,11 @@ fn rewrite_unified_diff_context(
     old_text: &str,
     new_text: &str,
     context: usize,
+    diff_algorithm: DiffAlgorithm,
 ) -> String {
     splice_unified_body(
         raw_diff,
-        &compute_unified_hunks(old_text, new_text, context),
+        &compute_unified_hunks(old_text, new_text, context, diff_algorithm),
     )
 }
 
@@ -4951,12 +5053,17 @@ enum UnifiedEditLine<'a> {
 
 /// Compute the unified-diff hunk body (the `@@ … @@` blocks, no file header)
 /// for `old_text` vs `new_text` at `context` lines of surrounding context.
-/// Myers line diff with a rolling-context assembler — a context-parameterized
-/// copy of git_internal's `compute_unified_diff` so the output matches its
-/// default (3-context) layout that is already validated against real Git.
-fn compute_unified_hunks(old_text: &str, new_text: &str, context: usize) -> String {
+/// Selected line diff with a rolling-context assembler — a context-parameterized
+/// copy of git_internal's `compute_unified_diff`. Myers matches git_internal's
+/// initial body; Patience/Histogram replace it with their selected anchors.
+fn compute_unified_hunks(
+    old_text: &str,
+    new_text: &str,
+    context: usize,
+    diff_algorithm: DiffAlgorithm,
+) -> String {
     let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
+        .algorithm(diff_algorithm.backend())
         .diff_lines(old_text, new_text);
     let changes: Vec<(ChangeTag, &str)> = diff
         .iter_all_changes()
@@ -5024,6 +5131,7 @@ fn compute_unified_hunks_normalized(
     old_text: &str,
     new_text: &str,
     context: usize,
+    diff_algorithm: DiffAlgorithm,
     normalize: fn(&str) -> String,
 ) -> String {
     let old_lines: Vec<&str> = old_text.lines().collect();
@@ -5034,7 +5142,7 @@ fn compute_unified_hunks_normalized(
     let old_norm_ref: Vec<&str> = old_norm.iter().map(String::as_str).collect();
     let new_norm_ref: Vec<&str> = new_norm.iter().map(String::as_str).collect();
     let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
+        .algorithm(diff_algorithm.backend())
         .diff_slices(&old_norm_ref, &new_norm_ref);
     let mut changes: Vec<(ChangeTag, &str)> = Vec::with_capacity(old_lines.len() + new_lines.len());
     for change in diff.iter_all_changes() {
@@ -5099,8 +5207,13 @@ struct DiffChangeGroup {
 /// line. For files whose final line lacks a trailing newline this may diverge from
 /// Git — exactly as `libra diff` / `-w` / `-U<n>` already do. The flag is faithful
 /// for all newline-terminated files (the domain Libra models).
-fn compute_unified_hunks_ignore_blank(old_text: &str, new_text: &str, context: usize) -> String {
-    compute_unified_hunks_ignore_blank_inner(old_text, new_text, context, None)
+fn compute_unified_hunks_ignore_blank(
+    old_text: &str,
+    new_text: &str,
+    context: usize,
+    diff_algorithm: DiffAlgorithm,
+) -> String {
+    compute_unified_hunks_ignore_blank_inner(old_text, new_text, context, diff_algorithm, None)
 }
 
 /// `--ignore-blank-lines` composed with a whitespace normalizer (see
@@ -5109,15 +5222,23 @@ fn compute_unified_hunks_ignore_blank_normalized(
     old_text: &str,
     new_text: &str,
     context: usize,
+    diff_algorithm: DiffAlgorithm,
     normalize: fn(&str) -> String,
 ) -> String {
-    compute_unified_hunks_ignore_blank_inner(old_text, new_text, context, Some(normalize))
+    compute_unified_hunks_ignore_blank_inner(
+        old_text,
+        new_text,
+        context,
+        diff_algorithm,
+        Some(normalize),
+    )
 }
 
 fn compute_unified_hunks_ignore_blank_inner(
     old_text: &str,
     new_text: &str,
     context: usize,
+    diff_algorithm: DiffAlgorithm,
     normalize: Option<fn(&str) -> String>,
 ) -> String {
     // Raw records: split on '\n' WITHOUT trimming '\r', so a `\r`-only CRLF blank
@@ -5159,7 +5280,7 @@ fn compute_unified_hunks_ignore_blank_inner(
     let old_ref: Vec<&str> = cmp_old.iter().map(String::as_str).collect();
     let new_ref: Vec<&str> = cmp_new.iter().map(String::as_str).collect();
     let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
+        .algorithm(diff_algorithm.backend())
         .diff_slices(&old_ref, &new_ref);
 
     // Build change groups (maximal runs of insert/delete), tracking 0-based old/new
@@ -5568,7 +5689,10 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         new: None,
         staged: true,
         pathspec: Vec::new(),
-        algorithm: Some("histogram".to_string()),
+        algorithm: None,
+        minimal: false,
+        patience: false,
+        histogram: false,
         output: None,
         name_only: false,
         name_status: false,
@@ -5616,7 +5740,14 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         ext_diff: false,
     };
     let config = resolve_diff_config(&args).await?;
-    let mut result = run_diff(&args, &OutputConfig::default(), &config, None).await?;
+    let mut result = run_diff(
+        &args,
+        &OutputConfig::default(),
+        &config,
+        None,
+        DiffAlgorithm::Myers,
+    )
+    .await?;
     apply_diff_prefixes(&mut result, &config.prefixes);
     Ok(format_unified_diff(&result))
 }
@@ -6295,13 +6426,30 @@ mod test {
     }
 
     #[test]
+    fn test_diff_algorithms_use_selected_line_anchors() {
+        let old = "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n";
+        let new = "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n";
+        let myers = compute_unified_hunks(old, new, 3, DiffAlgorithm::Myers);
+        let minimal = compute_unified_hunks(old, new, 3, DiffAlgorithm::MyersMinimal);
+        let patience = compute_unified_hunks(old, new, 3, DiffAlgorithm::Patience);
+        let histogram = compute_unified_hunks(old, new, 3, DiffAlgorithm::Histogram);
+
+        assert_eq!(minimal, myers, "minimal uses the no-deadline Myers backend");
+        assert_ne!(patience, myers, "patience must use its own anchors");
+        assert!(
+            !histogram.is_empty() && DiffAlgorithm::Histogram.backend() == Algorithm::Histogram,
+            "histogram must select the histogram backend"
+        );
+    }
+
+    #[test]
     fn test_ignore_blank_lines_far_blank_is_suppressed() {
         // `a..h` -> `a,<blank>,b..g,H`. The blank (old~1) and h->H (old-8) are
         // distance 7 apart > 2*ctx(6), so they do NOT merge: the blank-only hunk
         // is suppressed and only the content hunk survives (Git: `@@ -5,4 +6,4 @@`).
         let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
         let new = "a\n\nb\nc\nd\ne\nf\ng\nH\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, DiffAlgorithm::Myers);
         assert_eq!(
             hunk_count(&body),
             1,
@@ -6332,7 +6480,7 @@ mod test {
         // extends to d (Git: `@@ -1,4 +1,5 @@`).
         let old = "a\nb\nc\nd\n";
         let new = "A\nb\n\nc\nd\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 2);
+        let body = compute_unified_hunks_ignore_blank(old, new, 2, DiffAlgorithm::Myers);
         assert_eq!(hunk_count(&body), 1, "single merged hunk:\n{body}");
         assert!(
             body.contains("@@ -1,4 +1,5 @@"),
@@ -6356,7 +6504,7 @@ mod test {
         // them (Git: `@@ -1,8 +1,9 @@`).
         let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
         let new = "A\nb\nc\n\nd\ne\nf\ng\nH\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, DiffAlgorithm::Myers);
         assert_eq!(
             hunk_count(&body),
             1,
@@ -6387,7 +6535,7 @@ mod test {
         // context (Git: `@@ -1,4 +1,4 @@`, no blank).
         let old = "a\nb\nc\nd\ne\nf\n";
         let new = "A\nb\nc\nd\ne\n\nf\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, DiffAlgorithm::Myers);
         assert_eq!(hunk_count(&body), 1, "only the content hunk:\n{body}");
         assert!(
             body.contains("@@ -1,4 +1,4 @@"),
@@ -6403,13 +6551,14 @@ mod test {
     fn test_ignore_blank_lines_drops_blank_only_and_keeps_ws() {
         // A change that is only an added blank line -> empty body (file drops out).
         assert!(
-            compute_unified_hunks_ignore_blank("x\ny\n", "x\n\ny\n", 3)
+            compute_unified_hunks_ignore_blank("x\ny\n", "x\n\ny\n", 3, DiffAlgorithm::Myers,)
                 .trim()
                 .is_empty(),
             "blank-only change yields no hunks"
         );
         // A whitespace-only added line is NOT blank -> a hunk survives.
-        let ws = compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3);
+        let ws =
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3, DiffAlgorithm::Myers);
         assert!(
             !ws.trim().is_empty(),
             "whitespace-only line is not blank: {ws}"
@@ -6424,7 +6573,8 @@ mod test {
     fn test_ignore_blank_lines_crlf_empty_is_not_blank() {
         // A `\r`-only (CRLF) empty line is NOT blank to Git's xdl_blankline without
         // a whitespace flag (size <= 1 means LF-only), so its insertion is shown.
-        let body = compute_unified_hunks_ignore_blank("a\nb\n", "a\n\r\nb\n", 3);
+        let body =
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n\r\nb\n", 3, DiffAlgorithm::Myers);
         // `split('\n')` (unlike `lines()`) keeps the `\r`, so the emitted `+\r` line
         // is visible verbatim.
         assert!(
@@ -6441,6 +6591,7 @@ mod test {
             "a\nb\n",
             "a\n  \nb\n",
             3,
+            DiffAlgorithm::Myers,
             normalize_ignore_all_space,
         );
         assert!(
@@ -6448,7 +6599,8 @@ mod test {
             "-w makes the whitespace-only line blank, so it is suppressed:\n{composed}"
         );
         // Without the normalizer, a whitespace-only line is NOT blank -> shown.
-        let plain = compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3);
+        let plain =
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3, DiffAlgorithm::Myers);
         assert!(
             plain.lines().any(|l| l == "+  "),
             "without -w the whitespace-only line is shown:\n{plain}"
@@ -6464,7 +6616,7 @@ mod test {
         let old = "a\nc\nd\ne\ne\nf\ng\nf\ng\nc\ne\nf\n";
         let new = "a\nc\n\nd\n\ne\ne\nf\ng\nf\ng\nc\ne\nf\n";
         assert!(
-            compute_unified_hunks_ignore_blank(old, new, 3)
+            compute_unified_hunks_ignore_blank(old, new, 3, DiffAlgorithm::Myers)
                 .trim()
                 .is_empty(),
             "blank-only inserts (even adjacent) with no real change produce no hunks"
@@ -6513,7 +6665,7 @@ mod test {
             assert!(args.err().unwrap().kind() == clap::error::ErrorKind::MissingRequiredArgument);
         }
         {
-            // --algorithm arg is parsed separately from execution-time support.
+            // --algorithm selects a real backend.
             let args = DiffArgs::try_parse_from([
                 "diff",
                 "--old",
@@ -6526,26 +6678,49 @@ mod test {
             ])
             .unwrap();
             assert_eq!(args.algorithm, Some("myers".to_string()));
+            assert_eq!(resolve_diff_algorithm(&args).unwrap(), DiffAlgorithm::Myers);
         }
         {
-            // --algorithm defaults to the only currently supported backend.
+            // Git-compatible default: Myers.
             let args = DiffArgs::try_parse_from(["diff", "--old", "old", "target paths"]).unwrap();
-            assert_eq!(args.algorithm, Some("histogram".to_string()));
+            assert_eq!(args.algorithm, None);
+            assert_eq!(resolve_diff_algorithm(&args).unwrap(), DiffAlgorithm::Myers);
         }
         {
             let args = DiffArgs::try_parse_from([
                 "diff",
-                "--old",
-                "old",
-                "--new",
-                "new",
+                "--minimal",
+                "--patience",
+                "--histogram",
                 "--algorithm",
-                "myers",
-                "target paths",
+                "patience",
             ])
             .unwrap();
-            let err = validate_diff_algorithm(&args).expect_err("myers is not wired yet");
-            assert!(matches!(err, DiffError::UnsupportedAlgorithm(value) if value == "myers"));
+            assert_eq!(
+                resolve_diff_algorithm(&args).unwrap(),
+                DiffAlgorithm::Patience
+            );
+            assert!(
+                args.minimal,
+                "--minimal remains an independent quality request"
+            );
+            assert!(!args.patience && !args.histogram, "last selector wins");
+        }
+        {
+            let args = DiffArgs::try_parse_from(["diff", "--minimal"]).unwrap();
+            assert_eq!(
+                resolve_diff_algorithm(&args).unwrap(),
+                DiffAlgorithm::MyersMinimal
+            );
+        }
+        {
+            let args = DiffArgs::try_parse_from(["diff", "--algorithm", "bogus"]).unwrap();
+            let err = resolve_diff_algorithm(&args).expect_err("invalid backend must fail closed");
+            assert_eq!(
+                err.to_string(),
+                "invalid diff algorithm 'bogus'; expected myers, myersMinimal, patience, or histogram"
+            );
+            assert!(matches!(err, DiffError::InvalidAlgorithm(value) if value == "bogus"));
         }
     }
 

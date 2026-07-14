@@ -90,6 +90,14 @@ fn ai_libra_vcs_safety_allows_read_only_parameter_combinations() {
         ),
         (
             "diff",
+            vec!["--no-textconv", "--no-ext-diff", "--algorithm", "patience"],
+        ),
+        (
+            "diff",
+            vec!["--no-textconv", "--no-ext-diff", "--algorithm=histogram"],
+        ),
+        (
+            "diff",
             vec![
                 "--no-textconv",
                 "--no-ext-diff",

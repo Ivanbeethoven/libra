@@ -97,7 +97,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
 1. **注册与状态输出**
 
-   `claude-code` 行必须暴露：`supported=true`、`support_wave="first_batch"`、`registered=true`、`agent_kind=claude-code`、`db_value=claude_code`、`provider_name=claude`、`stability=stable`、`protected_dirs=[".claude"]`、`transcript_readable=true`、`hook_installable=true`、`installed=<bool>`、`capabilities.hooks=true`。（native transcript 可读性由 `transcript_readable=true` 表达；`capabilities.*` 只覆盖 E1 的 8 个 `DeclaredAgentCaps` bool，无 `native_transcript` 键。）
+   `claude-code` 行必须暴露：`supported=true`、`support_wave="first_batch"`、`registered=true`、`agent_kind=claude-code`、`db_value=claude_code`、`provider_name=claude`、`stability=stable`、`protected_dirs=[".claude"]`、`transcript_readable=true`、`hook_installable=true`、`installed=<bool>`、`capabilities.hooks=true`、`capabilities.transcript_preparer=true`。（native transcript 可读性由 `transcript_readable=true` 表达；`capabilities.*` 只覆盖 E1 的 8 个 `DeclaredAgentCaps` bool，无 `native_transcript` 键。M2 preparer 只在 provider-root 预授权后执行有界 flush-wait。）
 
 2. **启用顺序**
 
@@ -1025,7 +1025,7 @@ entire `cmd/entire/cli/agent/agent.go` 定义核心 `Agent`（identity 6 + trans
 |---|---|---|
 | `HookSupport`（install/uninstall/are-installed/parse） | Claude Code/Codex/OpenCode 三个第一批 provider 已有 `HookProvider`；Gemini 仅 legacy uninstall/data compatibility，不再 supported/installable | 维持 first-batch matrix；新增 provider 时必须同步 registry、docs、tests/INDEX 与 compat pin |
 | `ProtectedFilesProvider` | 未单独实现为 optional trait；当前仍使用 adapter `protected_dirs` | agent 可声明受保护文件，避免误改/误捕获 |
-| `TranscriptAnalyzer` / `PromptExtractor` / `TranscriptPreparer` | `TranscriptAnalyzer`、`PromptExtractor` 已在 AG-21 为首批 transcript fixtures 落地；`TranscriptPreparer` 仍是 optional trait 面 | 按 agent 解析/准备/分析 transcript（`PromptExtractor` gate 复用 `transcript_analyzer`） |
+| `TranscriptAnalyzer` / `PromptExtractor` / `TranscriptPreparer` | `TranscriptAnalyzer`、`PromptExtractor` 已在 AG-21 为首批 transcript fixtures 落地；M2 已为 Claude 接入有界 flush-wait preparer，且只在 provider-root 预授权后运行 | 按 agent 解析/准备/分析 transcript（`PromptExtractor` gate 复用 `transcript_analyzer`；其它 provider preparer 仍为 optional） |
 | `TokenCalculator` / `ModelExtractor` | `TokenCalculator` / `ModelExtractor` 已在 AG-21 为 Claude/Codex/OpenCode fixtures 落地 | 从 transcript 提取 token 用量（E6 key）和模型信息 |
 | `TextGenerator` | 无 | 第一批仅为 Claude Code/Codex/OpenCode 设计 `--print` 式独立文本生成能力；其它 agent 不进入首批支持 |
 | `TranscriptCompactor` | 无 | transcript 压缩/condensation（→ Entire Transcript Format） |

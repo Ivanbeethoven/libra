@@ -653,10 +653,23 @@ pub fn redact_turns(turns: &mut [NormalizedTurn]) {
                 SemanticRecord::User { text } | SemanticRecord::Assistant { text } => {
                     redact_string(text);
                 }
-                SemanticRecord::ToolCall { input, .. } => {
+                SemanticRecord::ToolCall {
+                    call_id,
+                    input,
+                    name,
+                } => {
+                    if let Some(call_id) = call_id {
+                        redact_string(call_id);
+                    }
                     redact_value(input, &redact_string);
+                    redact_string(name);
                 }
-                SemanticRecord::ToolResult { content, .. } => {
+                SemanticRecord::ToolResult {
+                    call_id, content, ..
+                } => {
+                    if let Some(call_id) = call_id {
+                        redact_string(call_id);
+                    }
                     redact_string(content);
                 }
             }
@@ -791,9 +804,11 @@ mod tests {
                 concat!(
                     r#"{{"type":"user","uuid":"u1","message":{{"role":"user","content":"use {}"}}}}"#,
                     "\n",
-                    r#"{{"type":"assistant","uuid":"a1","message":{{"role":"assistant","content":[{{"type":"text","text":"ok"}}]}}}}"#,
+                    r#"{{"type":"assistant","uuid":"a1","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"{}","name":"{}","input":{{"key":"{}"}}}}]}}}}"#,
+                    "\n",
+                    r#"{{"type":"user","uuid":"u2","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{}","content":"{}","is_error":false}}]}}}}"#,
                 ),
-                key
+                key, key, key, key, key, key
             )
         };
         // Two distinct AWS-style access key ids (redactor family AKIA…).
@@ -816,13 +831,14 @@ mod tests {
             unredacted_digest,
             "the secret must never reach the digest input"
         );
-        // And the redacted text no longer contains either key.
-        match &turns_a[0].records[0] {
-            SemanticRecord::User { text } => {
-                assert!(!text.contains("AKIAAAAAAAAAAAAAAAAA"), "got: {text}");
-            }
-            other => panic!("expected user record, got {other:?}"),
-        }
+        // Every allowlisted string position is redacted: user content, tool
+        // call id/name/input and tool-result id/content.
+        let canonical = canonical_turn_bytes(&turns_a[0].records);
+        let canonical = String::from_utf8(canonical).expect("canonical JSON is UTF-8");
+        assert!(
+            !canonical.contains("AKIAAAAAAAAAAAAAAAAA"),
+            "got: {canonical}"
+        );
     }
 
     #[test]

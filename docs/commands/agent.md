@@ -109,6 +109,10 @@ from the listing. Each row carries `slug`, `agent_kind`, `stability`,
 `hook_installable`, `installed`, `launchable_review`, `launchable_investigate`,
 `external_binary`, `config_paths`, `protected_dirs`, `capabilities`. The row
 shape is a frozen contract for automation.
+Claude Code advertises `capabilities.transcript_preparer=true`: before an
+authorized transcript is opened, Libra may briefly wait for a trailing JSONL
+record to finish flushing. The wait and tail probe are bounded; paths outside
+the provider root are rejected before the preparer runs.
 
 `agent session list --json` and `agent checkpoint list --json` return one
 page per call: `data` carries a `schema_version`, the rows under `sessions`

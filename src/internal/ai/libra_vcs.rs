@@ -390,6 +390,7 @@ fn diff_arg_safety(args: &[String], idx: usize) -> (ArgSafety, usize) {
         || arg.starts_with("--word-diff=")
         || arg.starts_with("--word-diff-regex=")
         || arg.starts_with("--color-words=")
+        || arg.starts_with("--algorithm=")
         || arg.starts_with("--diff-filter=")
         || arg.starts_with("--submodule=")
         || arg.starts_with("--relative=")
@@ -400,7 +401,13 @@ fn diff_arg_safety(args: &[String], idx: usize) -> (ArgSafety, usize) {
     }
     if matches!(
         arg,
-        "--diff-filter" | "--submodule" | "--relative" | "--word-diff-regex" | "-S" | "-G"
+        "--algorithm"
+            | "--diff-filter"
+            | "--submodule"
+            | "--relative"
+            | "--word-diff-regex"
+            | "-S"
+            | "-G"
     ) && args.get(idx + 1).is_some()
     {
         return (ArgSafety::Allow, idx + 2);

@@ -101,6 +101,138 @@ fn staged_change_matrix(fixture: &Fixture, name: &str) -> PathBuf {
 }
 
 #[test]
+fn algorithm_selectors_execute_real_backends_and_obey_precedence() {
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("algorithms");
+    let old = "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n";
+    let new = "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n";
+    fs::write(repo.join("code.c"), old).expect("write algorithm base");
+    fixture.commit_all(&repo, "algorithm base");
+    fs::write(repo.join("code.c"), new).expect("reorder functions");
+
+    let default = stdout(&fixture.success(&repo, &["diff", "--", "code.c"]));
+    let myers = stdout(&fixture.success(&repo, &["diff", "--algorithm=myers", "--", "code.c"]));
+    let minimal = stdout(&fixture.success(&repo, &["diff", "--minimal", "--", "code.c"]));
+    let named_minimal =
+        stdout(&fixture.success(&repo, &["diff", "--algorithm=myersMinimal", "--", "code.c"]));
+    let patience = stdout(&fixture.success(&repo, &["diff", "--patience", "--", "code.c"]));
+    let named_patience =
+        stdout(&fixture.success(&repo, &["diff", "--algorithm=patience", "--", "code.c"]));
+    let histogram = stdout(&fixture.success(&repo, &["diff", "--histogram", "--", "code.c"]));
+    let named_histogram =
+        stdout(&fixture.success(&repo, &["diff", "--algorithm=histogram", "--", "code.c"]));
+
+    assert_eq!(default, myers, "Myers is the truthful default");
+    assert_eq!(minimal, myers, "Myers already computes a shortest script");
+    assert_eq!(named_minimal, minimal, "named and shorthand minimal agree");
+    assert_ne!(patience, myers, "Patience uses different anchors here");
+    assert_eq!(
+        named_patience, patience,
+        "named and shorthand Patience agree"
+    );
+    assert_eq!(
+        named_histogram, histogram,
+        "named and shorthand Histogram agree"
+    );
+
+    let histogram_last = stdout(&fixture.success(
+        &repo,
+        &["diff", "--patience", "--histogram", "--", "code.c"],
+    ));
+    let patience_last = stdout(&fixture.success(
+        &repo,
+        &["diff", "--histogram", "--patience", "--", "code.c"],
+    ));
+    assert_eq!(histogram_last, histogram, "last algorithm selector wins");
+    assert_eq!(patience_last, patience, "last algorithm selector wins");
+
+    let myers_filtered = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--algorithm=myers",
+            "-w",
+            "--ignore-blank-lines",
+            "--",
+            "code.c",
+        ],
+    ));
+    let patience_filtered = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--patience",
+            "-w",
+            "--ignore-blank-lines",
+            "--",
+            "code.c",
+        ],
+    ));
+    assert_ne!(
+        patience_filtered, myers_filtered,
+        "whitespace/blank re-diff must retain the selected backend"
+    );
+
+    fs::write(repo.join(".libra_attributes"), "*.c diff=identity\n")
+        .expect("write textconv attributes");
+    fixture.success(&repo, &["config", "set", "diff.identity.textconv", "cat"]);
+    let myers_textconv =
+        stdout(&fixture.success(&repo, &["diff", "--algorithm=myers", "--", "code.c"]));
+    let patience_textconv =
+        stdout(&fixture.success(&repo, &["diff", "--patience", "--", "code.c"]));
+    assert_ne!(
+        patience_textconv, myers_textconv,
+        "textconv re-diff must retain the selected backend"
+    );
+
+    fs::rename(repo.join("code.c"), repo.join("moved.c")).expect("rename changed file");
+    fixture.success(&repo, &["add", "-A"]);
+    let myers_rename = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "--algorithm=myers",
+            "--no-textconv",
+            "--",
+            "code.c",
+            "moved.c",
+        ],
+    ));
+    let patience_rename = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "--patience",
+            "--no-textconv",
+            "--",
+            "code.c",
+            "moved.c",
+        ],
+    ));
+    assert!(
+        patience_rename.contains("rename from code.c"),
+        "{patience_rename}"
+    );
+    assert_ne!(
+        patience_rename, myers_rename,
+        "rename body must retain the selected backend"
+    );
+
+    let invalid = fixture.run(&repo, &["diff", "--algorithm=bogus", "--", "code.c"]);
+    assert_eq!(invalid.status.code(), Some(129));
+    assert!(invalid.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        stderr.contains("invalid diff algorithm 'bogus'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+    assert!(!stderr.contains("Scanning working tree"), "{stderr}");
+}
+
+#[test]
 fn raw_records_cover_add_delete_modify_rename_and_nul_mode() {
     let fixture = Fixture::new();
     let repo = staged_change_matrix(&fixture, "raw-matrix");

@@ -17,14 +17,15 @@ libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
            [--src-prefix=<PREFIX> --dst-prefix=<PREFIX>]
            [--word-diff[=<MODE>]] [--word-diff-regex=<REGEX>]
            [--color-words[=<REGEX>]]
-           [--algorithm <name>] [--output <file>]
+           [--algorithm <name>] [--minimal | --patience | --histogram]
+           [--output <file>]
 ```
 
 ## Description
 
 `libra diff` shows changes between different states of the repository. By default it compares the index against tracked working-tree paths (unstaged changes). Untracked files are not part of the default diff and therefore do not affect `--quiet`, `--exit-code`, `--name-status`, `--numstat`, or `--shortstat`; use `libra status`, `libra ls-files --others`, or `libra add` to inspect or promote untracked files. With `--staged`, it compares HEAD against the index (staged changes). With `--old` and `--new`, it compares two arbitrary commits.
 
-The diff engine currently uses the histogram backend. The parser accepts the forward-compatible names `myers` and `myersMinimal`, but execution rejects them with `LBR-CLI-002` rather than silently using another algorithm. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). Pickaxe filters `-S <STRING>` and `-G <REGEX>` select file pairs by changed occurrence count or matching added/removed lines. A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity; `--word-diff-regex=<regex>` defines comparison words, and `--color-words[=<regex>]` is the color shorthand (matching Git's structure; like all Libra diffs, ambiguous word alignments can differ, and hunk headers keep Libra's unified-diff format).
+The diff engine defaults to Myers, matching Git and the underlying built-in engine. `--minimal`/`--algorithm=myersMinimal` select the same no-deadline shortest-edit Myers implementation; `--patience` and `--histogram` (or their `--algorithm` values) select real readability-oriented backends. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). Pickaxe filters `-S <STRING>` and `-G <REGEX>` select file pairs by changed occurrence count or matching added/removed lines. A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity; `--word-diff-regex=<regex>` defines comparison words, and `--color-words[=<regex>]` is the color shorthand (matching Git's structure; like all Libra diffs, ambiguous word alignments can differ, and hunk headers keep Libra's unified-diff format).
 
 When the working tree contains unmerged conflict entries, the default working-tree diff renders a conflict-aware `diff --cc <path>` record instead of treating the conflict file as a `/dev/null` addition.
 
@@ -47,7 +48,10 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | Staged | | `--staged` | Compare HEAD against the index (staged changes). Conflicts with `--new`. |
 | Revisions | | positional | Up to two leading revisions, Git-style: `diff A` (A vs worktree), `diff A B` (≡ `A..B`), `diff A..B`, `diff A...B` (merge-base(A,B) vs B), `diff --staged A` (A vs index). Not interpreted when `--old`/`--new` is given. |
 | Pathspec | | positional | One or more files or directories to restrict the diff (after any revisions; use `--` to force the path reading). Supports exact files, directory prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic. Pre-`--` paths must exist or carry wildcard syntax / supported pathspec magic; post-`--` paths are taken verbatim. |
-| Algorithm | | `--algorithm <name>` | Diff algorithm. `histogram` is the only implemented backend; `myers` and `myersMinimal` are accepted by the parser but fail explicitly before scanning. |
+| Algorithm | | `--algorithm <name>` | Select `myers` (default), `myersMinimal`, `patience`, or `histogram`. All values select real backends; Myers-minimal is output-equivalent to Myers because Libra does not impose a diff deadline. |
+| Minimal | | `--minimal` | Request the smallest Myers edit script; equivalent to `--algorithm=myersMinimal`. It does not replace an explicitly selected Patience/Histogram backend. |
+| Patience | | `--patience` | Select the Patience backend, which uses unique-line anchors for reordered code. |
+| Histogram | | `--histogram` | Select the Histogram backend, which prefers low-frequency anchors in repetitive input. Patience/Histogram/`--algorithm` selectors use last-one-wins precedence. |
 | Output file | | `--output <FILENAME>` | Write human-readable output to a file instead of stdout. Ignored in `--json` mode. |
 | Name only | | `--name-only` | Show only the names of changed files. |
 | Name status | | `--name-status` | Show changed file names with a status letter (A/D/M/R/T/U when applicable). |
@@ -118,10 +122,12 @@ libra diff --staged src/
 
 **`--algorithm`**
 
-Select the diff algorithm. Histogram is the only implemented backend. The other parser-accepted names fail explicitly with `LBR-CLI-002` before any worktree scan:
+Select Myers (the default), Myers-minimal, Patience, or Histogram. The shorthand forms are often clearer; if multiple backend selectors are supplied, the last one wins. `--minimal` is an independent quality request: it selects Myers-minimal when Myers is active and does not replace an explicit Patience/Histogram selection.
 
 ```bash
-libra diff --algorithm histogram
+libra diff --algorithm patience
+libra diff --minimal
+libra diff --histogram
 ```
 
 **`--output`**
@@ -329,9 +335,9 @@ Git-style positional revisions are supported: `libra diff A` (A vs working tree)
 
 The Libra-only named flags (`--old`, `--new`) remain the ambiguity-free programmatic form — when either is given, every positional is a pathspec and no revision interpretation happens at all. This is valuable for AI agents constructing commands: there is exactly one way to express each intent, with no name-collision hazard.
 
-### Why histogram as the default algorithm?
+### Why Myers as the default algorithm?
 
-Git defaults to the Myers algorithm for historical reasons. Libra currently has one wired backend, histogram, chosen for readable source-code diffs. The parser reserves `myers` and `myersMinimal` for future compatibility, but execution rejects them explicitly so they cannot become silent no-ops.
+Myers is both Git's default and the algorithm used by Libra's underlying built-in diff before any post-processing. Keeping it as the public default makes the documented and actual behavior agree and avoids a redundant second pass. Patience is useful for reordered code, while Histogram favors uncommon anchors in repetitive files. Libra's Myers implementation runs without a deadline and finds a shortest edit script, so `--minimal`/`myersMinimal` intentionally produce the same output as ordinary Myers rather than acting as a silent approximation.
 
 ### The `--cached` alias
 
@@ -353,7 +359,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Staged changes | `--staged` | `--staged` / `--cached` | N/A (no staging area) |
 | Two commits | `--old <A> --new <B>` | `<A> <B>` or `<A>..<B>` | `--from <A> --to <B>` |
 | Pathspec filter | `<pathspec>...` | `-- <pathspec>...` | `<paths>...` |
-| Algorithm | `--algorithm=histogram` (only implemented backend; other accepted names fail) | `--diff-algorithm` (patience/histogram/myers/minimal) | N/A (uses internal algorithm) |
+| Algorithm | `--algorithm=<myers|myersMinimal|patience|histogram>` plus `--minimal`/`--patience`/`--histogram` | `--diff-algorithm` (patience/histogram/myers/minimal) plus shorthands | N/A (uses internal algorithm) |
 | Output to file | `--output <file>` | `--output <file>` | N/A (use shell redirect) |
 | Name only | `--name-only` | `--name-only` | `--name-only` |
 | Name with status | `--name-status` | `--name-status` | N/A |

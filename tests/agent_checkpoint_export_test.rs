@@ -928,15 +928,6 @@ async fn v1_fixture_checkpoint_remains_readable_via_checkpoint_show() {
     let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join(
         "tests/fixtures/agent_checkpoints/v1_claude_code/85/ae75d2-4c53-465a-b890-a9f861a50cc7",
     );
-    // OID-pinned fixture captured on another machine, absent from HEAD:
-    // missing preconditions print "skipped" and never fail (docs/tests.md
-    // gating convention) — restoring the fixture re-enables the test.
-    if !fixture_root.join("metadata.json").is_file() {
-        eprintln!(
-            "skipped (fixture tests/fixtures/agent_checkpoints/v1_claude_code missing from checkout)"
-        );
-        return;
-    }
     let metadata_bytes =
         std::fs::read(fixture_root.join("metadata.json")).expect("fixture metadata");
     let transcript_bytes =

@@ -91,6 +91,10 @@ fn known_agent_capability_matrix_matches_current_roster() {
     let claude = registration_for(AgentKind::ClaudeCode);
     assert!(claude.hook_installable);
     assert!(claude.capabilities.hooks);
+    assert!(
+        claude.capabilities.transcript_preparer,
+        "claude-code: M2 flush-wait preparer must be advertised"
+    );
     assert_eq!(claude.config_paths, [".claude/settings.json"]);
     let codex = registration_for(AgentKind::Codex);
     assert!(codex.hook_installable, "codex: AG-19 HookProvider landed");

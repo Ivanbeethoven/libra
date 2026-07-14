@@ -242,10 +242,10 @@ both filters run before an external diff driver. P1-08c also supports
 `--color-words[=<regex>]` as the redirected-output-aware color shorthand and
 `--word-diff-regex=<regex>` as the standalone custom tokenizer; global
 `--color=never` still wins, and `--word-diff=plain` remains bracketed under tty
-or forced color. Remaining P1-08 gaps are the
-minimal/patience/histogram/anchored algorithm surface; parser-accepted
-`--algorithm=myers|myersMinimal` values still fail
-explicitly.
+or forced color. P1-08c now also exposes real Myers (the truthful default),
+Myers-minimal, Patience, and Histogram backends through `--algorithm` plus
+`--minimal`/`--patience`/`--histogram`; only anchored diff remains in this
+algorithm batch.
 
 ## Git commands intentionally absent from `src/cli.rs`
 
