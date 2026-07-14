@@ -68,14 +68,24 @@ impl Default for ExportLimits {
 pub async fn trusted_opencode_binary() -> Result<PathBuf> {
     let record = read_trust(OPENCODE_TRUST_SLUG)
         .await
-        .context("read opencode trust record")?
-        .ok_or_else(|| {
-            anyhow!(
-                "the 'opencode' binary is not trusted for export; run \
-                 'libra agent rpc trust opencode' (after verifying the binary) \
-                 to enable the OpenCode export bridge"
-            )
-        })?;
+        .context("read opencode trust record")?;
+    trusted_opencode_binary_from(record).await
+}
+
+/// Injectable core of [`trusted_opencode_binary`] (GC-DR-07): the record
+/// lookup is separated so the fail-closed no-record arm is unit-testable
+/// without touching the process-wide config store (which may legitimately
+/// trust opencode on a dev machine).
+async fn trusted_opencode_binary_from(
+    record: Option<crate::internal::ai::observed_agents::TrustRecord>,
+) -> Result<PathBuf> {
+    let record = record.ok_or_else(|| {
+        anyhow!(
+            "the 'opencode' binary is not trusted for export; run \
+             'libra agent rpc trust opencode' (after verifying the binary) \
+             to enable the OpenCode export bridge"
+        )
+    })?;
     let provenance = revalidate_trust(OPENCODE_TRUST_SLUG, &record)
         .await
         .context("revalidate opencode binary trust")?;
@@ -127,6 +137,17 @@ async fn run_bounded_exporter(
     session_id: &str,
     limits: ExportLimits,
 ) -> Result<Vec<u8>> {
+    // Probe-verified upstream hazard (opencode 1.17.x, 2026-07-14): the CLI
+    // can exit BEFORE flushing stdout into a backpressured pipe — large
+    // exports arrive truncated (~64 KiB) with a SUCCESS status. Give the
+    // child an inherited anonymous FILE as stdout instead: file writes flush
+    // synchronously (verified complete at 370 KiB+), the FD crosses the
+    // sandbox's mount namespace untouched, and the byte cap is enforced on
+    // the file size after exit.
+    let stdout_file = tempfile::tempfile().context("create export stdout tempfile")?;
+    let stdout_for_child = stdout_file
+        .try_clone()
+        .context("clone export stdout handle")?;
     let mut command = tokio::process::Command::new(program);
     command
         .args(pre_args)
@@ -134,7 +155,7 @@ async fn run_bounded_exporter(
         .arg(session_id)
         .env_clear()
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(stdout_for_child))
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     // Minimal env: the exporter must locate its own session store, nothing
@@ -146,28 +167,19 @@ async fn run_bounded_exporter(
     }
 
     let mut child = command.spawn().context("spawn opencode export")?;
-    let mut stdout = child.stdout.take().expect("stdout piped"); // INVARIANT: piped above
     let mut stderr = child.stderr.take().expect("stderr piped"); // INVARIANT: piped above
 
-    let read_all = async {
-        let mut out = Vec::new();
-        // Read one past the cap so oversize is detected, never truncated
-        // into a silently-partial export.
-        let mut limited = (&mut stdout).take(limits.max_bytes.saturating_add(1));
-        limited
-            .read_to_end(&mut out)
-            .await
-            .context("read opencode export stdout")?;
+    let wait_all = async {
         let mut err_buf = Vec::new();
         let _ = (&mut stderr)
             .take(EXPORT_MAX_STDERR_BYTES as u64)
             .read_to_end(&mut err_buf)
             .await;
         let status = child.wait().await.context("wait for opencode export")?;
-        Ok::<_, anyhow::Error>((out, err_buf, status))
+        Ok::<_, anyhow::Error>((err_buf, status))
     };
 
-    let (out, err_buf, status) = match tokio::time::timeout(limits.deadline, read_all).await {
+    let (err_buf, status) = match tokio::time::timeout(limits.deadline, wait_all).await {
         Ok(result) => result?,
         Err(_elapsed) => {
             // Deadline: kill and fail closed — a slow exporter must not eat
@@ -181,12 +193,26 @@ async fn run_bounded_exporter(
         }
     };
 
-    if out.len() as u64 > limits.max_bytes {
+    // Byte cap on the flushed file (GC-DR-04): over-cap errors, never a
+    // silent truncation.
+    let mut stdout_file = stdout_file;
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let size = stdout_file
+        .seek(SeekFrom::End(0))
+        .context("measure export output")?;
+    if size > limits.max_bytes {
         bail!(
             "opencode export exceeded the {} byte cap; refusing truncated content",
             limits.max_bytes
         );
     }
+    stdout_file
+        .seek(SeekFrom::Start(0))
+        .context("rewind export output")?;
+    let mut out = Vec::with_capacity(size as usize);
+    stdout_file
+        .read_to_end(&mut out)
+        .context("read export output file")?;
     if !status.success() {
         bail!(
             "opencode export failed (status {status}); stderr (redacted, capped): {}",
@@ -271,6 +297,25 @@ pub async fn run_export_subprocess_sandboxed(
                 let d = dir.to_string_lossy().into_owned();
                 extra.extend(["--ro-bind".to_string(), d.clone(), d]);
             }
+        }
+        // Task-card-verified exception (opencode 1.17.x probe, 2026-07-14):
+        // the session store is WAL-mode SQLite, whose -wal/-shm side files
+        // need WRITE access even for pure reads — a read-only bind makes
+        // `export` fail with a generic error. Bind ONLY the opencode data
+        // dir read-write (mounted after the ro HOME bind so it wins);
+        // network stays unshared and everything else read-only.
+        let data_root = std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .map(|h| h.join(".local/share"))
+            })
+            .map(|base| base.join("opencode"));
+        if let Some(store) = data_root.filter(|p| p.is_dir()) {
+            let d = store.to_string_lossy().into_owned();
+            extra.extend(["--bind".to_string(), d.clone(), d]);
         }
         // The trusted binary itself may live outside the standard host paths
         // (e.g. ~/.opencode/bin) — HOME ro-bind above usually covers it; add
@@ -438,21 +483,16 @@ printf 'offline-ok'"#,
     }
 
     /// Untrusted binary: no trust record → capability unavailable with an
-    /// actionable hint (fail-closed; no PATH fallback).
+    /// actionable hint (fail-closed; no PATH fallback). Pinned against the
+    /// injectable core (GC-DR-07) — the process-wide config store may
+    /// legitimately trust opencode on a dev machine, and its connection is
+    /// cached process-wide, so env isolation cannot work here; the
+    /// record-present path is exercised by the live agent gate.
     #[tokio::test]
     async fn opencode_export_untrusted_binary_fails_closed() {
-        // No trust record exists in this isolated HOME.
-        let home = tempfile::tempdir().unwrap();
-        let prior = std::env::var_os("LIBRA_TEST_HOME");
-        unsafe { std::env::set_var("LIBRA_TEST_HOME", home.path()) };
-        let result = trusted_opencode_binary().await;
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("LIBRA_TEST_HOME", v),
-                None => std::env::remove_var("LIBRA_TEST_HOME"),
-            }
-        }
-        let err = result.expect_err("no trust record must fail closed");
+        let err = trusted_opencode_binary_from(None)
+            .await
+            .expect_err("no trust record must fail closed");
         assert!(format!("{err:#}").contains("not trusted"), "got {err:#}");
     }
 }

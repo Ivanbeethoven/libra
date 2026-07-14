@@ -984,7 +984,7 @@ async fn write_committed_checkpoint(
     // the adapter's extraction capabilities can derive metadata from them
     // after the redacted blob is produced.
     let mut transcript_raw_for_extraction: Option<Vec<u8>> = None;
-    let transcript_redacted = match AgentKind::from_db_str(agent_kind) {
+    let mut transcript_redacted = match AgentKind::from_db_str(agent_kind) {
         Some(kind) => {
             let adapter = agent_for(kind);
             let seam_ctx = crate::internal::ai::observed_agents::AgentSessionCtx {
@@ -1099,6 +1099,161 @@ async fn write_committed_checkpoint(
                 return Ok(());
             }
             live_reservation = Some((owner, now_ms, outcome.reserved));
+        }
+    }
+
+    // DR-04b (M3): OpenCode has no on-disk transcript — content arrives via
+    // the trusted, sandboxed `opencode export` bridge, converged through the
+    // per-session export job (ADR-DR-11) and gated per turn like every other
+    // path. Bridge unavailability (untrusted binary, no bwrap) degrades to
+    // the legacy metadata-only capture with a warning — never an unsandboxed
+    // or ungated content write.
+    let mut claim_channel: &'static str = "live";
+    let mut export_release: Option<(String, i64, i64)> = None;
+    if agent_kind == "opencode" {
+        use crate::internal::ai::{
+            export_job::{self, IdleOutcome},
+            observed_agents::{
+                coverage, normalize_opencode_export,
+                opencode_export::{
+                    ExportLimits, run_export_subprocess_sandboxed, trusted_opencode_binary,
+                },
+                transcript_source::ExportAuthorized,
+            },
+        };
+        let owner = format!("export:{}:{}", std::process::id(), uuid::Uuid::new_v4());
+        let now_ms = Utc::now().timestamp_millis();
+        match export_job::observe_idle(conn, "opencode", &envelope.session_id, &owner, now_ms).await
+        {
+            Err(err) => {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "opencode export job unavailable; falling back to metadata-only capture"
+                );
+            }
+            Ok(IdleOutcome::RecordedOnly) => {
+                tracing::info!(
+                    session_id = %libra_session_id,
+                    "opencode idle recorded; an in-flight export runner will cover it"
+                );
+                return Ok(());
+            }
+            Ok(IdleOutcome::Runner {
+                fence_token,
+                target_generation,
+                ..
+            }) => {
+                let bridge = async {
+                    let binary = trusted_opencode_binary().await?;
+                    run_export_subprocess_sandboxed(
+                        &binary,
+                        &envelope.session_id,
+                        ExportLimits::default(),
+                    )
+                    .await
+                }
+                .await;
+                match bridge {
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "opencode export bridge unavailable; metadata-only capture"
+                        );
+                        let _ = export_job::release(
+                            conn,
+                            "opencode",
+                            &envelope.session_id,
+                            &owner,
+                            fence_token,
+                            "failed",
+                            Some("LBR-AGENT-005"),
+                            Utc::now().timestamp_millis(),
+                        )
+                        .await;
+                    }
+                    Ok(bytes) => {
+                        // Digest-bound authorization tag (ADR-DR-02): minted
+                        // here, re-verified like every Bytes source.
+                        let auth = ExportAuthorized::issue("opencode", libra_session_id, &bytes);
+                        debug_assert!(auth.matches("opencode", libra_session_id, &bytes));
+                        let mut turns = normalize_opencode_export(&bytes);
+                        coverage::redact_turns(&mut turns);
+                        let outcome = match coverage_gate::reserve_turn_claims_for_channel(
+                            conn,
+                            libra_session_id,
+                            &turns,
+                            &owner,
+                            now_ms,
+                            "export",
+                        )
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(err) => {
+                                // Fail-closed: no ungated append; job released
+                                // dirty so the next idle retries.
+                                let _ = export_job::release(
+                                    conn,
+                                    "opencode",
+                                    &envelope.session_id,
+                                    &owner,
+                                    fence_token,
+                                    "dirty",
+                                    None,
+                                    Utc::now().timestamp_millis(),
+                                )
+                                .await;
+                                return Err(err.context(
+                                    "coverage gate reservation failed; export capture aborted \
+                                     (fail-closed)",
+                                ));
+                            }
+                        };
+                        if outcome.is_noop() {
+                            tracing::info!(
+                                session_id = %libra_session_id,
+                                skipped_covered = outcome.skipped_covered,
+                                skipped_inflight = outcome.skipped_inflight,
+                                conflicted = outcome.conflicted,
+                                "opencode export: every turn already covered; no append"
+                            );
+                            let done_ms = Utc::now().timestamp_millis();
+                            let _ = export_job::advance_processed(
+                                conn,
+                                "opencode",
+                                &envelope.session_id,
+                                &owner,
+                                fence_token,
+                                target_generation,
+                                done_ms,
+                            )
+                            .await;
+                            let _ = export_job::release(
+                                conn,
+                                "opencode",
+                                &envelope.session_id,
+                                &owner,
+                                fence_token,
+                                "idle",
+                                None,
+                                done_ms,
+                            )
+                            .await;
+                            return Ok(());
+                        }
+                        // Whole-blob baseline for the checkpoint: the export
+                        // bytes through the generic redactor (same contract
+                        // as the live Claude blob — ADR-DR-04/DR-12).
+                        let (redacted, report) = Redactor::new_default().redact(&bytes);
+                        merge_redaction_report_into(&mut report_value, &report);
+                        transcript_raw_for_extraction = Some(bytes);
+                        transcript_redacted = redacted;
+                        claim_channel = "export";
+                        live_reservation = Some((owner.clone(), now_ms, outcome.reserved));
+                        export_release = Some((owner, fence_token, target_generation));
+                    }
+                }
+            }
         }
     }
 
@@ -1246,6 +1401,7 @@ async fn write_committed_checkpoint(
     let claim_plan =
         live_reservation.map(
             |(owner, now_ms, claims)| coverage_gate::LiveClaimCommitPlan {
+                source_channel: claim_channel,
                 session_id: libra_session_id.to_string(),
                 checkpoint_id: checkpoint_id.clone(),
                 owner,
@@ -1333,6 +1489,50 @@ async fn write_committed_checkpoint(
         );
     }
     write_span.record("stage", "done");
+
+    // DR-04b: the export runner advances its processed generation and
+    // releases the lease HONESTLY — `dirty` when more idles arrived during
+    // the run (the next idle picks them up; no unbounded loop on the hook
+    // path), `idle` when clean; a fenced-out runner touches nothing.
+    if let Some((owner, fence_token, target_generation)) = export_release {
+        use crate::internal::ai::export_job::{self, AdvanceOutcome};
+        let done_ms = Utc::now().timestamp_millis();
+        let advance = export_job::advance_processed(
+            conn,
+            "opencode",
+            &envelope.session_id,
+            &owner,
+            fence_token,
+            target_generation,
+            done_ms,
+        )
+        .await;
+        let terminal = match advance {
+            Ok(AdvanceOutcome::Clean) => Some("idle"),
+            Ok(AdvanceOutcome::MoreWork { .. }) => Some("dirty"),
+            Ok(AdvanceOutcome::FencedOut) => None,
+            Err(err) => {
+                tracing::warn!(
+                    error = %format!("{err:#}"),
+                    "failed to advance opencode export generation"
+                );
+                Some("dirty")
+            }
+        };
+        if let Some(state) = terminal {
+            let _ = export_job::release(
+                conn,
+                "opencode",
+                &envelope.session_id,
+                &owner,
+                fence_token,
+                state,
+                None,
+                done_ms,
+            )
+            .await;
+        }
+    }
 
     // Suppress the unused-warning for redaction_matches; reserved for a
     // Phase 3 enhancement that adds per-rule counters to metadata.
