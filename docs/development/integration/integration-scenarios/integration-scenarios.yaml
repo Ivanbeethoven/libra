@@ -54,9 +54,10 @@ notes: |
   All scenarios must follow the §3.3.1 canonical libra()/gitfix() isolation
   template in the md (env -i + SAFE_PATH + TMPDIR + RUN_ROOT).
   Cargo-only compatibility targets are not duplicated as runner scenarios;
-  P2-02 mailinfo and P2-03 format-patch interoperability are registered as
-  compat_mailinfo_basic / compat_format_patch_mail_roundtrip in tests/INDEX.md
-  and the integration-test-plan matrix.
+  P2-02 mailinfo, P2-03 format-patch interoperability, and P2-04's explicit
+  non-sending send-email policy are registered through compat_mailinfo_basic,
+  compat_format_patch_mail_roundtrip, and compat_matrix_alignment in
+  tests/INDEX.md and the integration-test-plan matrix.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

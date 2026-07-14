@@ -128,6 +128,13 @@
 
 ### Documentation
 
+- **Explicit non-sending `send-email` policy (v0.18.87)**: records
+  `send-email` as unsupported rather than exposing a misleading transport
+  stub. Libra does not read `sendemail.*`, manage SMTP credentials, or contact
+  mail servers; users generate interoperable messages with `libra
+  format-patch` and validate/send them with stock `git send-email` or another
+  mailer. English/Chinese user guidance, the D19 governance decision, and a
+  compatibility guard pin the no-network boundary.
 - **AI provider env constructor policy (v0.17.1048)**: provider
   Rustdocs now define `Client::from_env()` as a source-compatible
   legacy helper for the 0.17 line and `Client::from_resolved_env(...)`

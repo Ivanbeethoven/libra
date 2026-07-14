@@ -256,6 +256,7 @@ and start with a supplied prefix; selector retention/clearing follows Git.
 |---------|------|-------|
 | submodule | unsupported | intentional product boundary (see [docs/development/commands/_compatibility.md#d1-submodule-子命令族](docs/development/commands/_compatibility.md#d1-submodule-子命令族)) |
 | sparse-checkout | unsupported | no public sparse checkout command (see [docs/development/commands/_compatibility.md#d10-clone---sparse-与顶层-sparse-checkout-命令](docs/development/commands/_compatibility.md#d10-clone---sparse-与顶层-sparse-checkout-命令)) |
+| send-email | unsupported | P2-04 / D19 policy: Libra exposes no mail-transport command and never reads `sendemail.*` configuration, SMTP credentials, or contacts a mail server. Generate messages with `libra format-patch`, then validate or send them with stock `git send-email` or another mailer (see [docs/commands/send-email.md](docs/commands/send-email.md)). |
 
 ## Hooks
 

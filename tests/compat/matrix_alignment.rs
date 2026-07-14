@@ -1,6 +1,6 @@
 mod matrix_alignment_support;
 
-use std::fs;
+use std::{fs, process::Command};
 
 use matrix_alignment_support::{
     assert_contains, cli_commands, code_router_routes, command_development_public_commands,
@@ -19,6 +19,83 @@ fn compatibility_matrix_matches_cli_commands() {
     assert!(
         missing.is_empty() && extra.is_empty(),
         "COMPATIBILITY.md top-level command matrix is out of sync with src/cli.rs::Commands.\nmissing from COMPATIBILITY.md: {missing:?}\nlisted in COMPATIBILITY.md but absent from src/cli.rs::Commands: {extra:?}"
+    );
+}
+
+#[test]
+fn send_email_policy_is_explicit_and_non_sending() {
+    assert!(
+        !cli_commands().contains("send-email"),
+        "P2-04 / D19 requires send-email to remain absent until a reviewed transport RFC lands"
+    );
+
+    let outside_repo = tempfile::tempdir().expect("create no-repository send-email test directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .args(["send-email", "--dry-run", "0001-example.patch"])
+        .current_dir(outside_repo.path())
+        .output()
+        .expect("run libra send-email negative-path guard");
+    assert_eq!(
+        output.status.code(),
+        Some(129),
+        "an absent send-email command must use the stable CLI-error exit"
+    );
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_contains(
+        &diagnostic,
+        "'send-email' is not a libra command",
+        "send-email runtime rejection",
+    );
+    assert_contains(
+        &diagnostic,
+        "LBR-CLI-001",
+        "send-email stable runtime error code",
+    );
+
+    let compat = read_repo_file("COMPATIBILITY.md");
+    assert_contains(
+        &compat,
+        "| send-email | unsupported | P2-04 / D19 policy:",
+        "COMPATIBILITY.md absent-command matrix",
+    );
+    assert_contains(
+        &compat,
+        "never reads `sendemail.*` configuration, SMTP credentials, or contacts a mail server",
+        "COMPATIBILITY.md no-network boundary",
+    );
+
+    let user_doc = read_repo_file("docs/commands/send-email.md");
+    for needle in [
+        "Libra does not implement SMTP",
+        "git send-email --dry-run",
+        "LBR-CLI-001",
+    ] {
+        assert_contains(&user_doc, needle, "docs/commands/send-email.md");
+    }
+
+    let zh_user_doc = read_repo_file("docs/commands/zh-CN/send-email.md");
+    for needle in [
+        "Libra 不实现 SMTP 投递",
+        "git send-email --dry-run",
+        "LBR-CLI-001",
+    ] {
+        assert_contains(&zh_user_doc, needle, "docs/commands/zh-CN/send-email.md");
+    }
+
+    let development_doc = read_repo_file("docs/development/commands/send-email.md");
+    assert_contains(
+        &development_doc,
+        "No `Commands::SendEmail` variant",
+        "docs/development/commands/send-email.md",
+    );
+    assert_contains(
+        &read_repo_file("docs/development/commands/_compatibility.md"),
+        "### D19：`send-email` SMTP 传输",
+        "send-email governance decision",
     );
 }
 

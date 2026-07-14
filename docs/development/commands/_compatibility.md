@@ -207,6 +207,13 @@ unsupported 子面。
 - 原因：commit-safe 地收窄工作树需要 **skip-worktree/materializing-sparse 机制**（Libra 至今无此索引位——正是 D10 延后的 materializing 形）：HEAD 是完整提交树，任何窄于 HEAD 的索引都会让 `commit` 丢文件，而全索引+窄工作树在没有 skip-worktree 位时会让 `status` 谎报删除。因此磁盘收窄与 D10 绑定，不能在 v1 单独安全交付。
 - 重启条件：先落地 D10 的 materializing sparse-checkout / skip-worktree 索引位（含 status/add/commit/checkout 全链一致性与测试），再让 `--deps-of` 复用其物化路径实现磁盘收窄。
 
+### D19：`send-email` SMTP 传输
+
+- 状态：P2-04 明确维持 `unsupported`。`src/cli.rs::Commands` 不暴露 `send-email`，Libra 不读取 `sendemail.*` 配置、不管理 SMTP 凭据，也不联系邮件服务器。
+- 原因：仅提供一个 `--dry-run` / `--validate-only` 壳会让用户误以为 Git 的 recipient/config/alias/credential/TLS/SMTP 语义已接入。P2-03 已证明 `libra format-patch` 产物可由 Git 消费，所以安全边界是让 Libra 只生成邮件，将校验和投递交给 stock `git send-email` 或其他专用 mailer。
+- 测试证据：`compat_matrix_alignment::send_email_policy_is_explicit_and_non_sending` 钉死 CLI 无此 variant、`LBR-CLI-001` 失败面、用户/开发/兼容文档一致性；P2-03 的 `compat_format_patch_mail_roundtrip` 继续守卫交接产物。
+- 重启条件：有明确的内建投递需求，并完成 SMTP/TLS 威胁模型、凭据存储与日志脱敏、Git `sendemail.*`/alias/recipient 语义、timeout/retry/idempotency 边界，以及可控邮件服务器端到端测试后，再以新 RFC 重启。
+
 ## 维护要求
 
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。

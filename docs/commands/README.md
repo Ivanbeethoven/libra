@@ -168,6 +168,12 @@ Every Libra command accepts the following global flags:
 | `libra index-pack` | | Build a `.idx` pack index file for an existing `.pack` archive (hidden) | [index-pack.md](index-pack.md) |
 | `libra hooks` | | External AI agent (Claude Code / Gemini) hook entry point; called by configs installed by `libra agent enable` (hidden) | [hooks.md](hooks.md) |
 
+## Unsupported Git Transport Commands
+
+| Git command | Libra status | Safe workflow | Doc |
+|-------------|--------------|---------------|-----|
+| `git send-email` | No `libra send-email`; Libra performs no SMTP delivery | Generate with `libra format-patch`, then validate/send with stock Git or another mailer | [send-email.md](send-email.md) |
+
 ## Structured Output Envelope
 
 All commands that support `--json` / `--machine` return a consistent JSON envelope:

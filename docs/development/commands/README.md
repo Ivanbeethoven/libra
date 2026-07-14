@@ -138,10 +138,11 @@
 - `package`：内部设计资料保留（见 `docs/development/internal/package.md`）
 - `prune`：内部设计资料保留（见 `docs/development/internal/prune.md`）
 - `stats`：内部设计资料保留（见 `docs/development/internal/stats.md`）
+- [`send-email`](send-email.md)：P2-04 / D19 明确不接入 SMTP 传输；使用 `format-patch` 产物交给 stock Git 或其他 mailer
 
 若未来需要发布其中任一命令，必须重新走完整的 CLI 接入、`COMPATIBILITY.md` 登记、用户文档和回归测试流程。
 
 ## 汇总文档
 
-- [`_compatibility.md`](_compatibility.md)：Git 兼容治理、D1-D10 拒绝/延后决策、参数级缺口状态。
+- [`_compatibility.md`](_compatibility.md)：Git 兼容治理、D1-D19 拒绝/延后决策、参数级缺口状态。
 - [`_general.md`](_general.md)：跨命令实现规范、CLIG 现代化、测试和文档维护要求。
