@@ -245,6 +245,31 @@ pub fn stable_promoted_spec_for(kind: AgentKind) -> Option<&'static StablePromot
 /// import (GC-DR-08).
 const ROLLOUT_MAX_ENTRIES_PER_DIR: usize = 4_096;
 const ROLLOUT_MAX_FILES_SCANNED: usize = 10_000;
+/// Global directory-read budget: even a tree of EMPTY numeric date dirs
+/// (4096 years × months × days) must not fan out unboundedly.
+const ROLLOUT_MAX_DIRS_VISITED: usize = 2_048;
+/// Monotonic wall-clock deadline for one discovery pass.
+const ROLLOUT_DISCOVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Injectable bounds (GC-DR-07) so tests pin every cap deterministically.
+#[derive(Debug, Clone, Copy)]
+pub struct RolloutDiscoveryLimits {
+    pub max_entries_per_dir: usize,
+    pub max_files_scanned: usize,
+    pub max_dirs_visited: usize,
+    pub deadline: std::time::Duration,
+}
+
+impl Default for RolloutDiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_entries_per_dir: ROLLOUT_MAX_ENTRIES_PER_DIR,
+            max_files_scanned: ROLLOUT_MAX_FILES_SCANNED,
+            max_dirs_visited: ROLLOUT_MAX_DIRS_VISITED,
+            deadline: ROLLOUT_DISCOVERY_DEADLINE,
+        }
+    }
+}
 
 fn codex_sessions_root() -> Option<std::path::PathBuf> {
     // $CODEX_HOME (absolute) wins WITHOUT requiring a resolvable home dir;
@@ -268,6 +293,7 @@ fn codex_sessions_root() -> Option<std::path::PathBuf> {
 /// diagnose it instead of reading "not found".
 fn sorted_desc_entries(
     dir: &std::path::Path,
+    max_entries: usize,
     keep: impl Fn(&str) -> bool,
 ) -> Result<Vec<std::ffi::OsString>> {
     let read = match fs::read_dir(dir) {
@@ -279,12 +305,12 @@ fn sorted_desc_entries(
     };
     let mut names: Vec<std::ffi::OsString> = Vec::new();
     for (scanned, entry) in read.enumerate() {
-        if scanned >= ROLLOUT_MAX_ENTRIES_PER_DIR {
+        if scanned >= max_entries {
             return Err(anyhow!(
                 "rollout directory {} exceeds the {} entry scan bound; refusing a possibly \
                  stale answer (GC-DR-08 bounded discovery)",
                 dir.display(),
-                ROLLOUT_MAX_ENTRIES_PER_DIR
+                max_entries
             ));
         }
         let entry =
@@ -312,6 +338,16 @@ fn all_ascii_digits(name: &str, len: usize) -> bool {
 /// partitions first, first match wins. Fail-closed on an invalid id or a
 /// symlinked match; `Ok(None)` only when nothing matches.
 pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>> {
+    find_codex_rollout_bounded(session_id, RolloutDiscoveryLimits::default())
+}
+
+/// [`find_codex_rollout`] with injectable bounds (GC-DR-07/08). Every bound
+/// fails LOUDLY when exceeded — a truncated walk must never silently claim
+/// "newest" or "not found".
+pub fn find_codex_rollout_bounded(
+    session_id: &str,
+    limits: RolloutDiscoveryLimits,
+) -> Result<Option<std::path::PathBuf>> {
     let valid = !session_id.is_empty()
         && session_id.len() <= 64
         && session_id
@@ -326,28 +362,61 @@ pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>
         return Ok(None);
     };
     let suffix = format!("-{session_id}.jsonl");
+    let started = std::time::Instant::now();
     let mut files_seen = 0usize;
-    for year in sorted_desc_entries(&root, |n| all_ascii_digits(n, 4))? {
+    let mut dirs_visited = 0usize;
+    let visit_dir = |dirs_visited: &mut usize| -> Result<()> {
+        *dirs_visited += 1;
+        if *dirs_visited > limits.max_dirs_visited {
+            return Err(anyhow!(
+                "rollout discovery visited more than {} directories; refusing a possibly \
+                 stale answer (GC-DR-08 bounded fan-out)",
+                limits.max_dirs_visited
+            ));
+        }
+        if started.elapsed() > limits.deadline {
+            return Err(anyhow!(
+                "rollout discovery exceeded its {:?} deadline; refusing a possibly \
+                 stale answer (GC-DR-08 bounded discovery)",
+                limits.deadline
+            ));
+        }
+        Ok(())
+    };
+    visit_dir(&mut dirs_visited)?;
+    for year in sorted_desc_entries(&root, limits.max_entries_per_dir, |n| {
+        all_ascii_digits(n, 4)
+    })? {
         let year_dir = root.join(&year);
         if !year_dir.is_dir() {
             continue;
         }
-        for month in sorted_desc_entries(&year_dir, |n| all_ascii_digits(n, 2))? {
+        visit_dir(&mut dirs_visited)?;
+        for month in sorted_desc_entries(&year_dir, limits.max_entries_per_dir, |n| {
+            all_ascii_digits(n, 2)
+        })? {
             let month_dir = year_dir.join(&month);
             if !month_dir.is_dir() {
                 continue;
             }
-            for day in sorted_desc_entries(&month_dir, |n| all_ascii_digits(n, 2))? {
+            visit_dir(&mut dirs_visited)?;
+            for day in sorted_desc_entries(&month_dir, limits.max_entries_per_dir, |n| {
+                all_ascii_digits(n, 2)
+            })? {
                 let day_dir = month_dir.join(&day);
                 if !day_dir.is_dir() {
                     continue;
                 }
-                let names = sorted_desc_entries(&day_dir, |n| n.starts_with("rollout-"))?;
+                visit_dir(&mut dirs_visited)?;
+                let names = sorted_desc_entries(&day_dir, limits.max_entries_per_dir, |n| {
+                    n.starts_with("rollout-")
+                })?;
                 files_seen += names.len();
-                if files_seen > ROLLOUT_MAX_FILES_SCANNED {
+                if files_seen > limits.max_files_scanned {
                     return Err(anyhow!(
-                        "rollout discovery scanned more than {ROLLOUT_MAX_FILES_SCANNED} files; \
-                         refusing a possibly stale answer (GC-DR-08 bounded discovery)"
+                        "rollout discovery scanned more than {} files; refusing a possibly \
+                         stale answer (GC-DR-08 bounded discovery)",
+                        limits.max_files_scanned
                     ));
                 }
                 for name in names {
@@ -405,6 +474,71 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// R2 P1: every discovery bound fails LOUDLY — global dir budget on an
+    /// empty numeric tree, per-dir scan bound, and total-file cap.
+    #[test]
+    #[serial_test::serial]
+    fn codex_rollout_discovery_bounds_fail_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_home = tmp.path().join("codex-abs");
+        let _g = CodexHomeGuard::set(&tmp.path().join("no-such-home"), &codex_home);
+        let sid = "0199a213-81a0-7800-8aa2-58a4a352b423";
+
+        // Global fan-out budget: empty numeric date dirs exhaust the visit
+        // budget and must error, never Ok(None).
+        for y in 0..6 {
+            std::fs::create_dir_all(codex_home.join(format!("sessions/20{:02}/01/01", 10 + y)))
+                .unwrap();
+        }
+        let tight_dirs = RolloutDiscoveryLimits {
+            max_dirs_visited: 4,
+            ..Default::default()
+        };
+        let err =
+            find_codex_rollout_bounded(sid, tight_dirs).expect_err("dir budget must fail loudly");
+        assert!(format!("{err:#}").contains("directories"), "got {err:#}");
+
+        // Per-dir scan bound: more entries than the bound → loud error.
+        let tight_entries = RolloutDiscoveryLimits {
+            max_entries_per_dir: 3,
+            ..Default::default()
+        };
+        let err = find_codex_rollout_bounded(sid, tight_entries)
+            .expect_err("per-dir scan bound must fail loudly");
+        assert!(
+            format!("{err:#}").contains("entry scan bound"),
+            "got {err:#}"
+        );
+
+        // Total-file cap: too many rollout files → loud error.
+        let day = codex_home.join("sessions/2015/01/01");
+        for i in 0..3 {
+            std::fs::write(
+                day.join(format!(
+                    "rollout-2015-01-01T00-00-0{i}-ffffffff-0000-0000-0000-00000000000{i}.jsonl"
+                )),
+                "{}\n",
+            )
+            .unwrap();
+        }
+        let tight_files = RolloutDiscoveryLimits {
+            max_files_scanned: 2,
+            ..Default::default()
+        };
+        let err =
+            find_codex_rollout_bounded(sid, tight_files).expect_err("file cap must fail loudly");
+        assert!(format!("{err:#}").contains("files"), "got {err:#}");
+
+        // Deadline: an already-expired deadline errors on the first visit.
+        let expired = RolloutDiscoveryLimits {
+            deadline: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let err = find_codex_rollout_bounded(sid, expired)
+            .expect_err("expired deadline must fail loudly");
+        assert!(format!("{err:#}").contains("deadline"), "got {err:#}");
     }
 
     /// R1 follow-ups: absolute $CODEX_HOME needs no home; junk lexically-high
