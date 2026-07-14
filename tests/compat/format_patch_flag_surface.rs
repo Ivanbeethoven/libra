@@ -38,6 +38,8 @@ fn format_patch_help_lists_expected_flags() {
     // Flags that MUST appear in --help
     for flag in [
         "--output-directory",
+        "-1",
+        "--root",
         "--stdout",
         "--numbered",
         "--start-number",
@@ -48,7 +50,13 @@ fn format_patch_help_lists_expected_flags() {
         "--in-reply-to",
         "--reroll-count",
         "--signoff",
+        "--no-signoff",
         "--full-index",
+        "--minimal",
+        "--histogram",
+        "--ignore-if-in-upstream",
+        "--src-prefix",
+        "--dst-prefix",
         "--no-stat",
         "--keep-subject",
         "--suffix",

@@ -64,6 +64,7 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra commit` | `ci` | Record staged changes as a new commit with optional vault signing and conventional format | [commit.md](commit.md) |
 | `libra am` | | Apply plain-text format-patch mails with continue/skip/abort recovery | [am.md](am.md) |
+| `libra format-patch` | | Generate Git-consumable plain or MIME mbox patch series | [format-patch.md](format-patch.md) |
 | `libra log` | `hist`, `history` | Show commit history with graph, patch, stat, and custom format support | [log.md](log.md) |
 | `libra logfile` | | Inspect the tracing log-file configuration (path, rotation, filter, size) | [logfile.md](logfile.md) |
 | `libra shortlog` | `slog` | Summarize reachable commits grouped by author | [shortlog.md](shortlog.md) |

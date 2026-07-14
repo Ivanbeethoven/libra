@@ -24,13 +24,17 @@ use serde::Serialize;
 use crate::{
     command::log,
     common_utils::parse_commit_msg,
-    internal::{config::ConfigKv, notes},
+    internal::notes,
     utils::{
+        atomic_write,
         error::{CliError, CliResult, StableErrorCode},
-        output::OutputConfig,
+        output::{OutputConfig, stdout_write_error},
         util,
     },
 };
+
+const DEFAULT_SUBJECT_PREFIX: &str = "PATCH";
+const DEFAULT_SUFFIX: &str = ".patch";
 
 // ---------------------------------------------------------------------------
 // EXAMPLES constant for `--help` (required by compat_help_examples_banner)
@@ -39,6 +43,10 @@ pub const FORMAT_PATCH_EXAMPLES: &str = "\
 Examples:
   # Generate patches for the last two commits
   libra format-patch HEAD~2..HEAD
+
+  # Generate exactly HEAD, or include all commits through the root
+  libra format-patch -1 --stdout
+  libra format-patch --root --stdout
 
   # Numbered output to a directory
   libra format-patch -n -o patches/ main..feature
@@ -51,6 +59,9 @@ Examples:
 
   # All output to stdout (suitable for piping to `git am`)
   libra format-patch --stdout origin/main..
+
+  # Skip patch-equivalent upstream commits and customize diff path prefixes
+  libra format-patch --ignore-if-in-upstream --src-prefix=old/ --dst-prefix=new/ origin/main..HEAD
 
   # Add recipient headers (To: and Cc:, repeatable)
   libra format-patch --to reviewer@example.com --cc list@example.com origin/main..
@@ -90,6 +101,14 @@ pub struct FormatPatchArgs {
     #[arg(value_name = "revision-range")]
     pub revision_range: Option<String>,
 
+    /// Generate only the named commit, or HEAD when no revision is given.
+    #[arg(short = '1')]
+    pub last_one: bool,
+
+    /// Include the root commit and all reachable non-merge ancestors.
+    #[arg(long = "root")]
+    pub root: bool,
+
     /// Write patch files into DIR instead of the current working directory.
     #[arg(short = 'o', long = "output-directory", value_name = "DIR")]
     pub output_directory: Option<String>,
@@ -108,12 +127,8 @@ pub struct FormatPatchArgs {
     pub start_number: usize,
 
     /// Use PREFIX instead of "PATCH" in the Subject: line.
-    #[arg(
-        long = "subject-prefix",
-        value_name = "PREFIX",
-        default_value = "PATCH"
-    )]
-    pub subject_prefix: String,
+    #[arg(long = "subject-prefix", value_name = "PREFIX")]
+    pub subject_prefix: Option<String>,
 
     /// Generate a cover-letter template before the actual patches (named
     /// `0000-cover-letter<suffix>`, or `0` under `--numbered-files`).
@@ -166,6 +181,10 @@ pub struct FormatPatchArgs {
     #[arg(short = 's', long = "signoff")]
     pub signoff: bool,
 
+    /// Do not add a signoff, overriding `format.signOff` config.
+    #[arg(long = "no-signoff", overrides_with = "signoff")]
+    pub no_signoff: bool,
+
     /// Append each commit's notes after the `---` line. With no value the
     /// default notes ref (`refs/notes/commits`) is used; `--notes=<ref>` reads
     /// the given ref. Commits without a note are emitted unchanged.
@@ -192,6 +211,29 @@ pub struct FormatPatchArgs {
     #[arg(long = "full-index")]
     pub full_index: bool,
 
+    /// Spend extra time finding the smallest Myers diff. Libra's default Myers
+    /// backend already guarantees a shortest edit script, so this is output-
+    /// equivalent to the default.
+    #[arg(long = "minimal")]
+    pub minimal: bool,
+
+    /// Generate patch hunks with the histogram diff algorithm.
+    #[arg(long = "histogram")]
+    pub histogram: bool,
+
+    /// Omit commits whose stable patch-id already exists on the excluded side
+    /// of the revision range.
+    #[arg(long = "ignore-if-in-upstream")]
+    pub ignore_if_in_upstream: bool,
+
+    /// Use PREFIX instead of `a/` for old-side paths in patch headers.
+    #[arg(long = "src-prefix", value_name = "PREFIX")]
+    pub src_prefix: Option<String>,
+
+    /// Use PREFIX instead of `b/` for new-side paths in patch headers.
+    #[arg(long = "dst-prefix", value_name = "PREFIX")]
+    pub dst_prefix: Option<String>,
+
     /// Do not show the diffstat summary before the diff.
     #[arg(long = "no-stat")]
     pub no_stat: bool,
@@ -203,8 +245,8 @@ pub struct FormatPatchArgs {
 
     /// Filename suffix for generated patches (default ".patch"); e.g. ".txt".
     /// Ignored under `--numbered-files` (which uses bare sequence numbers).
-    #[arg(long = "suffix", value_name = "SFX", default_value = ".patch")]
-    pub suffix: String,
+    #[arg(long = "suffix", value_name = "SFX")]
+    pub suffix: Option<String>,
 
     /// Output an all-zero hash in each patch's "From <hash>" line instead of
     /// the commit hash (stable output for testing/reproducibility).
@@ -270,6 +312,16 @@ enum FormatPatchError {
 
     #[error("failed to create output directory '{}': {detail}", .dir)]
     OutputDirCreate { dir: String, detail: String },
+
+    #[error("failed to read config '{key}': {detail}")]
+    ConfigRead { key: &'static str, detail: String },
+
+    #[error("bad config value '{value}' for '{key}' (expected {expected})")]
+    InvalidConfig {
+        key: &'static str,
+        value: String,
+        expected: &'static str,
+    },
 }
 
 impl From<FormatPatchError> for CliError {
@@ -290,6 +342,11 @@ impl From<FormatPatchError> for CliError {
             FormatPatchError::OutputDirCreate { .. } => {
                 CliError::fatal(err.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
+            FormatPatchError::ConfigRead { .. } => {
+                CliError::fatal(err.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            FormatPatchError::InvalidConfig { .. } => CliError::failure(err.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidTarget),
         }
     }
 }
@@ -325,6 +382,8 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
         return Err(CliError::from(FormatPatchError::NotInRepo));
     }
 
+    resolve_format_config(&mut args).await?;
+
     // `--signature-file` reads the footer text from a file; resolve it into the
     // same slot `--signature` uses (the two are mutually exclusive). Trailing
     // newlines are trimmed so the footer is rendered consistently. Skip the read
@@ -342,6 +401,18 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     // 2. Resolve revision range
     let commits = resolve_range_commits(&args).await?;
     if commits.is_empty() {
+        if args.ignore_if_in_upstream {
+            if output.is_json() {
+                crate::utils::output::emit_json_data(
+                    "format-patch",
+                    &FormatPatchOutput {
+                        patches: Vec::new(),
+                    },
+                    output,
+                )?;
+            }
+            return Ok(());
+        }
         return Err(CliError::failure("no patches to generate")
             .with_stable_code(StableErrorCode::CliInvalidTarget));
     }
@@ -350,41 +421,37 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     // attached to the cover letter when present, otherwise to the last patch.
     let base_block = build_base_block(&args, &commits).await?;
 
-    // 3. Determine output directory
-    let out_dir = resolve_output_dir(&args)?;
-
-    // 4. Build thread Message-ID (used for --thread / --in-reply-to)
+    // 3. Build thread Message-ID (used for --thread / --in-reply-to)
     let thread_id = build_thread_id(&args, &commits);
 
     // Resolve the `--from` identity once (shared across all patches).
     let from_identity = resolve_from_identity(&args).await?;
 
-    // 5. Determine numbering
+    // 4. Determine numbering
     let total = commits.len();
     let start_num = args.start_number;
 
-    // 6. Generate cover letter if requested
-    let mut records = Vec::new();
+    // 5. Render the complete series before creating any patch file. A later
+    // object/config error therefore cannot leave a partially generated series.
+    let mut rendered = Vec::with_capacity(total + usize::from(args.cover_letter));
     if args.cover_letter {
         let cover_body = format_cover_letter(
             &args,
             &commits,
+            &thread_id,
             from_identity.as_ref(),
             base_block.as_deref(),
         )?;
-        let path = write_patch_file(&args, &out_dir, 0, total, start_num, "", &cover_body)?;
-        if !output.quiet {
-            eprintln!("{}", path.display());
-        }
-        records.push(PatchRecord {
+        rendered.push(RenderedPatch {
             number: 0,
             commit: "0000000000000000000000000000000000000000".to_string(),
             subject: "*** SUBJECT HERE ***".to_string(),
-            path: path.display().to_string(),
+            slug: String::new(),
+            body: cover_body,
         });
     }
 
-    // 7. Iterate commits and generate patches
+    // 6. Render each commit patch.
     for (idx, commit) in commits.iter().enumerate() {
         let patch_num = start_num + idx;
         // Without a cover letter, the base trailer rides on the last patch.
@@ -405,40 +472,38 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
         )
         .await?;
         let slug = patch_slug(commit, &args);
+        rendered.push(RenderedPatch {
+            number: patch_num,
+            commit: commit.id.to_string(),
+            subject: commit_subject_line(commit),
+            slug,
+            body: patch_body,
+        });
+    }
+
+    // 7. Persist only after every message has rendered successfully. Each file
+    // uses temp+rename atomicity; stdout uses the shared BrokenPipe policy.
+    let out_dir = resolve_output_dir(&args)?;
+    let mut records = Vec::with_capacity(rendered.len());
+    for patch in rendered {
+        let path = write_patch_file(
+            &args,
+            &out_dir,
+            patch.number,
+            total,
+            start_num,
+            &patch.slug,
+            &patch.body,
+        )?;
         if !output.quiet {
-            let path = write_patch_file(
-                &args,
-                &out_dir,
-                patch_num,
-                total,
-                start_num,
-                &slug,
-                &patch_body,
-            )?;
             eprintln!("{}", path.display());
-            records.push(PatchRecord {
-                number: patch_num,
-                commit: commit.id.to_string(),
-                subject: commit_subject_line(commit),
-                path: path.display().to_string(),
-            });
-        } else {
-            let path = write_patch_file(
-                &args,
-                &out_dir,
-                patch_num,
-                total,
-                start_num,
-                &slug,
-                &patch_body,
-            )?;
-            records.push(PatchRecord {
-                number: patch_num,
-                commit: commit.id.to_string(),
-                subject: commit_subject_line(commit),
-                path: path.display().to_string(),
-            });
         }
+        records.push(PatchRecord {
+            number: patch.number,
+            commit: patch.commit,
+            subject: patch.subject,
+            path: path.display().to_string(),
+        });
     }
 
     // 8. Emit JSON if requested
@@ -467,6 +532,14 @@ struct PatchRecord {
     path: String,
 }
 
+struct RenderedPatch {
+    number: usize,
+    commit: String,
+    subject: String,
+    slug: String,
+    body: String,
+}
+
 // ---------------------------------------------------------------------------
 // Revision range resolution
 // ---------------------------------------------------------------------------
@@ -488,6 +561,11 @@ async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, Cl
             Some(resolve_single_rev(left_spec).await?),
             resolve_single_rev(right_spec).await?,
         )
+    } else if args.root || args.last_one {
+        // `--root [REV]` walks from REV through the root. `-1 [REV]` names the
+        // one commit to emit rather than retaining the usual `<REV>..HEAD`
+        // single-revision interpretation.
+        (None, resolve_single_rev(spec).await?)
     } else {
         // Single revision: range is <spec>..HEAD
         let head = resolve_current_head().await?;
@@ -495,20 +573,24 @@ async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, Cl
     };
 
     // Collect the set of excluded OIDs (the exclude tip and all its ancestors)
-    let excluded: HashSet<ObjectHash> = if let Some(exclude_tip) = exclude_tip_opt {
-        let mut s = HashSet::new();
-        s.insert(exclude_tip);
-        if let Ok(ancestors) = log::get_reachable_commits(exclude_tip.to_string(), None).await {
-            // INVARIANT: get_reachable_commits returns in BFS order; we only
-            // need the OIDs for set membership so iteration is fine.
-            for c in &ancestors {
-                s.insert(c.id);
+    let (excluded, upstream_commits): (HashSet<ObjectHash>, Vec<Commit>) =
+        if let Some(exclude_tip) = exclude_tip_opt {
+            let ancestors = log::get_reachable_commits(exclude_tip.to_string(), None)
+                .await
+                .map_err(|error| {
+                    FormatPatchError::InvalidTarget(format!(
+                        "failed to walk excluded commits from '{spec}': {error}"
+                    ))
+                })?;
+            let mut s = HashSet::new();
+            s.insert(exclude_tip);
+            for commit in &ancestors {
+                s.insert(commit.id);
             }
-        }
-        s
-    } else {
-        HashSet::new()
-    };
+            (s, ancestors)
+        } else {
+            (HashSet::new(), Vec::new())
+        };
 
     // Walk from the included tip.  get_reachable_commits performs a BFS
     // traversal, returning commits in newest-first order (tip, then
@@ -529,6 +611,28 @@ async fn resolve_range_commits(args: &FormatPatchArgs) -> Result<Vec<Commit>, Cl
     // Deduplicate (reachable set may already include the tip).
     let mut seen = HashSet::new();
     commits.retain(|c| seen.insert(c.id));
+
+    // `-1` limits the newest-first walk before output ordering is reversed.
+    if args.last_one {
+        commits.truncate(1);
+    }
+
+    if args.ignore_if_in_upstream && !upstream_commits.is_empty() {
+        let mut upstream_patch_ids = HashSet::new();
+        for commit in upstream_commits
+            .iter()
+            .filter(|commit| commit.parent_commit_ids.len() <= 1)
+        {
+            upstream_patch_ids.insert(git_patch_id_for_commit(commit).await?);
+        }
+        let mut retained = Vec::with_capacity(commits.len());
+        for commit in commits {
+            if !upstream_patch_ids.contains(&git_patch_id_for_commit(&commit).await?) {
+                retained.push(commit);
+            }
+        }
+        commits = retained;
+    }
 
     // BFS returns newest-first; reverse gives oldest-first for linear history.
     commits.reverse();
@@ -566,7 +670,7 @@ async fn format_patch_body(
     patch_num: usize,
     total: usize,
     start_num: usize,
-    thread_id: &Option<String>,
+    threading: &Option<Threading>,
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
 ) -> Result<String, CliError> {
@@ -621,7 +725,7 @@ async fn format_patch_body(
         .unwrap_or_default();
     let prefix = format!(
         "{prefix}{version}",
-        prefix = sanitize_header_value(&args.subject_prefix)
+        prefix = sanitize_header_value(subject_prefix(args))
     );
 
     let num_str = if args.numbered || args.cover_letter {
@@ -634,7 +738,14 @@ async fn format_patch_body(
     out.push_str(&format!("Subject: [{prefix}{num_str}] {subject}\n"));
 
     // ---- Threading headers ----
-    push_threading_headers(&mut out, thread_id, patch_num, start_num, total);
+    push_threading_headers(
+        &mut out,
+        threading,
+        patch_num,
+        start_num,
+        total,
+        args.cover_letter,
+    );
 
     // `--attach`/`--inline` wrap the patch in a MIME multipart: the log message
     // + diffstat go in a `text/plain` part, the diff in a `text/x-patch` part.
@@ -705,7 +816,7 @@ async fn format_patch_body(
     }
 
     // ---- Unified diff ----
-    let diff = log::generate_diff(commit, vec![]).await?;
+    let diff = log::generate_diff_with_options(commit, vec![], &commit_diff_options(args)).await?;
 
     if let Some(disposition) = attach_disposition {
         // MIME multipart assembly (byte-compatible with `git format-patch --attach`).
@@ -716,7 +827,7 @@ async fn format_patch_body(
             total,
             start_num,
             &slug,
-            &args.suffix,
+            suffix(args),
             args.numbered_files,
         );
         out.push_str("This is a multi-part message in MIME format.\n");
@@ -1031,44 +1142,75 @@ async fn build_base_block(
 // Threading helpers
 // ---------------------------------------------------------------------------
 
-/// Build the thread Message-ID.  When `--in-reply-to` is given it becomes
-/// the root; otherwise a deterministic ID is derived from the first commit.
-fn build_thread_id(args: &FormatPatchArgs, commits: &[Commit]) -> Option<String> {
+#[derive(Clone, Debug)]
+struct Threading {
+    series_id: String,
+    external_reply_to: Option<String>,
+}
+
+/// Build deterministic message IDs for the series and retain an optional
+/// external parent separately. `--in-reply-to` is never reused as a generated
+/// Message-ID, which avoids duplicate IDs and accidental `<<id>>` headers.
+fn build_thread_id(args: &FormatPatchArgs, commits: &[Commit]) -> Option<Threading> {
     if !args.thread || args.no_thread {
         return None;
     }
-    if let Some(ref reply_to) = args.in_reply_to {
-        return Some(sanitize_header_value(reply_to));
-    }
     commits.first().map(|c| {
         let ts = c.committer.timestamp;
-        let short = &c.id.to_string()[..8.min(c.id.to_string().len())];
-        format!("{short}-{ts}@libra")
+        let id = c.id.to_string();
+        let short = &id[..8.min(id.len())];
+        let series_id = format!("{short}-{ts}@libra");
+        let external_reply_to = args.in_reply_to.as_deref().map(normalize_message_id);
+        Threading {
+            series_id,
+            external_reply_to,
+        }
     })
+}
+
+fn normalize_message_id(value: &str) -> String {
+    sanitize_header_value(value)
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string()
 }
 
 /// Push `Message-ID`, `In-Reply-To`, and `References` headers.
 fn push_threading_headers(
     out: &mut String,
-    thread_id: &Option<String>,
+    threading: &Option<Threading>,
     patch_num: usize,
     start_num: usize,
     total: usize,
+    has_cover_letter: bool,
 ) {
-    let Some(msg_id) = thread_id else {
+    let Some(threading) = threading else {
         return;
     };
     let is_first = patch_num == start_num;
-    let patch_msg_id = if total == 1 || is_first {
-        format!("Message-ID: <{msg_id}>\n")
+    let message_id = if is_first {
+        threading.series_id.clone()
     } else {
-        format!(
-            "Message-ID: <{msg_id}-p{patch_num}>\n\
-             In-Reply-To: <{msg_id}>\n\
-             References: <{msg_id}>\n"
-        )
+        format!("{}-p{patch_num}", threading.series_id)
     };
-    out.push_str(&patch_msg_id);
+    out.push_str(&format!("Message-ID: <{message_id}>\n"));
+
+    let cover_id = format!("{}-cover", threading.series_id);
+    let reply_to = if has_cover_letter {
+        Some(cover_id.as_str())
+    } else if let Some(external) = threading.external_reply_to.as_deref() {
+        Some(external)
+    } else if total > 1 && !is_first {
+        Some(threading.series_id.as_str())
+    } else {
+        None
+    };
+    if let Some(reply_to) = reply_to {
+        out.push_str(&format!("In-Reply-To: <{reply_to}>\n"));
+        let reference = threading.external_reply_to.as_deref().unwrap_or(reply_to);
+        out.push_str(&format!("References: <{reference}>\n"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,6 +1222,7 @@ fn push_threading_headers(
 fn format_cover_letter(
     args: &FormatPatchArgs,
     commits: &[Commit],
+    threading: &Option<Threading>,
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
 ) -> Result<String, CliError> {
@@ -1097,7 +1240,7 @@ fn format_cover_letter(
         .reroll_count
         .map(|v| format!(" v{v}"))
         .unwrap_or_default();
-    let prefix = format!("{}{}", sanitize_header_value(&args.subject_prefix), version);
+    let prefix = format!("{}{}", sanitize_header_value(subject_prefix(args)), version);
 
     // `From:` shows the `--from` identity when given (the cover letter has no
     // author of its own, so the template's `From:` is otherwise left blank).
@@ -1117,6 +1260,13 @@ fn format_cover_letter(
         "Subject: [{prefix} 0/{total}] *** SUBJECT HERE ***\n",
         total = commits.len()
     ));
+    if let Some(threading) = threading {
+        out.push_str(&format!("Message-ID: <{}-cover>\n", threading.series_id));
+        if let Some(parent) = threading.external_reply_to.as_deref() {
+            out.push_str(&format!("In-Reply-To: <{parent}>\n"));
+            out.push_str(&format!("References: <{parent}>\n"));
+        }
+    }
     out.push_str("MIME-Version: 1.0\n");
     out.push_str("Content-Type: text/plain; charset=UTF-8\n");
     out.push_str("Content-Transfer-Encoding: 8bit\n");
@@ -1135,7 +1285,7 @@ fn format_cover_letter(
             "{:0width$}-{}{}\n",
             i + 1,
             patch_slug(commit, args),
-            args.suffix,
+            suffix(args),
             width = number_width(commits.len())
         ));
     }
@@ -1347,14 +1497,12 @@ fn write_patch_file(
 ) -> Result<PathBuf, CliError> {
     if args.stdout {
         let mut stdout = std::io::stdout().lock();
-        stdout.write_all(body.as_bytes()).map_err(|e| {
-            CliError::fatal(format!("failed to write patch to stdout: {e}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
-        stdout.write_all(b"\n").map_err(|e| {
-            CliError::fatal(format!("failed to finish writing patch to stdout: {e}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
+        stdout
+            .write_all(body.as_bytes())
+            .map_err(|error| stdout_write_error("write format-patch output", error))?;
+        stdout
+            .write_all(b"\n")
+            .map_err(|error| stdout_write_error("finish format-patch output", error))?;
         Ok(PathBuf::from("<stdout>"))
     } else {
         let filename = patch_filename(
@@ -1363,14 +1511,15 @@ fn write_patch_file(
             total,
             start_num,
             slug,
-            &args.suffix,
+            suffix(args),
             args.numbered_files,
         );
         let path = out_dir.join(&filename);
-        std::fs::write(&path, body).map_err(|e| FormatPatchError::OutputWrite {
-            path: path.clone(),
-            detail: e.to_string(),
-        })?;
+        atomic_write::write_atomic(&path, body.as_bytes(), atomic_write::sync_data_enabled())
+            .map_err(|error| FormatPatchError::OutputWrite {
+                path: path.clone(),
+                detail: error.to_string(),
+            })?;
         Ok(path)
     }
 }
@@ -1382,6 +1531,80 @@ fn write_patch_file(
 /// Convert a commit's committer timestamp to a `DateTime<Utc>`.
 fn timestamp_from_commit(commit: &Commit) -> DateTime<Utc> {
     DateTime::from_timestamp(commit.committer.timestamp as i64, 0).unwrap_or(DateTime::UNIX_EPOCH)
+}
+
+fn subject_prefix(args: &FormatPatchArgs) -> &str {
+    args.subject_prefix
+        .as_deref()
+        .unwrap_or(DEFAULT_SUBJECT_PREFIX)
+}
+
+fn suffix(args: &FormatPatchArgs) -> &str {
+    args.suffix.as_deref().unwrap_or(DEFAULT_SUFFIX)
+}
+
+fn commit_diff_options(args: &FormatPatchArgs) -> log::CommitDiffOptions {
+    log::CommitDiffOptions {
+        histogram: args.histogram,
+        full_index: args.full_index,
+        source_prefix: args.src_prefix.clone().unwrap_or_else(|| "a/".to_string()),
+        destination_prefix: args.dst_prefix.clone().unwrap_or_else(|| "b/".to_string()),
+    }
+}
+
+async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatPatchError> {
+    if args.subject_prefix.is_none() {
+        args.subject_prefix = Some(
+            read_format_config("format.subjectPrefix")
+                .await?
+                .unwrap_or_else(|| DEFAULT_SUBJECT_PREFIX.to_string()),
+        );
+    }
+    if !args.stdout
+        && args.output_directory.is_none()
+        && let Some(directory) = read_format_config("format.outputDirectory").await?
+    {
+        if directory.is_empty() {
+            return Err(FormatPatchError::InvalidConfig {
+                key: "format.outputDirectory",
+                value: directory,
+                expected: "a non-empty directory path",
+            });
+        }
+        args.output_directory = Some(directory);
+    }
+    if args.suffix.is_none() {
+        args.suffix = Some(
+            read_format_config("format.suffix")
+                .await?
+                .unwrap_or_else(|| DEFAULT_SUFFIX.to_string()),
+        );
+    }
+    if !args.signoff
+        && !args.no_signoff
+        && let Some(value) = read_format_config("format.signOff").await?
+    {
+        args.signoff = crate::internal::config::parse_git_config_bool(&value).ok_or(
+            FormatPatchError::InvalidConfig {
+                key: "format.signOff",
+                value,
+                expected: "a Git boolean",
+            },
+        )?;
+    }
+    Ok(())
+}
+
+async fn read_format_config(key: &'static str) -> Result<Option<String>, FormatPatchError> {
+    crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        key,
+    )
+    .await
+    .map_err(|error| FormatPatchError::ConfigRead {
+        key,
+        detail: format!("{error:#}"),
+    })
 }
 
 /// The recipient lists to emit, after applying `--no-to`/`--no-cc` (which, with
@@ -1519,16 +1742,12 @@ async fn resolve_from_identity(
 /// Returns an error when either key is missing so that `--signoff` never
 /// silently writes a false DCO trailer with a fallback identity.
 async fn resolve_signoff_identity() -> Result<(String, String), FormatPatchError> {
-    let name = ConfigKv::get("user.name")
-        .await
-        .ok()
-        .flatten()
-        .map(|e| e.value);
-    let email = ConfigKv::get("user.email")
-        .await
-        .ok()
-        .flatten()
-        .map(|e| e.value);
+    let name = read_format_config("user.name")
+        .await?
+        .filter(|value| !value.trim().is_empty());
+    let email = read_format_config("user.email")
+        .await?
+        .filter(|value| !value.trim().is_empty());
 
     let detail = match (name, email) {
         (Some(name), Some(email)) => return Ok((name, email)),
@@ -1537,4 +1756,30 @@ async fn resolve_signoff_identity() -> Result<(String, String), FormatPatchError
         (None, None) => "user.name and user.email are not configured".to_string(),
     };
     Err(FormatPatchError::IdentityMissing(detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FormatPatchError;
+
+    #[test]
+    fn config_error_messages_are_stable_and_actionable() {
+        assert_eq!(
+            FormatPatchError::ConfigRead {
+                key: "format.suffix",
+                detail: "database is locked".to_string(),
+            }
+            .to_string(),
+            "failed to read config 'format.suffix': database is locked"
+        );
+        assert_eq!(
+            FormatPatchError::InvalidConfig {
+                key: "format.signOff",
+                value: "sometimes".to_string(),
+                expected: "a Git boolean",
+            }
+            .to_string(),
+            "bad config value 'sometimes' for 'format.signOff' (expected a Git boolean)"
+        );
+    }
 }

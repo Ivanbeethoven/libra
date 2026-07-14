@@ -4,6 +4,16 @@
 
 ### Added
 
+- **Reliable format-patch mail output (v0.18.86)**: adds `-1`, `--root`,
+  `--minimal`, `--histogram`, `--ignore-if-in-upstream`, and diff-prefix
+  controls; honors strict `format.subjectPrefix`, `format.signOff`,
+  `format.outputDirectory`, and `format.suffix` defaults with CLI precedence.
+  Cover-letter threading now uses unique generated message IDs, full-index is
+  effective, complete series render before atomic file writes, and stdout uses
+  quiet BrokenPipe handling. A seven-scenario L1 target proves plain and MIME
+  Libra→Git `am`, Git→Libra `am`, config, threading, root/diff, and upstream
+  patch-id behavior.
+
 - **Minimal mail parsing plumbing (v0.18.85)**: adds repo-independent
   `libra mailinfo <msg> <patch> < mail` with Git-shaped author/email/subject/date
   metadata, body-only message output, separator-through-signature patch output,

@@ -143,6 +143,7 @@ fn large_stdout_commands_exit_quietly_when_downstream_closes() {
         vec!["show".into(), "--stat".into(), "HEAD".into()],
         vec!["for-each-ref".into(), format!("--format={huge_format}")],
         vec!["cat-file".into(), "-p".into(), "HEAD".into()],
+        vec!["format-patch".into(), "-1".into(), "--stdout".into()],
         vec!["--json".into(), "status".into()],
     ];
 

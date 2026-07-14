@@ -5128,6 +5128,23 @@ fn rewrite_unified_diff_context(
     )
 }
 
+/// Re-render a commit patch's text hunks with the histogram backend while
+/// preserving the object/mode/path headers produced by `git_internal`.
+///
+/// `format-patch --histogram` uses this focused seam instead of constructing a
+/// full working-tree [`DiffArgs`] value. Binary and header-only diffs have no
+/// hunk body, so [`splice_unified_body`] leaves them unchanged.
+pub(crate) fn rewrite_unified_diff_histogram(
+    raw_diff: &str,
+    old_text: &str,
+    new_text: &str,
+) -> String {
+    splice_unified_body(
+        raw_diff,
+        &compute_unified_hunks(old_text, new_text, 3, &DiffAlgorithm::Histogram),
+    )
+}
+
 /// Replace a single file's hunk body with `body`, keeping git_internal's header
 /// (`diff --git` / mode / `index` / `---` / `+++`). A diff with no hunk line
 /// (binary marker or identical content) is returned unchanged.

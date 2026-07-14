@@ -23,7 +23,7 @@ use serde::Serialize;
 
 use self::config::{ResolvedLogConfig, resolve_log_config};
 use crate::{
-    command::load_object,
+    command::{diff, load_object},
     common_utils::parse_commit_msg,
     internal::{
         branch::{Branch, BranchStoreError},
@@ -2570,6 +2570,37 @@ pub(crate) async fn generate_diff(
     commit: &Commit,
     paths: Vec<PathBuf>,
 ) -> Result<String, CliError> {
+    generate_diff_with_options(commit, paths, &CommitDiffOptions::default()).await
+}
+
+/// Diff rendering controls used by mail-patch generation.
+#[derive(Clone, Debug)]
+pub(crate) struct CommitDiffOptions {
+    pub(crate) histogram: bool,
+    pub(crate) full_index: bool,
+    pub(crate) source_prefix: String,
+    pub(crate) destination_prefix: String,
+}
+
+impl Default for CommitDiffOptions {
+    fn default() -> Self {
+        Self {
+            histogram: false,
+            full_index: false,
+            source_prefix: "a/".to_string(),
+            destination_prefix: "b/".to_string(),
+        }
+    }
+}
+
+/// Generate a commit diff with the bounded set of rendering controls exposed
+/// by `format-patch`. Myers-minimal needs no separate switch: Libra's Myers
+/// backend already computes the shortest edit script without a deadline.
+pub(crate) async fn generate_diff_with_options(
+    commit: &Commit,
+    paths: Vec<PathBuf>,
+    options: &CommitDiffOptions,
+) -> Result<String, CliError> {
     // prepare old and new blobs
     // new_blobs from commit tree
     let tree = load_object::<Tree>(&commit.tree_id)
@@ -2588,12 +2619,115 @@ pub(crate) async fn generate_diff(
         Vec::new()
     };
 
-    let diffs = build_commit_diff_items(old_blobs, new_blobs, paths)?;
+    let old_map: HashMap<PathBuf, ObjectHash> = old_blobs.iter().cloned().collect();
+    let new_map: HashMap<PathBuf, ObjectHash> = new_blobs.iter().cloned().collect();
+    let mut diffs = build_commit_diff_items(old_blobs, new_blobs, paths)?;
+    for item in &mut diffs {
+        let path = PathBuf::from(&item.path);
+        if options.histogram && item.data.contains("\n@@ ") {
+            let old_text = old_map
+                .get(&path)
+                .map(load_commit_blob_content)
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            let new_text = new_map
+                .get(&path)
+                .map(load_commit_blob_content)
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            item.data = diff::rewrite_unified_diff_histogram(&item.data, &old_text, &new_text);
+        }
+        if options.full_index {
+            rewrite_commit_diff_index(
+                &mut item.data,
+                old_map.get(&path),
+                new_map.get(&path),
+                commit.id.to_string().len(),
+            );
+        }
+        rewrite_commit_diff_prefixes(
+            &mut item.data,
+            &item.path,
+            &options.source_prefix,
+            &options.destination_prefix,
+        );
+    }
     let mut out = String::new();
     for d in diffs {
         out.push_str(&d.data);
     }
     Ok(out)
+}
+
+fn rewrite_commit_diff_index(
+    raw_diff: &mut String,
+    old_id: Option<&ObjectHash>,
+    new_id: Option<&ObjectHash>,
+    hash_width: usize,
+) {
+    let zero = "0".repeat(hash_width);
+    let old = old_id
+        .map(ToString::to_string)
+        .unwrap_or_else(|| zero.clone());
+    let new = new_id.map(ToString::to_string).unwrap_or(zero);
+    let mut rewritten = String::with_capacity(raw_diff.len() + hash_width * 2);
+    for line in raw_diff.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("index ")
+            && let Some((_, suffix)) = rest.split_once(' ')
+        {
+            rewritten.push_str(&format!("index {old}..{new} {suffix}"));
+        } else {
+            rewritten.push_str(line);
+        }
+    }
+    *raw_diff = rewritten;
+}
+
+fn rewrite_commit_diff_prefixes(
+    raw_diff: &mut String,
+    path: &str,
+    source_prefix: &str,
+    destination_prefix: &str,
+) {
+    if source_prefix == "a/" && destination_prefix == "b/" {
+        return;
+    }
+    let replacements = [
+        (
+            format!("diff --git a/{path} b/{path}"),
+            format!("diff --git {source_prefix}{path} {destination_prefix}{path}"),
+        ),
+        (
+            format!("--- a/{path}"),
+            format!("--- {source_prefix}{path}"),
+        ),
+        (
+            format!("+++ b/{path}"),
+            format!("+++ {destination_prefix}{path}"),
+        ),
+        (
+            format!("Binary files a/{path} and b/{path} differ"),
+            format!("Binary files {source_prefix}{path} and {destination_prefix}{path} differ"),
+        ),
+    ];
+    let mut rewritten = String::with_capacity(raw_diff.len());
+    for line in raw_diff.split_inclusive('\n') {
+        let (content, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |content| (content, "\n"));
+        if let Some((_, replacement)) = replacements
+            .iter()
+            .find(|(candidate, _)| candidate == content)
+        {
+            rewritten.push_str(replacement);
+        } else {
+            rewritten.push_str(content);
+        }
+        rewritten.push_str(newline);
+    }
+    *raw_diff = rewritten;
 }
 
 #[cfg(test)]

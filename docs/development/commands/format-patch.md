@@ -8,6 +8,15 @@
 
 - 兼容级别：`partial`。核心补丁导出能力已公开，支持 15+ 参数（含 `--suffix <sfx>`，默认 `.patch`；`--zero-commit`；`--signature`/`--no-signature`；`--signature-file <file>`；`--encode-email-headers`/`--no-encode-email-headers`），merge 提交默认跳过。收件人头 `--to`/`--cc`（可重复，按 git 折叠续行，置于 MIME 头之后，cover letter 同样输出）与 `--no-to`/`--no-cc`（抑制——Libra 无 `format.to`/`format.cc` 配置可重置）已实现。`--from [<ident>]`（改写 `From:` 头为给定身份，无值时用 committer 配置身份；与提交作者不同则将原作者保留为 in-body `From:` 供 `git am` 还原）已实现。`--notes[=<ref>]`（在 `---` 之后、diffstat 之前附加 notes，复用 notes 子系统）已实现。`--attach` / `--inline`（将补丁包成 `multipart/mixed` MIME：log+diffstat 为 `text/plain` part，diff 为 `text/x-patch` part，`Content-Disposition` 分别为 `attachment`/`inline`；boundary 取工具版本，二者互斥）已实现。`--base=<commit>`（记录 `base-commit:` 尾注 + 介于 base 与系列之间各提交的 `prerequisite-patch-id:`，供 `git am --base`）已实现：尾注挂在最后一个补丁上，或在 `--cover-letter` 时挂在 cover letter 上；base 必须是系列的祖先（否则 `base commit should be the ancestor of revision list`，退出 128）；patch-id 复用 git 的 stable 算法（逐行去空白、跳过 `index` 行、忽略 hunk 行号、按文件 SHA 后用逐字节进位加法合并，即 git `flush_one_hunk`，非 XOR），对 text diff 与 `git patch-id --stable` 字节一致（含多文件）；前置补丁跳过 merge 提交；**binary 文件前置补丁不保证字节一致**（见缺口表说明）。`--base=auto`（依赖上游推断 base）暂以用法错误（退出 129）拒绝。未实现的 Git 选项包括 `--interdiff`、`--range-diff`（`--force` 非 Git format-patch 标志）。
 
+### P2-03 邮件输出可靠性闭环
+
+- Revision：`-1 [REV]` 精确导出一个 commit；`--root [REV]` 从指定 tip 遍历至 root；`--ignore-if-in-upstream` 用 default stable patch-id 与排除侧可达 commits 比较，全部命中时成功输出空 series。排除侧遍历错误不再被静默吞掉。
+- Diff：`log::generate_diff_with_options` 为 format-patch 提供 `--histogram`、真实 `--full-index` 及 `--src-prefix`/`--dst-prefix`；`--minimal` 明确复用本就无 deadline、保证 shortest edit script 的 Myers backend。Histogram 通过 `diff::rewrite_unified_diff_histogram` 复用共享 hunk renderer。
+- Config：`format.subjectPrefix`、`format.signOff`、`format.outputDirectory`、`format.suffix` 使用严格 local→global→system cascade，显式 CLI 值短路无关坏默认；`--no-signoff` 覆盖 config，`--stdout` 不读取 output-directory 默认。Signoff identity 同样严格读取 cascaded `user.name`/`user.email`，不吞 config 错误。
+- Mail/thread：外部 `--in-reply-to` 与本系列生成的 Message-ID 分离；cover letter 先回复外部 parent，各 patch 再回复 cover，避免重复 Message-ID 与双尖括号。MIME attachment boundary/closing delimiter 已由真实 `git am` 消费测试固定。
+- 输出：整套邮件先完整渲染，再创建任何文件；单文件通过 temp+rename atomic write，stdout 复用统一 BrokenPipe policy。
+- 互操作：`compat_format_patch_mail_roundtrip` 的 7 个 L1 场景覆盖 Libra format-patch→Git am、Git format-patch→Libra am、config/CLI precedence、cover/thread、MIME、root/algorithm/full-index/prefix、upstream patch-id suppression。
+
 ## 设计方案
 
 - 入口与分发：`src/cli.rs::Commands::FormatPatch` 公开顶层 CLI，`src/command/mod.rs` 导出 `format_patch` 模块；CLI 层在 `src/cli.rs` 把解析后的参数交给 `command::format_patch::execute_safe`，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
@@ -50,7 +59,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：`src/command/mod.rs` 导出 `format_patch`，`src/cli.rs::Commands::FormatPatch` 负责 CLI 接入。
 - 用户文档：`docs/commands/format-patch.md`。
 - Synopsis：`libra format-patch [OPTIONS] [revision-range]`。
-- 公开参数包括：`[revision-range]`、`-o, --output-directory <DIR>`、`--stdout`、`-n, --numbered`、`--start-number <N>`、`--subject-prefix <PREFIX>`、`--cover-letter`、`--thread` / `--no-thread`、`--in-reply-to <MESSAGE_ID>`、`--to <ADDRESS>`、`--cc <ADDRESS>`、`--no-to`、`--no-cc`、`--from [<IDENT>]`、`-v, --reroll-count <N>`、`-s, --signoff`、`--full-index`、`--no-stat`、`--keep-subject`、`--suffix <SFX>`、`--zero-commit`、`--signature <SIGNATURE>`、`--no-signature`、`--signature-file <FILE>`、`--encode-email-headers` / `--no-encode-email-headers`、`--numbered-files`、`--notes [<REF>]`、`--attach`、`--inline`。`--signature-file` 在 `execute_safe` 早期读文件并填入 `signature` 槽（与 `--signature` 互斥，trim 尾换行）；`--encode-email-headers` 经 `encode_email_header` 对含非 ASCII 的 `From` 名称与 `Subject` 做整值 RFC 2047 Q 编码（`=?UTF-8?q?...?=`），纯 ASCII 或未开启时原样输出。
+- 公开参数包括：`[revision-range]`、`-1`、`--root`、`-o, --output-directory <DIR>`、`--stdout`、`-n, --numbered`、`--start-number <N>`、`--subject-prefix <PREFIX>`、`--cover-letter`、`--thread` / `--no-thread`、`--in-reply-to <MESSAGE_ID>`、`--to <ADDRESS>`、`--cc <ADDRESS>`、`--no-to`、`--no-cc`、`--from [<IDENT>]`、`-v, --reroll-count <N>`、`-s, --signoff`、`--no-signoff`、`--full-index`、`--minimal`、`--histogram`、`--ignore-if-in-upstream`、`--src-prefix`、`--dst-prefix`、`--no-stat`、`--keep-subject`、`--suffix <SFX>`、`--zero-commit`、`--signature <SIGNATURE>`、`--no-signature`、`--signature-file <FILE>`、`--encode-email-headers` / `--no-encode-email-headers`、`--numbered-files`、`--notes [<REF>]`、`--attach`、`--inline`。`--signature-file` 在 `execute_safe` 早期读文件并填入 `signature` 槽（与 `--signature` 互斥，trim 尾换行）；`--encode-email-headers` 经 `encode_email_header` 对含非 ASCII 的 `From` 名称与 `Subject` 做整值 RFC 2047 Q 编码（`=?UTF-8?q?...?=`），纯 ASCII 或未开启时原样输出。
 
 ## 还未实现的功能
 

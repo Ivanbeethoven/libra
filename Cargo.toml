@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.85"
+version = "0.18.86"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -280,6 +280,10 @@ path = "tests/compat/help_no_impl_meta_leak.rs"
 [[test]]
 name = "compat_format_patch_flag_surface"
 path = "tests/compat/format_patch_flag_surface.rs"
+
+[[test]]
+name = "compat_format_patch_mail_roundtrip"
+path = "tests/compat/format_patch_mail_roundtrip_test.rs"
 
 [[test]]
 name = "compat_otlp_feature_gate_guard"
