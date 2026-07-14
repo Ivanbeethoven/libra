@@ -608,7 +608,7 @@ pub fn trusted_bwrap_available() -> bool {
     let Ok(bwrap) = resolve_trusted_bwrap() else {
         return false;
     };
-    std::process::Command::new(&bwrap)
+    let Ok(mut child) = std::process::Command::new(&bwrap)
         .args([
             "--unshare-all",
             "--die-with-parent",
@@ -621,9 +621,32 @@ pub fn trusted_bwrap_available() -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .spawn()
+    else {
+        return false;
+    };
+    // Actually bounded (Codex M3 R5 P2): the no-op probe returns in
+    // milliseconds, but a trusted bwrap stalled in namespace/mount setup must
+    // not hang the caller — poll with a short deadline, then kill and reap.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// Non-Linux hosts have no bwrap sandbox — the export capability is
