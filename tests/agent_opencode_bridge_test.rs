@@ -33,8 +33,12 @@ struct BridgeRepo {
 
 impl BridgeRepo {
     async fn init(export_body: &str) -> Option<Self> {
-        if which_bwrap().is_none() {
-            eprintln!("skipped (bwrap not installed)");
+        // Detect "trusted AND usable", not merely present (Codex M3 R3): the
+        // export path degrades when bwrap fails the integrity policy (e.g. it
+        // lives under a user-writable path), which would make the content
+        // assertions below spuriously fail — skip instead.
+        if !libra::internal::ai::observed_agents::opencode_export::trusted_bwrap_available() {
+            eprintln!("skipped (no trusted, usable bwrap)");
             return None;
         }
         let tmp = TempDir::new().expect("tempdir");
@@ -212,14 +216,6 @@ fn describe(out: &Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     )
-}
-
-fn which_bwrap() -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|d| d.join("bwrap"))
-            .find(|c| c.is_file())
-    })
 }
 
 /// A minimal valid export with one user turn (`hi` / `hello`) — normalizes

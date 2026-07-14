@@ -184,7 +184,7 @@ pub async fn run_export_subprocess(
         bail!("exporter binary path must be absolute (trusted provenance)");
     }
 
-    run_bounded_exporter(binary, &[], session_id, limits).await
+    run_bounded_exporter(binary, &[], session_id, limits, Vec::new()).await
 }
 
 /// Core bounded runner: `<program> [<pre_args>…] export <session_id>` with
@@ -196,7 +196,13 @@ async fn run_bounded_exporter(
     pre_args: &[String],
     session_id: &str,
     limits: ExportLimits,
+    keep_fds: Vec<std::os::fd::OwnedFd>,
 ) -> Result<Vec<u8>> {
+    // Fds pinned by the caller (e.g. the RW store bind's /proc/self/fd source)
+    // must stay OPEN and non-CLOEXEC in this process until the child has been
+    // spawned so it inherits them; holding the OwnedFds for the whole function
+    // guarantees that and closes them on return.
+    let _keep_fds = keep_fds;
     // Probe-verified upstream hazard (opencode 1.17.x, 2026-07-14): the CLI
     // can exit BEFORE flushing stdout into a backpressured pipe — large
     // exports arrive truncated (~64 KiB) with a SUCCESS status. Give the
@@ -459,13 +465,31 @@ pub async fn run_export_subprocess_sandboxed(
         // need WRITE access even for pure reads — a read-only bind makes
         // `export` fail with a generic error. Bind ONLY the opencode data
         // dir read-write (mounted after the ro HOME bind so it wins);
-        // network stays unshared and everything else read-only. The store is
-        // resolved to a CANONICAL directory strictly contained under the data
-        // root (Codex M3 R2 P1-5) so a planted `…/opencode -> ~/.ssh` symlink
-        // cannot get an arbitrary target bound read-write.
+        // network stays unshared and everything else read-only.
+        //
+        // The store is resolved rejecting a symlinked `opencode` entry, then
+        // PINNED by an O_PATH fd and bound via `/proc/self/fd/N` (Codex M3 R3
+        // P1): the RW bind references the exact validated inode, so neither a
+        // `…/opencode -> ~/.ssh` symlink nor a post-check path swap can
+        // redirect an arbitrary target into the sandbox read-write.
+        let mut keep_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
         if let Some(store) = resolve_opencode_store() {
-            let d = store.to_string_lossy().into_owned();
-            extra.extend(["--bind".to_string(), d.clone(), d]);
+            match open_pinned_store(&store) {
+                Ok(fd) => {
+                    use std::os::fd::AsRawFd;
+                    let src = format!("/proc/self/fd/{}", fd.as_raw_fd());
+                    let dest = store.to_string_lossy().into_owned();
+                    extra.extend(["--bind".to_string(), src, dest]);
+                    keep_fds.push(fd);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        store = %store.display(),
+                        "cannot pin opencode data dir for RW bind; skipping (export may degrade)"
+                    );
+                }
+            }
         }
         // The trusted binary itself may live outside the standard host paths
         // (e.g. ~/.opencode/bin) — HOME ro-bind above usually covers it; add
@@ -478,7 +502,7 @@ pub async fn run_export_subprocess_sandboxed(
         args.extend(extra);
         args.extend(tail);
 
-        run_bounded_exporter(&bwrap, &args, session_id, limits).await
+        run_bounded_exporter(&bwrap, &args, session_id, limits, keep_fds).await
     }
 }
 
@@ -514,46 +538,88 @@ fn resolve_trusted_bwrap() -> Result<std::path::PathBuf> {
     validate_trusted_bwrap(&candidate)
 }
 
+/// Whether the current (effective) user could MODIFY this path component, and
+/// therefore swap it under us. Portable integrity anchor (Codex M3 R3 P1):
+/// instead of demanding `uid == 0` (which both admits a post-validation swap
+/// when an ancestor is user-writable, and wrongly rejects safely-packaged
+/// binaries whose owner is remapped in a user namespace), we ask the precise
+/// question — can the invoking principal write here? If no component of the
+/// path is user-writable, the file cannot be replaced, closing the TOCTOU.
+#[cfg(target_os = "linux")]
+fn modifiable_by_current_user(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode();
+    // Group- or world-writable is treated as modifiable regardless of group
+    // membership (conservative; standard system paths are never 0o0X2/0o0XX7).
+    if mode & 0o022 != 0 {
+        return true;
+    }
+    // SAFETY: geteuid is always successful and has no memory effects.
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        // Running as root: root ignores permission bits, so the real threat is
+        // a NON-root owner able to rewrite an owner-writable component.
+        return meta.uid() != 0 && mode & 0o200 != 0;
+    }
+    // Non-root: modifiable iff we own it and the owner-write bit is set.
+    meta.uid() == euid && mode & 0o200 != 0
+}
+
 /// Integrity core (testable without env mutation): resolve every symlink so
-/// the ownership/mode checks apply to the file that will actually be exec'd,
-/// then require a root-owned regular file that is not writable by group or
-/// other. Anything else is refused fail-closed (GC-DR-14).
+/// the checks apply to the file that will actually be exec'd, require a
+/// regular file, then require that NO path component (the binary or any
+/// ancestor directory) is modifiable by the invoking user. Anything else is
+/// refused fail-closed (GC-DR-14).
 #[cfg(target_os = "linux")]
 fn validate_trusted_bwrap(candidate: &std::path::Path) -> Result<std::path::PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-
     let canonical = std::fs::canonicalize(candidate).with_context(|| {
         format!(
             "cannot resolve sandbox binary {} (fail-closed)",
             candidate.display()
         )
     })?;
-    let meta = std::fs::metadata(&canonical)
+    let file_meta = std::fs::metadata(&canonical)
         .with_context(|| format!("cannot stat sandbox binary {}", canonical.display()))?;
-    if !meta.file_type().is_file() {
+    if !file_meta.file_type().is_file() {
         bail!(
             "sandbox binary {} is not a regular file; refusing (fail-closed)",
             canonical.display()
         );
     }
-    if meta.uid() != 0 {
-        bail!(
-            "sandbox binary {} is not owned by root (uid {}); a non-root bwrap could be an \
-             attacker-planted helper that runs the exporter unsandboxed — refusing \
-             (fail-closed, GC-DR-14)",
-            canonical.display(),
-            meta.uid()
-        );
-    }
-    if meta.mode() & 0o022 != 0 {
-        bail!(
-            "sandbox binary {} is writable by group or other (mode {:o}); refusing \
-             (fail-closed)",
-            canonical.display(),
-            meta.mode() & 0o7777
-        );
+    // The canonical path has no symlinks, so walking `.parent()` and stat-ing
+    // each component is race-consistent with what will be exec'd. Any
+    // user-writable component (the file OR a directory above it) means the
+    // helper could be swapped for one that runs the exporter unsandboxed.
+    let mut component: Option<&std::path::Path> = Some(canonical.as_path());
+    while let Some(path) = component {
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("cannot stat sandbox path component {}", path.display()))?;
+        if modifiable_by_current_user(&meta) {
+            bail!(
+                "sandbox binary path component {} is modifiable by the current user; a planted \
+                 or swapped helper could run the exporter unsandboxed — refusing (fail-closed, \
+                 GC-DR-14)",
+                path.display()
+            );
+        }
+        component = path.parent();
     }
     Ok(canonical)
+}
+
+/// Whether a trusted, usable bubblewrap sandbox is available on this host
+/// (resolves + integrity-validates the bwrap binary). Tests gate on this so
+/// they detect "trusted AND usable", not merely "bwrap present" (Codex M3 R3).
+#[cfg(target_os = "linux")]
+pub fn trusted_bwrap_available() -> bool {
+    resolve_trusted_bwrap().is_ok()
+}
+
+/// Non-Linux hosts have no bwrap sandbox — the export capability is
+/// unavailable (fail-closed), so it is never "trusted and usable".
+#[cfg(not(target_os = "linux"))]
+pub fn trusted_bwrap_available() -> bool {
+    false
 }
 
 /// Resolve the OpenCode WAL store to a CANONICAL directory strictly contained
@@ -575,23 +641,63 @@ fn resolve_opencode_store() -> Option<std::path::PathBuf> {
     resolve_opencode_store_under(&base)
 }
 
-/// Containment core (testable without env mutation): canonicalize `base` and
-/// its `opencode` child, then require the resolved store to stay strictly
-/// under the canonical base. Rejects `opencode -> ~/.ssh` and `..`-based
-/// escapes so an out-of-tree target is never bound read-write.
+/// Resolution core (testable without env mutation): canonicalize `base`, then
+/// stat its literal `opencode` child WITHOUT following a final symlink. A
+/// symlinked `opencode` entry (e.g. `-> ~/.ssh` or `-> .`) is rejected here
+/// rather than canonicalized-and-contained — canonicalize FOLLOWS the symlink,
+/// so a `-> ~/.ssh` under an attacker-set `XDG_DATA_HOME=$HOME` would spuriously
+/// pass a "contained under base" test. Returns the real directory path; the
+/// caller pins it by fd before binding (Codex M3 R3 P1).
 #[cfg(target_os = "linux")]
 fn resolve_opencode_store_under(base: &std::path::Path) -> Option<std::path::PathBuf> {
     let base = std::fs::canonicalize(base).ok()?;
-    let store = std::fs::canonicalize(base.join("opencode")).ok()?;
-    if !store.starts_with(&base) {
+    let entry = base.join("opencode");
+    let meta = std::fs::symlink_metadata(&entry).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
         tracing::warn!(
-            store = %store.display(),
-            base = %base.display(),
-            "opencode data dir resolves outside the approved data root; refusing RW bind"
+            entry = %entry.display(),
+            "opencode data dir is a symlink or not a directory; refusing RW bind"
         );
         return None;
     }
-    store.is_dir().then_some(store)
+    Some(entry)
+}
+
+/// Pin a directory by an `O_PATH` fd for a race-safe `/proc/self/fd/N` bind
+/// (Codex M3 R3 P1). `O_NOFOLLOW` rejects a final-component symlink swapped in
+/// after resolution, `O_DIRECTORY` requires a directory, and CLOEXEC is
+/// cleared so the bwrap child inherits the fd and can resolve `/proc/self/fd/N`
+/// when it establishes the bind mount.
+#[cfg(target_os = "linux")]
+fn open_pinned_store(dir: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
+    use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
+
+    let cpath =
+        std::ffi::CString::new(dir.as_os_str().as_bytes()).context("store path contains NUL")?;
+    // SAFETY: `cpath` is a valid NUL-terminated C string for the duration of
+    // the call; the returned fd is wrapped in OwnedFd for RAII.
+    let raw = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("pin opencode data dir {}", dir.display()));
+    }
+    // SAFETY: `raw` is a fresh, owned fd we just obtained from open(2).
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    use std::os::fd::AsRawFd;
+    // SAFETY: fcntl on our own fd; F_GETFD/F_SETFD have no memory effects.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error()).context("F_GETFD on pinned store fd");
+    }
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("clear CLOEXEC on pinned store fd");
+    }
+    Ok(fd)
 }
 
 #[cfg(test)]
@@ -752,26 +858,99 @@ mod tests {
         assert!(format!("{err:#}").contains("byte cap"), "got {err:#}");
     }
 
-    /// Codex M3 R2 P1-4: a non-root (or group/other-writable) "bwrap" must be
-    /// refused — otherwise a planted helper could ignore its arguments and run
-    /// the exporter unsandboxed. Runs the env-free integrity core so it holds
-    /// whether the test user is root or not.
+    /// Codex M3 R3 P1: a "bwrap" living under a user-writable path (a tempdir,
+    /// whose ancestry the invoking user can rewrite) must be refused — a
+    /// planted or post-check-swapped helper could otherwise run the exporter
+    /// unsandboxed. The env-free integrity core walks the ancestry, so this
+    /// holds whether the test user is root or not.
     #[cfg(target_os = "linux")]
     #[test]
     fn validate_trusted_bwrap_refuses_untrusted_helper() {
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("bwrap");
         std::fs::write(&fake, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-        // World-writable: fails the mode check even when the owner is root, and
-        // fails the uid check when it is not — either way, refused.
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let err =
-            validate_trusted_bwrap(&fake).expect_err("untrusted sandbox helper must be refused");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = validate_trusted_bwrap(&fake)
+            .expect_err("user-writable sandbox helper must be refused");
         assert!(format!("{err:#}").contains("refusing"), "got {err:#}");
     }
 
-    /// Codex M3 R2 P1-5: an `opencode` data dir that is a symlink escaping the
-    /// data root must NOT be resolved for the RW bind; a real contained dir is.
+    /// Codex M3 R3 P2: the integrity policy must ACCEPT a legitimately packaged
+    /// bwrap (root-owned ancestry, not user-writable) so trusted deployments do
+    /// not silently degrade. When the host has such a bwrap, `trusted_bwrap_
+    /// available()` is true and `validate_trusted_bwrap` accepts it; otherwise
+    /// the case is skipped rather than asserted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_trusted_bwrap_accepts_system_binary() {
+        let Some(bwrap) = which_bwrap() else {
+            eprintln!("skipped (no bwrap on PATH)");
+            return;
+        };
+        if validate_trusted_bwrap(&bwrap).is_ok() {
+            assert!(
+                trusted_bwrap_available(),
+                "a validatable system bwrap must report available"
+            );
+        } else {
+            eprintln!("skipped (system bwrap is under a user-writable path here)");
+        }
+    }
+
+    /// Codex M3 R3 P1: the pinned-fd RW bind works through real bwrap — a file
+    /// the child writes inside the `/proc/self/fd/N`-bound directory lands on
+    /// the host at the pinned inode — and a symlinked entry is refused at pin
+    /// time (`O_NOFOLLOW`), so no swap can redirect the RW mount. Skips without
+    /// a trusted bwrap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_pinned_store_binds_rw_through_bwrap() {
+        use std::os::fd::AsRawFd;
+        let Some(bwrap) = which_bwrap().filter(|b| validate_trusted_bwrap(b).is_ok()) else {
+            eprintln!("skipped (no trusted bwrap)");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("opencode");
+        std::fs::create_dir(&store).unwrap();
+
+        let fd = open_pinned_store(&store).expect("pin real dir");
+        let src = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        let status = std::process::Command::new(&bwrap)
+            .args([
+                "--unshare-all",
+                "--die-with-parent",
+                "--ro-bind",
+                "/",
+                "/",
+                "--bind",
+                &src,
+                "/mnt",
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo ok > /mnt/probe",
+            ])
+            .status()
+            .expect("spawn bwrap");
+        drop(fd);
+        assert!(status.success(), "pinned RW bind must let the child write");
+        assert!(
+            store.join("probe").exists(),
+            "child write must land on the host store via the pinned fd"
+        );
+
+        // A symlinked entry is refused at pin time (O_NOFOLLOW → ELOOP).
+        let link = tmp.path().join("opencode-link");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+        assert!(
+            open_pinned_store(&link).is_err(),
+            "symlinked store must be refused at pin time"
+        );
+    }
+
+    /// Codex M3 R2/R3 P1-5: an `opencode` data dir that is a symlink must NOT
+    /// be resolved for the RW bind; a real directory is.
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_opencode_store_refuses_symlink_escape() {
@@ -843,8 +1022,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn opencode_export_offline_sandbox_profile() {
-        if which_bwrap().is_none() && std::env::var_os("LIBRA_LINUX_SANDBOX_EXE").is_none() {
-            eprintln!("skipped (bwrap not installed)");
+        // Detect "trusted AND usable", not merely present (Codex M3 R3): a
+        // bwrap under a user-writable path is refused by the integrity policy,
+        // so the sandbox would degrade — skip rather than assert success.
+        if !trusted_bwrap_available() {
+            eprintln!("skipped (no trusted, usable bwrap)");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
