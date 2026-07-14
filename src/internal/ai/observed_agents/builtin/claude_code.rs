@@ -12,7 +12,7 @@
 
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -420,6 +420,10 @@ const FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// A transcript whose mtime is at least this old is already settled — skip
 /// the wait entirely (the "stale mtime 跳过" rule).
 const FLUSH_STALE_THRESHOLD: Duration = Duration::from_secs(3);
+/// The flush probe never reads more than the same 16 MiB hard cap enforced by
+/// the actual transcript reader. This prevents a hook-supplied or runaway
+/// file from causing an unbounded allocation before the authorized read.
+const FLUSH_TAIL_PROBE_BYTES: u64 = MAX_TRANSCRIPT_BYTES;
 
 /// Outcome of one flush-wait pass (diagnostic; callers proceed to read
 /// either way — a budget-exhausted tail simply parses `incomplete`).
@@ -435,18 +439,48 @@ pub enum FlushOutcome {
 /// Does the file currently end in a complete JSONL record (trailing
 /// newline + parseable last line)?
 fn tail_is_complete(path: &Path) -> bool {
-    let Ok(bytes) = fs::read(path) else {
+    tail_is_complete_with_limit(path, FLUSH_TAIL_PROBE_BYTES)
+}
+
+fn tail_is_complete_with_limit(path: &Path, max_probe_bytes: u64) -> bool {
+    if max_probe_bytes == 0 {
+        return false;
+    }
+    let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
-    if bytes.is_empty() {
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return false;
+    };
+    if len == 0 {
         return true; // empty file: nothing in flight
+    }
+    let probe_len = len.min(max_probe_bytes);
+    let Ok(offset) = i64::try_from(probe_len) else {
+        return false;
+    };
+    if file.seek(SeekFrom::End(-offset)).is_err() {
+        return false;
+    }
+    let Ok(capacity) = usize::try_from(probe_len) else {
+        return false;
+    };
+    let mut bytes = Vec::with_capacity(capacity);
+    if file.take(probe_len).read_to_end(&mut bytes).is_err() || bytes.len() as u64 != probe_len {
+        return false;
     }
     if bytes.last() != Some(&b'\n') {
         return false;
     }
-    let Some(last_line) = bytes[..bytes.len() - 1].split(|b| *b == b'\n').next_back() else {
-        return true;
+    let before_terminator = &bytes[..bytes.len() - 1];
+    let line_start = match before_terminator.iter().rposition(|byte| *byte == b'\n') {
+        Some(index) => index + 1,
+        None if probe_len == len => 0,
+        // The final record starts before the bounded probe, so we cannot
+        // prove it is valid without exceeding the memory ceiling.
+        None => return false,
     };
+    let last_line = &before_terminator[line_start..];
     serde_json::from_slice::<serde_json::Value>(last_line).is_ok()
 }
 
@@ -468,10 +502,21 @@ pub fn flush_wait(path: &Path, budget: Duration, poll: Duration) -> FlushOutcome
         return FlushOutcome::Settled;
     }
     let deadline = Instant::now() + budget;
+    let mut last_snapshot = None;
     loop {
-        if tail_is_complete(path) {
+        let Ok(current) = fs::metadata(path) else {
+            return FlushOutcome::Settled;
+        };
+        if current.len() > MAX_TRANSCRIPT_BYTES {
+            // The authorized reader will return its actionable size error;
+            // waiting cannot make an already-oversized transcript readable.
             return FlushOutcome::Settled;
         }
+        let snapshot = (current.len(), current.modified().ok());
+        if last_snapshot.as_ref() != Some(&snapshot) && tail_is_complete(path) {
+            return FlushOutcome::Settled;
+        }
+        last_snapshot = Some(snapshot);
         if Instant::now() >= deadline {
             return FlushOutcome::BudgetExhausted;
         }
@@ -683,6 +728,17 @@ mod tests {
         let complete = dir.path().join("complete.jsonl");
         std::fs::write(&complete, "{\"type\":\"user\"}\n").unwrap();
         assert_eq!(flush_wait(&complete, budget, poll), FlushOutcome::Settled);
+
+        // A complete record larger than the configured probe is not loaded
+        // in full or guessed complete; the production probe uses the reader's
+        // 16 MiB hard cap.
+        let long_line = dir.path().join("long-line.jsonl");
+        std::fs::write(
+            &long_line,
+            format!("{{\"text\":\"{}\"}}\n", "x".repeat(128)),
+        )
+        .unwrap();
+        assert!(!tail_is_complete_with_limit(&long_line, 64));
 
         // In-flight tail (no trailing newline): budget exhausts, bounded.
         let inflight = dir.path().join("inflight.jsonl");

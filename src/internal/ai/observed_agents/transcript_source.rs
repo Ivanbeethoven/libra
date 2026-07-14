@@ -209,6 +209,13 @@ pub fn resolve_transcript_source(
     let Some(path) = ctx.transcript_path.as_deref() else {
         return Ok(None);
     };
+    // Authorize before invoking any provider hook: preparers may inspect the
+    // file (Claude's flush-wait does), so an untrusted hook-supplied path must
+    // never reach them. Re-check after preparation to narrow the component-
+    // swap window before the final open.
+    if !transcript_path_within_provider_root(adapter, path) {
+        return Ok(None);
+    }
     // DR-01 (ADR-DR-02/07): the optional flush-wait side-effect hook runs
     // BEFORE the safe open, so the handle sees a settled tail whenever the
     // budget allows. Always non-fatal.
@@ -218,7 +225,7 @@ pub fn resolve_transcript_source(
         tracing::warn!(error = %format!("{err:#}"), "transcript preparer failed; continuing");
     }
     if !transcript_path_within_provider_root(adapter, path) {
-        // Untrusted path: never read it (fail-closed on the security gate).
+        // The path moved outside the trusted root while the preparer ran.
         return Ok(None);
     }
     match std::fs::File::open(path) {
@@ -242,10 +249,48 @@ pub fn resolve_transcript_source(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use serial_test::serial;
 
     use super::*;
-    use crate::internal::ai::observed_agents::builtin::ClaudeCodeObservedAgent;
+    use crate::internal::ai::observed_agents::{
+        AgentKind, builtin::ClaudeCodeObservedAgent, capability::TranscriptPreparer,
+    };
+
+    #[derive(Default)]
+    struct CountingPreparer {
+        calls: AtomicUsize,
+    }
+
+    impl ObservedAgent for CountingPreparer {
+        fn provider_kind(&self) -> AgentKind {
+            AgentKind::ClaudeCode
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "counting-preparer"
+        }
+
+        fn read_transcript(&self, _session: &AgentSessionCtx) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn protected_dirs(&self) -> &'static [&'static str] {
+            &[".claude"]
+        }
+
+        fn as_transcript_preparer(&self) -> Option<&dyn TranscriptPreparer> {
+            Some(self)
+        }
+    }
+
+    impl TranscriptPreparer for CountingPreparer {
+        fn prepare_transcript(&self, _session: &AgentSessionCtx) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     /// RAII guard that points `LIBRA_TEST_HOME` at `path` and restores the
     /// prior value on drop. Env mutation is `unsafe` and the tests carry
@@ -308,12 +353,17 @@ mod tests {
         // refuse it (fail-closed) so the writer falls back to the prompt.
         let outside = home.path().join("evil.jsonl");
         std::fs::write(&outside, b"secret").unwrap();
-        let agent = ClaudeCodeObservedAgent::new();
+        let agent = CountingPreparer::default();
         let adapter: &dyn ObservedAgent = &agent;
         assert!(
             resolve_transcript_source(adapter, &test_ctx(Some(outside.clone())))
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            agent.calls.load(Ordering::SeqCst),
+            0,
+            "provider-root rejection must happen before any preparer read"
         );
     }
 
