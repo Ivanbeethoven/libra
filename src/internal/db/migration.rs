@@ -774,6 +774,26 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026071401_agent_export_job.sql"),
             include_str!("../../../sql/migrations/2026071401_agent_export_job_down.sql"),
         ),
+        // plan-20260713 DR-05c (M4): import-job state / crash-recovery identity
+        // (ADR-DR-06). Import-only; the coverage claim gate remains the
+        // cross-path exactly-once authority. Stable key excludes content
+        // digest so a re-run resumes the same job.
+        sql_migration(
+            2026071402,
+            "agent_import_identity",
+            include_str!("../../../sql/migrations/2026071402_agent_import_identity.sql"),
+            include_str!("../../../sql/migrations/2026071402_agent_import_identity_down.sql"),
+        ),
+        // plan-20260713 ADR-DR-06/DR-19 (M4): local anti-resurrection tombstone
+        // — written in-transaction before an erase deletes `agent_session`
+        // (concurrent write barrier). Carries the import-block key plus a
+        // FK-free `erased_session_id` for DR-07's read-only `erased` display.
+        sql_migration(
+            2026071403,
+            "agent_import_tombstone",
+            include_str!("../../../sql/migrations/2026071403_agent_import_tombstone.sql"),
+            include_str!("../../../sql/migrations/2026071403_agent_import_tombstone_down.sql"),
+        ),
     ]
 }
 
