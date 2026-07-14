@@ -211,6 +211,51 @@ pub enum AdvanceOutcome {
     FencedOut,
 }
 
+/// Advance the runner's processed generation and release its lease with a
+/// state that matches the observed generation. This keeps callers from
+/// accidentally marking a job `idle` after [`AdvanceOutcome::MoreWork`]. A
+/// fenced-out runner never attempts a release because the new owner's state
+/// must remain untouched.
+pub async fn advance_and_release(
+    conn: &DatabaseConnection,
+    agent_kind: &str,
+    provider_session_id: &str,
+    owner: &str,
+    fence_token: i64,
+    target: i64,
+    now_ms: i64,
+) -> Result<AdvanceOutcome> {
+    let outcome = advance_processed(
+        conn,
+        agent_kind,
+        provider_session_id,
+        owner,
+        fence_token,
+        target,
+        now_ms,
+    )
+    .await?;
+    let state = match outcome {
+        AdvanceOutcome::Clean => Some("idle"),
+        AdvanceOutcome::MoreWork { .. } => Some("dirty"),
+        AdvanceOutcome::FencedOut => None,
+    };
+    if let Some(state) = state {
+        release(
+            conn,
+            agent_kind,
+            provider_session_id,
+            owner,
+            fence_token,
+            state,
+            None,
+            now_ms,
+        )
+        .await?;
+    }
+    Ok(outcome)
+}
+
 /// Release the lease under owner+fence, marking the terminal state honestly:
 /// `dirty` when work remains, `failed` with a stable code, else `idle`. A
 /// fenced-out release is a silent no-op (the new owner's state wins).
@@ -384,6 +429,64 @@ mod tests {
             observe_idle(&conn, kind, sid, "a", 3_000).await.unwrap(),
             IdleOutcome::Runner { .. }
         ));
+    }
+
+    /// A caller that does not need to append content still must preserve an
+    /// idle observed during its run by releasing `dirty`, not `idle`.
+    #[tokio::test]
+    async fn advance_and_release_keeps_later_generation_dirty() {
+        let conn = job_db().await;
+        let (kind, sid) = ("opencode", "settle-dirty");
+        let IdleOutcome::Runner {
+            fence_token,
+            target_generation,
+            ..
+        } = observe_idle(&conn, kind, sid, "runner", 1_000)
+            .await
+            .unwrap()
+        else {
+            panic!("first idle must become the runner");
+        };
+        assert_eq!(
+            observe_idle(&conn, kind, sid, "later", 2_000)
+                .await
+                .unwrap(),
+            IdleOutcome::RecordedOnly
+        );
+
+        let outcome = advance_and_release(
+            &conn,
+            kind,
+            sid,
+            "runner",
+            fence_token,
+            target_generation,
+            3_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            AdvanceOutcome::MoreWork {
+                target_generation: 2
+            }
+        );
+
+        let row = conn
+            .query_one(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT state, owner, observed_generation, processed_generation
+                 FROM agent_export_job
+                 WHERE agent_kind = ? AND provider_session_id = ?",
+                [kind.into(), sid.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("job row");
+        assert_eq!(row.try_get_by::<String, _>("state").unwrap(), "dirty");
+        assert_eq!(row.try_get_by::<Option<String>, _>("owner").unwrap(), None);
+        assert_eq!(row.try_get_by::<i64, _>("observed_generation").unwrap(), 2);
+        assert_eq!(row.try_get_by::<i64, _>("processed_generation").unwrap(), 1);
     }
 
     /// opencode_export_stale_owner_cannot_release_or_commit +

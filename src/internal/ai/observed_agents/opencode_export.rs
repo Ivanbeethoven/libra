@@ -14,14 +14,17 @@
 //! - **Environment**: `env_clear()` plus a minimal allowlist (`HOME`,
 //!   `XDG_DATA_HOME`, `XDG_CONFIG_HOME`) so the exporter can find its own
 //!   session store but never a credential.
-//! - **Bounds** (GC-DR-04): the child's stdout is an inherited anonymous
-//!   FILE (probe-verified: the CLI truncates large exports into
-//!   backpressured pipes while exiting success), write-bounded at the byte
-//!   cap via `RLIMIT_FSIZE` (overflow terminates the child immediately —
-//!   never fills disk, never truncates silently) and re-checked on the file
-//!   size after exit; the whole run sits under a wall-clock deadline
-//!   (default 3 s — expiry kills the child). stderr is capped and redacted
-//!   before it can appear in any error text (GC-DR-13).
+//! - **Bounds** (GC-DR-04): the child's stdout is an inherited anonymous FILE
+//!   (probe-verified: the CLI truncates large exports into backpressured pipes
+//!   while exiting success), bounded three ways — a `RLIMIT_FSIZE` write-time
+//!   cap terminates a runaway child at the byte limit before it fills disk,
+//!   the file size is actively polled against the same cap while the child
+//!   runs, and it is re-checked after exit; over-cap always kills and errors,
+//!   never returns truncated content. The whole run sits under a wall-clock
+//!   deadline (default 3 s — expiry kills the child's process group). stderr
+//!   is capped and redacted before it can appear in any error text
+//!   (GC-DR-13). A child that leaves descendants in its process group after
+//!   exit is killed without its output being accepted.
 //!
 //! Sandbox: the Required bwrap offline profile lives in
 //! [`run_export_subprocess_sandboxed`] — network unshared, host paths and
@@ -49,6 +52,10 @@ pub const EXPORT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const EXPORT_DEADLINE: Duration = Duration::from_secs(3);
 /// stderr retention cap — enough to diagnose, small enough to redact cheaply.
 const EXPORT_MAX_STDERR_BYTES: usize = 4 * 1024;
+/// File-backed stdout must still be bounded while the child is running. A
+/// short interval prevents a runaway trusted exporter from consuming disk for
+/// the full subprocess deadline before the post-exit size check can run.
+const EXPORT_SIZE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Injectable bounds (GC-DR-07).
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +134,40 @@ pub async fn authorized_sandboxed_export(
     Ok(TranscriptSource::Bytes { bytes, auth })
 }
 
+/// Kill the process group created for an exporter. The direct child is the
+/// group leader, so its pid is also the pgid. This prevents shell-based or
+/// multi-process exporters from leaving descendants behind after a byte-cap
+/// or deadline failure.
+fn kill_export_process_group(pgid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid.filter(|pid| *pid > 1) {
+        // SAFETY: the command is placed in a fresh process group immediately
+        // before spawn. A negative pid targets only that group; failure means
+        // it has already exited and is benign.
+        unsafe {
+            libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
+/// Whether an exporter descendant remains in the process group after the
+/// direct child has exited. Accepting the output while this is true would let
+/// that descendant keep mutating the inherited stdout file after validation.
+fn export_process_group_alive(pgid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid.filter(|pid| *pid > 1) {
+        // SAFETY: signal 0 performs an existence/permission check without
+        // delivering a signal. EPERM still proves the group exists.
+        let result = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+        return result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+    false
+}
+
 /// Run `<binary> export <session_id>` under the module's bounds and return
 /// the raw export bytes. The caller (DR-04b wiring) tags them via
 /// `ExportAuthorized::issue` and feeds the seam — this function itself never
@@ -161,8 +202,8 @@ async fn run_bounded_exporter(
     // exports arrive truncated (~64 KiB) with a SUCCESS status. Give the
     // child an inherited anonymous FILE as stdout instead: file writes flush
     // synchronously (verified complete at 370 KiB+), the FD crosses the
-    // sandbox's mount namespace untouched, and the byte cap is enforced on
-    // the file size after exit.
+    // sandbox's mount namespace untouched, and the byte cap is monitored
+    // while the child runs as well as verified after exit.
     let stdout_file = tempfile::tempfile().context("create export stdout tempfile")?;
     let stdout_for_child = stdout_file
         .try_clone()
@@ -197,6 +238,8 @@ async fn run_bounded_exporter(
         .stdout(std::process::Stdio::from(stdout_for_child))
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     // Minimal env: the exporter must locate its own session store, nothing
     // else. Credentials/endpoints never pass (env_clear + explicit list).
     for name in ["HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME"] {
@@ -206,29 +249,106 @@ async fn run_bounded_exporter(
     }
 
     let mut child = command.spawn().context("spawn opencode export")?;
+    let process_group = child.id();
     let mut stderr = child.stderr.take().expect("stderr piped"); // INVARIANT: piped above
 
-    let wait_all = async {
+    let mut stderr_reader = tokio::spawn(async move {
         let mut err_buf = Vec::new();
         let _ = (&mut stderr)
             .take(EXPORT_MAX_STDERR_BYTES as u64)
             .read_to_end(&mut err_buf)
             .await;
-        let status = child.wait().await.context("wait for opencode export")?;
-        Ok::<_, anyhow::Error>((err_buf, status))
+        err_buf
+    });
+
+    enum WaitOutcome {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Deadline,
+        OverCap(u64),
+        SizeReadFailed(std::io::Error),
+    }
+
+    let deadline = tokio::time::sleep(limits.deadline);
+    tokio::pin!(deadline);
+    let mut size_poll = tokio::time::interval(EXPORT_SIZE_POLL_INTERVAL);
+    size_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let outcome = loop {
+        tokio::select! {
+            status = child.wait() => break WaitOutcome::Exited(status),
+            _ = &mut deadline => break WaitOutcome::Deadline,
+            _ = size_poll.tick() => {
+                match stdout_file.metadata() {
+                    Ok(metadata) if metadata.len() > limits.max_bytes => {
+                        break WaitOutcome::OverCap(metadata.len());
+                    }
+                    Ok(_) => {}
+                    Err(err) => break WaitOutcome::SizeReadFailed(err),
+                }
+            }
+        }
     };
 
-    let (err_buf, status) = match tokio::time::timeout(limits.deadline, wait_all).await {
-        Ok(result) => result?,
-        Err(_elapsed) => {
+    let (err_buf, status) = match outcome {
+        WaitOutcome::Exited(status) => {
+            if export_process_group_alive(process_group) {
+                kill_export_process_group(process_group);
+                stderr_reader.abort();
+                let _ = stderr_reader.await;
+                bail!(
+                    "opencode export left descendant processes running after exit; \
+                     killed without accepting mutable output"
+                );
+            }
+            let err_buf = tokio::select! {
+                result = &mut stderr_reader => {
+                    result.context("join opencode export stderr reader")?
+                }
+                _ = &mut deadline => {
+                    kill_export_process_group(process_group);
+                    stderr_reader.abort();
+                    let _ = stderr_reader.await;
+                    bail!(
+                        "opencode export exceeded its {:?} deadline while finishing stderr; \
+                         killed without accepting content",
+                        limits.deadline
+                    );
+                }
+            };
+            (err_buf, status.context("wait for opencode export")?)
+        }
+        WaitOutcome::Deadline => {
             // Deadline: kill and fail closed — a slow exporter must not eat
             // the hook budget (GC-DR-04).
+            kill_export_process_group(process_group);
             let _ = child.kill().await;
+            stderr_reader.abort();
+            let _ = child.wait().await;
+            let _ = stderr_reader.await;
             bail!(
                 "opencode export exceeded its {:?} deadline; killed (content \
                  skipped this idle — a later idle retries)",
                 limits.deadline
             );
+        }
+        WaitOutcome::OverCap(observed) => {
+            kill_export_process_group(process_group);
+            let _ = child.kill().await;
+            stderr_reader.abort();
+            let _ = child.wait().await;
+            let _ = stderr_reader.await;
+            bail!(
+                "opencode export exceeded the {} byte cap while running \
+                 (observed {observed} bytes); killed without returning content",
+                limits.max_bytes
+            );
+        }
+        WaitOutcome::SizeReadFailed(err) => {
+            kill_export_process_group(process_group);
+            let _ = child.kill().await;
+            stderr_reader.abort();
+            let _ = child.wait().await;
+            let _ = stderr_reader.await;
+            return Err(err).context("monitor opencode export output size");
         }
     };
 
@@ -436,6 +556,56 @@ mod tests {
             .await
             .expect_err("over-cap output must fail");
         assert!(format!("{err:#}").contains("byte cap"), "got {err:#}");
+    }
+
+    /// A non-terminating writer is killed by the byte cap instead of being
+    /// allowed to consume disk until the much later wall-clock deadline.
+    #[tokio::test]
+    async fn opencode_export_byte_cap_kills_runaway_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(dir.path(), "while :; do head -c 65536 /dev/zero; done");
+        let limits = ExportLimits {
+            max_bytes: 1024,
+            deadline: Duration::from_secs(5),
+        };
+        let started = std::time::Instant::now();
+        let err = run_export_subprocess(&bin, "s1", limits)
+            .await
+            .expect_err("runaway output must be killed at the byte cap");
+        assert!(format!("{err:#}").contains("byte cap"), "got {err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "byte cap must preempt the deadline, waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A successful direct child cannot leave a background writer holding the
+    /// inherited output descriptors after the result has been validated.
+    #[tokio::test]
+    async fn opencode_export_rejects_surviving_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_exporter(dir.path(), "sleep 30 & printf 'apparently-done'");
+        let started = std::time::Instant::now();
+        let err = run_export_subprocess(
+            &bin,
+            "s1",
+            ExportLimits {
+                max_bytes: 1024,
+                deadline: Duration::from_secs(5),
+            },
+        )
+        .await
+        .expect_err("surviving exporter descendants must be killed");
+        assert!(
+            format!("{err:#}").contains("descendant processes"),
+            "got {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "descendant rejection must be prompt, waited {:?}",
+            started.elapsed()
+        );
     }
 
     /// Deadline kills a hung exporter; the wait stays bounded.
