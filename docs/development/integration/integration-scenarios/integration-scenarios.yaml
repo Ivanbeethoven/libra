@@ -57,7 +57,8 @@ notes: |
   P2-02 mailinfo, P2-03 format-patch interoperability, and P2-04's explicit
   non-sending send-email policy are registered through compat_mailinfo_basic,
   compat_format_patch_mail_roundtrip, and compat_matrix_alignment in
-  tests/INDEX.md and the integration-test-plan matrix.
+  tests/INDEX.md and the integration-test-plan matrix. IX-01's isolated full
+  installer smoke is likewise Cargo-only as compat_install_alias.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

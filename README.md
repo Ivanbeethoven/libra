@@ -58,6 +58,12 @@ cd libra
 cargo build --release
 ```
 
+The script installer also creates the optional shorthand
+`~/.libra/bin/lba -> libra` as a relative symlink. Re-running the same version
+repairs a missing alias without replacing the binary. Use `--no-alias` or
+`LIBRA_NO_ALIAS=1` to opt out; an existing user-owned `lba` is never
+overwritten. See [installer behavior and options](docs/installation.md).
+
 ### Initialize Your First Repository
 
 ```bash

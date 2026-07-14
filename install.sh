@@ -18,7 +18,7 @@ INSTALL_DIR="${LIBRA_INSTALL_DIR:-$LIBRA_HOME/bin}"
 # user opts in with LIBRA_ALLOW_FALLBACK=1. Default behaviour is fail-fast so
 # offline installs cannot silently regress to a stale version. Bump this on
 # every release so the opt-in fallback remains useful.
-DEFAULT_VERSION="v0.17.874"
+DEFAULT_VERSION="v0.18.88"
 
 # ─── theme (Dusk) ────────────────────────────────────────────────────────────
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ -z "${LIBRA_NO_TUI:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
@@ -199,6 +199,7 @@ OPTIONS:
     -v, --version <VERSION>    Specify version (default: latest)
     -d, --dir <PATH>           Installation directory (default: \$HOME/.libra/bin)
         --no-modify-path       Do not touch shell rc files (still writes \$LIBRA_HOME/env)
+        --no-alias             Do not create the optional lba -> libra symlink
     -h, --help                 Show this help message
 
 EXAMPLES:
@@ -214,10 +215,14 @@ EXAMPLES:
     # Skip shell-rc modification (source \$HOME/.libra/env yourself)
     curl -fsSL https://download.libra.tools/install.sh | sh -s -- --no-modify-path
 
+    # Install without the optional lba shorthand
+    curl -fsSL https://download.libra.tools/install.sh | sh -s -- --no-alias
+
 ENVIRONMENT VARIABLES:
     LIBRA_VERSION              Override version detection
     LIBRA_HOME                 Override install root (default: \$HOME/.libra)
     LIBRA_INSTALL_DIR          Override binary directory (default: \$LIBRA_HOME/bin)
+    LIBRA_NO_ALIAS=1           Do not create the optional lba -> libra symlink
     LIBRA_BASE_URL             Override download base URL
     LIBRA_REQUIRE_CHECKSUM=1   Fail if mirror does not publish <binary>.sha256
     LIBRA_ALLOW_FALLBACK=1     If release API is unreachable, install \$DEFAULT_VERSION
@@ -231,6 +236,8 @@ EOF
 parse_args() {
     VERSION="${LIBRA_VERSION:-}"
     MODIFY_PATH=1
+    CREATE_ALIAS=1
+    [ "${LIBRA_NO_ALIAS:-0}" = "1" ] && CREATE_ALIAS=0
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)         usage ;;
@@ -241,9 +248,81 @@ parse_args() {
                 [ $# -lt 2 ] && error_exit "missing argument for $1" "args" "expected: -d <path>"
                 INSTALL_DIR="$2"; shift 2 ;;
             --no-modify-path)  MODIFY_PATH=0; shift ;;
+            --no-alias)        CREATE_ALIAS=0; shift ;;
             *) error_exit "unknown option: $1" "args" "use --help to see supported flags" ;;
         esac
     done
+}
+
+# Create the optional short command beside the installed binary. The relative
+# target keeps the alias valid if LIBRA_HOME is moved as a directory.
+#
+# Safety contract:
+# - a regular file/directory or a symlink to anything except this installation's
+#   libra binary is never overwritten;
+# - a valid relative/absolute libra symlink may be refreshed to the canonical
+#   relative target;
+# - filesystems/platforms that reject symlinks produce a warning, not a failed
+#   libra installation.
+ensure_lba_alias() {
+    ALIAS_PATH="${INSTALL_DIR}/lba"
+
+    if [ "${CREATE_ALIAS:-1}" != "1" ]; then
+        ALIAS_STATUS=disabled
+        return 0
+    fi
+
+    if [ ! -x "${INSTALL_DIR}/libra" ]; then
+        ALIAS_STATUS=skipped
+        warn_fact "lba alias" "not created — ${INSTALL_DIR}/libra is not executable"
+        return 0
+    fi
+
+    if [ -L "$ALIAS_PATH" ]; then
+        # Command substitution strips trailing newlines. Append and remove a
+        # sentinel so a foreign target such as "libra<newline>" cannot be
+        # misclassified as the exact safe target "libra".
+        alias_target_with_sentinel=$(
+            readlink -n "$ALIAS_PATH" 2>/dev/null || true
+            printf '_'
+        )
+        alias_target=${alias_target_with_sentinel%_}
+        case "$alias_target" in
+            libra)
+                ALIAS_STATUS=ready
+                fact "lba alias" "$ALIAS_PATH -> libra"
+                ;;
+            "${INSTALL_DIR}/libra")
+                if ln -sfn libra "$ALIAS_PATH" 2>/dev/null; then
+                    ALIAS_STATUS=ready
+                    fact "lba alias" "$ALIAS_PATH -> libra"
+                else
+                    ALIAS_STATUS=skipped
+                    warn_fact "lba alias" "could not refresh $ALIAS_PATH — leaving the existing alias unchanged"
+                fi
+                ;;
+            *)
+                ALIAS_STATUS=skipped
+                warn_fact "lba alias" "$ALIAS_PATH already points elsewhere — leaving it unchanged"
+                ;;
+        esac
+        return 0
+    fi
+
+    if [ -e "$ALIAS_PATH" ]; then
+        ALIAS_STATUS=skipped
+        warn_fact "lba alias" "$ALIAS_PATH already exists and is not a Libra alias — leaving it unchanged"
+        return 0
+    fi
+
+    if ln -s libra "$ALIAS_PATH" 2>/dev/null; then
+        ALIAS_STATUS=ready
+        fact "lba alias" "$ALIAS_PATH -> libra"
+    else
+        ALIAS_STATUS=skipped
+        warn_fact "lba alias" "could not create $ALIAS_PATH — symlinks may be unavailable; use libra normally"
+    fi
+    return 0
 }
 
 # Reject paths that would corrupt the generated env file (which inserts the
@@ -253,6 +332,7 @@ validate_path() {
     name=$1
     val=$2
     bad=""
+    # shellcheck disable=SC1003  # case includes a literal backslash pattern/value
     case "$val" in
         *'"'*) bad='"' ;;
         *'$'*) bad='$' ;;
@@ -426,7 +506,9 @@ screen_welcome() {
     agent_say "Hi — I'm the libra installer. I'll set up the AI-agent-native VCS for you in about 30 seconds. I'll show you what I'm doing at every step."
     printf '  %sgithub.com/libra-tools/libra%s\n'   "$C_DIM" "$C_RESET"
     printf '  %scurl -fsSL https://download.libra.tools/install.sh | sh%s\n\n' "$C_DIM" "$C_RESET"
-    [ "$TTY" = "1" ] && sleep 0.5 2>/dev/null || true
+    if [ "$TTY" = "1" ]; then
+        sleep 0.5 2>/dev/null || true
+    fi
 }
 
 screen_detect() {
@@ -502,7 +584,11 @@ screen_method() {
 
 screen_already_installed() {
     success_box
-    agent_say "libra ${VERSION} is already installed at ${EXISTING_PATH}. Nothing to do."
+    if [ "${ALIAS_STATUS:-}" = "ready" ]; then
+        agent_say "libra ${VERSION} is already installed at ${EXISTING_PATH}. The optional lba shorthand is ready too."
+    else
+        agent_say "libra ${VERSION} is already installed at ${EXISTING_PATH}. Nothing else to install."
+    fi
 
     section "installed"
     printf '  %s✓%s libra %s%s · %s%s\n\n' \
@@ -555,6 +641,7 @@ screen_install() {
         || error_exit "could not install to $target" "install"
 
     INSTALLED_PATH="$target"
+    ensure_lba_alias
     printf '\n'
 }
 
@@ -707,7 +794,11 @@ screen_shell() {
 
 screen_success() {
     success_box
-    agent_say "Installed in about 30 seconds. You're all set — here's what to try first:"
+    if [ "${ALIAS_STATUS:-}" = "ready" ]; then
+        agent_say "Installed in about 30 seconds. You're all set — use libra normally, or the new lba shorthand."
+    else
+        agent_say "Installed in about 30 seconds. You're all set — here's what to try first:"
+    fi
 
     pad="                                       "
     fmtcmd() {
@@ -784,6 +875,9 @@ main() {
 
     # Short-circuit: same version already installed → don't touch anything.
     if [ -n "$EXISTING_VERSION" ] && [ "$EXISTING_VERSION" = "$VERSION" ]; then
+        # Re-running the installer repairs a missing/legacy alias even when the
+        # binary itself does not need to be downloaded again.
+        ensure_lba_alias
         screen_already_installed
         exit 0
     fi

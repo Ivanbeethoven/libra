@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.87"
+version = "0.18.88"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -212,6 +212,10 @@ path = "tests/compat/checkout_alias_help.rs"
 [[test]]
 name = "compat_matrix_alignment"
 path = "tests/compat/matrix_alignment.rs"
+
+[[test]]
+name = "compat_install_alias"
+path = "tests/compat/install_alias_test.rs"
 
 [[test]]
 name = "compat_live_compat_workflow"

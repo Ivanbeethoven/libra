@@ -58,6 +58,11 @@ cd libra
 cargo build --release
 ```
 
+脚本安装器还会创建可选短命令 `~/.libra/bin/lba -> libra`（相对 symlink）。
+重复安装同一版本会修复缺失的 alias，不替换二进制。使用 `--no-alias` 或
+`LIBRA_NO_ALIAS=1` 可关闭；已存在的用户自有 `lba` 绝不会被覆盖。详见
+[安装器行为与选项](docs/installation.zh-CN.md)。
+
 ### 初始化你的第一个仓库
 
 ```bash

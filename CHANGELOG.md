@@ -4,6 +4,13 @@
 
 ### Added
 
+- **Optional `lba` installer shorthand (v0.18.88)**: `install.sh` now creates
+  a movable relative `lba -> libra` symlink by default. Same-version reruns
+  repair a missing alias, `--no-alias` and `LIBRA_NO_ALIAS=1` opt out, and
+  regular files or foreign symlinks named `lba` are preserved with a warning.
+  Symlink-unavailable platforms retain a successful Libra install and receive
+  an actionable warning. A deterministic full-installer smoke target covers
+  clean install, repair, idempotency, opt-outs, collision safety, and fallback.
 - **Reliable format-patch mail output (v0.18.86)**: adds `-1`, `--root`,
   `--minimal`, `--histogram`, `--ignore-if-in-upstream`, and diff-prefix
   controls; honors strict `format.subjectPrefix`, `format.signOff`,
