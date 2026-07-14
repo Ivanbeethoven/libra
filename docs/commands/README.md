@@ -71,8 +71,8 @@ Every Libra command accepts the following global flags:
 | `libra diff-tree` | | Diff between two trees (git diff-tree) | [diff-tree.md](diff-tree.md) |
 | `libra diff-index` | | Diff a tree against the working tree (git diff-index) | [diff-index.md](diff-index.md) |
 | `libra diff-files` | | Diff the index against the working tree (git diff-files) | [diff-files.md](diff-files.md) |
-| `libra fast-export` | | Emit history as a git fast-import stream | [fast-export.md](fast-export.md) |
-| `libra fast-import` | | Import a git fast-import stream | [fast-import.md](fast-import.md) |
+| `libra fast-export` | | Emit multi-ref/range history, tags, and notes as a Git fast-import stream | [fast-export.md](fast-export.md) |
+| `libra fast-import` | | Import quoted/inline/tag/notes fast-import streams with atomic ref publication | [fast-import.md](fast-import.md) |
 | `libra blame` | | Trace each line of a file to its introducing commit | [blame.md](blame.md) |
 | `libra describe` | `desc` | Find the nearest reachable tag and format as `tag-N-g<abbrev>` | [describe.md](describe.md) |
 | `libra grep` | | Search for patterns in tracked files with regex, revision, and index support | [grep.md](grep.md) |
@@ -104,7 +104,7 @@ Every Libra command accepts the following global flags:
 | `libra replace` | | Substitute one object for another on read (refs/replace) | [replace.md](replace.md) |
 | `libra rerere` | | Reuse recorded conflict resolutions | [rerere.md](rerere.md) |
 | `libra bisect` | | Binary search to find the commit that introduced a bug; supports `start` / `bad` / `good` / `reset` / `skip` / `log` / `run` / `view` | [bisect.md](bisect.md) |
-| `libra bundle` | | Create and inspect Git v2 bundle files (`create` / `verify` / `list-heads`) | [bundle.md](bundle.md) |
+| `libra bundle` | | Create, verify, inspect, and unbundle Git v2 bundles | [bundle.md](bundle.md) |
 
 ### Remote Operations
 

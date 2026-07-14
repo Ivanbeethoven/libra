@@ -2,43 +2,46 @@
 
 ## 命令实现目标
 
-`libra fast-export [<rev>]` 把 `<rev>`（默认 HEAD）可达历史导出为 `git fast-import` 流。只读，不写对象/refs。GGT-13 互操作池命令之一（独立增量）。
+`libra fast-export [--all] [REV...]` 以 Git fast-import 协议导出多个 ref、范围、tag 与 notes；命令只读。P1-11 的成功标准是常见离线迁移保真和双向真实 Git 互操作，不是完整复刻 `git fast-export` 的所有过滤器。
 
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：`fast-export [<rev>]`；blob（带 mark、去重）、commit（mark/author/committer/data/from/merge）、`deleteall` + 整树 `M` 重建；提交在 `<rev>` 解析的分支 ref 下发出。
-- **有意差异/延后**：用整树重建（`deleteall`+`M`）而非父 diff（更大但等价）；一次多 ref、附注/签名 tag、`--export-marks`/`--import-marks`、blob/path 过滤未实现。
+- 已支持：默认 `HEAD`、multi-revision、`A..B`、`^A`、`--all`、local branches、lightweight/annotated commit tags、Libra notes→`N`、Git C-style UTF-8 path quoting、共享 marks、`done`。
+- 有意实现形态：每个 commit 用 `deleteall` + 全树 `M`，比 parent diff 大但 tree 等价。
+- 签名边界：commit signing header 在 fast-import commit record 中不可表达，导出时剥离；tag message 原样保留。
+- fail-closed：坏 ref/object/tag row、缺对象、note target 无法由 stream mark 表示、stdout 写失败均返回 `CliError`，不宣称成功。
 
 ## 设计方案
 
-- 入口与分发：`src/cli.rs::Commands::FastExport` → `command::fast_export::execute_safe`。
-- 源码分层：`src/command/fast_export.rs`：`FastExportArgs`（`rev?`）、`execute`/`execute_safe`、`resolve_ref_name`、`topological_order`、`flatten_tree`、`format_ident`。
-- 复用：`util::get_commit_base`（rev→commit）、`Head::current`（HEAD→分支名）、`command::log::get_reachable_commits`（可达提交）、`command::load_object::<Tree/Blob>`（Result-based，无 panic）。
-- 流程：解析 tip + ref_name → 取可达提交 → `topological_order`（迭代后序 DFS，父先于子，保证 `from`/`merge` mark 已定义）→ 对每提交：`flatten_tree`（递归，得 (path, TreeItemMode, oid)）→ 未见 blob 发出（mark + `data <len>` + bytes）→ commit 头（mark/author/committer/data/msg）→ `from`/`merge`（按已 mark 的父）→ `deleteall` → 每文件 `M <mode> :<mark> <path>`（gitlink 用 sha 不用 mark）。
-- mark：blob 与 commit 共享递增计数器。mode：`TreeItemMode::to_bytes()`（100644/100755/120000/160000）。
-- 输出：`BufWriter<StdoutLock>`，流式写（不全量缓冲）。
-- 底层操作对象：只读对象库（commit/tree/blob）。无写入。
+- 入口：`src/cli.rs::Commands::FastExport` → `command::fast_export::execute_safe`。
+- `build_export_plan` 归一化 branches/tags/positive specs/exclusions；所有 ref 共享一份 `HashMap<ObjectHash, mark>`。
+- `collect_commit_ids` 先计算 exclusions，再收集闭包；`topological_order` 用迭代后序 DFS 保证 parent mark 先定义。范围外 parent 使用 literal OID，形成 incremental prerequisite。
+- `flatten_tree` 递归生成稳定路径序；blob 去重后发出，gitlink 使用 literal commit OID。
+- annotated tag 以 `tag` record + mark 发出，使 note 可以引用 tag object；`emit_notes` 按 notes ref 分组并写 root notes commit/N records。
+- `quote_path` 按字节输出 Git C escapes；Libra tree 名是 UTF-8，非 UTF-8 Git path 仍为明确边界。
+- 输出使用 `BufWriter<StdoutLock>`；不写 SQLite、对象库、index/ref/worktree；全局 JSON/machine 不包协议流。
 
 ## 实现历史
 
-- 2026-06-30（GGT-13 / 2，`grit-gap.md` 阶段 6）：互操作池第二个命令；独立增量。
+- 2026-06-30（GGT-13）：首版单 revision、blob/commit、整树 M。
+- 2026-07-14（P1-11）：multi-ref/range、annotated tag、notes、quoting、真实 Git 双向 round-trip、SHA-256 smoke 与 fail-closed note closure。
 
 ## 当前状态
 
-- 公开状态：已公开（`Commands::FastExport`）。
-- 测试：`tests/command/fast_export_test.rs`（流结构：blob/data/commit refs/heads/deleteall/M 100644 :/author/committer；两提交 `from :` 链接；显式 rev；坏 rev 128；非仓库 128）。
-- 用户文档：`docs/commands/fast-export.md`（EN + zh-CN）。
+- 公开：`Commands::FastExport`。
+- 核心证据：`compat_import_export_roundtrip::libra_all_export_round_trips_refs_tags_notes_ranges_and_quoted_paths`、`fast_streams_interoperate_bidirectionally_with_real_git`、SHA-256 case；unit tests pin path quoting/range/message boundary。
+- 用户文档：`docs/commands/fast-export.md` 与 `docs/commands/zh-CN/fast-export.md`。
 
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 当前处理 |
 |---|---|---|
-| 输出形式 | 父 diff（更小输出） | 整树重建（正确但更大）；后续可改 diff。 |
-| 范围 | 一次多 ref、tag、marks 文件、过滤 | 延后；首版单 rev。 |
-| 配套 | `fast-import`（反向） | GGT-13 另一独立增量（后续）。 |
+| revision | `A...B` | 不承诺；使用显式正/负 revisions。 |
+| marks/filter | marks files、`--anonymize`、path/blob filtering | 延后。 |
+| tag | 最终目标非 commit 的 annotated tag | fail-closed `LBR-UNSUPPORTED-001`。 |
+| stream size | parent-diff 压缩 | 继续使用正确但更大的全树形式。 |
 
 ## 维护要求
 
-- 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。
-- 拓扑序必须保证父先于子（`from`/`merge` mark 先定义）；改输出形式时保持流可被 `git fast-import` 解析。
+任何 emitter 改动都必须同时通过 Libra→Libra、Libra→system Git、system Git→Libra 与 SHA-256 测试；严禁重新引入 silent note dropping 或未定义 mark。

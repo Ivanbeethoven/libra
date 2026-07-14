@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Import/export fidelity (v0.18.82)**: expands `fast-export` with multiple
+  revisions, incremental ranges, `--all`, annotated tags, notes, and Git path
+  quoting; expands `fast-import` with inline blobs, copy/rename, annotated tags,
+  note records and Git notes-tree translation, reset deletion, bounded parsing,
+  object-type validation, and atomic branch/tag/note publication. `bundle`
+  gains `--all`/`--branches`/`--tags`, full checksum verification, and bounded,
+  hash-kind-aware `unbundle` that imports objects without moving refs. A new
+  compatibility target covers Libra round trips, system-Git interoperability,
+  transactional failures, repeated unbundle, and SHA-256 repositories; English
+  and Chinese command/developer docs describe the supported and deferred edges.
+
 - **Sandboxed repository hooks (v0.18.80)**: adds an Option-A-compatible
   `.libra/hooks` lifecycle for commit, checkout/switch, merge, rebase, and
   pull without executing `.git/hooks`. Hooks run with structured arguments,
