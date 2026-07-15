@@ -73,3 +73,41 @@ pub(crate) fn path_matches(path: &Path, pathspecs: &[PathBuf]) -> bool {
             .iter()
             .any(|pathspec| path == pathspec || path.starts_with(pathspec))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(stages: [bool; 3]) -> UnmergedEntry {
+        let hash = ObjectHash::new(&[0u8; 20]);
+        let stage = |present: bool| {
+            present.then_some(UnmergedStage {
+                mode: 0o100644,
+                hash,
+            })
+        };
+        UnmergedEntry::new(
+            PathBuf::from("conflict.txt"),
+            [stage(stages[0]), stage(stages[1]), stage(stages[2])],
+        )
+    }
+
+    #[test]
+    fn xy_covers_all_seven_unmerged_combinations() {
+        // Git status porcelain v1 unmerged XY codes (git-status(1)).
+        assert_eq!(entry([true, false, false]).xy(), ('D', 'D')); // both deleted
+        assert_eq!(entry([false, true, false]).xy(), ('A', 'U')); // added by us
+        assert_eq!(entry([true, true, false]).xy(), ('U', 'D')); // deleted by them
+        assert_eq!(entry([false, false, true]).xy(), ('U', 'A')); // added by them
+        assert_eq!(entry([true, false, true]).xy(), ('D', 'U')); // deleted by us
+        assert_eq!(entry([false, true, true]).xy(), ('A', 'A')); // both added
+        assert_eq!(entry([true, true, true]).xy(), ('U', 'U')); // both modified
+    }
+
+    #[test]
+    fn xy_empty_stages_defaults_to_uu() {
+        // Defensive: collectors should never emit empty stage sets, but if they
+        // do, treat as content conflict rather than inventing a new code.
+        assert_eq!(entry([false, false, false]).xy(), ('U', 'U'));
+    }
+}

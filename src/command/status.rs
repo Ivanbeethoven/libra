@@ -2422,7 +2422,7 @@ pub fn generate_short_format_status(
     generate_short_format_status_with_unmerged(staged, unstaged, &[])
 }
 
-fn generate_short_format_status_with_unmerged(
+pub(crate) fn generate_short_format_status_with_unmerged(
     staged: &Changes,
     unstaged: &Changes,
     unmerged: &[UnmergedEntry],
@@ -3371,6 +3371,47 @@ mod test {
             .to_string(),
             "path 'src/foo' is not valid UTF-8",
         );
+    }
+
+    #[test]
+    fn short_format_surface_emits_all_seven_unmerged_xy_codes() {
+        use crate::command::unmerged::{UnmergedEntry, UnmergedStage};
+
+        let hash = ObjectHash::new(&[0u8; 20]);
+        let mk = |name: &str, stages: [bool; 3]| {
+            let stage = |present: bool| {
+                present.then_some(UnmergedStage {
+                    mode: 0o100644,
+                    hash,
+                })
+            };
+            UnmergedEntry::new(
+                PathBuf::from(name),
+                [stage(stages[0]), stage(stages[1]), stage(stages[2])],
+            )
+        };
+        let unmerged = vec![
+            mk("dd.txt", [true, false, false]),
+            mk("au.txt", [false, true, false]),
+            mk("ud.txt", [true, true, false]),
+            mk("ua.txt", [false, false, true]),
+            mk("du.txt", [true, false, true]),
+            mk("aa.txt", [false, true, true]),
+            mk("uu.txt", [true, true, true]),
+        ];
+        let empty = Changes::default();
+        let rows = generate_short_format_status_with_unmerged(&empty, &empty, &unmerged);
+        let by_path: std::collections::BTreeMap<_, _> = rows
+            .into_iter()
+            .map(|(path, x, y)| (path, (x, y)))
+            .collect();
+        assert_eq!(by_path.get(&PathBuf::from("dd.txt")), Some(&('D', 'D')));
+        assert_eq!(by_path.get(&PathBuf::from("au.txt")), Some(&('A', 'U')));
+        assert_eq!(by_path.get(&PathBuf::from("ud.txt")), Some(&('U', 'D')));
+        assert_eq!(by_path.get(&PathBuf::from("ua.txt")), Some(&('U', 'A')));
+        assert_eq!(by_path.get(&PathBuf::from("du.txt")), Some(&('D', 'U')));
+        assert_eq!(by_path.get(&PathBuf::from("aa.txt")), Some(&('A', 'A')));
+        assert_eq!(by_path.get(&PathBuf::from("uu.txt")), Some(&('U', 'U')));
     }
 
     #[test]

@@ -168,8 +168,104 @@ fn conflict_paths_are_unmerged_across_status_ls_files_and_diff() {
     ] {
         let repo = TestRepo::new();
         repo.create_conflict(flow);
-        assert_unmerged_contract(&repo, flow.label());
+        assert_unmerged_contract(&repo, flow.label(), "UU");
     }
+}
+
+#[test]
+fn unmerged_xy_codes_cover_delete_and_add_conflicts() {
+    // Plan P0-01 exact acceptance: porcelain v1 reports DD/AU/UD/UA/DU/AA/UU.
+    // UU is covered by the content-conflict suite above; these merge fixtures
+    // exercise the remaining common codes available from real conflict flows.
+    // DD/AU/UA are pinned by `command::unmerged::tests::xy_covers_all_seven_*`.
+    let cases = [
+        ("UD", ConflictKind::DeletedByThem),
+        ("DU", ConflictKind::DeletedByUs),
+        ("AA", ConflictKind::BothAdded),
+    ];
+    for (xy, kind) in cases {
+        let repo = TestRepo::new();
+        kind.plant(&repo);
+        assert_porcelain_xy(&repo, kind.label(), xy);
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum ConflictKind {
+    DeletedByThem,
+    DeletedByUs,
+    BothAdded,
+}
+
+impl ConflictKind {
+    fn label(self) -> &'static str {
+        match self {
+            ConflictKind::DeletedByThem => "deleted-by-them",
+            ConflictKind::DeletedByUs => "deleted-by-us",
+            ConflictKind::BothAdded => "both-added",
+        }
+    }
+
+    fn plant(self, repo: &TestRepo) {
+        match self {
+            ConflictKind::DeletedByThem => {
+                // ours modifies, theirs deletes → UD (stages 1+2)
+                repo.success(&["switch", "-c", "side"]);
+                repo.success(&["rm", "conflict.txt"]);
+                repo.success(&["commit", "-s", "-m", "side deletes"]);
+                repo.success(&["switch", "main"]);
+                repo.commit_conflict_text("main keeps", "main modifies");
+                repo.expect_conflict(&["merge", "side"]);
+            }
+            ConflictKind::DeletedByUs => {
+                // ours deletes, theirs modifies → DU (stages 1+3)
+                repo.success(&["switch", "-c", "side"]);
+                repo.commit_conflict_text("side keeps", "side modifies");
+                repo.success(&["switch", "main"]);
+                repo.success(&["rm", "conflict.txt"]);
+                repo.success(&["commit", "-s", "-m", "main deletes"]);
+                repo.expect_conflict(&["merge", "side"]);
+            }
+            ConflictKind::BothAdded => {
+                // file absent in base, both sides add → AA (stages 2+3)
+                repo.success(&["rm", "conflict.txt"]);
+                repo.success(&["commit", "-s", "-m", "remove for both-add"]);
+                repo.success(&["switch", "-c", "side"]);
+                repo.write("added.txt", "side\n");
+                repo.success(&["add", "added.txt"]);
+                repo.success(&["commit", "-s", "-m", "side adds"]);
+                repo.success(&["switch", "main"]);
+                repo.write("added.txt", "main\n");
+                repo.success(&["add", "added.txt"]);
+                repo.success(&["commit", "-s", "-m", "main adds"]);
+                repo.expect_conflict(&["merge", "side"]);
+            }
+        }
+    }
+}
+
+fn assert_porcelain_xy(repo: &TestRepo, label: &str, xy: &str) {
+    let path = if xy == "AA" {
+        "added.txt"
+    } else {
+        "conflict.txt"
+    };
+    let expected_v1 = format!("{xy} {path}");
+    let porcelain = repo.stdout(&["status", "--porcelain"]);
+    assert!(
+        porcelain.lines().any(|line| line == expected_v1),
+        "{label}: porcelain v1 must report {expected_v1}, got:\n{porcelain}"
+    );
+
+    let porcelain_v2 = repo.stdout(&["status", "--porcelain=v2"]);
+    let unmerged = porcelain_v2
+        .lines()
+        .find(|line| line.ends_with(&format!(" {path}")))
+        .unwrap_or_else(|| panic!("{label}: missing porcelain v2 conflict row:\n{porcelain_v2}"));
+    let fields: Vec<_> = unmerged.split_whitespace().collect();
+    assert!(fields.len() >= 3, "{label}: malformed v2 row {unmerged}");
+    assert_eq!(fields[0], "u", "{label}: v2 row must be unmerged");
+    assert_eq!(fields[1], xy, "{label}: v2 XY must be {xy}");
 }
 
 #[test]
@@ -233,11 +329,12 @@ fn status_top_pathspec_from_subdir_keeps_merge_conflict_paths() {
     );
 }
 
-fn assert_unmerged_contract(repo: &TestRepo, label: &str) {
+fn assert_unmerged_contract(repo: &TestRepo, label: &str, xy: &str) {
     let porcelain = repo.stdout(&["status", "--porcelain"]);
+    let expected_v1 = format!("{xy} conflict.txt");
     assert!(
-        porcelain.lines().any(|line| line == "UU conflict.txt"),
-        "{label}: porcelain v1 must report UU, got:\n{porcelain}"
+        porcelain.lines().any(|line| line == expected_v1),
+        "{label}: porcelain v1 must report {expected_v1}, got:\n{porcelain}"
     );
     assert!(
         !porcelain.lines().any(|line| line == "?? conflict.txt"),
@@ -252,7 +349,7 @@ fn assert_unmerged_contract(repo: &TestRepo, label: &str) {
     let fields: Vec<_> = unmerged.split_whitespace().collect();
     assert_eq!(fields.len(), 11, "{label}: malformed v2 row {unmerged}");
     assert_eq!(fields[0], "u", "{label}: v2 row must be unmerged");
-    assert_eq!(fields[1], "UU", "{label}: v2 XY must be UU");
+    assert_eq!(fields[1], xy, "{label}: v2 XY must be {xy}");
     assert_eq!(fields[2], "N...", "{label}: v2 submodule field");
     assert_eq!(&fields[3..7], &["100644", "100644", "100644", "100644"]);
     assert_eq!(fields[10], "conflict.txt");
