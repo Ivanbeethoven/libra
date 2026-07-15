@@ -4,6 +4,8 @@ mod options;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::time::Duration;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -12,7 +14,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use clap::Parser;

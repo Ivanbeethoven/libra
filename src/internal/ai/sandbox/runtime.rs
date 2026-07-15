@@ -648,6 +648,8 @@ impl SandboxManager {
             });
         }
 
+        // Rebound only by the Linux bwrap branch below; immutable elsewhere.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut protected_mount_cleanup_paths = Vec::new();
         let (command, arg0, effective_sandbox) = match sandbox {
             SandboxType::None => (command, None, SandboxType::None),
@@ -1012,6 +1014,7 @@ fn push_bwrap_read_only_subpath(args: &mut Vec<String>, path: &Path) {
 /// Extract only the synthetic empty mounts emitted by
 /// [`push_bwrap_read_only_subpath`]. Other `--tmpfs` arguments, including the
 /// private `/tmp` and sensitive-read masks, are not host mountpoint artifacts.
+#[cfg(target_os = "linux")]
 fn protected_mount_cleanup_paths_from_bwrap_args(args: &[String]) -> Vec<PathBuf> {
     args.windows(4)
         .filter(|window| {
