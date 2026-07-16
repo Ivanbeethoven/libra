@@ -17,7 +17,9 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
+use anyhow::anyhow;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -139,6 +141,8 @@ pub fn ensure_parent_not_world_writable(path: &Path) -> Result<()> {
             );
         }
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -161,6 +165,8 @@ pub fn ensure_dir_not_world_writable(path: &Path) -> Result<()> {
             );
         }
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

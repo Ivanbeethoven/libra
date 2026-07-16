@@ -187,6 +187,14 @@ pub async fn run_export_subprocess(
     run_bounded_exporter(binary, &[], session_id, limits, Vec::new()).await
 }
 
+/// Fds the caller pinned that must stay open (and inheritable) until the
+/// child has been spawned. File descriptors only exist on Unix; elsewhere the
+/// alias is an uninhabited placeholder so the runner signature stays portable.
+#[cfg(unix)]
+type PinnedFds = Vec<std::os::fd::OwnedFd>;
+#[cfg(not(unix))]
+type PinnedFds = Vec<std::convert::Infallible>;
+
 /// Core bounded runner: `<program> [<pre_args>…] export <session_id>` with
 /// the module's env/caps/deadline contract. `pre_args` lets the sandboxed
 /// variant prepend the bwrap arg vector while keeping ONE code path for the
@@ -196,7 +204,7 @@ async fn run_bounded_exporter(
     pre_args: &[String],
     session_id: &str,
     limits: ExportLimits,
-    keep_fds: Vec<std::os::fd::OwnedFd>,
+    keep_fds: PinnedFds,
 ) -> Result<Vec<u8>> {
     // Fds pinned by the caller (e.g. the RW store bind's /proc/self/fd source)
     // must stay OPEN and non-CLOEXEC in this process until the child has been
