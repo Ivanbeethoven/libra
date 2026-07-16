@@ -8,7 +8,7 @@ use libra::internal::ai::tools::{
 use serde_json::Value;
 use tempfile::TempDir;
 
-const SAMPLE: &str = include_str!("data/ai_semantic/rust/sample.rs");
+const SAMPLE: &str = include_str!("data/ai_semantic/rust/tools_sample.rs");
 
 fn semantic_registry(root: &Path) -> libra::internal::ai::tools::ToolRegistry {
     register_semantic_handlers(ToolRegistryBuilder::with_working_dir(root.to_path_buf())).build()

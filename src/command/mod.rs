@@ -94,6 +94,7 @@ pub mod rebase;
 pub mod reflog;
 pub mod remote;
 pub mod remove;
+pub(crate) mod rename_detect;
 pub mod repack;
 pub mod replace;
 pub mod rerere;

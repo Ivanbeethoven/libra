@@ -58,30 +58,25 @@ const LFS_POINTER_MAX_SIZE: usize = 300; // bytes
 ///
 /// **Panics** if `path` cannot be read (LFS hash + size require the file to
 /// exist at this point). Callers are expected to have verified existence
-/// via `is_lfs_tracked` / `Path::exists` before invoking this. The
-/// `.unwrap_or_else()` wrappers name the path so the panic surfaces which
-/// file failed if the contract is ever violated.
+/// via `is_lfs_tracked` / `Path::exists` before invoking this. New callers
+/// that cannot uphold that contract (e.g. racy worktree scans) must use
+/// [`generate_pointer_file_result`] instead.
 pub fn generate_pointer_file(path: impl AsRef<Path>) -> (String, String) {
     let path = path.as_ref();
-    // calc file hash without type
-    let oid = calc_lfs_file_hash(path).unwrap_or_else(|err| {
-        panic!(
-            "generate_pointer_file({}): calc_lfs_file_hash failed: {err}",
-            path.display()
-        )
-    });
+    generate_pointer_file_result(path)
+        .unwrap_or_else(|err| panic!("generate_pointer_file({}): {err}", path.display()))
+}
 
-    let size = path
-        .metadata()
-        .unwrap_or_else(|err| {
-            panic!(
-                "generate_pointer_file({}): metadata read failed: {err}",
-                path.display()
-            )
-        })
-        .len();
+/// Fallible [`generate_pointer_file`]: returns the pointer content and LFS
+/// oid, propagating read/metadata failures instead of panicking. Rename
+/// detection and other best-effort readers use this so a vanished or
+/// unreadable file degrades to a skipped candidate rather than a crash.
+pub fn generate_pointer_file_result(path: impl AsRef<Path>) -> io::Result<(String, String)> {
+    let path = path.as_ref();
+    let oid = calc_lfs_file_hash(path)?;
+    let size = path.metadata()?.len();
     let pointer = format_pointer_string(&oid, size);
-    (pointer, oid)
+    Ok((pointer, oid))
 }
 
 pub fn format_pointer_string(oid: &str, size: u64) -> String {

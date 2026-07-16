@@ -145,6 +145,22 @@ const INDEX_UPDATE_MAX_ATTEMPTS: usize = 12;
 
 /// Synchronous facade for the configured object backend.
 ///
+/// Coarse classification of an object read failure (see
+/// [`ClientStorage::classify_read_failure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ObjectReadFailure {
+    /// The object does not exist in any reachable tier.
+    Missing,
+    /// The object exists but its bytes are invalid (header/zlib/size).
+    Corrupt,
+    /// The object exists remotely but the read policy forbids fetching it.
+    Unavailable,
+    /// A bounded read refused the object because it exceeds the limit.
+    TooLarge,
+    /// Any other failure (I/O, runtime bridge, ...).
+    Other,
+}
+
 /// Wraps a `dyn Storage` (local, remote, or tiered) and adapts every operation to a
 /// blocking call by routing through the dedicated [`RUNTIME`]. Cheap to clone —
 /// internally it is an `Arc` plus a `PathBuf`.
@@ -778,6 +794,38 @@ impl ClientStorage {
                 .await
                 .map(|(data, _)| data)
         })
+    }
+
+    /// Coarsely classify a read failure from [`Self::get`] /
+    /// [`Self::get_with_limit`] for callers that degrade per-object (rename
+    /// detection, previews) instead of failing the whole command.
+    ///
+    /// This lives in the storage layer, next to where the error messages are
+    /// produced (`storage/local.rs`, `storage/load_cost.rs`,
+    /// `storage/tiered.rs`), so the distinguishing details and this mapping
+    /// evolve together; see `classify_read_failure_pins_storage_messages`.
+    pub fn classify_read_failure(err: &GitError) -> ObjectReadFailure {
+        match err {
+            GitError::ObjectNotFound(detail) => {
+                // tiered.rs: "... the offline/local read policy forbids
+                // fetching it from the durable tier ..."
+                if detail.contains("read policy forbids") {
+                    ObjectReadFailure::Unavailable
+                } else {
+                    ObjectReadFailure::Missing
+                }
+            }
+            GitError::InvalidObjectInfo(detail) => {
+                // local.rs / load_cost.rs bounded reads: "... exceeds preview
+                // limit of {limit} bytes".
+                if detail.contains("exceeds preview limit") {
+                    ObjectReadFailure::TooLarge
+                } else {
+                    ObjectReadFailure::Corrupt
+                }
+            }
+            _ => ObjectReadFailure::Other,
+        }
     }
 
     /// Compute a conservative bounded load cost without materializing its payload.
@@ -1836,7 +1884,10 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
-    use super::{ClientStorage, resolve_env_sync, update_object_index, update_object_index_once};
+    use super::{
+        ClientStorage, ObjectReadFailure, resolve_env_sync, update_object_index,
+        update_object_index_once,
+    };
     use crate::{
         internal::{
             config::ConfigKv,
@@ -1952,6 +2003,73 @@ mod tests {
         let storage = ClientStorage::init(objects_dir);
         let data = storage.get(&blob.id)?;
         assert_eq!(data, blob.data);
+        Ok(())
+    }
+
+    /// Pins `classify_read_failure` to the real storage error paths: the
+    /// mapping relies on message details produced by `storage/local.rs`,
+    /// `storage/load_cost.rs` and `storage/tiered.rs`, so exercise those
+    /// paths end-to-end instead of matching hand-written strings.
+    #[test]
+    #[serial]
+    fn classify_read_failure_pins_storage_messages() -> Result<(), GitError> {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = ClientStorage::init_local(tmp.path().join("objects"));
+
+        // Missing: never-written object.
+        let ghost = Blob::from_content("classify-missing-object");
+        let missing = storage.get(&ghost.id).expect_err("object must be absent");
+        assert_eq!(
+            ClientStorage::classify_read_failure(&missing),
+            ObjectReadFailure::Missing
+        );
+
+        // TooLarge: bounded read below the object's load cost.
+        let big = Blob::from_content(&"x".repeat(4096));
+        storage.put(
+            &big.id,
+            &big.data,
+            git_internal::internal::object::types::ObjectType::Blob,
+        )?;
+        let too_large = storage
+            .get_with_limit(&big.id, 8)
+            .expect_err("limit below cost must refuse");
+        assert_eq!(
+            ClientStorage::classify_read_failure(&too_large),
+            ObjectReadFailure::TooLarge
+        );
+
+        // Corrupt: truncate the loose file so the zlib/header decode fails.
+        let corrupt_victim = Blob::from_content("classify-corrupt-object");
+        storage.put(
+            &corrupt_victim.id,
+            &corrupt_victim.data,
+            git_internal::internal::object::types::ObjectType::Blob,
+        )?;
+        let hex = corrupt_victim.id.to_string();
+        let loose = tmp.path().join("objects").join(&hex[..2]).join(&hex[2..]);
+        assert!(
+            loose.is_file(),
+            "loose object expected at {}",
+            loose.display()
+        );
+        // Loose objects are written read-only; lift the mode before corrupting.
+        let mut perms = std::fs::metadata(&loose)
+            .expect("loose metadata")
+            .permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&loose, perms).expect("make loose writable");
+        std::fs::write(&loose, b"not a zlib stream").expect("corrupt loose object");
+        let corrupt = storage
+            .get(&corrupt_victim.id)
+            .expect_err("corrupt loose object must fail");
+        assert_eq!(
+            ClientStorage::classify_read_failure(&corrupt),
+            ObjectReadFailure::Corrupt
+        );
+
         Ok(())
     }
 

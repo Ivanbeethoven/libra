@@ -179,3 +179,199 @@ fn diff_renames_errors_fail_before_progress_with_stable_codes() {
     assert!(unreadable.stdout.is_empty());
     assert_no_progress(&unreadable);
 }
+
+/// plan-20260714 R0-1: `diff.renameLimit` cascades (status>diff comes later
+/// with `status.renameLimit`); `0` uncaps; invalid values fail closed before
+/// progress.
+#[test]
+fn diff_rename_limit_config() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("diff-rename-limit");
+    fixture.init_repo(&repo);
+    // Three renamed files with *distinct* content and different basenames so
+    // only the inexact pass can pair them.
+    let bodies = [
+        "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\n",
+        "one\ntwo\nthree\nfour\nfive\nsix\nseven\n",
+        "red\ngreen\nblue\ncyan\nmagenta\nyellow\n",
+    ];
+    for (i, body) in bodies.iter().enumerate() {
+        fixture.commit_file(&repo, &format!("src{i}.txt"), body, &format!("base{i}"));
+    }
+    for (i, body) in bodies.iter().enumerate() {
+        fs::remove_file(repo.join(format!("src{i}.txt"))).expect("remove source");
+        let tweaked = body.replacen('\n', "!\n", 1);
+        fs::write(repo.join(format!("dst{i}.log")), tweaked).expect("write dest");
+    }
+    fixture.success(&repo, &["add", "-A"]);
+
+    // limit=2 < 3 sources: inexact skipped per side, no rename rows.
+    fixture.success(&repo, &["config", "diff.renameLimit", "2"]);
+    let capped = fixture.success(&repo, &["diff", "--staged", "-M40%"]);
+    let capped_out = stdout_trim(&capped);
+    assert!(
+        !capped_out.contains("rename from"),
+        "limit=2 must skip inexact: {capped_out}"
+    );
+    let stderr = String::from_utf8_lossy(&capped.stderr);
+    assert!(
+        stderr.contains("diff.renameLimit"),
+        "limit skip warns with config name: {stderr}"
+    );
+
+    // limit=0 uncaps: all three pairs found.
+    fixture.success(&repo, &["config", "diff.renameLimit", "0"]);
+    let uncapped = stdout_trim(&fixture.success(&repo, &["diff", "--staged", "-M40%"]));
+    for i in 0..3 {
+        assert!(
+            uncapped.contains(&format!("rename from src{i}.txt")),
+            "limit=0 must pair src{i}: {uncapped}"
+        );
+    }
+
+    // Invalid value fails closed with a stable code before any diff output.
+    fixture.success(&repo, &["config", "--", "diff.renameLimit", "-1"]);
+    let rejected = fixture.run(&repo, &["diff", "--staged", "-M40%"]);
+    assert_eq!(rejected.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("diff.renameLimit"), "{stderr}");
+    assert!(rejected.stdout.is_empty());
+    fixture.success(&repo, &["config", "--unset", "diff.renameLimit"]);
+}
+
+/// plan-20260714 R0-1: `diff.renameComparisonBudget` parses (0 → unlimited,
+/// invalid fail-closed) and exhaustion discards inexact candidates with a
+/// warning while exact renames survive.
+#[test]
+fn diff_rename_comparison_budget_config() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("diff-rename-budget");
+    fixture.init_repo(&repo);
+    fixture.commit_file(
+        &repo,
+        "exact.txt",
+        "exact content stays identical\n",
+        "exact base",
+    );
+    // Two inexact candidates so budget=1 deterministically exhausts on the
+    // second comparison regardless of iteration order, and the discard rule
+    // (drop ALL scored inexact edges, keep exact) is observable.
+    fixture.commit_file(
+        &repo,
+        "near-a.txt",
+        "alpha1\nalpha2\nalpha3\nalpha4\nalpha5\n",
+        "near-a base",
+    );
+    fixture.commit_file(
+        &repo,
+        "near-b.txt",
+        "beta1\nbeta2\nbeta3\nbeta4\nbeta5\n",
+        "near-b base",
+    );
+    fs::rename(repo.join("exact.txt"), repo.join("exact-moved.txt")).expect("mv exact");
+    for (src, dst, body) in [
+        (
+            "near-a.txt",
+            "moved-a.log",
+            "alpha1\nalpha2\nalpha3\nalpha4\nCHANGED\n",
+        ),
+        (
+            "near-b.txt",
+            "moved-b.log",
+            "beta1\nbeta2\nbeta3\nbeta4\nCHANGED\n",
+        ),
+    ] {
+        fs::remove_file(repo.join(src)).expect("rm near source");
+        fs::write(repo.join(dst), body).expect("write near dest");
+    }
+    fixture.success(&repo, &["add", "-A"]);
+
+    // budget=1: at most one inexact comparison is allowed; the second one
+    // exhausts the budget, discarding every scored inexact candidate. Only
+    // the exact rename survives.
+    fixture.success(&repo, &["config", "diff.renameComparisonBudget", "1"]);
+    let budgeted = fixture.success(&repo, &["diff", "--staged", "-M40%"]);
+    let budgeted_out = stdout_trim(&budgeted);
+    assert!(
+        budgeted_out.contains("rename from exact.txt"),
+        "exact rename must survive budget exhaustion: {budgeted_out}"
+    );
+    assert!(
+        !budgeted_out.contains("rename from near-a.txt")
+            && !budgeted_out.contains("rename from near-b.txt"),
+        "all inexact candidates must be discarded on budget exhaustion: {budgeted_out}"
+    );
+    let stderr = String::from_utf8_lossy(&budgeted.stderr);
+    assert!(
+        stderr.contains("diff.renameComparisonBudget"),
+        "budget discard warns: {stderr}"
+    );
+
+    // budget=0 → unlimited (same as unset).
+    fixture.success(&repo, &["config", "diff.renameComparisonBudget", "0"]);
+    let unlimited = stdout_trim(&fixture.success(&repo, &["diff", "--staged", "-M40%"]));
+    assert!(
+        unlimited.contains("rename from near-a.txt")
+            && unlimited.contains("rename from near-b.txt"),
+        "budget=0 keeps inexact detection: {unlimited}"
+    );
+
+    // Invalid value fails closed.
+    fixture.success(
+        &repo,
+        &["config", "--", "diff.renameComparisonBudget", "abc"],
+    );
+    let rejected = fixture.run(&repo, &["diff", "--staged", "-M40%"]);
+    assert_eq!(rejected.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("diff.renameComparisonBudget"), "{stderr}");
+    fixture.success(&repo, &["config", "--unset", "diff.renameComparisonBudget"]);
+}
+
+/// plan-20260714 §B.7: without configuration, diff has NO comparison budget —
+/// a candidate set larger than status's 500k comparison ceiling must still
+/// pair. 710 × 710 = 504,100 inexact comparisons: if a default budget of
+/// `Some(500_000)` (or anything smaller) were ever wired into diff, the
+/// discard rule would strip these renames and this test would fail. Stays
+/// under the default `diff.renameLimit` (1000 per side) so only the budget
+/// semantics are exercised.
+#[test]
+fn diff_no_comparison_budget_regression() {
+    const N: usize = 710;
+    let fixture = Fixture::new();
+    let repo = fixture.path("diff-no-budget");
+    fixture.init_repo(&repo);
+    for i in 0..N {
+        fs::write(
+            repo.join(format!("f{i:03}.txt")),
+            format!("file {i}\nshared line\nunique {i} {i}\n"),
+        )
+        .expect("write source");
+    }
+    fixture.success(&repo, &["add", "-A"]);
+    fixture.success(&repo, &["commit", "-m", "base", "--no-verify"]);
+    for i in 0..N {
+        fs::remove_file(repo.join(format!("f{i:03}.txt"))).expect("remove source");
+        // Change one line so the exact (identical-OID) pass cannot pair the
+        // files: every pairing below MUST come from inexact scoring.
+        fs::write(
+            repo.join(format!("g{i:03}.txt")),
+            format!("file {i} CHANGED\nshared line\nunique {i} {i}\n"),
+        )
+        .expect("write inexact dest");
+    }
+    fixture.success(&repo, &["add", "-A"]);
+
+    let output = fixture.success(&repo, &["diff", "--staged", "-M40%"]);
+    let stdout = stdout_trim(&output);
+    assert!(
+        stdout.contains("rename from f000.txt")
+            && stdout.contains(&format!("rename from f{:03}.txt", N - 1)),
+        "all inexact renames must pair without a default budget"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("renameComparisonBudget"),
+        "no budget warning without configuration: {stderr}"
+    );
+}
