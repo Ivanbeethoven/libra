@@ -1,6 +1,7 @@
 //! Streaming crash-safe atomic replacement for payloads that cannot be held in memory.
 
 use std::{
+    fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -20,9 +21,33 @@ impl StreamingAtomicFile {
     /// Create a writer in a staging directory, durably creating its ancestors
     /// when `sync` is enabled. The target may be selected after streaming.
     pub(crate) fn new_in(staging_dir: &Path, sync: bool) -> io::Result<Self> {
+        Self::new_in_with_optional_permissions(staging_dir, sync, None)
+    }
+
+    /// Create a writer with an explicit creation mode. This is reserved for
+    /// public repository objects whose historical contract is `0666 & umask`;
+    /// private state continues to use [`Self::new_in`] and tempfile's 0600
+    /// default.
+    pub(crate) fn new_in_with_permissions(
+        staging_dir: &Path,
+        sync: bool,
+        permissions: fs::Permissions,
+    ) -> io::Result<Self> {
+        Self::new_in_with_optional_permissions(staging_dir, sync, Some(permissions))
+    }
+
+    fn new_in_with_optional_permissions(
+        staging_dir: &Path,
+        sync: bool,
+        permissions: Option<fs::Permissions>,
+    ) -> io::Result<Self> {
         ensure_dir_exists(staging_dir, sync)?;
+        let mut builder = tempfile::Builder::new();
+        if let Some(permissions) = permissions {
+            builder.permissions(permissions);
+        }
         Ok(Self {
-            temporary: NamedTempFile::new_in(staging_dir)?,
+            temporary: builder.tempfile_in(staging_dir)?,
             staging_dir: staging_dir.to_path_buf(),
             sync,
         })

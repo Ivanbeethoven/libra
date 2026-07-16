@@ -63,6 +63,10 @@ pub mod automation;
 // `agent/runtime/sub_agent.rs` and `session/jsonl.rs`, so the module
 // is unconditionally available.
 pub mod agent_run;
+// Historical external-agent transcript import orchestration (M4 / DR-05).
+// Kept outside `observed_agents` so the capture adapters remain independent
+// from checkpoint/runtime persistence layers.
+pub mod agent_import;
 // Capability packages (CEX-S2-17): auditable, checksum-verified bundles of
 // skills / commands / sources / sub-agent definitions plus the per-repo
 // installed-package store the session bootstrap reads.

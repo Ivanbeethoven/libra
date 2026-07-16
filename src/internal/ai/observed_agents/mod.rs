@@ -65,7 +65,12 @@ pub use capability::{
 pub use coverage::{
     COVERAGE_SCHEMA_VERSION, CanonValue, Completeness, NormalizedTurn, SemanticRecord,
     canonical_turn_bytes, coverage_digest_hex, normalize_claude_transcript,
-    normalize_opencode_export, parse_canon_value,
+    normalize_codex_rollout, normalize_opencode_export, parse_canon_value, redact_turns,
+    safe_turn_projection,
+};
+pub(crate) use coverage::{
+    normalize_claude_transcript_until, normalize_codex_rollout_until,
+    normalize_opencode_export_until, redact_turns_with_report,
 };
 pub use derived::derive_tool_call_records;
 pub use preview::{PREVIEW_SPECS, PreviewAgent, PreviewSpec, is_preview, preview_spec_for};
@@ -86,8 +91,12 @@ pub use skill_projection::{
 };
 pub use transcript_source::{
     AuthorizedTranscriptFile, ExportAuthorized, ProviderRootAuthorized,
-    TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource, resolve_transcript_source,
-    transcript_path_within_provider_root,
+    TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource, resolve_import_transcript_source,
+    resolve_transcript_source, transcript_path_within_provider_root,
+};
+pub(crate) use transcript_source::{
+    open_provider_directory_for_discovery, pinned_provider_directory_path,
+    resolve_import_transcript_source_until,
 };
 pub use trust::{
     DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY, Provenance,

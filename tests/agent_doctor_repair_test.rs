@@ -320,6 +320,149 @@ fn assert_store_clean(report: &Value) {
 const TRANSCRIPT: &str =
     "{\"type\":\"user\",\"text\":\"hello doctor\"}\n{\"type\":\"assistant\",\"text\":\"done\"}\n";
 
+#[tokio::test]
+async fn doctor_reports_and_repairs_expired_empty_inflight_marker() {
+    let repo = DoctorRepo::init();
+    repo.exec_sql(
+        "INSERT INTO metadata_kv (
+            scope, target, `key`, value, value_type, created_at, updated_at
+         ) VALUES ('agent_traces_inflight', ?, ?, ?, 'text', '0', '0')",
+        vec![
+            "doctor-session".into(),
+            "doctor-expired-attempt".into(),
+            json!({
+                "schema_version": 1,
+                "session_id": "doctor-session",
+                "attempt_id": "doctor-expired-attempt",
+                "started_at_ms": 0,
+                "ttl_ms": 0
+            })
+            .to_string()
+            .into(),
+        ],
+    )
+    .await;
+
+    let detected = repo.doctor_json(false);
+    let finding = findings(&detected)
+        .into_iter()
+        .find(|finding| finding["inconsistency_type"] == "expired_inflight_marker")
+        .expect("expired marker finding");
+    assert_eq!(finding["manual_required"], json!(false));
+    assert_eq!(finding["repaired"], json!(false));
+
+    let repaired = repo.doctor_json(true);
+    let finding = findings(&repaired)
+        .into_iter()
+        .find(|finding| finding["inconsistency_type"] == "expired_inflight_marker")
+        .expect("expired marker repair finding");
+    assert_eq!(finding["repaired"], json!(true));
+    assert_store_clean(&repo.doctor_json(false));
+}
+
+#[tokio::test]
+async fn doctor_surfaces_malformed_inflight_marker_as_manual_required() {
+    let repo = DoctorRepo::init();
+    repo.exec_sql(
+        "INSERT INTO metadata_kv (
+            scope, target, `key`, value, value_type, created_at, updated_at
+         ) VALUES ('agent_traces_inflight', ?, ?, ?, 'text', '0', '0')",
+        vec![
+            "doctor-damaged-session".into(),
+            "doctor-damaged-attempt".into(),
+            "{not-json".into(),
+        ],
+    )
+    .await;
+
+    for repair in [false, true] {
+        let report = repo.doctor_json(repair);
+        let finding = findings(&report)
+            .into_iter()
+            .find(|finding| finding["inconsistency_type"] == "invalid_inflight_marker")
+            .expect("invalid marker finding");
+        assert_eq!(finding["manual_required"], json!(true));
+        assert_eq!(finding["repaired"], json!(false));
+        assert!(
+            finding["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("automatic removal is unsafe"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn doctor_surfaces_conflicted_coverage_claim_without_raw_identity() {
+    let repo = DoctorRepo::init();
+    let session = "conflict-doctor-sensitive-session";
+    repo.ingest_checkpoint(session, TRANSCRIPT);
+    for schema_version in [1_i64, 2] {
+        repo.exec_sql(
+            "INSERT INTO agent_coverage_claim (
+                session_id, logical_turn_key, coverage_schema_version,
+                coverage_digest, completeness, revision, state, source_channel,
+                created_at, updated_at
+             )
+             SELECT session_id, 'doctor-conflict-turn', ?, ?, 'complete', 1,
+                    'conflicted', 'import', 1, 1
+             FROM agent_session WHERE provider_session_id = ?",
+            vec![schema_version.into(), "a".repeat(64).into(), session.into()],
+        )
+        .await;
+        repo.exec_sql(
+            "INSERT INTO agent_coverage_conflict (
+                session_id, logical_turn_key, coverage_schema_version,
+                incumbent_revision, incumbent_digest, incumbent_checkpoint_id,
+                incoming_digest, incoming_source_channel, incoming_observed_at,
+                incoming_canonical_json, incoming_redaction_report_json
+             )
+             SELECT session_id, 'doctor-conflict-turn', ?, 1, ?, NULL, ?,
+                    'import', ?, '[{\"role\":\"user\",\"text\":\"redacted\"}]',
+                    '{\"matches\":[],\"bytes_scanned\":0,\"bytes_redacted\":0}'
+             FROM agent_session WHERE provider_session_id = ?",
+            vec![
+                schema_version.into(),
+                "a".repeat(64).into(),
+                if schema_version == 1 {
+                    "b".repeat(64).into()
+                } else {
+                    "c".repeat(64).into()
+                },
+                schema_version.into(),
+                session.into(),
+            ],
+        )
+        .await;
+    }
+
+    for repair in [false, true] {
+        let report = repo.doctor_json(repair);
+        let conflict_findings = findings(&report)
+            .into_iter()
+            .filter(|finding| finding["inconsistency_type"] == "conflicted_coverage_claim")
+            .collect::<Vec<_>>();
+        assert_eq!(conflict_findings.len(), 2);
+        assert_ne!(
+            conflict_findings[0]["checkpoint_id"], conflict_findings[1]["checkpoint_id"],
+            "schema versions need distinct sanitized finding identities"
+        );
+        for (index, finding) in conflict_findings.iter().enumerate() {
+            assert_eq!(finding["manual_required"], json!(true));
+            assert_eq!(finding["repaired"], json!(false));
+            let rendered = finding.to_string();
+            assert!(
+                !rendered.contains(session),
+                "raw session identity leaked: {rendered}"
+            );
+            assert!(rendered.contains(&format!("coverage schema {}", index + 1)));
+            assert!(rendered.contains("incumbent revision 1"));
+            assert!(rendered.contains("incoming digest="));
+            assert!(rendered.contains("sanitized canonical evidence and redaction report"));
+            assert!(rendered.contains("are stored in agent_coverage_conflict"));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Loose-object reading helpers (E4 tree navigation for sidecar tests)
 // ---------------------------------------------------------------------------
@@ -1872,13 +2015,10 @@ async fn findings_object_index_tolerates_agent_transcript_tag() {
         .unwrap_or_else(|| "unknown-repo".to_string())
     };
     repo.exec_sql(
-        "DELETE FROM object_index WHERE o_id = ?",
-        vec![findings_oid.clone().into()],
-    )
-    .await;
-    repo.exec_sql(
         "INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced) \
-         VALUES (?, ?, ?, ?, ?, 0)",
+         VALUES (?, ?, ?, ?, ?, 0)
+         ON CONFLICT(repo_id, o_id) DO UPDATE SET
+           o_type = excluded.o_type, o_size = excluded.o_size",
         vec![
             findings_oid.clone().into(),
             "agent_transcript".into(),

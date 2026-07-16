@@ -123,6 +123,12 @@ structured report is always present.
 | `128` | `LBR-AGENT-012` | `internal` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed | a trusted `libra-agent-*` binary exits before answering the invoked method |
 | `128` | `LBR-AGENT-013` | `internal` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` | `libra agent checkpoint export --raw` (or equivalent) without `--allow-raw` |
 | `128` | `LBR-AGENT-014` | `internal` | A `review`/`investigate` run was refused because the shared run queue is full — more than `agent.max_concurrent_runs` runs are active and the wait queue is at its cap (10) | starting an 11th queued `libra review`/`libra investigate` run while the concurrency budget is saturated |
+| `128` | `LBR-AGENT-015` | `internal` | Historical transcript belongs to another repository or conflicts with the selected provider identity | importing a Claude session whose verified `cwd` is a different Libra repository |
+| `128` | `LBR-AGENT-016` | `internal` | Historical transcript has no single verifiable working directory | importing a transcript with no `cwd`, or with events from two repositories |
+| `129` | `LBR-AGENT-017` | `cli` | Requested `libra agent` schema version is unsupported | requesting `libra agent list --schema-version 3` |
+| `128` | `LBR-AGENT-018` | `internal` | Historical import completed only partially; failed selections remain retryable | a bounded batch containing one valid session and one fenced or malformed session |
+| `128` | `LBR-AGENT-019` | `internal` | Local anti-resurrection tombstone blocked historical import | re-importing a provider session after local session erasure without an explicit audited restore |
+| `128` | `LBR-AGENT-020` | `internal` | Transcript source lacks a valid provider-root or trusted-export authorization proof | attempting to import through a symlink or an untrusted exporter |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 ## Stable Codes By Category
@@ -203,6 +209,12 @@ structured report is always present.
 | `LBR-AGENT-012` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed |
 | `LBR-AGENT-013` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` |
 | `LBR-AGENT-014` | A `review`/`investigate` run was refused because the shared run queue is full (over `agent.max_concurrent_runs` active and the wait queue at its cap) |
+| `LBR-AGENT-015` | Historical transcript belongs to another repository or conflicts with the selected provider identity |
+| `LBR-AGENT-016` | Historical transcript has no single verifiable working directory |
+| `LBR-AGENT-017` | Requested `libra agent` schema version is unsupported |
+| `LBR-AGENT-018` | Historical import completed only partially; failed selections remain retryable |
+| `LBR-AGENT-019` | Local anti-resurrection tombstone blocked historical import until an explicit audited restore |
+| `LBR-AGENT-020` | Transcript source lacks a valid provider-root or trusted-export authorization proof |
 
 ### Unsupported
 

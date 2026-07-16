@@ -2,7 +2,8 @@
 //!
 //! Detection surfaces hook installation state, stuck active sessions, orphan
 //! checkpoints, and — AG-20 (plan.md Task A5, `agent.md` doctor repair
-//! matrix) — the three checkpoint-store inconsistency classes:
+//! matrix) — checkpoint-store inconsistency classes plus writer-marker
+//! recovery state:
 //!
 //! 1. **`stale_catalog_row` / `missing_objects`** — an `agent_checkpoint`
 //!    row whose `traces_commit` / `tree_oid` / `metadata_blob_oid` disagree
@@ -47,12 +48,16 @@
 //!    Only rows with an UNRECOVERABLE class-1 finding fall back to class-1
 //!    reporting; an auto-repairable stale row still gets its (ref-side)
 //!    class-3 check and repair in the same `--repair` run.
+//! 4. **`expired_inflight_marker` / `invalid_inflight_marker`** — valid
+//!    expired writer markers are drained through the serialized all-ref
+//!    reachability cleanup; malformed rows are reported manual-required
+//!    because their candidate ownership cannot be decoded safely.
 //!
 //! **Legacy-v1 exemption**: checkpoints whose tree lacks `manifest.json`
 //! (pre-AG-20 layout, `metadata.json` + `transcript/<provider>` only — see
 //! `tests/fixtures/agent_checkpoints/v1_claude_code/`) are classified
 //! `legacy-v1`, counted in `legacy_v1_checkpoints`, and NEVER included in
-//! the three classes or touched by `--repair`.
+//! checkpoint-object repair classes or touched by `--repair`.
 //!
 //! **Orphan rule fidelity** (`agent.md` write-sequence section):
 //! session-without-checkpoint is a LEGAL intermediate state and is never
@@ -92,6 +97,7 @@ use git_internal::{
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use super::DoctorArgs;
 use crate::{
@@ -130,6 +136,9 @@ const CLASS_MISSING_OBJECTS: &str = "missing_objects";
 const CLASS_STALE_CATALOG_ROW: &str = "stale_catalog_row";
 const CLASS_MISSING_CATALOG_ROW: &str = "missing_catalog_row";
 const CLASS_MISSING_OBJECT_INDEX: &str = "missing_object_index";
+const CLASS_INVALID_INFLIGHT_MARKER: &str = "invalid_inflight_marker";
+const CLASS_EXPIRED_INFLIGHT_MARKER: &str = "expired_inflight_marker";
+const CLASS_CONFLICTED_COVERAGE_CLAIM: &str = "conflicted_coverage_claim";
 /// A0-06: a run manifest's `findings_oid` points at a blob missing from the
 /// object store.
 const CLASS_MISSING_FINDINGS_OBJECT: &str = "missing_findings_object";
@@ -159,7 +168,7 @@ struct DoctorReport {
     /// channel — see the `libra agent remove gemini` hint). Captured gemini
     /// session/checkpoint *rows* are legal read-only data, never flagged.
     gemini_hooks_remnant: bool,
-    /// AG-20 checkpoint-store scan (three-class detection + repair).
+    /// AG-20 checkpoint-store/marker scan (detection + repair).
     checkpoint_store: CheckpointStoreReport,
     /// A0-06 review/investigate findings-object scan (detection + repair).
     findings_store: FindingsStoreReport,
@@ -201,7 +210,7 @@ struct CheckpointStoreReport {
     catalog_rows: i64,
     ref_reachable_checkpoints: usize,
     /// Pre-AG-20 layout checkpoints (no `manifest.json`). Exempt from the
-    /// three inconsistency classes and from `--repair` by contract.
+    /// checkpoint-object inconsistency classes and from `--repair` by contract.
     legacy_v1_checkpoints: usize,
     /// LIVE traces-writer in-flight markers (window A/B guards). Commits
     /// they name are writers mid-flight and are excluded from class 2.
@@ -215,8 +224,7 @@ struct CheckpointStoreReport {
 
 #[derive(Debug, Serialize)]
 struct CheckpointFinding {
-    /// One of `stale_catalog_row`, `missing_objects`,
-    /// `missing_catalog_row`, `missing_object_index`.
+    /// Stable checkpoint-store or writer-marker inconsistency class.
     inconsistency_type: String,
     checkpoint_id: String,
     /// Human-readable diagnosis — OIDs and reasons only, never transcript
@@ -230,6 +238,13 @@ struct CheckpointFinding {
 /// `manual_required` is accurate even without `--repair`.
 #[derive(Debug)]
 enum RepairPlan {
+    /// A valid expired writer marker: run the serialized all-ref
+    /// reachability drain. Empty markers are simply cleared.
+    RepairExpiredInflightMarker {
+        session_id: String,
+        attempt_id: String,
+        observed_at_ms: i64,
+    },
     /// Class 2: probe-first idempotent catalog INSERT.
     InsertCatalogRow {
         checkpoint_id: String,
@@ -369,11 +384,11 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
 }
 
 // ---------------------------------------------------------------------------
-// AG-20 checkpoint-store scan (three classes + legacy-v1)
+// AG-20 checkpoint-store/marker scan (repair classes + legacy-v1)
 // ---------------------------------------------------------------------------
 
 /// One `agent_checkpoint` row as loaded for the scan (only the columns the
-/// three classes actually compare — doctor is metadata-first and never
+/// checkpoint-object classes actually compare — doctor is metadata-first and never
 /// loads transcript blobs).
 #[derive(Debug, Clone)]
 struct CatalogRow {
@@ -772,7 +787,7 @@ fn manifest_declared_blobs(manifest: &serde_json::Value) -> Vec<(String, String,
     out
 }
 
-/// Run the AG-20 three-class scan (and, with `repair`, the repairs).
+/// Run the AG-20 checkpoint-store and marker scan (and repairs when enabled).
 ///
 /// The scan itself fails soft: object-store degradations become `note`
 /// entries and under-detect instead of erroring, so `doctor` stays usable
@@ -818,17 +833,171 @@ async fn scan_checkpoint_store(
         Arc::new(conn.clone()),
         TRACES_BRANCH,
     );
+    let mut findings: Vec<CheckpointFinding> = Vec::new();
+    let mut plans: Vec<RepairPlan> = Vec::new();
 
-    // Live in-flight markers: commits/attempts named by a live marker are
-    // writers mid-flight (window B), not inconsistencies.
+    if table_exists(conn, "agent_coverage_claim").await? {
+        let conflicts = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT c.session_id, c.logical_turn_key, c.coverage_schema_version,
+                        c.coverage_digest, c.completeness, c.revision,
+                        f.incoming_digest, f.incoming_source_channel,
+                        f.incoming_observed_at, f.incoming_redaction_report_json
+                 FROM agent_coverage_claim c
+                 LEFT JOIN agent_coverage_conflict f
+                   ON f.session_id = c.session_id
+                  AND f.logical_turn_key = c.logical_turn_key
+                  AND f.coverage_schema_version = c.coverage_schema_version
+                 WHERE c.state = 'conflicted'
+                 ORDER BY c.session_id, c.logical_turn_key, c.coverage_schema_version"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to inspect conflicted coverage claims: {error}"
+                ))
+            })?;
+        for row in conflicts {
+            let session_id: String = row.try_get_by("session_id").map_err(|error| {
+                CliError::fatal(format!("failed to read coverage conflict session: {error}"))
+            })?;
+            let logical_turn_key: String = row.try_get_by("logical_turn_key").map_err(|error| {
+                CliError::fatal(format!("failed to read coverage conflict key: {error}"))
+            })?;
+            let coverage_schema_version: i64 =
+                row.try_get_by("coverage_schema_version").map_err(|error| {
+                    CliError::fatal(format!(
+                        "failed to read coverage conflict schema version: {error}"
+                    ))
+                })?;
+            let coverage_digest: String = row.try_get_by("coverage_digest").map_err(|error| {
+                CliError::fatal(format!("failed to read coverage conflict digest: {error}"))
+            })?;
+            let completeness: String = row.try_get_by("completeness").map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to read coverage conflict completeness: {error}"
+                ))
+            })?;
+            let revision: i64 = row.try_get_by("revision").map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to read coverage conflict revision: {error}"
+                ))
+            })?;
+            let mut identity = Sha256::new();
+            identity.update(session_id.as_bytes());
+            identity.update([0]);
+            identity.update(logical_turn_key.as_bytes());
+            identity.update([0]);
+            identity.update(coverage_schema_version.to_be_bytes());
+            let identity = hex::encode(identity.finalize());
+            let incoming_digest: Option<String> =
+                row.try_get_by("incoming_digest").map_err(|error| {
+                    CliError::fatal(format!("failed to read incoming conflict digest: {error}"))
+                })?;
+            let incoming_source_channel: Option<String> =
+                row.try_get_by("incoming_source_channel").map_err(|error| {
+                    CliError::fatal(format!("failed to read conflict source channel: {error}"))
+                })?;
+            let incoming_observed_at: Option<i64> =
+                row.try_get_by("incoming_observed_at").map_err(|error| {
+                    CliError::fatal(format!("failed to read conflict observation time: {error}"))
+                })?;
+            let incoming_redaction_report_json: Option<String> = row
+                .try_get_by("incoming_redaction_report_json")
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read conflict redaction report: {error}"))
+                })?;
+            let challenger = match (
+                incoming_digest,
+                incoming_source_channel,
+                incoming_observed_at,
+                incoming_redaction_report_json,
+            ) {
+                (Some(digest), Some(channel), Some(observed_at), Some(redaction_report)) => {
+                    format!(
+                        "incoming digest={digest}, channel={channel}, observed_at={observed_at}; sanitized canonical evidence and redaction report {redaction_report} are stored in agent_coverage_conflict"
+                    )
+                }
+                _ => "incoming evidence is missing (legacy or externally damaged conflict row)"
+                    .to_string(),
+            };
+            findings.push(CheckpointFinding {
+                inconsistency_type: CLASS_CONFLICTED_COVERAGE_CLAIM.to_string(),
+                checkpoint_id: format!("coverage-conflict-{identity}"),
+                detail: format!(
+                    "coverage conflict {identity} for coverage schema {coverage_schema_version} is parked at incumbent revision {revision} (completeness={completeness}, digest={coverage_digest}); {challenger}; automatic resolution is unsafe because choosing either complete payload would discard provenance; inspect both durable candidates and resolve manually"
+                ),
+                repaired: false,
+                manual_required: true,
+            });
+            plans.push(RepairPlan::Manual);
+        }
+    }
+
+    // Inspect raw marker rows so malformed state is surfaced instead of being
+    // silently skipped. Live valid markers protect window A/B. Valid expired
+    // markers and cleanup-pending markers are safely repairable through the
+    // serialized reachability drain. Cleanup-pending means the writer already
+    // exited, so its ordinary TTL never delays repair. Malformed rows remain
+    // manual-required because their OID ownership cannot be inferred from
+    // untrusted JSON.
     let now_ms = Utc::now().timestamp_millis();
-    let markers = match history::list_live_traces_inflight_markers(conn, now_ms).await {
-        Ok(markers) => markers,
+    let marker_entries = match crate::internal::metadata::MetadataKv::list_scope_with_conn(
+        conn,
+        crate::internal::metadata::MetadataScope::AgentTracesInflight,
+    )
+    .await
+    {
+        Ok(entries) => entries,
         Err(err) => {
             notes.push(format!("in-flight marker listing unavailable: {err:#}"));
             Vec::new()
         }
     };
+    let mut markers = Vec::new();
+    for entry in marker_entries {
+        match history::decode_and_validate_traces_inflight_marker(
+            &entry.value,
+            &entry.target,
+            &entry.key,
+        ) {
+            Ok(marker) if marker.is_live(now_ms) && !marker.cleanup_pending => markers.push(marker),
+            Ok(marker) => {
+                findings.push(CheckpointFinding {
+                    inconsistency_type: CLASS_EXPIRED_INFLIGHT_MARKER.to_string(),
+                    checkpoint_id: marker.attempt_id.clone(),
+                    detail: format!(
+                        "expired or cleanup-pending traces marker for session '{}' owns {} candidate object(s) (cleanup_pending={}); `libra agent doctor --repair` will run the serialized all-ref reachability drain",
+                        marker.session_id,
+                        marker.oids.len(),
+                        marker.cleanup_pending
+                    ),
+                    repaired: false,
+                    manual_required: false,
+                });
+                plans.push(RepairPlan::RepairExpiredInflightMarker {
+                    session_id: marker.session_id,
+                    attempt_id: marker.attempt_id,
+                    observed_at_ms: now_ms,
+                });
+            }
+            Err(error) => {
+                findings.push(CheckpointFinding {
+                    inconsistency_type: CLASS_INVALID_INFLIGHT_MARKER.to_string(),
+                    checkpoint_id: entry.key,
+                    detail: format!(
+                        "malformed traces writer marker for session '{}': {error:#}; automatic removal is unsafe because object ownership cannot be decoded",
+                        entry.target
+                    ),
+                    repaired: false,
+                    manual_required: true,
+                });
+                plans.push(RepairPlan::Manual);
+            }
+        }
+    }
     report.live_inflight_markers = markers.len();
     let mut inflight_ids: BTreeSet<String> = BTreeSet::new();
     let mut inflight_commits: BTreeSet<String> = BTreeSet::new();
@@ -856,7 +1025,7 @@ async fn scan_checkpoint_store(
     let row_ids: BTreeSet<String> = rows.iter().map(|r| r.checkpoint_id.clone()).collect();
 
     // Legacy-v1 classification first — legacy checkpoints are exempt from
-    // all three classes. Ref-reachable checkpoints classify via their
+    // all checkpoint-object classes. Ref-reachable checkpoints classify via their
     // introducing commit's tree; catalog-only rows via their own tree_oid.
     let mut legacy_ids: BTreeSet<String> = BTreeSet::new();
     for (id, rc) in &ref_map {
@@ -873,8 +1042,6 @@ async fn scan_checkpoint_store(
     }
     report.legacy_v1_checkpoints = legacy_ids.len();
 
-    let mut findings: Vec<CheckpointFinding> = Vec::new();
-    let mut plans: Vec<RepairPlan> = Vec::new();
     // Only rows with an UNRECOVERABLE class-1 finding (`missing_objects`)
     // are excluded from class 3 ("unrecoverable falls back to class-1
     // reporting"). An auto-repairable `stale_catalog_row` must NOT
@@ -1185,7 +1352,7 @@ async fn scan_checkpoint_store(
     // ---- Repair execution (idempotent; spans per attempt) ---------------
     if repair {
         for (finding, plan) in findings.iter_mut().zip(plans.iter()) {
-            execute_repair(conn, finding, plan, &repo_id).await;
+            execute_repair(conn, &history, finding, plan, &repo_id).await;
             emit_repair_span(finding);
         }
     }
@@ -1222,12 +1389,29 @@ fn emit_repair_span(finding: &CheckpointFinding) {
 /// unrepaired so the operator sees exactly what happened.
 async fn execute_repair(
     conn: &DatabaseConnection,
+    history: &HistoryManager,
     finding: &mut CheckpointFinding,
     plan: &RepairPlan,
     repo_id: &str,
 ) {
     match plan {
         RepairPlan::Manual => {}
+        RepairPlan::RepairExpiredInflightMarker {
+            session_id,
+            attempt_id,
+            observed_at_ms,
+        } => match history
+            .repair_expired_traces_inflight_marker(session_id, attempt_id, *observed_at_ms)
+            .await
+        {
+            Ok(true) => finding.repaired = true,
+            Ok(false) => finding.detail.push_str(
+                "; repair skipped because the marker was refreshed or remained protected; retry after the active writer exits",
+            ),
+            Err(err) => finding
+                .detail
+                .push_str(&format!("; reachability repair failed closed: {err:#}")),
+        },
         RepairPlan::InsertCatalogRow {
             checkpoint_id,
             session_id,

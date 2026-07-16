@@ -60,7 +60,7 @@ pub(super) fn read(
 fn open_and_read_header(
     path: &Path,
 ) -> Result<(ZlibDecoder<fs::File>, ObjectType, u64, u64), GitError> {
-    let file = fs::File::open(path)?;
+    let file = open_regular_loose_object(path)?;
     let storage_len = file.metadata()?.len();
     let mut decoder = ZlibDecoder::new(file);
     let mut header = Vec::with_capacity(MAX_HEADER_BYTES);
@@ -116,6 +116,39 @@ fn open_and_read_header(
         ))
     })?;
     Ok((decoder, object_type, declared, storage_len))
+}
+
+#[cfg(unix)]
+fn open_regular_loose_object(path: &Path) -> Result<fs::File, GitError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // O_NONBLOCK prevents a corrupt loose-object FIFO/device from parking a
+    // Tokio blocking worker forever before the traversal deadline can fire;
+    // O_NOFOLLOW rejects a symlink at the content-addressed final component.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(invalid(format!(
+            "loose object at {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_regular_loose_object(path: &Path) -> Result<fs::File, GitError> {
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(invalid(format!(
+            "loose object at {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
 }
 
 fn consume_exact_payload(

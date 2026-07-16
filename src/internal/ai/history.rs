@@ -29,16 +29,26 @@
 //! Both loops have bounded iteration counts so misuse cannot deadlock the
 //! caller.
 
-use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    str::FromStr,
+    sync::{Arc, OnceLock, mpsc},
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use git_internal::{
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::object::{
         ObjectTrait,
         commit::Commit,
         signature::{Signature, SignatureType},
         tree::{Tree, TreeItem, TreeItemMode},
+        types::ObjectType,
     },
 };
 use sea_orm::{
@@ -46,7 +56,11 @@ use sea_orm::{
     EntityTrait, QueryFilter, QueryResult, Set, SqlErr, Statement, TransactionTrait, Value,
     sea_query::Expr,
 };
-use tokio::time::sleep;
+use serde::{Deserialize, Serialize};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::sleep,
+};
 
 use crate::{
     internal::{
@@ -54,8 +68,11 @@ use crate::{
         model::reference::{self, ConfigKind},
     },
     utils::{
-        object::{read_git_object, write_git_object},
-        storage::Storage,
+        object::{
+            git_object_hash, read_git_object, read_git_object_bounded_validated, write_git_object,
+            write_git_object_with_status,
+        },
+        storage::{Storage, tiered::verify_fetched_object},
     },
 };
 
@@ -81,6 +98,210 @@ const SQLITE_BUSY_RETRY_BASE_MS: u64 = 100;
 /// concurrent writer advances the ref between read and CAS. The bound is
 /// generous because each retry is purely local (no network I/O).
 const HISTORY_HEAD_CONFLICT_MAX_RETRIES: usize = 32;
+const REJECTED_CLEANUP_MAX_INFLATED_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+const REJECTED_CLEANUP_MAX_VISITED_OBJECTS: usize = 250_000;
+const REJECTED_CLEANUP_MAX_TRAVERSAL_DURATION: Duration = Duration::from_secs(30);
+const OBJECT_INDEX_FOREGROUND_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+const OBJECT_INDEX_CLEANUP_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+const REJECTED_CLEANUP_MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const REJECTED_CLEANUP_MAX_TOTAL_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+const REJECTED_CLEANUP_MAX_INDEX_FILES: usize = 256;
+const REJECTED_CLEANUP_INDEX_HELPER_FRAME_CAP: u64 = 64 * 1024 * 1024;
+pub const REJECTED_CLEANUP_INDEX_HELPER_ARG: &str =
+    "--libra-internal-rejected-cleanup-index-helper";
+pub const CHECKPOINT_OBJECT_IO_HELPER_ARG: &str = "--libra-internal-checkpoint-object-io-helper";
+pub const CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP: u64 = 32 * 1024 * 1024;
+pub const CHECKPOINT_OBJECT_IO_HELPER_OUTPUT_CAP: u64 = 32 * 1024 * 1024;
+const CHECKPOINT_OBJECT_READ_MAX_INFLATED_BYTES: u64 = 16 * 1024 * 1024;
+
+fn rejected_cleanup_traversal_duration() -> Duration {
+    if cfg!(debug_assertions)
+        && let Ok(value) = std::env::var("LIBRA_TEST_REJECTED_CLEANUP_DEADLINE_MS")
+        && let Ok(milliseconds) = value.parse::<u64>()
+        && milliseconds > 0
+        && milliseconds <= REJECTED_CLEANUP_MAX_TRAVERSAL_DURATION.as_millis() as u64
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    REJECTED_CLEANUP_MAX_TRAVERSAL_DURATION
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RejectedCleanupDbSnapshot {
+    markers: Vec<TracesInflightMarker>,
+    candidates: HashSet<String>,
+    graph_roots: Vec<String>,
+    active_operations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RejectedCleanupRootSnapshot {
+    db: RejectedCleanupDbSnapshot,
+    index_roots: HashSet<String>,
+    index_fingerprints: Vec<(String, String)>,
+    active_operations: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RejectedCleanupIndexSnapshot {
+    roots: HashSet<String>,
+    fingerprints: Vec<(String, String)>,
+    active_operations: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RejectedCleanupIndexHelperRequest {
+    repo_path: PathBuf,
+    hash_bytes: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RejectedCleanupIndexHelperResponse {
+    snapshot: Option<RejectedCleanupIndexSnapshot>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CheckpointObjectIoHelperRequest {
+    /// Standard-base64 encoding of the native path bytes (UTF-8 off Unix).
+    repo_path_base64: String,
+    operation: CheckpointObjectIoOperation,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CheckpointObjectIoOperation {
+    Read {
+        oid: String,
+        expected_type: String,
+    },
+    Write {
+        object_type: String,
+        data_base64: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum CheckpointObjectIoHelperResponse {
+    Read {
+        oid: String,
+        object_type: String,
+        data_base64: String,
+    },
+    Written {
+        oid: String,
+        was_created: bool,
+    },
+    Error {
+        message: String,
+    },
+}
+
+struct CleanupHelperChild {
+    child: Option<Child>,
+    reaper: mpsc::Sender<Child>,
+}
+
+impl CleanupHelperChild {
+    fn new(child: Child, reaper: mpsc::Sender<Child>) -> Self {
+        Self {
+            child: Some(child),
+            reaper,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        // INVARIANT: the guard owns its child until Drop; no method removes it.
+        self.child
+            .as_mut()
+            .expect("cleanup helper child remains owned by its reap guard")
+    }
+}
+
+impl Drop for CleanupHelperChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                // Waiting here would let a helper stuck in uninterruptible
+                // filesystem I/O extend the foreground command past its
+                // absolute deadline. The process-wide nonblocking reaper
+                // owns the Child until try_wait observes and reaps its exit.
+                if let Err(error) = self.reaper.send(child) {
+                    let mut child = error.0;
+                    let _ = child.try_wait();
+                }
+            }
+        }
+    }
+}
+
+static CLEANUP_HELPER_REAPER: OnceLock<Result<mpsc::Sender<Child>, String>> = OnceLock::new();
+
+#[cfg(test)]
+static CLEANUP_HELPER_REAPED_CHILDREN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn cleanup_helper_reaper_sender() -> Result<mpsc::Sender<Child>> {
+    let result = CLEANUP_HELPER_REAPER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<Child>();
+        std::thread::Builder::new()
+            .name("libra-cleanup-helper-reaper".to_string())
+            .spawn(move || {
+                let mut children = Vec::<Child>::new();
+                loop {
+                    match receiver.recv_timeout(Duration::from_millis(25)) {
+                        Ok(child) => children.push(child),
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) if children.is_empty() => break,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+                    }
+                    while let Ok(child) = receiver.try_recv() {
+                        children.push(child);
+                    }
+                    let mut index = 0;
+                    while index < children.len() {
+                        match children[index].try_wait() {
+                            Ok(Some(_)) => {
+                                let mut reaped = children.swap_remove(index);
+                                // `try_wait` above observed and reaped this
+                                // process. Calling `wait` returns the cached
+                                // status immediately and makes that lifecycle
+                                // explicit to Clippy's zombie-process audit.
+                                let _ = reaped.wait();
+                                #[cfg(test)]
+                                CLEANUP_HELPER_REAPED_CHILDREN
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            Ok(None) | Err(_) => index += 1,
+                        }
+                    }
+                }
+            })
+            .map(|_| sender)
+            .map_err(|error| format!("start cleanup helper reaper thread: {error}"))
+    });
+    result
+        .as_ref()
+        .cloned()
+        .map_err(|message| anyhow!(message.clone()))
+}
+
+/// Exact ownership identity for one traces writer marker. Checkpoint IDs are
+/// intentionally stable across retries, so the random generation is what
+/// prevents an expired writer from adopting a takeover writer's replacement
+/// marker under the same metadata key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TracesWriterFence {
+    session_id: String,
+    attempt_id: String,
+    generation: String,
+}
 
 /// Outcome of a compare-and-swap reference update.
 ///
@@ -112,6 +333,12 @@ fn is_sqlite_busy(err: &DbErr) -> bool {
     message.contains("database is locked") || message.contains("database schema is locked")
 }
 
+fn anyhow_is_sqlite_busy(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<DbErr>())
+        .any(is_sqlite_busy)
+}
+
 /// Detect unique-constraint violations on the `reference` table.
 ///
 /// Functional scope:
@@ -120,6 +347,522 @@ fn is_sqlite_busy(err: &DbErr) -> bool {
 ///   that as a `HeadChanged` outcome rather than a hard error.
 fn is_sqlite_unique_violation(err: &DbErr) -> bool {
     matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
+}
+
+fn read_cleanup_regular_file(
+    path: &Path,
+    per_file_limit: u64,
+    aggregate_remaining: u64,
+    what: &str,
+) -> Result<Option<Vec<u8>>> {
+    read_cleanup_regular_file_inner(path, per_file_limit, aggregate_remaining, what, || {})
+}
+
+fn read_cleanup_regular_file_inner<F: FnOnce()>(
+    path: &Path,
+    per_file_limit: u64,
+    aggregate_remaining: u64,
+    what: &str,
+    after_metadata: F,
+) -> Result<Option<Vec<u8>>> {
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = fs::File::open(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open {what} without following symlinks"));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect held {what} descriptor"))?;
+    if !metadata.file_type().is_file() {
+        bail!("{what} is not a regular file");
+    }
+    let limit = per_file_limit.min(aggregate_remaining);
+    if metadata.len() > limit {
+        bail!("{what} exceeds the {limit} byte cleanup read limit");
+    }
+    after_metadata();
+    let mut bytes = Vec::new();
+    (&file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read held {what} descriptor"))?;
+    if bytes.len() as u64 > limit {
+        bail!("{what} grew beyond the {limit} byte cleanup read limit");
+    }
+    Ok(Some(bytes))
+}
+
+fn parse_cleanup_index_roots(
+    bytes: &[u8],
+    hash_bytes: usize,
+    what: &str,
+) -> Result<HashSet<String>> {
+    if !matches!(hash_bytes, 20 | 32) {
+        bail!("{what} uses unsupported {hash_bytes}-byte object ids");
+    }
+    if bytes.len() < 12 + hash_bytes || &bytes[..4] != b"DIRC" {
+        bail!("{what} has an invalid index header");
+    }
+    let read_u32 = |offset: usize| -> Result<u32> {
+        let raw = bytes
+            .get(offset..offset + 4)
+            .ok_or_else(|| anyhow!("{what} is truncated"))?;
+        let raw: [u8; 4] = raw
+            .try_into()
+            .map_err(|_| anyhow!("{what} has an invalid integer field"))?;
+        Ok(u32::from_be_bytes(raw))
+    };
+    if read_u32(4)? != 2 {
+        bail!("{what} is not a supported version-2 index");
+    }
+    let entry_count = usize::try_from(read_u32(8)?)
+        .with_context(|| format!("{what} entry count exceeds this platform"))?;
+    let checksum_start = bytes.len() - hash_bytes;
+    let expected_checksum = &bytes[checksum_start..];
+    let checksum_matches = match hash_bytes {
+        20 => {
+            use sha1::Digest as _;
+            sha1::Sha1::digest(&bytes[..checksum_start]).as_slice() == expected_checksum
+        }
+        32 => {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&bytes[..checksum_start]).as_slice() == expected_checksum
+        }
+        _ => false,
+    };
+    if !checksum_matches {
+        bail!("{what} checksum does not match the held file bytes");
+    }
+
+    let minimum_entry_bytes = 40_usize
+        .checked_add(hash_bytes)
+        .and_then(|size| size.checked_add(3))
+        .ok_or_else(|| anyhow!("{what} entry size overflow"))?;
+    if entry_count > checksum_start.saturating_sub(12) / minimum_entry_bytes {
+        bail!("{what} entry count exceeds its bounded file size");
+    }
+    let mut roots = HashSet::new();
+    let mut cursor = 12_usize;
+    for _ in 0..entry_count {
+        let entry_start = cursor;
+        let hash_start = cursor
+            .checked_add(40)
+            .ok_or_else(|| anyhow!("{what} entry offset overflow"))?;
+        let hash_end = hash_start
+            .checked_add(hash_bytes)
+            .ok_or_else(|| anyhow!("{what} object id offset overflow"))?;
+        let flags_end = hash_end
+            .checked_add(2)
+            .ok_or_else(|| anyhow!("{what} flags offset overflow"))?;
+        if flags_end > checksum_start {
+            bail!("{what} entry is truncated");
+        }
+        roots.insert(hex::encode(&bytes[hash_start..hash_end]));
+        let flags = u16::from_be_bytes([bytes[hash_end], bytes[hash_end + 1]]);
+        let declared_name_len = usize::from(flags & 0x0fff);
+        let name_start = flags_end;
+        let name_end = if declared_name_len == 0x0fff {
+            bytes[name_start..checksum_start]
+                .iter()
+                .position(|byte| *byte == 0)
+                .map(|offset| name_start + offset)
+                .ok_or_else(|| anyhow!("{what} long path has no terminator"))?
+        } else {
+            let end = name_start
+                .checked_add(declared_name_len)
+                .ok_or_else(|| anyhow!("{what} path length overflow"))?;
+            if end >= checksum_start || bytes[end] != 0 {
+                bail!("{what} path is truncated or not NUL-terminated");
+            }
+            end
+        };
+        cursor = name_end + 1;
+        while !(cursor - entry_start).is_multiple_of(8) {
+            if cursor >= checksum_start || bytes[cursor] != 0 {
+                bail!("{what} entry padding is invalid");
+            }
+            cursor += 1;
+        }
+    }
+
+    while cursor < checksum_start {
+        let header_end = cursor
+            .checked_add(8)
+            .ok_or_else(|| anyhow!("{what} extension offset overflow"))?;
+        if header_end > checksum_start {
+            bail!("{what} extension header is truncated");
+        }
+        if !bytes[cursor].is_ascii_uppercase() {
+            bail!("{what} contains an unsupported required index extension");
+        }
+        let size = usize::try_from(read_u32(cursor + 4)?)
+            .with_context(|| format!("{what} extension size exceeds this platform"))?;
+        cursor = header_end
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("{what} extension size overflow"))?;
+        if cursor > checksum_start {
+            bail!("{what} extension payload is truncated");
+        }
+    }
+    Ok(roots)
+}
+
+fn collect_rejected_cleanup_index_snapshot(
+    repo_path: &Path,
+    hash_bytes: usize,
+) -> Result<RejectedCleanupIndexSnapshot> {
+    use sha2::{Digest, Sha256};
+
+    let mut index_paths = vec![repo_path.join("index")];
+    let registry_path = repo_path.join("worktrees.json");
+    let mut fingerprints = Vec::new();
+    let mut total_bytes = 0_u64;
+    let registry_what = "worktree registry before rejected object cleanup";
+    if let Some(bytes) = read_cleanup_regular_file(
+        &registry_path,
+        REJECTED_CLEANUP_MAX_INDEX_BYTES,
+        REJECTED_CLEANUP_MAX_TOTAL_INDEX_BYTES,
+        registry_what,
+    )? {
+        total_bytes = bytes.len() as u64;
+        fingerprints.push((
+            registry_path.to_string_lossy().into_owned(),
+            hex::encode(Sha256::digest(&bytes)),
+        ));
+        let document: serde_json::Value = serde_json::from_slice(&bytes)
+            .context("parse worktree registry before rejected object cleanup")?;
+        let worktrees = document
+            .get("worktrees")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow!("worktree registry has no worktrees array"))?;
+        if worktrees.len() > REJECTED_CLEANUP_MAX_INDEX_FILES {
+            bail!(
+                "worktree registry exceeds the {} index-file cleanup limit",
+                REJECTED_CLEANUP_MAX_INDEX_FILES
+            );
+        }
+        for worktree in worktrees {
+            let path = worktree
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("worktree registry entry has no path"))?;
+            index_paths.push(Path::new(path).join(".libra/index"));
+        }
+    }
+    index_paths.sort();
+    index_paths.dedup();
+
+    let mut index_roots = HashSet::new();
+    for index_path in index_paths {
+        let remaining = REJECTED_CLEANUP_MAX_TOTAL_INDEX_BYTES.saturating_sub(total_bytes);
+        let what = format!("worktree index '{}'", index_path.display());
+        let Some(bytes) = read_cleanup_regular_file(
+            &index_path,
+            REJECTED_CLEANUP_MAX_INDEX_BYTES,
+            remaining,
+            &what,
+        )?
+        else {
+            continue;
+        };
+        total_bytes = total_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| anyhow!("worktree index cleanup input size overflow"))?;
+        fingerprints.push((
+            index_path.to_string_lossy().into_owned(),
+            hex::encode(Sha256::digest(&bytes)),
+        ));
+        index_roots.extend(parse_cleanup_index_roots(&bytes, hash_bytes, &what)?);
+    }
+    fingerprints.sort();
+
+    let mut active_operations = Vec::new();
+    for name in [
+        "rebase-merge",
+        "rebase-apply",
+        "merge-state.json",
+        "merge-autostash.json",
+        "revert-state.json",
+    ] {
+        match fs::symlink_metadata(repo_path.join(name)) {
+            Ok(_) => active_operations.push(name.to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect repository operation state '{name}'"));
+            }
+        }
+    }
+
+    Ok(RejectedCleanupIndexSnapshot {
+        roots: index_roots,
+        fingerprints,
+        active_operations,
+    })
+}
+
+pub fn run_rejected_cleanup_index_helper(input: &[u8]) -> Result<Vec<u8>> {
+    let request: RejectedCleanupIndexHelperRequest =
+        serde_json::from_slice(input).context("decode rejected-cleanup index helper request")?;
+    let response =
+        match collect_rejected_cleanup_index_snapshot(&request.repo_path, request.hash_bytes) {
+            Ok(snapshot) => RejectedCleanupIndexHelperResponse {
+                snapshot: Some(snapshot),
+                error: None,
+            },
+            Err(error) => RejectedCleanupIndexHelperResponse {
+                snapshot: None,
+                error: Some(format!("{error:#}")),
+            },
+        };
+    serde_json::to_vec(&response).context("encode rejected-cleanup index helper response")
+}
+
+fn encode_checkpoint_object_path(path: &Path) -> Result<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        Ok(STANDARD.encode(path.as_os_str().as_bytes()))
+    }
+    #[cfg(not(unix))]
+    {
+        let text = path
+            .to_str()
+            .ok_or_else(|| anyhow!("checkpoint object store path is not valid platform text"))?;
+        Ok(STANDARD.encode(text.as_bytes()))
+    }
+}
+
+fn decode_checkpoint_object_path(encoded: &str) -> Result<PathBuf> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let bytes = STANDARD
+        .decode(encoded)
+        .context("decode checkpoint object store path")?;
+    #[cfg(unix)]
+    {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        let text =
+            String::from_utf8(bytes).context("checkpoint object store path is not valid UTF-8")?;
+        Ok(PathBuf::from(text))
+    }
+}
+
+/// Execute one checkpoint object read/write in the private helper process.
+/// Errors are encoded in the response so the parent receives an actionable
+/// cause while still treating malformed private frames as a hard helper
+/// failure.
+pub fn run_checkpoint_object_io_helper(input: &[u8]) -> Result<Vec<u8>> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let request: CheckpointObjectIoHelperRequest =
+        serde_json::from_slice(input).context("decode checkpoint object-I/O helper request")?;
+    let response = match decode_checkpoint_object_path(&request.repo_path_base64) {
+        Err(error) => CheckpointObjectIoHelperResponse::Error {
+            message: format!("invalid checkpoint object store path: {error:#}"),
+        },
+        Ok(repo_path) => match request.operation {
+            CheckpointObjectIoOperation::Read { oid, expected_type } => {
+                if !matches!(expected_type.as_str(), "tree" | "commit") {
+                    CheckpointObjectIoHelperResponse::Error {
+                        message: format!("unsupported checkpoint read type '{expected_type}'"),
+                    }
+                } else {
+                    match ObjectHash::from_str(&oid) {
+                        Err(error) => CheckpointObjectIoHelperResponse::Error {
+                            message: format!("invalid checkpoint object id '{oid}': {error}"),
+                        },
+                        Ok(parsed_oid) => match read_git_object_bounded_validated(
+                            &repo_path,
+                            &parsed_oid,
+                            CHECKPOINT_OBJECT_READ_MAX_INFLATED_BYTES,
+                        ) {
+                            Ok((object_type, data)) if object_type == expected_type => {
+                                CheckpointObjectIoHelperResponse::Read {
+                                    oid,
+                                    object_type,
+                                    data_base64: STANDARD.encode(data),
+                                }
+                            }
+                            Ok((object_type, _)) => CheckpointObjectIoHelperResponse::Error {
+                                message: format!(
+                                    "checkpoint object {parsed_oid} has type '{object_type}', expected '{expected_type}'"
+                                ),
+                            },
+                            Err(error) => CheckpointObjectIoHelperResponse::Error {
+                                message: format!(
+                                    "failed to read checkpoint object {parsed_oid}: {error}"
+                                ),
+                            },
+                        },
+                    }
+                }
+            }
+            CheckpointObjectIoOperation::Write {
+                object_type,
+                data_base64,
+            } => {
+                if !matches!(object_type.as_str(), "blob" | "tree" | "commit") {
+                    CheckpointObjectIoHelperResponse::Error {
+                        message: format!("unsupported checkpoint object type '{object_type}'"),
+                    }
+                } else {
+                    match STANDARD.decode(data_base64) {
+                        Err(error) => CheckpointObjectIoHelperResponse::Error {
+                            message: format!("invalid checkpoint object payload: {error}"),
+                        },
+                        Ok(data) => {
+                            if cfg!(debug_assertions)
+                                && let Some(ready) = std::env::var_os(
+                                    "LIBRA_TEST_CHECKPOINT_OBJECT_WRITE_READY_FILE",
+                                )
+                            {
+                                let _ = std::fs::write(ready, b"ready");
+                                loop {
+                                    std::thread::park();
+                                }
+                            }
+                            match write_git_object_with_status(&repo_path, &object_type, &data) {
+                                Ok((oid, was_created)) => {
+                                    CheckpointObjectIoHelperResponse::Written {
+                                        oid: oid.to_string(),
+                                        was_created,
+                                    }
+                                }
+                                Err(error) => CheckpointObjectIoHelperResponse::Error {
+                                    message: format!(
+                                        "failed to write checkpoint {object_type} object: {error}"
+                                    ),
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    };
+    serde_json::to_vec(&response).context("encode checkpoint object-I/O helper response")
+}
+
+fn terminate_checkpoint_object_helper(
+    mut child: tokio::process::Child,
+    stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) {
+    stdout_task.abort();
+    let _ = child.start_kill();
+    // A helper blocked in kernel filesystem I/O may not become reapable
+    // immediately after SIGKILL. Keep ownership in a detached task so the
+    // foreground deadline never waits for that transition.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+}
+
+async fn invoke_checkpoint_object_helper(
+    repo_path: &Path,
+    operation: CheckpointObjectIoOperation,
+    deadline: Instant,
+) -> Result<CheckpointObjectIoHelperResponse> {
+    let request = CheckpointObjectIoHelperRequest {
+        repo_path_base64: encode_checkpoint_object_path(repo_path)?,
+        operation,
+    };
+    let frame = serde_json::to_vec(&request).context("encode checkpoint object-I/O request")?;
+    if frame.len() as u64 > CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP {
+        bail!(
+            "checkpoint object-I/O request exceeds the {}-byte helper limit",
+            CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP
+        );
+    }
+    if Instant::now() >= deadline {
+        bail!("checkpoint append exceeded the historical import execution deadline");
+    }
+
+    let program = std::env::current_exe().context("resolve checkpoint object-I/O helper")?;
+    let mut child = tokio::process::Command::new(program)
+        .arg(CHECKPOINT_OBJECT_IO_HELPER_ARG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start checkpoint object-I/O helper")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("checkpoint object-I/O helper has no stdin pipe"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("checkpoint object-I/O helper has no stdout pipe"))?;
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout
+            .take(CHECKPOINT_OBJECT_IO_HELPER_OUTPUT_CAP.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok(bytes)
+    });
+    let send_result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        stdin.write_all(&frame).await?;
+        stdin.shutdown().await
+    })
+    .await;
+    match send_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            terminate_checkpoint_object_helper(child, stdout_task);
+            return Err(error).context("send checkpoint object-I/O request");
+        }
+        Err(_) => {
+            terminate_checkpoint_object_helper(child, stdout_task);
+            bail!("checkpoint append exceeded the historical import execution deadline");
+        }
+    }
+    drop(stdin);
+
+    let status =
+        match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), child.wait()).await
+        {
+            Ok(result) => result.context("wait for checkpoint object-I/O helper")?,
+            Err(_) => {
+                terminate_checkpoint_object_helper(child, stdout_task);
+                bail!("checkpoint append exceeded the historical import execution deadline");
+            }
+        };
+    let response_bytes =
+        tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), stdout_task)
+            .await
+            .map_err(|_| {
+                anyhow!("checkpoint append exceeded the historical import execution deadline")
+            })?
+            .context("join checkpoint object-I/O response reader")?
+            .context("read checkpoint object-I/O response")?;
+    if !status.success() || response_bytes.len() as u64 > CHECKPOINT_OBJECT_IO_HELPER_OUTPUT_CAP {
+        bail!("checkpoint object-I/O helper returned an invalid response");
+    }
+    serde_json::from_slice(&response_bytes).context("decode checkpoint object-I/O response")
 }
 
 /// Manages object history using an orphan branch and Git Tree structure.
@@ -568,6 +1311,25 @@ impl HistoryManager {
     /// All other callers go through [`Self::write_tree`] and discard the
     /// size.
     fn write_tree_with_size(&self, tree_items: &[TreeItem]) -> Result<(ObjectHash, usize)> {
+        let mut ignored = HashSet::new();
+        self.write_tree_with_size_tracked(tree_items, &mut ignored)
+    }
+
+    fn write_tree_with_size_tracked(
+        &self,
+        tree_items: &[TreeItem],
+        newly_written: &mut HashSet<String>,
+    ) -> Result<(ObjectHash, usize)> {
+        let data = Self::encode_tree_data(tree_items)?;
+        let size = data.len();
+        let (hash, was_created) = write_git_object_with_status(&self.repo_path, "tree", &data)?;
+        if was_created {
+            newly_written.insert(hash.to_string());
+        }
+        Ok((hash, size))
+    }
+
+    fn encode_tree_data(tree_items: &[TreeItem]) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         for item in tree_items {
             let mode_str = match item.mode {
@@ -591,17 +1353,19 @@ impl HistoryManager {
             }
             data.extend_from_slice(&hash_bytes);
         }
-
-        let size = data.len();
-        let hash = write_git_object(&self.repo_path, "tree", &data)?;
-        Ok((hash, size))
+        Ok(data)
     }
 
     /// Write a tree object and stamp it into `object_index` with the
     /// given `o_type`. Used by the agent capture path so cloud sync
     /// uploads the trees that compose `refs/libra/traces`.
-    fn write_tree_indexed(&self, tree_items: &[TreeItem], o_type: &str) -> Result<ObjectHash> {
-        let (hash, size) = self.write_tree_with_size(tree_items)?;
+    fn write_tree_indexed_tracked(
+        &self,
+        tree_items: &[TreeItem],
+        o_type: &str,
+        newly_written: &mut HashSet<String>,
+    ) -> Result<ObjectHash> {
+        let (hash, size) = self.write_tree_with_size_tracked(tree_items, newly_written)?;
         crate::utils::client_storage::enqueue_agent_blob_object_index_update(
             &self.repo_path,
             &hash.to_string(),
@@ -609,6 +1373,418 @@ impl HistoryManager {
             size as i64,
         );
         Ok(hash)
+    }
+
+    async fn load_traces_writer_fence(
+        &self,
+        session_id: &str,
+        attempt_id: &str,
+    ) -> Result<TracesWriterFence> {
+        let entry = crate::internal::metadata::MetadataKv::get_with_conn(
+            self.db_conn.as_ref(),
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            session_id,
+            attempt_id,
+        )
+        .await
+        .context("load checkpoint writer marker generation")?
+        .ok_or_else(|| anyhow!("checkpoint writer marker is missing before append"))?;
+        let marker =
+            decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)?;
+        if marker.cleanup_pending {
+            bail!("checkpoint writer marker entered cleanup before append; retry the operation");
+        }
+        let generation = marker.generation.ok_or_else(|| {
+            anyhow!(
+                "checkpoint writer marker predates generation fencing; wait for it to expire and retry"
+            )
+        })?;
+        Ok(TracesWriterFence {
+            session_id: session_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            generation,
+        })
+    }
+
+    fn ensure_marker_matches_fence(
+        marker: &TracesInflightMarker,
+        fence: &TracesWriterFence,
+    ) -> Result<()> {
+        if marker.session_id != fence.session_id
+            || marker.attempt_id != fence.attempt_id
+            || marker.generation.as_deref() != Some(fence.generation.as_str())
+            || marker.cleanup_pending
+        {
+            bail!(
+                "checkpoint writer marker generation was fenced or replaced; retry the operation"
+            );
+        }
+        Ok(())
+    }
+
+    async fn persist_attempt_oid_before_write(
+        &self,
+        fence: &TracesWriterFence,
+        oid: &ObjectHash,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        // Object-index updates from the preceding object use a background
+        // SQLite writer. Optimistically take the marker transaction; if the
+        // queue won the lock race, drain it before the bounded retry. Waiting
+        // unconditionally here would serialize every object-index update and
+        // make multi-turn historical imports miss their total deadline.
+        for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                bail!("checkpoint append exceeded the historical import execution deadline");
+            }
+            let result: Result<()> = async {
+                let txn = self
+                    .db_conn
+                    .begin()
+                    .await
+                    .context("begin checkpoint object ownership update")?;
+                let entry = crate::internal::metadata::MetadataKv::get_with_conn(
+                    &txn,
+                    crate::internal::metadata::MetadataScope::AgentTracesInflight,
+                    &fence.session_id,
+                    &fence.attempt_id,
+                )
+                .await
+                .context("load checkpoint writer marker before object write")?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "checkpoint writer marker disappeared before object write; refusing to create loose objects"
+                    )
+                })?;
+                let mut marker = decode_and_validate_traces_inflight_marker(
+                    &entry.value,
+                    &entry.target,
+                    &entry.key,
+                )?;
+                Self::ensure_marker_matches_fence(&marker, fence)?;
+                marker.schema_version = marker.schema_version.max(3);
+                let oid = oid.to_string();
+                if !marker.oids.contains(&oid) {
+                    marker.oids.push(oid);
+                    marker.oids.sort();
+                    if !update_traces_inflight_marker_if_generation(
+                        &txn,
+                        &marker,
+                        &fence.generation,
+                    )
+                    .await
+                    .context("persist checkpoint object ownership before write")?
+                    {
+                        txn.rollback().await.ok();
+                        bail!("checkpoint writer marker generation changed before object write");
+                    }
+                }
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    txn.rollback().await.ok();
+                    bail!(
+                        "checkpoint append exceeded the historical import execution deadline"
+                    );
+                }
+                txn.commit()
+                    .await
+                    .context("commit checkpoint object ownership before write")?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if anyhow_is_sqlite_busy(&error) && attempt < SQLITE_BUSY_MAX_RETRIES =>
+                {
+                    let now = Instant::now();
+                    let drain_deadline = deadline
+                        .unwrap_or(now + OBJECT_INDEX_FOREGROUND_DRAIN_BUDGET)
+                        .min(now + OBJECT_INDEX_FOREGROUND_DRAIN_BUDGET);
+                    let _ = crate::utils::client_storage::ClientStorage::wait_for_background_tasks_until(
+                        drain_deadline,
+                    )
+                    .await;
+                    sleep(Duration::from_millis(
+                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(anyhow!(
+            "checkpoint object ownership update exhausted its bounded SQLite retry loop"
+        ))
+    }
+
+    async fn finalize_attempt_oid_after_write(
+        &self,
+        fence: &TracesWriterFence,
+        oid: &ObjectHash,
+        was_created: bool,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                bail!("checkpoint append exceeded the historical import execution deadline");
+            }
+            let result: Result<()> = async {
+                let txn = self
+                    .db_conn
+                    .begin()
+                    .await
+                    .context("begin checkpoint object ownership finalization")?;
+                let entry = crate::internal::metadata::MetadataKv::get_with_conn(
+                    &txn,
+                    crate::internal::metadata::MetadataScope::AgentTracesInflight,
+                    &fence.session_id,
+                    &fence.attempt_id,
+                )
+                .await
+                .context("load checkpoint writer marker after object write")?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "checkpoint writer marker disappeared after object write; refusing to continue"
+                    )
+                })?;
+                let mut marker = decode_and_validate_traces_inflight_marker(
+                    &entry.value,
+                    &entry.target,
+                    &entry.key,
+                )?;
+                Self::ensure_marker_matches_fence(&marker, fence)?;
+                marker.schema_version = marker.schema_version.max(3);
+                let oid = oid.to_string();
+                marker.oids.retain(|candidate| candidate != &oid);
+                if was_created && !marker.created_oids.contains(&oid) {
+                    marker.created_oids.push(oid);
+                    marker.created_oids.sort();
+                }
+                if !update_traces_inflight_marker_if_generation(
+                    &txn,
+                    &marker,
+                    &fence.generation,
+                )
+                .await
+                .context("finalize checkpoint object ownership after write")?
+                {
+                    txn.rollback().await.ok();
+                    bail!("checkpoint writer marker generation changed after object write");
+                }
+                txn.commit()
+                    .await
+                    .context("commit checkpoint object ownership finalization")?;
+                Ok(())
+            }
+            .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if anyhow_is_sqlite_busy(&error) && attempt < SQLITE_BUSY_MAX_RETRIES =>
+                {
+                    let now = Instant::now();
+                    let drain_deadline = deadline
+                        .unwrap_or(now + OBJECT_INDEX_FOREGROUND_DRAIN_BUDGET)
+                        .min(now + OBJECT_INDEX_FOREGROUND_DRAIN_BUDGET);
+                    let _ = crate::utils::client_storage::ClientStorage::wait_for_background_tasks_until(
+                        drain_deadline,
+                    )
+                    .await;
+                    sleep(Duration::from_millis(
+                        SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(anyhow!(
+            "checkpoint object ownership finalization exhausted its bounded SQLite retry loop"
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_indexed_object_for_attempt(
+        &self,
+        object_type: &str,
+        data: &[u8],
+        index_type: &str,
+        what: &str,
+        fence: &TracesWriterFence,
+        deadline: Option<Instant>,
+        newly_written: &mut HashSet<String>,
+    ) -> Result<ObjectHash> {
+        let expected_oid = git_object_hash(object_type, data);
+        let oid_string = expected_oid.to_string();
+        let needs_preclaim = if deadline.is_some() {
+            // A foreground existence probe can itself block on FUSE/NFS.
+            // Preclaiming an already-existing object is harmless: successful
+            // helper completion removes that transient ownership row.
+            true
+        } else {
+            !self
+                .repo_path
+                .join("objects")
+                .join(&oid_string[..2])
+                .join(&oid_string[2..])
+                .exists()
+        };
+        if needs_preclaim {
+            self.persist_attempt_oid_before_write(fence, &expected_oid, deadline)
+                .await?;
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!("checkpoint append exceeded the historical import execution deadline");
+        }
+        let (oid, was_created) = if let Some(deadline) = deadline {
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+            let response = invoke_checkpoint_object_helper(
+                &self.repo_path,
+                CheckpointObjectIoOperation::Write {
+                    object_type: object_type.to_string(),
+                    data_base64: STANDARD.encode(data),
+                },
+                deadline,
+            )
+            .await
+            .with_context(|| format!("failed to write checkpoint {what} {object_type}"))?;
+            match response {
+                CheckpointObjectIoHelperResponse::Written { oid, was_created } => (
+                    ObjectHash::from_str(&oid).map_err(|error| {
+                        anyhow!("helper returned invalid checkpoint oid '{oid}': {error}")
+                    })?,
+                    was_created,
+                ),
+                CheckpointObjectIoHelperResponse::Error { message } => {
+                    bail!("failed to write checkpoint {what} {object_type}: {message}")
+                }
+                CheckpointObjectIoHelperResponse::Read { .. } => {
+                    bail!("checkpoint object-I/O helper returned a read response for a write")
+                }
+            }
+        } else {
+            write_git_object_with_status(&self.repo_path, object_type, data)
+                .with_context(|| format!("failed to write checkpoint {what} {object_type}"))?
+        };
+        if oid != expected_oid {
+            bail!("checkpoint object hash changed between ownership registration and write");
+        }
+        if was_created {
+            newly_written.insert(oid.to_string());
+        }
+        self.finalize_attempt_oid_after_write(fence, &oid, was_created, deadline)
+            .await?;
+        if was_created
+            && cfg!(debug_assertions)
+            && std::env::var_os("LIBRA_TEST_CHECKPOINT_CRASH_AFTER_FIRST_OBJECT").is_some()
+        {
+            std::process::exit(86);
+        }
+        crate::utils::client_storage::enqueue_agent_blob_object_index_update(
+            &self.repo_path,
+            &oid.to_string(),
+            index_type,
+            data.len() as i64,
+        );
+        Ok(oid)
+    }
+
+    async fn read_checkpoint_object_for_attempt(
+        &self,
+        oid: &ObjectHash,
+        expected_type: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<u8>> {
+        let Some(deadline) = deadline else {
+            return read_git_object(&self.repo_path, oid).map_err(Into::into);
+        };
+        let response = invoke_checkpoint_object_helper(
+            &self.repo_path,
+            CheckpointObjectIoOperation::Read {
+                oid: oid.to_string(),
+                expected_type: expected_type.to_string(),
+            },
+            deadline,
+        )
+        .await?;
+        match response {
+            CheckpointObjectIoHelperResponse::Read {
+                oid: returned_oid,
+                object_type,
+                data_base64,
+            } => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+                if returned_oid != oid.to_string() {
+                    bail!("checkpoint object-I/O helper returned the wrong object id");
+                }
+                if object_type != expected_type {
+                    bail!(
+                        "checkpoint object-I/O helper returned type '{object_type}', expected '{expected_type}'"
+                    );
+                }
+                STANDARD
+                    .decode(data_base64)
+                    .context("decode checkpoint object-I/O read payload")
+            }
+            CheckpointObjectIoHelperResponse::Error { message } => {
+                bail!("failed to read checkpoint object {oid}: {message}")
+            }
+            CheckpointObjectIoHelperResponse::Written { .. } => {
+                bail!("checkpoint object-I/O helper returned a write response for a read")
+            }
+        }
+    }
+
+    async fn load_commit_tree_for_attempt(
+        &self,
+        commit_id: &ObjectHash,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<TreeItem>> {
+        let data = self
+            .read_checkpoint_object_for_attempt(commit_id, "commit", deadline)
+            .await?;
+        let content = String::from_utf8_lossy(&data);
+        for line in content.lines() {
+            if let Some(hash_str) = line.strip_prefix("tree ") {
+                let tree_hash = ObjectHash::from_str(hash_str)
+                    .map_err(|error| anyhow!("Invalid tree hash in commit: {error}"))?;
+                return self.load_tree_for_attempt(&tree_hash, deadline).await;
+            }
+        }
+        bail!("Commit has no tree")
+    }
+
+    async fn load_tree_for_attempt(
+        &self,
+        tree_id: &ObjectHash,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<TreeItem>> {
+        let data = self
+            .read_checkpoint_object_for_attempt(tree_id, "tree", deadline)
+            .await?;
+        Ok(Tree::from_bytes(&data, *tree_id)?.tree_items)
+    }
+
+    async fn write_tree_indexed_for_attempt(
+        &self,
+        tree_items: &[TreeItem],
+        fence: &TracesWriterFence,
+        deadline: Option<Instant>,
+        newly_written: &mut HashSet<String>,
+    ) -> Result<ObjectHash> {
+        let data = Self::encode_tree_data(tree_items)?;
+        self.write_indexed_object_for_attempt(
+            "tree",
+            &data,
+            "tree",
+            "tree",
+            fence,
+            deadline,
+            newly_written,
+        )
+        .await
     }
 
     fn create_append_commit(
@@ -761,7 +1937,7 @@ impl HistoryManager {
         expected_head: Option<ObjectHash>,
         new_hash: ObjectHash,
     ) -> Result<RefUpdateOutcome> {
-        self.update_ref_if_matches_with_extra(ref_name, expected_head, new_hash, None)
+        self.update_ref_if_matches_with_extra(ref_name, expected_head, new_hash, None, None, None)
             .await
     }
 
@@ -778,11 +1954,16 @@ impl HistoryManager {
         expected_head: Option<ObjectHash>,
         new_hash: ObjectHash,
         extra: Option<(&dyn TracesTxnExtra, &TracesCommitCtx)>,
+        deadline: Option<Instant>,
+        marker_fence: Option<&TracesWriterFence>,
     ) -> Result<RefUpdateOutcome> {
         let expected_commit = expected_head.map(|hash| hash.to_string());
         let new_commit = new_hash.to_string();
 
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                bail!("checkpoint append exceeded the historical import execution deadline");
+            }
             let txn: DatabaseTransaction = match self.db_conn.begin().await {
                 Ok(txn) => txn,
                 Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
@@ -794,6 +1975,37 @@ impl HistoryManager {
                 }
                 Err(err) => return Err(err).context("Failed to begin transaction"),
             };
+
+            // An expired ordinary marker may have been fenced and retired by
+            // crash recovery while this writer was stalled. The marker check
+            // rides the same SQLite writer transaction as the ref/catalog CAS:
+            // cleanup wins first => this writer cannot publish; this writer
+            // wins first => cleanup observes the committed root/catalog.
+            if let Some(marker_fence) = marker_fence {
+                let entry = crate::internal::metadata::MetadataKv::get_with_conn(
+                    &txn,
+                    crate::internal::metadata::MetadataScope::AgentTracesInflight,
+                    &marker_fence.session_id,
+                    &marker_fence.attempt_id,
+                )
+                .await
+                .context("revalidate checkpoint writer marker before ref update")?;
+                let Some(entry) = entry else {
+                    txn.rollback().await.ok();
+                    bail!(
+                        "checkpoint writer marker was fenced before ref update; retry the operation"
+                    );
+                };
+                let marker = decode_and_validate_traces_inflight_marker(
+                    &entry.value,
+                    &entry.target,
+                    &entry.key,
+                )?;
+                if let Err(error) = Self::ensure_marker_matches_fence(&marker, marker_fence) {
+                    txn.rollback().await.ok();
+                    return Err(error.context("revalidate marker generation before ref update"));
+                }
+            }
 
             let existing = match reference::Entity::find()
                 .filter(reference::Column::Name.eq(ref_name))
@@ -891,6 +2103,11 @@ impl HistoryManager {
                 );
             }
 
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                let _ = txn.rollback().await;
+                bail!("checkpoint append exceeded the historical import execution deadline");
+            }
+
             match txn.commit().await {
                 Ok(()) => return Ok(RefUpdateOutcome::Updated),
                 Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
@@ -934,6 +2151,61 @@ impl HistoryManager {
         &self,
         params: CheckpointCommitParams<'_>,
     ) -> Result<CheckpointCommit> {
+        // Durable rejected-object markers are diagnostic/GC work. Appends do
+        // only the O(1) exact writer-fence check below; a repository-wide
+        // reachability scan here can otherwise impose a permanent 30s+ stall
+        // on every checkpoint while making no foreground deletion decision.
+        let writer_fence = self
+            .load_traces_writer_fence(params.session_id, params.checkpoint_id)
+            .await?;
+        if writer_fence.generation != params.marker_generation {
+            bail!(
+                "checkpoint writer marker generation was fenced or replaced before append; retry the operation"
+            );
+        }
+        let mut newly_written = HashSet::new();
+        let result = self
+            .append_checkpoint_commit_inner(params, &writer_fence, &mut newly_written)
+            .await;
+        match result {
+            Ok(commit) => Ok(commit),
+            Err(error) => {
+                if let Err(cleanup_error) = self
+                    .cleanup_rejected_checkpoint_objects(&writer_fence, &newly_written)
+                    .await
+                {
+                    return Err(anyhow!(
+                        "{error:#}; failed to clean rejected checkpoint objects: {cleanup_error:#}"
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn append_checkpoint_commit_inner(
+        &self,
+        params: CheckpointCommitParams<'_>,
+        writer_fence: &TracesWriterFence,
+        newly_written: &mut HashSet<String>,
+    ) -> Result<CheckpointCommit> {
+        if cfg!(debug_assertions)
+            && let Ok(value) = std::env::var("LIBRA_TEST_CHECKPOINT_APPEND_DELAY_MS")
+            && let Ok(delay_ms) = value.parse::<u64>()
+        {
+            let delay = sleep(Duration::from_millis(delay_ms));
+            if let Some(deadline) = params.deadline {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), delay)
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "checkpoint append exceeded the historical import execution deadline"
+                        )
+                    })?;
+            } else {
+                delay.await;
+            }
+        }
         // Phase 1: write content blobs once. They are content-addressed, so
         // re-running a CAS retry loop never duplicates them.
         //
@@ -944,33 +2216,54 @@ impl HistoryManager {
         // tag because cloud sync doesn't filter by o_type — the custom tag
         // exists for downstream tooling that enumerates captured
         // transcripts.
+        let deadline = params.deadline;
+        let ensure_deadline = || -> Result<()> {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                bail!("checkpoint append exceeded the historical import execution deadline");
+            }
+            Ok(())
+        };
+        ensure_deadline()?;
         let mut object_count: u64 = 0;
-        let mut write_indexed_blob =
-            |bytes: &[u8], o_type: &str, what: &str| -> Result<ObjectHash> {
-                let oid = write_git_object(&self.repo_path, "blob", bytes)
-                    .with_context(|| format!("failed to write checkpoint {what} blob"))?;
-                crate::utils::client_storage::enqueue_agent_blob_object_index_update(
-                    &self.repo_path,
-                    &oid.to_string(),
-                    o_type,
-                    bytes.len() as i64,
-                );
-                object_count += 1;
-                Ok(oid)
-            };
-
-        let metadata_blob_oid =
-            write_indexed_blob(params.metadata_json.bytes(), "blob", "metadata.json")?;
-        let events_blob_oid = write_indexed_blob(
-            params.lifecycle_events_jsonl.bytes(),
-            "blob",
-            "events/lifecycle.jsonl",
-        )?;
-        let report_blob_oid = write_indexed_blob(
-            params.redaction_report_json.bytes(),
-            "blob",
-            "redaction_report.json",
-        )?;
+        let metadata_blob_oid = self
+            .write_indexed_object_for_attempt(
+                "blob",
+                params.metadata_json.bytes(),
+                "blob",
+                "metadata.json",
+                writer_fence,
+                params.deadline,
+                newly_written,
+            )
+            .await?;
+        object_count += 1;
+        ensure_deadline()?;
+        let events_blob_oid = self
+            .write_indexed_object_for_attempt(
+                "blob",
+                params.lifecycle_events_jsonl.bytes(),
+                "blob",
+                "events/lifecycle.jsonl",
+                writer_fence,
+                params.deadline,
+                newly_written,
+            )
+            .await?;
+        object_count += 1;
+        ensure_deadline()?;
+        let report_blob_oid = self
+            .write_indexed_object_for_attempt(
+                "blob",
+                params.redaction_report_json.bytes(),
+                "blob",
+                "redaction_report.json",
+                writer_fence,
+                params.deadline,
+                newly_written,
+            )
+            .await?;
+        object_count += 1;
+        ensure_deadline()?;
 
         // Transcript: E5 line-boundary-safe chunking above the threshold.
         // Small transcripts stay a single `transcript/<agent_kind>.jsonl`
@@ -992,7 +2285,19 @@ impl HistoryManager {
             } else {
                 transcript_file_name.clone()
             };
-            let oid = write_indexed_blob(chunk, "agent_transcript", "transcript")?;
+            let oid = self
+                .write_indexed_object_for_attempt(
+                    "blob",
+                    chunk,
+                    "agent_transcript",
+                    "transcript",
+                    writer_fence,
+                    params.deadline,
+                    newly_written,
+                )
+                .await?;
+            object_count += 1;
+            ensure_deadline()?;
             transcript_parts.push(TranscriptPartRef {
                 name,
                 oid,
@@ -1012,8 +2317,19 @@ impl HistoryManager {
             transcript_bytes,
             params.redaction_report_json.bytes(),
         ]);
-        let content_hash_blob_oid =
-            write_indexed_blob(content_hash.as_bytes(), "blob", "content_hash.txt")?;
+        let content_hash_blob_oid = self
+            .write_indexed_object_for_attempt(
+                "blob",
+                content_hash.as_bytes(),
+                "blob",
+                "content_hash.txt",
+                writer_fence,
+                params.deadline,
+                newly_written,
+            )
+            .await?;
+        object_count += 1;
+        ensure_deadline()?;
 
         // manifest.json is written LAST among the blobs: it declares every
         // other entry's OID/length (including content_hash.txt), so nothing
@@ -1028,7 +2344,19 @@ impl HistoryManager {
             ManifestBlobRef::new(report_blob_oid, params.redaction_report_json.len()),
             ManifestBlobRef::new(content_hash_blob_oid, content_hash.len()),
         )?;
-        let manifest_blob_oid = write_indexed_blob(&manifest_bytes, "blob", "manifest.json")?;
+        let manifest_blob_oid = self
+            .write_indexed_object_for_attempt(
+                "blob",
+                &manifest_bytes,
+                "blob",
+                "manifest.json",
+                writer_fence,
+                params.deadline,
+                newly_written,
+            )
+            .await?;
+        object_count += 1;
+        ensure_deadline()?;
 
         // Phase 2: build the leaf trees (transcript/, events/).
         // All trees written under the agent capture path go through
@@ -1040,15 +2368,26 @@ impl HistoryManager {
             .map(|part| TreeItem::new(TreeItemMode::Blob, part.oid, part.name.clone()))
             .collect();
         transcript_items.sort_by(|a, b| a.name.cmp(&b.name));
-        let transcript_subtree = self.write_tree_indexed(&transcript_items, "tree")?;
-        let events_subtree = self.write_tree_indexed(
-            &[TreeItem::new(
-                TreeItemMode::Blob,
-                events_blob_oid,
-                CHECKPOINT_LIFECYCLE_EVENTS_FILE.to_string(),
-            )],
-            "tree",
-        )?;
+        let transcript_subtree = self
+            .write_tree_indexed_for_attempt(
+                &transcript_items,
+                writer_fence,
+                params.deadline,
+                newly_written,
+            )
+            .await?;
+        let events_subtree = self
+            .write_tree_indexed_for_attempt(
+                &[TreeItem::new(
+                    TreeItemMode::Blob,
+                    events_blob_oid,
+                    CHECKPOINT_LIFECYCLE_EVENTS_FILE.to_string(),
+                )],
+                writer_fence,
+                params.deadline,
+                newly_written,
+            )
+            .await?;
         object_count += 2;
 
         let mut inner_items = vec![
@@ -1080,7 +2419,14 @@ impl HistoryManager {
             TreeItem::new(TreeItemMode::Tree, events_subtree, "events".to_string()),
         ];
         inner_items.sort_by(|a, b| a.name.cmp(&b.name));
-        let inner_tree = self.write_tree_indexed(&inner_items, "tree")?;
+        let inner_tree = self
+            .write_tree_indexed_for_attempt(
+                &inner_items,
+                writer_fence,
+                params.deadline,
+                newly_written,
+            )
+            .await?;
         object_count += 1;
 
         // Phase 3: CAS loop. Read parent, splice
@@ -1094,14 +2440,26 @@ impl HistoryManager {
             .to_string();
         let rest = params.checkpoint_id[2..].to_string();
         for attempt in 0..=HISTORY_HEAD_CONFLICT_MAX_RETRIES {
+            ensure_deadline()?;
             let parent = self.resolve_history_head().await?;
+            ensure_deadline()?;
             // Test-only: deterministic head-moved-between-read-and-CAS
             // injection (see the struct field's doc).
             #[cfg(test)]
             if let Some(hook) = &self.test_after_head_read {
                 hook().await?;
             }
-            let new_root = self.splice_checkpoint_tree(parent, &prefix, &rest, inner_tree)?;
+            let new_root = self
+                .splice_checkpoint_tree_for_attempt(
+                    parent,
+                    &prefix,
+                    &rest,
+                    inner_tree,
+                    writer_fence,
+                    params.deadline,
+                    newly_written,
+                )
+                .await?;
             // splice_checkpoint_tree writes exactly three trees
             // (rest→prefix→checkpoint→root splice) per attempt; +1 commit.
             object_count += 4;
@@ -1127,18 +2485,18 @@ impl HistoryManager {
             let commit_data = commit
                 .to_data()
                 .context("failed to serialize checkpoint commit")?;
-            let commit_hash = write_git_object(&self.repo_path, "commit", &commit_data)?;
-            // Phase 3.5c: agent capture commits must reach R2 too.
-            // Tagging at every CAS retry is idempotent because
-            // `update_object_index_once` does an existence check before
-            // inserting, and the same `commit_data` produces the same
-            // OID across retries.
-            crate::utils::client_storage::enqueue_agent_blob_object_index_update(
-                &self.repo_path,
-                &commit_hash.to_string(),
-                "commit",
-                commit_data.len() as i64,
-            );
+            let commit_hash = self
+                .write_indexed_object_for_attempt(
+                    "commit",
+                    &commit_data,
+                    "commit",
+                    "commit",
+                    writer_fence,
+                    params.deadline,
+                    newly_written,
+                )
+                .await?;
+            ensure_deadline()?;
 
             // Per-attempt ctx: commit hash and root tree change on every CAS
             // rebuild, so the companion writes get the values of THIS attempt.
@@ -1153,14 +2511,24 @@ impl HistoryManager {
                     parent,
                     commit_hash,
                     params.txn_extra.map(|extra| (extra, &commit_ctx)),
+                    params.deadline,
+                    Some(writer_fence),
                 )
                 .await?
             {
                 RefUpdateOutcome::Updated => {
+                    if cfg!(debug_assertions)
+                        && let Ok(value) =
+                            std::env::var("LIBRA_TEST_CHECKPOINT_POST_COMMIT_DELAY_MS")
+                        && let Ok(delay_ms) = value.parse::<u64>()
+                    {
+                        sleep(Duration::from_millis(delay_ms)).await;
+                    }
                     return Ok(CheckpointCommit {
                         commit_hash,
                         tree_oid: new_root,
                         metadata_blob_oid,
+                        marker_generation: writer_fence.generation.clone(),
                         cas_retries: attempt as u64,
                         object_count,
                     });
@@ -1176,7 +2544,706 @@ impl HistoryManager {
                 }
             }
         }
-        unreachable!("CAS retry loop must return on success or terminal error")
+        Err(anyhow!(
+            "checkpoint CAS retry loop exhausted without a terminal outcome"
+        ))
+    }
+
+    async fn rejected_cleanup_db_snapshot<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+    ) -> Result<RejectedCleanupDbSnapshot> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut markers = list_all_traces_inflight_markers(conn).await?;
+        markers.sort_by(|left, right| {
+            (&left.session_id, &left.attempt_id).cmp(&(&right.session_id, &right.attempt_id))
+        });
+
+        let mut candidates = HashSet::new();
+        for marker in markers
+            .iter()
+            .filter(|marker| marker.cleanup_pending || !marker.is_live(now_ms))
+        {
+            let cataloged = conn
+                .query_one(Statement::from_sql_and_values(
+                    conn.get_database_backend(),
+                    "SELECT 1 FROM agent_checkpoint WHERE checkpoint_id = ?",
+                    [marker.attempt_id.clone().into()],
+                ))
+                .await
+                .context("verify rejected checkpoint cleanup candidate")?;
+            if cataloged.is_none() {
+                candidates.extend(marker.created_oids.iter().cloned());
+            }
+        }
+
+        let mut root_rows = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT `commit` AS oid FROM reference WHERE `commit` IS NOT NULL LIMIT 250001"
+                    .to_string(),
+            ))
+            .await
+            .context("list reference roots for rejected object cleanup")?;
+        let reflog_exists = conn
+            .query_one(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ["reflog".into()],
+            ))
+            .await
+            .context("check reflog table before rejected object cleanup")?
+            .is_some();
+        if reflog_exists && root_rows.len() <= REJECTED_CLEANUP_MAX_VISITED_OBJECTS {
+            root_rows.extend(
+                conn.query_all(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT old_oid AS oid FROM reflog
+                     UNION ALL SELECT new_oid AS oid FROM reflog
+                     LIMIT 250001"
+                        .to_string(),
+                ))
+                .await
+                .context("list reflog roots for rejected object cleanup")?,
+            );
+        }
+        if root_rows.len() > REJECTED_CLEANUP_MAX_VISITED_OBJECTS {
+            bail!(
+                "repository has more than {} reference/reflog cleanup roots",
+                REJECTED_CLEANUP_MAX_VISITED_OBJECTS
+            );
+        }
+        let mut graph_roots = Vec::with_capacity(root_rows.len());
+        for row in root_rows {
+            let value: String = row.try_get_by("oid")?;
+            if !value.is_empty() && !value.bytes().all(|byte| byte == b'0') {
+                ObjectHash::from_str(&value).map_err(|error| {
+                    anyhow!("repository cleanup root {value} is invalid: {error}")
+                })?;
+                graph_roots.push(value);
+            }
+        }
+        graph_roots.sort();
+        graph_roots.dedup();
+
+        let mut active_operations = Vec::new();
+        for table in ["rebase_state", "sequence_state"] {
+            let table_exists = conn
+                .query_one(Statement::from_sql_and_values(
+                    conn.get_database_backend(),
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    [table.into()],
+                ))
+                .await
+                .with_context(|| format!("check {table} table before object cleanup"))?
+                .is_some();
+            if table_exists
+                && conn
+                    .query_one(Statement::from_string(
+                        conn.get_database_backend(),
+                        format!("SELECT 1 FROM {table} LIMIT 1"),
+                    ))
+                    .await
+                    .with_context(|| format!("check active {table} before object cleanup"))?
+                    .is_some()
+            {
+                active_operations.push(table.to_string());
+            }
+        }
+
+        Ok(RejectedCleanupDbSnapshot {
+            markers,
+            candidates,
+            graph_roots,
+            active_operations,
+        })
+    }
+
+    fn rejected_cleanup_index_snapshot(
+        &self,
+        deadline: Instant,
+    ) -> Result<RejectedCleanupIndexSnapshot> {
+        if Instant::now() >= deadline {
+            bail!("repository cleanup deadline expired before index snapshot");
+        }
+        let request = serde_json::to_vec(&RejectedCleanupIndexHelperRequest {
+            repo_path: self.repo_path.clone(),
+            hash_bytes: get_hash_kind().size(),
+        })
+        .context("encode rejected-cleanup index helper request")?;
+        let current_exe = std::env::current_exe()
+            .context("resolve Libra executable for rejected-cleanup index helper")?;
+        let program = if cfg!(debug_assertions)
+            && !current_exe
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem == "libra")
+        {
+            current_exe
+                .parent()
+                .and_then(Path::parent)
+                .map(|parent| parent.join("libra"))
+                .filter(|candidate| candidate.is_file())
+                .unwrap_or(current_exe)
+        } else {
+            current_exe
+        };
+        let mut output =
+            tempfile::tempfile().context("create rejected-cleanup index helper output file")?;
+        // Initialize the nonblocking reap service before creating a child, so
+        // thread-allocation failure cannot strand an already-started helper.
+        let reaper = cleanup_helper_reaper_sender()?;
+        let child_output = output
+            .try_clone()
+            .context("clone rejected-cleanup index helper output file")?;
+        let child = Command::new(&program)
+            .arg(REJECTED_CLEANUP_INDEX_HELPER_ARG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(child_output))
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "start rejected-cleanup index helper '{}'",
+                    program.display()
+                )
+            })?;
+        let mut child = CleanupHelperChild::new(child, reaper);
+        let mut stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("rejected-cleanup index helper has no stdin pipe"))?;
+        stdin
+            .write_all(&request)
+            .context("write rejected-cleanup index helper request")?;
+        drop(stdin);
+
+        let status = loop {
+            if let Some(status) = child
+                .child_mut()
+                .try_wait()
+                .context("poll rejected-cleanup index helper")?
+            {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                bail!("repository cleanup index snapshot exceeded its traversal deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if !status.success() {
+            bail!("rejected-cleanup index helper exited unsuccessfully");
+        }
+        output
+            .seek(SeekFrom::Start(0))
+            .context("rewind rejected-cleanup index helper output")?;
+        let mut response = Vec::new();
+        (&mut output)
+            .take(REJECTED_CLEANUP_INDEX_HELPER_FRAME_CAP.saturating_add(1))
+            .read_to_end(&mut response)
+            .context("read rejected-cleanup index helper output")?;
+        if response.len() as u64 > REJECTED_CLEANUP_INDEX_HELPER_FRAME_CAP {
+            bail!("rejected-cleanup index helper response exceeds its frame limit");
+        }
+        let response: RejectedCleanupIndexHelperResponse = serde_json::from_slice(&response)
+            .context("decode rejected-cleanup index helper response")?;
+        match (response.snapshot, response.error) {
+            (Some(snapshot), None) => Ok(snapshot),
+            (None, Some(error)) => bail!("rejected-cleanup index snapshot failed: {error}"),
+            _ => bail!("rejected-cleanup index helper returned an invalid response"),
+        }
+    }
+
+    async fn rejected_cleanup_root_snapshot<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        deadline: Instant,
+    ) -> Result<RejectedCleanupRootSnapshot> {
+        let db = self.rejected_cleanup_db_snapshot(conn).await?;
+        let RejectedCleanupIndexSnapshot {
+            roots,
+            fingerprints,
+            mut active_operations,
+        } = self.rejected_cleanup_index_snapshot(deadline)?;
+        active_operations.extend(db.active_operations.iter().cloned());
+        active_operations.sort();
+        active_operations.dedup();
+        Ok(RejectedCleanupRootSnapshot {
+            db,
+            index_roots: roots,
+            index_fingerprints: fingerprints,
+            active_operations,
+        })
+    }
+
+    #[cfg(test)]
+    async fn reachable_rejected_objects_with_limit(
+        &self,
+        ref_heads: Vec<ObjectHash>,
+        candidates: &HashSet<String>,
+        max_inflated_object_bytes: u64,
+    ) -> Result<HashSet<String>> {
+        self.reachable_rejected_objects_with_limits(
+            ref_heads,
+            candidates,
+            max_inflated_object_bytes,
+            REJECTED_CLEANUP_MAX_VISITED_OBJECTS,
+            Instant::now() + REJECTED_CLEANUP_MAX_TRAVERSAL_DURATION,
+        )
+        .await
+    }
+
+    async fn reachable_rejected_objects_with_limits(
+        &self,
+        ref_heads: Vec<ObjectHash>,
+        candidates: &HashSet<String>,
+        max_inflated_object_bytes: u64,
+        max_visited_objects: usize,
+        deadline: Instant,
+    ) -> Result<HashSet<String>> {
+        let mut reachable = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut stack = ref_heads;
+        while let Some(oid) = stack.pop() {
+            if Instant::now() >= deadline {
+                bail!(
+                    "ref-reachability cleanup exceeded its {} second traversal deadline after visiting {} objects",
+                    REJECTED_CLEANUP_MAX_TRAVERSAL_DURATION.as_secs(),
+                    seen.len()
+                );
+            }
+            if !seen.contains(&oid) && seen.len() >= max_visited_objects {
+                bail!(
+                    "ref-reachability cleanup exceeded its {max_visited_objects} object traversal limit"
+                );
+            }
+            if !seen.insert(oid) {
+                continue;
+            }
+            let oid_string = oid.to_string();
+            if candidates.contains(&oid_string) {
+                reachable.insert(oid_string);
+            }
+            // Diagnostic reachability must understand every ref root, including
+            // objects held in local packs or alternates. The storage-level
+            // bounded read enforces a conservative load-cost cap before
+            // materializing the payload; the explicit OID verification keeps
+            // a corrupt loose/packed object from making deletion unsafe.
+            let (data, object_type) = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                self.storage.get_with_limit(&oid, max_inflated_object_bytes),
+            )
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "ref-reachability cleanup exceeded its traversal deadline while reading {oid}"
+                )
+            })?
+            .with_context(|| format!("read ref-reachable {oid} during cleanup"))?;
+            if Instant::now() >= deadline {
+                bail!(
+                    "ref-reachability cleanup exceeded its traversal deadline after reading {oid}"
+                );
+            }
+            verify_fetched_object(&oid, object_type, &data)
+                .with_context(|| format!("verify ref-reachable {oid} during cleanup"))?;
+            match object_type {
+                ObjectType::Commit => {
+                    let commit = Commit::from_bytes(&data, oid)
+                        .map_err(|error| anyhow!("parse ref-reachable commit {oid}: {error}"))?;
+                    stack.push(commit.tree_id);
+                    stack.extend(commit.parent_commit_ids);
+                }
+                ObjectType::Tree => {
+                    let tree = Tree::from_bytes(&data, oid)
+                        .map_err(|error| anyhow!("parse ref-reachable tree {oid}: {error}"))?;
+                    for item in tree.tree_items {
+                        let item_oid = item.id.to_string();
+                        if candidates.contains(&item_oid) {
+                            reachable.insert(item_oid);
+                        }
+                        if item.mode == TreeItemMode::Tree {
+                            stack.push(item.id);
+                        }
+                    }
+                }
+                ObjectType::Tag => {
+                    let body = std::str::from_utf8(&data).with_context(|| {
+                        format!("parse ref-reachable annotated tag {oid} as UTF-8")
+                    })?;
+                    let target = body
+                        .lines()
+                        .next()
+                        .and_then(|line| line.strip_prefix("object "))
+                        .ok_or_else(|| {
+                            anyhow!("ref-reachable annotated tag {oid} has no object target")
+                        })?;
+                    stack.push(ObjectHash::from_str(target).map_err(|error| {
+                        anyhow!("parse annotated tag {oid} target {target}: {error}")
+                    })?);
+                }
+                ObjectType::Blob => {}
+                other => {
+                    bail!(
+                        "ref-reachable object {oid} has unsupported type '{other}' during rejected checkpoint cleanup"
+                    )
+                }
+            }
+        }
+        Ok(reachable)
+    }
+
+    /// Convert objects created by a rejected append into a durable ownership
+    /// record. The foreground failure path only registers the exact writer's
+    /// cleanup job; doctor/GC owns object-index draining and repository-wide
+    /// reachability so an append deadline cannot be extended by maintenance.
+    async fn cleanup_rejected_checkpoint_objects(
+        &self,
+        writer_fence: &TracesWriterFence,
+        newly_written: &HashSet<String>,
+    ) -> Result<()> {
+        // Persist ownership of every candidate before returning the rejected
+        // append to its caller. This happens before any optional background
+        // queue wait, so a timeout can never erase the only durable record of
+        // newly-created object ownership.
+        let txn = self
+            .db_conn
+            .begin()
+            .await
+            .context("begin rejected checkpoint cleanup registration")?;
+        let existing = crate::internal::metadata::MetadataKv::get_with_conn(
+            &txn,
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            &writer_fence.session_id,
+            &writer_fence.attempt_id,
+        )
+        .await
+        .context("load rejected checkpoint writer marker")?;
+        let mut marker = match existing {
+            Some(entry) => {
+                let marker = decode_and_validate_traces_inflight_marker(
+                    &entry.value,
+                    &entry.target,
+                    &entry.key,
+                )?;
+                if Self::ensure_marker_matches_fence(&marker, writer_fence).is_err() {
+                    txn.rollback().await.ok();
+                    tracing::debug!(
+                        session_id = %writer_fence.session_id,
+                        checkpoint_id = %writer_fence.attempt_id,
+                        "leaving rejected objects to repository GC after marker generation changed"
+                    );
+                    return Ok(());
+                }
+                marker
+            }
+            None => {
+                txn.rollback().await.ok();
+                return Ok(());
+            }
+        };
+        marker.schema_version = marker.schema_version.max(3);
+        marker.created_oids.extend(newly_written.iter().cloned());
+        marker.created_oids.sort();
+        marker.created_oids.dedup();
+        if marker.created_oids.is_empty() {
+            clear_traces_inflight_marker_if_generation(
+                &txn,
+                &writer_fence.session_id,
+                &writer_fence.attempt_id,
+                &writer_fence.generation,
+            )
+            .await?;
+            txn.commit()
+                .await
+                .context("commit empty rejected checkpoint cleanup")?;
+            return Ok(());
+        }
+        marker.cleanup_pending = true;
+        if !update_traces_inflight_marker_if_generation(&txn, &marker, &writer_fence.generation)
+            .await
+            .context("persist rejected checkpoint cleanup job")?
+        {
+            txn.rollback().await.ok();
+            return Ok(());
+        }
+        txn.commit()
+            .await
+            .context("commit rejected checkpoint cleanup registration")?;
+        Ok(())
+    }
+
+    /// Drain all durable rejected-append cleanup jobs in one serialized
+    /// reachability pass. A non-cleanup live writer defers the pass; pending
+    /// jobs themselves may be expired and are still never forgotten.
+    async fn drain_rejected_checkpoint_cleanup_jobs(&self) -> Result<()> {
+        self.drain_rejected_checkpoint_cleanup_jobs_ignoring(None)
+            .await
+    }
+
+    /// Doctor repair entry point for one valid expired marker. The shared
+    /// serialized drain performs a fail-closed all-ref reachability diagnostic
+    /// before retiring ownership. Physical payload reclamation remains the
+    /// repository GC's responsibility. Returns whether the named marker was
+    /// fully retired.
+    pub async fn repair_expired_traces_inflight_marker(
+        &self,
+        session_id: &str,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let entry = crate::internal::metadata::MetadataKv::get_with_conn(
+            self.db_conn.as_ref(),
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            session_id,
+            attempt_id,
+        )
+        .await
+        .context("load expired traces marker for doctor repair")?;
+        let Some(entry) = entry else {
+            return Ok(true);
+        };
+        let marker =
+            decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)?;
+        if !marker.cleanup_pending && marker.is_live(now_ms) {
+            return Ok(false);
+        }
+        self.drain_rejected_checkpoint_cleanup_jobs().await?;
+        Ok(crate::internal::metadata::MetadataKv::get_with_conn(
+            self.db_conn.as_ref(),
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            session_id,
+            attempt_id,
+        )
+        .await
+        .context("verify expired traces marker doctor repair")?
+        .is_none())
+    }
+
+    async fn drain_rejected_checkpoint_cleanup_jobs_ignoring(
+        &self,
+        ignored_attempt: Option<(&str, &str)>,
+    ) -> Result<()> {
+        if !crate::utils::client_storage::ClientStorage::wait_for_background_tasks_until(
+            Instant::now() + OBJECT_INDEX_CLEANUP_DRAIN_BUDGET,
+        )
+        .await
+        {
+            return Err(RejectedCheckpointCleanupDeferred {
+                reason: "object-index queue did not drain within 5 seconds".to_string(),
+            }
+            .into());
+        }
+        let cleanup_deadline = Instant::now() + rejected_cleanup_traversal_duration();
+
+        // Snapshot all DB and filesystem GC roots without a SQLite writer
+        // transaction. The potentially expensive object walk below therefore
+        // never stalls ordinary repository writes.
+        let initial = self
+            .rejected_cleanup_root_snapshot(self.db_conn.as_ref(), cleanup_deadline)
+            .await
+            .map_err(|error| RejectedCheckpointCleanupDeferred {
+                reason: format!("repository cleanup roots could not be snapshotted: {error:#}"),
+            })?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let pending = initial
+            .db
+            .markers
+            .iter()
+            .filter(|marker| marker.cleanup_pending || !marker.is_live(now_ms))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if let Some(other) = initial.db.markers.iter().find(|marker| {
+            !marker.cleanup_pending
+                && marker.is_live(now_ms)
+                && ignored_attempt.is_none_or(|(session_id, attempt_id)| {
+                    marker.session_id != session_id || marker.attempt_id != attempt_id
+                })
+        }) {
+            return Err(CheckpointPruneGuardError::LiveWriterMarker {
+                session_id: other.session_id.clone(),
+                attempt_id: other.attempt_id.clone(),
+                ttl_ms: other.ttl_ms,
+            }
+            .into());
+        }
+        if !initial.active_operations.is_empty() {
+            return Err(RejectedCheckpointCleanupDeferred {
+                reason: format!(
+                    "repository operation state is active ({})",
+                    initial.active_operations.join(", ")
+                ),
+            }
+            .into());
+        }
+
+        let candidates = initial.db.candidates.clone();
+        let mut reachable = if candidates.is_empty() {
+            HashSet::new()
+        } else {
+            let heads = initial
+                .db
+                .graph_roots
+                .iter()
+                .map(|value| {
+                    ObjectHash::from_str(value).map_err(|error| {
+                        anyhow!("repository cleanup root {value} is invalid: {error}")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            self.reachable_rejected_objects_with_limits(
+                heads,
+                &candidates,
+                REJECTED_CLEANUP_MAX_INFLATED_OBJECT_BYTES,
+                REJECTED_CLEANUP_MAX_VISITED_OBJECTS,
+                cleanup_deadline,
+            )
+            .await
+            .map_err(|error| RejectedCheckpointCleanupDeferred {
+                reason: format!("repository reachability could not be proven: {error:#}"),
+            })?
+        };
+        reachable.extend(candidates.intersection(&initial.index_roots).cloned());
+        for marker in initial
+            .db
+            .markers
+            .iter()
+            .filter(|marker| !marker.cleanup_pending && marker.is_live(now_ms))
+        {
+            reachable.extend(
+                marker
+                    .oids
+                    .iter()
+                    .chain(&marker.created_oids)
+                    .filter(|oid| candidates.contains(*oid))
+                    .cloned(),
+            );
+        }
+        let unreachable = candidates
+            .difference(&reachable)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        // Re-read every root after traversal. Any concurrent ref, reflog,
+        // worktree-index, operation-state, marker, or catalog change makes
+        // the proof stale and leaves the durable cleanup job for a retry.
+        let revalidated = self
+            .rejected_cleanup_root_snapshot(self.db_conn.as_ref(), cleanup_deadline)
+            .await
+            .map_err(|error| RejectedCheckpointCleanupDeferred {
+                reason: format!("repository cleanup roots could not be revalidated: {error:#}"),
+            })?;
+        if revalidated != initial {
+            return Err(RejectedCheckpointCleanupDeferred {
+                reason: "repository cleanup roots changed during reachability traversal"
+                    .to_string(),
+            }
+            .into());
+        }
+
+        // Take the writer lock only for the final compare/retire phase.
+        // Ref/reflog/marker/catalog writers cannot move after the comparison
+        // until this transaction commits.
+        let txn = self
+            .db_conn
+            .begin()
+            .await
+            .context("begin rejected checkpoint object cleanup")?;
+        txn.execute(Statement::from_string(
+            txn.get_database_backend(),
+            "UPDATE metadata_kv SET updated_at = updated_at
+             WHERE scope = 'agent_traces_inflight'"
+                .to_string(),
+        ))
+        .await
+        .context("lock traces marker registry for rejected object cleanup")?;
+        let locked_db = self.rejected_cleanup_db_snapshot(&txn).await?;
+        if locked_db != revalidated.db {
+            txn.rollback().await.ok();
+            return Err(RejectedCheckpointCleanupDeferred {
+                reason: "database cleanup roots changed before the deletion lock was acquired"
+                    .to_string(),
+            }
+            .into());
+        }
+        let RejectedCleanupIndexSnapshot {
+            roots: locked_index_roots,
+            fingerprints: locked_index_fingerprints,
+            active_operations: mut locked_operations,
+        } = match self.rejected_cleanup_index_snapshot(cleanup_deadline) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                txn.rollback().await.ok();
+                return Err(RejectedCheckpointCleanupDeferred {
+                    reason: format!(
+                        "filesystem cleanup roots could not be locked before the deadline: {error:#}"
+                    ),
+                }
+                .into());
+            }
+        };
+        locked_operations.extend(locked_db.active_operations.iter().cloned());
+        locked_operations.sort();
+        locked_operations.dedup();
+        if locked_index_roots != revalidated.index_roots
+            || locked_index_fingerprints != revalidated.index_fingerprints
+            || locked_operations != revalidated.active_operations
+        {
+            txn.rollback().await.ok();
+            return Err(RejectedCheckpointCleanupDeferred {
+                reason: "filesystem cleanup roots changed before deletion".to_string(),
+            }
+            .into());
+        }
+        let locked_now_ms = chrono::Utc::now().timestamp_millis();
+        let pending = locked_db
+            .markers
+            .iter()
+            .filter(|marker| marker.cleanup_pending || !marker.is_live(locked_now_ms))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            txn.commit()
+                .await
+                .context("commit empty rejected checkpoint cleanup")?;
+            return Ok(());
+        }
+        if let Some(other) = locked_db.markers.iter().find(|marker| {
+            !marker.cleanup_pending
+                && marker.is_live(locked_now_ms)
+                && ignored_attempt.is_none_or(|(session_id, attempt_id)| {
+                    marker.session_id != session_id || marker.attempt_id != attempt_id
+                })
+        }) {
+            txn.rollback().await.ok();
+            return Err(CheckpointPruneGuardError::LiveWriterMarker {
+                session_id: other.session_id.clone(),
+                attempt_id: other.attempt_id.clone(),
+                ttl_ms: other.ttl_ms,
+            }
+            .into());
+        }
+        if !unreachable.is_empty() {
+            // Do not unlink shared content-addressed payloads here. Worktree
+            // index writers do not participate in this SQLite lock, so an
+            // index could begin referencing a candidate after the final root
+            // snapshot. Retire attempt ownership and leave the payload plus
+            // object_index row for repository GC, whose grace/locking policy
+            // is the correct place for physical reclamation.
+            tracing::debug!(
+                orphaned_objects = unreachable.len(),
+                "retiring rejected checkpoint ownership without inline object deletion"
+            );
+        }
+        for marker in pending {
+            clear_traces_inflight_marker(&txn, &marker.session_id, &marker.attempt_id).await?;
+        }
+        txn.commit()
+            .await
+            .context("commit rejected checkpoint object cleanup")?;
+        Ok(())
     }
 
     /// Remove checkpoint commits from this manager's ref and delete their
@@ -1230,6 +3297,7 @@ impl HistoryManager {
                 ref_rewritten: false,
                 window_guard: "noop",
                 deleted_object_index_rows: 0,
+                deleted_import_identities: 0,
             });
         }
 
@@ -1250,6 +3318,7 @@ impl HistoryManager {
                     ref_rewritten: false,
                     window_guard: "noop",
                     deleted_object_index_rows: 0,
+                    deleted_import_identities: 0,
                 });
             }
 
@@ -1292,7 +3361,12 @@ impl HistoryManager {
                 )
                 .await?
             {
-                (RefUpdateOutcome::Updated, removed_checkpoints, deleted_object_index_rows) => {
+                (
+                    RefUpdateOutcome::Updated,
+                    removed_checkpoints,
+                    deleted_object_index_rows,
+                    deleted_import_identities,
+                ) => {
                     finish_span("markers_and_catalog_verified", deleted_object_index_rows);
                     return Ok(CheckpointPruneOutcome {
                         removed_checkpoints,
@@ -1300,14 +3374,15 @@ impl HistoryManager {
                         ref_rewritten: expected_head != new_head,
                         window_guard: "markers_and_catalog_verified",
                         deleted_object_index_rows,
+                        deleted_import_identities,
                     });
                 }
-                (RefUpdateOutcome::HeadChanged, _, _)
+                (RefUpdateOutcome::HeadChanged, _, _, _)
                     if attempt < HISTORY_HEAD_CONFLICT_MAX_RETRIES =>
                 {
                     continue;
                 }
-                (RefUpdateOutcome::HeadChanged, _, _) => {
+                (RefUpdateOutcome::HeadChanged, _, _, _) => {
                     return Err(anyhow!(
                         "traces head changed repeatedly while pruning checkpoints"
                     ));
@@ -1337,6 +3412,141 @@ impl HistoryManager {
         use sea_orm::{Statement, Value};
         let backend = self.db_conn.get_database_backend();
 
+        // ADR-DR-19 (M4): establish the anti-resurrection barrier BEFORE
+        // pruning/deleting anything. The same transaction fences every
+        // import/export/coverage holder for this provider identity. If the
+        // later ref prune is interrupted, the session remains tombstoned and
+        // a retry can safely finish deletion; no in-flight writer can revive
+        // it in the meantime.
+        let identity = self
+            .db_conn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT agent_kind, provider_session_id, metadata_json
+                 FROM agent_session WHERE session_id = ?",
+                [Value::from(session_id.to_string())],
+            ))
+            .await
+            .context("read provider identity for session erasure")?;
+        let provider_identity = if let Some(row) = identity {
+            let agent_kind: String = row.try_get_by("agent_kind")?;
+            let provider_session_id: String = row.try_get_by("provider_session_id")?;
+            let metadata_json: String = row.try_get_by("metadata_json")?;
+            let source_fingerprint = serde_json::from_str::<serde_json::Value>(&metadata_json)
+                .ok()
+                .and_then(|metadata| {
+                    metadata
+                        .get("source_fingerprint")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| {
+                            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                        .map(str::to_owned)
+                });
+            let txn = self
+                .db_conn
+                .begin()
+                .await
+                .context("begin agent erasure tombstone transaction")?;
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO agent_import_tombstone (
+                    tombstone_id, agent_kind, provider_session_id,
+                    erased_session_id, source_fingerprint, erased_at
+                 ) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(agent_kind, provider_session_id) DO UPDATE SET
+                    erased_session_id = excluded.erased_session_id,
+                    source_fingerprint = COALESCE(
+                        excluded.source_fingerprint,
+                        agent_import_tombstone.source_fingerprint
+                    ),
+                    erased_at = excluded.erased_at",
+                [
+                    uuid::Uuid::new_v4().to_string().into(),
+                    agent_kind.clone().into(),
+                    provider_session_id.clone().into(),
+                    session_id.into(),
+                    Value::from(source_fingerprint),
+                    chrono::Utc::now().timestamp_millis().into(),
+                ],
+            ))
+            .await
+            .context("write agent import anti-resurrection tombstone")?;
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE agent_import_identity
+                 SET state = 'failed', owner = NULL, lease_expires_at = NULL,
+                     fence_token = COALESCE(fence_token, 0) + 1,
+                     last_error_code = 'LBR-AGENT-019', updated_at = ?
+                 WHERE agent_kind = ? AND provider_session_id = ?",
+                [
+                    chrono::Utc::now().timestamp_millis().into(),
+                    agent_kind.clone().into(),
+                    provider_session_id.clone().into(),
+                ],
+            ))
+            .await
+            .context("fence import identity holders during erasure")?;
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE agent_coverage_claim
+                 SET state = 'abandoned', owner = NULL, lease_expires_at = NULL,
+                     fence_token = COALESCE(fence_token, 0) + 1, updated_at = ?
+                 WHERE session_id = ? AND state IN ('reserved_live','reserved_import')",
+                [
+                    chrono::Utc::now().timestamp_millis().into(),
+                    session_id.into(),
+                ],
+            ))
+            .await
+            .context("fence coverage claim holders during erasure")?;
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "UPDATE agent_export_job
+                 SET state = 'failed', owner = NULL, lease_expires_at = NULL,
+                     fence_token = fence_token + 1,
+                     last_error_code = 'LBR-AGENT-019', updated_at = ?
+                 WHERE agent_kind = ? AND provider_session_id = ?",
+                [
+                    chrono::Utc::now().timestamp_millis().into(),
+                    agent_kind.clone().into(),
+                    provider_session_id.clone().into(),
+                ],
+            ))
+            .await
+            .context("fence export job holders during erasure")?;
+            txn.commit()
+                .await
+                .context("commit agent erasure tombstone transaction")?;
+            Some((agent_kind, provider_session_id))
+        } else {
+            None
+        };
+
+        // A session can be between reservation and its first catalog row, so
+        // an empty checkpoint list does not prove that erasure has no writer
+        // to race. Marker creation is serialized with the tombstone
+        // transaction above; once the tombstone wins, no new marker for this
+        // provider identity can be created. Refuse this attempt until the
+        // already-marked writer finishes or its rejected objects are cleaned.
+        let live_markers = list_live_traces_inflight_markers(
+            self.db_conn.as_ref(),
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+        .context("verify in-flight writers before agent session erasure")?;
+        if let Some(marker) = live_markers
+            .into_iter()
+            .find(|marker| marker.session_id == session_id)
+        {
+            return Err(CheckpointPruneGuardError::LiveWriterMarker {
+                session_id: marker.session_id,
+                attempt_id: marker.attempt_id,
+                ttl_ms: marker.ttl_ms,
+            }
+            .into());
+        }
+
         // Enumerate the session's checkpoints from the catalog.
         let rows = self
             .db_conn
@@ -1357,9 +3567,15 @@ impl HistoryManager {
         // deleting the session row.
         let prune = self.prune_checkpoint_commits(&checkpoint_ids).await?;
 
-        // Delete the session row (cascades any residual checkpoint rows).
-        let deleted = self
+        // Delete the session row (cascades claims/revisions/checkpoints) and
+        // application-owned import/export job rows together. The tombstone is
+        // deliberately retained outside ordinary retention.
+        let txn = self
             .db_conn
+            .begin()
+            .await
+            .context("begin agent session catalog erasure")?;
+        let deleted = txn
             .execute(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM agent_session WHERE session_id = ?",
@@ -1367,6 +3583,30 @@ impl HistoryManager {
             ))
             .await
             .context("delete agent_session row for erasure")?;
+        if let Some((agent_kind, provider_session_id)) = provider_identity {
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM agent_import_identity
+                 WHERE agent_kind = ? AND provider_session_id = ?",
+                [
+                    agent_kind.clone().into(),
+                    provider_session_id.clone().into(),
+                ],
+            ))
+            .await
+            .context("delete import identity rows for erased session")?;
+            txn.execute(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM agent_export_job
+                 WHERE agent_kind = ? AND provider_session_id = ?",
+                [agent_kind.into(), provider_session_id.into()],
+            ))
+            .await
+            .context("delete export job rows for erased session")?;
+        }
+        txn.commit()
+            .await
+            .context("commit agent session catalog erasure")?;
 
         Ok(SessionEraseOutcome {
             session_deleted: deleted.rows_affected() > 0,
@@ -1602,7 +3842,8 @@ impl HistoryManager {
     /// transaction so a crash cannot leave the catalog and the index
     /// disagreeing about the pruned checkpoints.
     ///
-    /// Returns `(outcome, removed_rows, deleted_object_index_rows)`.
+    /// Returns `(outcome, removed_rows, deleted_object_index_rows,
+    /// deleted_import_identities)`.
     async fn commit_checkpoint_prune(
         &self,
         expected_head: Option<ObjectHash>,
@@ -1610,7 +3851,7 @@ impl HistoryManager {
         rewritten: &[RewrittenCheckpoint],
         remove_ids: &HashSet<String>,
         unreachable_oids: &[String],
-    ) -> Result<(RefUpdateOutcome, u64, u64)> {
+    ) -> Result<(RefUpdateOutcome, u64, u64, u64)> {
         let expected_commit = expected_head.map(|hash| hash.to_string());
         let new_commit = new_head.map(|hash| hash.to_string());
 
@@ -1650,7 +3891,7 @@ impl HistoryManager {
             let write_ref = match existing {
                 Some(model) if model.commit != expected_commit => {
                     let _ = txn.rollback().await;
-                    return Ok((RefUpdateOutcome::HeadChanged, 0, 0));
+                    return Ok((RefUpdateOutcome::HeadChanged, 0, 0, 0));
                 }
                 Some(model) => {
                     let mut active: reference::ActiveModel = model.into();
@@ -1659,7 +3900,7 @@ impl HistoryManager {
                 }
                 None if expected_commit.is_some() => {
                     let _ = txn.rollback().await;
-                    return Ok((RefUpdateOutcome::HeadChanged, 0, 0));
+                    return Ok((RefUpdateOutcome::HeadChanged, 0, 0, 0));
                 }
                 None => {
                     let new_ref = reference::ActiveModel {
@@ -1714,6 +3955,111 @@ impl HistoryManager {
 
             let mut removed = 0;
             for id in remove_ids {
+                // GC-DR-11: coverage revisions/current pointers and import
+                // attempt cursors are part of the same catalog fact as the
+                // checkpoint. Reconcile them before deleting the row so no
+                // committed claim can point at a pruned checkpoint.
+                txn.execute(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM agent_coverage_conflict
+                     WHERE incumbent_checkpoint_id = ?
+                        OR EXISTS (
+                          SELECT 1 FROM agent_coverage_claim c
+                          WHERE c.session_id = agent_coverage_conflict.session_id
+                            AND c.logical_turn_key = agent_coverage_conflict.logical_turn_key
+                            AND c.coverage_schema_version = agent_coverage_conflict.coverage_schema_version
+                            AND c.checkpoint_id = ?
+                        )",
+                    [Value::from(id.clone()), Value::from(id.clone())],
+                ))
+                .await
+                .context("delete conflict evidence whose incumbent checkpoint is pruned")?;
+                txn.execute(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM agent_coverage_revision WHERE checkpoint_id = ?",
+                    [Value::from(id.clone())],
+                ))
+                .await
+                .context("delete coverage revisions for pruned checkpoint")?;
+                txn.execute(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM agent_coverage_claim
+                     WHERE checkpoint_id = ?
+                       AND NOT EXISTS (
+                         SELECT 1 FROM agent_coverage_revision r
+                         WHERE r.session_id = agent_coverage_claim.session_id
+                           AND r.logical_turn_key = agent_coverage_claim.logical_turn_key
+                           AND r.coverage_schema_version = agent_coverage_claim.coverage_schema_version
+                       )",
+                    [Value::from(id.clone())],
+                ))
+                .await
+                .context("delete coverage claims emptied by checkpoint prune")?;
+                txn.execute(Statement::from_sql_and_values(
+                    backend,
+                    "UPDATE agent_coverage_claim
+                     SET revision = (
+                           SELECT r.revision FROM agent_coverage_revision r
+                           WHERE r.session_id = agent_coverage_claim.session_id
+                             AND r.logical_turn_key = agent_coverage_claim.logical_turn_key
+                             AND r.coverage_schema_version = agent_coverage_claim.coverage_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ),
+                         coverage_digest = (
+                           SELECT r.coverage_digest FROM agent_coverage_revision r
+                           WHERE r.session_id = agent_coverage_claim.session_id
+                             AND r.logical_turn_key = agent_coverage_claim.logical_turn_key
+                             AND r.coverage_schema_version = agent_coverage_claim.coverage_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ),
+                         completeness = (
+                           SELECT r.completeness FROM agent_coverage_revision r
+                           WHERE r.session_id = agent_coverage_claim.session_id
+                             AND r.logical_turn_key = agent_coverage_claim.logical_turn_key
+                             AND r.coverage_schema_version = agent_coverage_claim.coverage_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ),
+                         source_channel = (
+                           SELECT r.source_channel FROM agent_coverage_revision r
+                           WHERE r.session_id = agent_coverage_claim.session_id
+                             AND r.logical_turn_key = agent_coverage_claim.logical_turn_key
+                             AND r.coverage_schema_version = agent_coverage_claim.coverage_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ),
+                         checkpoint_id = (
+                           SELECT r.checkpoint_id FROM agent_coverage_revision r
+                           WHERE r.session_id = agent_coverage_claim.session_id
+                             AND r.logical_turn_key = agent_coverage_claim.logical_turn_key
+                             AND r.coverage_schema_version = agent_coverage_claim.coverage_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ),
+                         traces_commit = (
+                           SELECT c.traces_commit
+                           FROM agent_coverage_revision r
+                           JOIN agent_checkpoint c ON c.checkpoint_id = r.checkpoint_id
+                           WHERE r.session_id = agent_coverage_claim.session_id
+                             AND r.logical_turn_key = agent_coverage_claim.logical_turn_key
+                             AND r.coverage_schema_version = agent_coverage_claim.coverage_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ),
+                         state = 'catalog_committed', owner = NULL,
+                         lease_expires_at = NULL, updated_at = ?
+                     WHERE checkpoint_id = ?",
+                    [
+                        Value::from(chrono::Utc::now().timestamp_millis()),
+                        Value::from(id.clone()),
+                    ],
+                ))
+                .await
+                .context("repoint coverage claim after checkpoint prune")?;
+                txn.execute(Statement::from_sql_and_values(
+                    backend,
+                    "UPDATE agent_import_identity SET attempt_checkpoint_id = NULL
+                     WHERE attempt_checkpoint_id = ?",
+                    [Value::from(id.clone())],
+                ))
+                .await
+                .context("clear pruned import attempt checkpoint pointer")?;
                 match txn
                     .execute(Statement::from_sql_and_values(
                         backend,
@@ -1734,6 +4080,27 @@ impl HistoryManager {
                     Err(err) => return Err(err).context("Failed to delete pruned checkpoint row"),
                 }
             }
+
+            let deleted_import_identities = txn
+                .execute(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM agent_import_identity
+                 WHERE state IN ('discovered','partial','committed','failed')
+                   AND owner IS NULL
+                   AND EXISTS (
+                     SELECT 1 FROM agent_session s
+                     WHERE s.agent_kind = agent_import_identity.agent_kind
+                       AND s.provider_session_id = agent_import_identity.provider_session_id
+                       AND NOT EXISTS (
+                         SELECT 1 FROM agent_coverage_claim c
+                         WHERE c.session_id = s.session_id
+                       )
+                 )",
+                    Vec::<Value>::new(),
+                ))
+                .await
+                .context("delete import identity after pruning its final coverage claim")?
+                .rows_affected();
 
             // AG-20: drop `object_index` rows for OIDs this prune made
             // unreachable so cloud sync stops advertising them. Rides in
@@ -1765,6 +4132,7 @@ impl HistoryManager {
                         RefUpdateOutcome::Updated,
                         removed,
                         deleted_object_index_rows,
+                        deleted_import_identities,
                     ));
                 }
                 Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
@@ -1791,6 +4159,18 @@ impl HistoryManager {
         prefix: &str,
         rest: &str,
         inner_tree: ObjectHash,
+    ) -> Result<ObjectHash> {
+        let mut ignored = HashSet::new();
+        self.splice_checkpoint_tree_tracked(parent, prefix, rest, inner_tree, &mut ignored)
+    }
+
+    fn splice_checkpoint_tree_tracked(
+        &self,
+        parent: Option<ObjectHash>,
+        prefix: &str,
+        rest: &str,
+        inner_tree: ObjectHash,
+        newly_written: &mut HashSet<String>,
     ) -> Result<ObjectHash> {
         let mut root_items = match parent {
             Some(parent_id) => self.load_commit_tree(&parent_id)?,
@@ -1839,7 +4219,7 @@ impl HistoryManager {
         prefix_items.sort_by(|a, b| a.name.cmp(&b.name));
         // Phase 3.5c: tag every tree spliced into the agent capture
         // history so cloud sync uploads the full reachability set.
-        let prefix_tree = self.write_tree_indexed(&prefix_items, "tree")?;
+        let prefix_tree = self.write_tree_indexed_tracked(&prefix_items, "tree", newly_written)?;
 
         checkpoint_items.retain(|item| item.name != prefix);
         checkpoint_items.push(TreeItem::new(
@@ -1848,7 +4228,8 @@ impl HistoryManager {
             prefix.to_string(),
         ));
         checkpoint_items.sort_by(|a, b| a.name.cmp(&b.name));
-        let checkpoint_tree = self.write_tree_indexed(&checkpoint_items, "tree")?;
+        let checkpoint_tree =
+            self.write_tree_indexed_tracked(&checkpoint_items, "tree", newly_written)?;
 
         root_items.retain(|item| item.name != "checkpoint");
         root_items.push(TreeItem::new(
@@ -1857,7 +4238,98 @@ impl HistoryManager {
             "checkpoint".to_string(),
         ));
         root_items.sort_by(|a, b| a.name.cmp(&b.name));
-        self.write_tree_indexed(&root_items, "tree")
+        self.write_tree_indexed_tracked(&root_items, "tree", newly_written)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn splice_checkpoint_tree_for_attempt(
+        &self,
+        parent: Option<ObjectHash>,
+        prefix: &str,
+        rest: &str,
+        inner_tree: ObjectHash,
+        writer_fence: &TracesWriterFence,
+        deadline: Option<Instant>,
+        newly_written: &mut HashSet<String>,
+    ) -> Result<ObjectHash> {
+        let mut root_items = match parent {
+            Some(parent_id) => {
+                self.load_commit_tree_for_attempt(&parent_id, deadline)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        let checkpoint_entry = root_items
+            .iter()
+            .find(|item| item.name == "checkpoint")
+            .cloned();
+        let mut checkpoint_items = match checkpoint_entry {
+            Some(entry) if entry.mode == TreeItemMode::Tree => {
+                self.load_tree_for_attempt(&entry.id, deadline).await?
+            }
+            Some(entry) => {
+                bail!(
+                    "traces tree corruption: 'checkpoint' entry expected to be a tree, got mode {:?} (oid {})",
+                    entry.mode,
+                    entry.id
+                )
+            }
+            None => Vec::new(),
+        };
+        let prefix_entry = checkpoint_items
+            .iter()
+            .find(|item| item.name == prefix)
+            .cloned();
+        let mut prefix_items = match prefix_entry {
+            Some(entry) if entry.mode == TreeItemMode::Tree => {
+                self.load_tree_for_attempt(&entry.id, deadline).await?
+            }
+            Some(entry) => {
+                bail!(
+                    "traces tree corruption: 'checkpoint/{prefix}' entry expected to be a tree, got mode {:?} (oid {})",
+                    entry.mode,
+                    entry.id
+                )
+            }
+            None => Vec::new(),
+        };
+
+        prefix_items.retain(|item| item.name != rest);
+        prefix_items.push(TreeItem::new(
+            TreeItemMode::Tree,
+            inner_tree,
+            rest.to_string(),
+        ));
+        prefix_items.sort_by(|a, b| a.name.cmp(&b.name));
+        let prefix_tree = self
+            .write_tree_indexed_for_attempt(&prefix_items, writer_fence, deadline, newly_written)
+            .await?;
+
+        checkpoint_items.retain(|item| item.name != prefix);
+        checkpoint_items.push(TreeItem::new(
+            TreeItemMode::Tree,
+            prefix_tree,
+            prefix.to_string(),
+        ));
+        checkpoint_items.sort_by(|a, b| a.name.cmp(&b.name));
+        let checkpoint_tree = self
+            .write_tree_indexed_for_attempt(
+                &checkpoint_items,
+                writer_fence,
+                deadline,
+                newly_written,
+            )
+            .await?;
+
+        root_items.retain(|item| item.name != "checkpoint");
+        root_items.push(TreeItem::new(
+            TreeItemMode::Tree,
+            checkpoint_tree,
+            "checkpoint".to_string(),
+        ));
+        root_items.sort_by(|a, b| a.name.cmp(&b.name));
+        self.write_tree_indexed_for_attempt(&root_items, writer_fence, deadline, newly_written)
+            .await
     }
 
     #[cfg(test)]
@@ -1877,6 +4349,11 @@ pub struct CheckpointCommitParams<'a> {
     pub checkpoint_id: &'a str,
     /// `agent_session.session_id` this checkpoint belongs to.
     pub session_id: &'a str,
+    /// Random generation returned by the marker registration that authorized
+    /// this specific writer. The append entry point compares it before any
+    /// object is created, so a stalled writer cannot adopt a replacement
+    /// marker registered under the same session/checkpoint key.
+    pub marker_generation: &'a str,
     /// `agent_session.agent_kind` (snake_case form, e.g. `claude_code`).
     /// Also the file-name stem of `transcript/<agent_kind>.jsonl` — E4-libra
     /// pins the snake_case db tag here, never the CLI slug (`claude-code`).
@@ -1916,6 +4393,10 @@ pub struct CheckpointCommitParams<'a> {
     /// whole transaction (ref included) rolls back. `None` keeps the legacy
     /// behavior (catalog inserted separately after the CAS).
     pub txn_extra: Option<&'a dyn TracesTxnExtra>,
+    /// Absolute command deadline for historical imports. Live/export writers
+    /// pass `None`; import object construction and CAS are cancelled when the
+    /// deadline is reached.
+    pub deadline: Option<Instant>,
 }
 
 /// Per-attempt commit identifiers handed to [`TracesTxnExtra::apply`] — the
@@ -2059,6 +4540,9 @@ pub struct CheckpointCommit {
     pub commit_hash: ObjectHash,
     pub tree_oid: ObjectHash,
     pub metadata_blob_oid: ObjectHash,
+    /// Exact marker generation consumed by this append. Callers use it when
+    /// retiring the marker after their catalog write completes.
+    pub marker_generation: String,
     /// Number of head-conflict retries the ref CAS loop needed (0 = first
     /// attempt won). Recorded on the `agent.checkpoint.write` span.
     pub cas_retries: u64,
@@ -2099,6 +4583,9 @@ pub struct CheckpointPruneOutcome {
     /// checkpoints). Recorded on the `agent.clean.prune` span as
     /// `deleted_objects`.
     pub deleted_object_index_rows: u64,
+    /// Import job identities physically deleted after their final coverage
+    /// claim disappeared in this prune transaction.
+    pub deleted_import_identities: u64,
 }
 
 /// Fail-closed refusals raised by [`HistoryManager::prune_checkpoint_commits`]
@@ -2108,6 +4595,14 @@ pub struct CheckpointPruneOutcome {
 /// Callers can `downcast_ref` through the `anyhow` chain to distinguish a
 /// deterministic guard refusal (retry later / run doctor) from a real
 /// storage failure.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "rejected checkpoint cleanup is deferred because {reason}; candidate ownership remains durable — inspect with `libra agent doctor`, run `libra agent doctor --repair` for safe repairs, and retry"
+)]
+struct RejectedCheckpointCleanupDeferred {
+    reason: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointPruneGuardError {
     /// Window A/B: a writer's in-flight marker is still live. The prune is
@@ -2447,15 +4942,11 @@ pub const AGENT_TRACES_INFLIGHT_TTL_MS: i64 = 10 * 60 * 1000;
 /// live marker tells the prune side "objects for this attempt may exist
 /// that neither the ref nor the catalog reaches yet — do not collect".
 ///
-/// **Guarantee level (honest)**: marker persistence is best-effort. The
-/// writer awaits the marker upsert before writing blobs, so on the normal
-/// path the marker IS durably in SQLite first; but a marker write/clear
-/// failure only logs a warning and never fails the ingest — a checkpoint
-/// must not be lost because its advisory guard could not be written. The
-/// prune side therefore must keep its ref-vs-catalog fail-closed
-/// comparison as the primary window-B defence and treat markers as an
-/// additional (window-A) shield.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Marker registration is fail-closed and precedes object construction. A
+/// cleanup-pending marker remains durable beyond its normal TTL until its
+/// candidate OIDs have been checked against repository roots and ownership is
+/// retired for later repository GC.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TracesInflightMarker {
     /// Marker JSON schema version (additive evolution only).
     pub schema_version: u32,
@@ -2463,6 +4954,11 @@ pub struct TracesInflightMarker {
     pub session_id: String,
     /// Attempt UUID — the checkpoint id this write will (try to) catalog.
     pub attempt_id: String,
+    /// Unpredictable writer generation. The `(session_id, attempt_id)` key is
+    /// stable across takeover, so every marker mutation and final CAS must
+    /// additionally compare this token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
     /// Unix epoch milliseconds when the writer created the marker.
     pub started_at_ms: i64,
     /// Time-to-live in milliseconds; `started_at_ms + ttl_ms <= now` means
@@ -2477,19 +4973,37 @@ pub struct TracesInflightMarker {
     /// during window A.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oids: Vec<String>,
+    /// OIDs this attempt is proven to have published with `create_new`
+    /// semantics. Destructive recovery considers only this set. `oids`
+    /// contains unresolved preclaims and is deliberately leak-safe after a
+    /// crash between publish and ownership finalization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_oids: Vec<String>,
+    /// A rejected append owns the listed newly-created OIDs until a serialized
+    /// reachability pass drains them. Pending cleanup ignores the ordinary
+    /// marker TTL and blocks erasure from reporting success.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cleanup_pending: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl TracesInflightMarker {
     /// A fresh marker for a write attempt starting now.
     pub fn new(session_id: &str, attempt_id: &str, started_at_ms: i64) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 3,
             session_id: session_id.to_string(),
             attempt_id: attempt_id.to_string(),
+            generation: Some(uuid::Uuid::new_v4().to_string()),
             started_at_ms,
             ttl_ms: AGENT_TRACES_INFLIGHT_TTL_MS,
             commit: None,
             oids: Vec::new(),
+            created_oids: Vec::new(),
+            cleanup_pending: false,
         }
     }
 
@@ -2499,12 +5013,187 @@ impl TracesInflightMarker {
     }
 }
 
+fn validate_traces_inflight_marker(
+    marker: &TracesInflightMarker,
+    expected_session_id: &str,
+    expected_attempt_id: &str,
+) -> Result<()> {
+    if marker.session_id != expected_session_id || marker.attempt_id != expected_attempt_id {
+        bail!(
+            "traces in-flight marker identity does not match its metadata row (row {expected_session_id}/{expected_attempt_id}, value {}/{}); inspect it with `libra agent doctor` before retrying",
+            marker.session_id,
+            marker.attempt_id
+        );
+    }
+    if marker.schema_version >= 3 {
+        let generation = marker.generation.as_deref().ok_or_else(|| {
+            anyhow!(
+                "traces in-flight marker {expected_session_id}/{expected_attempt_id} schema {} has no writer generation; inspect it with `libra agent doctor` before retrying",
+                marker.schema_version
+            )
+        })?;
+        uuid::Uuid::parse_str(generation).map_err(|error| {
+            anyhow!(
+                "traces in-flight marker {expected_session_id}/{expected_attempt_id} has invalid writer generation '{generation}': {error}; inspect it with `libra agent doctor` before retrying"
+            )
+        })?;
+    }
+    for oid in &marker.oids {
+        ObjectHash::from_str(oid).map_err(|error| {
+            anyhow!(
+                "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid object id '{oid}': {error}; inspect it with `libra agent doctor` before retrying"
+            )
+        })?;
+    }
+    for oid in &marker.created_oids {
+        ObjectHash::from_str(oid).map_err(|error| {
+            anyhow!(
+                "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid created object id '{oid}': {error}; inspect it with `libra agent doctor` before retrying"
+            )
+        })?;
+    }
+    if let Some(commit) = marker.commit.as_deref() {
+        ObjectHash::from_str(commit).map_err(|error| {
+            anyhow!(
+                "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid commit id '{commit}': {error}; inspect it with `libra agent doctor` before retrying"
+            )
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_and_validate_traces_inflight_marker(
+    value: &str,
+    expected_session_id: &str,
+    expected_attempt_id: &str,
+) -> Result<TracesInflightMarker> {
+    let marker = serde_json::from_str::<TracesInflightMarker>(value).with_context(|| {
+        format!(
+            "decode traces in-flight marker for session {expected_session_id} attempt {expected_attempt_id}; inspect it with `libra agent doctor` before retrying"
+        )
+    })?;
+    validate_traces_inflight_marker(&marker, expected_session_id, expected_attempt_id)?;
+    Ok(marker)
+}
+
+/// Fence a stale writer marker without losing crash-recovery ownership.
+/// Empty attempts can be removed immediately; attempts that pre-registered
+/// any OID are promoted to a durable cleanup job for the normal reachability
+/// drain.
+pub async fn retire_stale_traces_inflight_marker<C: ConnectionTrait>(
+    conn: &C,
+    session_id: &str,
+    attempt_id: &str,
+) -> Result<()> {
+    let entry = crate::internal::metadata::MetadataKv::get_with_conn(
+        conn,
+        crate::internal::metadata::MetadataScope::AgentTracesInflight,
+        session_id,
+        attempt_id,
+    )
+    .await
+    .context("load stale traces writer marker")?;
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    let mut marker =
+        decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)?;
+    if marker.created_oids.is_empty() {
+        clear_traces_inflight_marker(conn, session_id, attempt_id).await?;
+    } else {
+        marker.schema_version = marker.schema_version.max(2);
+        marker.cleanup_pending = true;
+        write_traces_inflight_marker(conn, &marker)
+            .await
+            .context("promote stale traces marker to durable cleanup")?;
+    }
+    Ok(())
+}
+
+/// Expected coverage fence for fail-closed writer registration. Empty plans
+/// are valid for metadata/subagent checkpoints, but every claimed live/export
+/// turn must still be owned before any object is built.
+pub struct TracesCoverageFence<'a> {
+    pub logical_turn_key: &'a str,
+    pub owner: &'a str,
+    pub fence_token: i64,
+    pub reservation_state: &'a str,
+}
+
+/// Establish one writer attempt under the same SQLite writer lock used by
+/// erasure. The session/tombstone barrier and any coverage fences are checked
+/// in the marker transaction; a failed marker write aborts the checkpoint
+/// before loose objects or object-index tasks can exist.
+pub async fn register_traces_write_attempt(
+    conn: &DatabaseConnection,
+    marker: &TracesInflightMarker,
+    coverage_fences: &[TracesCoverageFence<'_>],
+) -> Result<()> {
+    let txn = conn
+        .begin()
+        .await
+        .context("begin traces writer-attempt registration")?;
+    let writable = txn
+        .query_one(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT 1 AS writable
+             FROM agent_session s
+             WHERE s.session_id = ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM agent_import_tombstone t
+                 WHERE t.agent_kind = s.agent_kind
+                   AND t.provider_session_id = s.provider_session_id
+               )",
+            [marker.session_id.clone().into()],
+        ))
+        .await
+        .context("verify traces writer session/tombstone barrier")?;
+    if writable.is_none() {
+        txn.rollback().await.ok();
+        bail!("agent session was erased or is unavailable for checkpoint writing");
+    }
+    for fence in coverage_fences {
+        let owned = txn
+            .query_one(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "SELECT 1 AS owned FROM agent_coverage_claim
+                 WHERE session_id = ? AND logical_turn_key = ?
+                   AND coverage_schema_version = 1 AND state = ?
+                   AND owner = ? AND fence_token = ?",
+                [
+                    marker.session_id.clone().into(),
+                    fence.logical_turn_key.into(),
+                    fence.reservation_state.into(),
+                    fence.owner.into(),
+                    fence.fence_token.into(),
+                ],
+            ))
+            .await
+            .context("verify traces writer coverage fence")?;
+        if owned.is_none() {
+            txn.rollback().await.ok();
+            bail!(
+                "coverage fence for turn '{}' is no longer owned; checkpoint write aborted",
+                fence.logical_turn_key
+            );
+        }
+    }
+    write_traces_inflight_marker(&txn, marker)
+        .await
+        .context("register traces writer marker")?;
+    txn.commit()
+        .await
+        .context("commit traces writer-attempt registration")?;
+    Ok(())
+}
+
 /// Upsert an in-flight marker row. Exported (not a stable API) so the
 /// writer, the prune side, and integration tests share one implementation.
 pub async fn write_traces_inflight_marker<C: ConnectionTrait>(
     conn: &C,
     marker: &TracesInflightMarker,
 ) -> Result<()> {
+    validate_traces_inflight_marker(marker, &marker.session_id, &marker.attempt_id)?;
     let value =
         serde_json::to_string(marker).context("failed to serialize traces in-flight marker")?;
     crate::internal::metadata::MetadataKv::set_with_conn(
@@ -2518,6 +5207,39 @@ pub async fn write_traces_inflight_marker<C: ConnectionTrait>(
     .await
     .context("failed to persist traces in-flight marker")?;
     Ok(())
+}
+
+/// Update an existing marker without allowing a stale writer to overwrite a
+/// replacement generation registered under the same stable metadata key.
+pub async fn update_traces_inflight_marker_if_generation<C: ConnectionTrait>(
+    conn: &C,
+    marker: &TracesInflightMarker,
+    expected_generation: &str,
+) -> Result<bool> {
+    validate_traces_inflight_marker(marker, &marker.session_id, &marker.attempt_id)?;
+    if marker.generation.as_deref() != Some(expected_generation) {
+        bail!("refusing to update a traces marker with a mismatched writer generation");
+    }
+    let value =
+        serde_json::to_string(marker).context("failed to serialize traces in-flight marker")?;
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "UPDATE metadata_kv
+             SET value = ?, value_type = 'text', updated_at = ?
+             WHERE scope = 'agent_traces_inflight' AND target = ? AND key = ?
+               AND json_extract(value, '$.generation') = ?",
+            [
+                value.into(),
+                chrono::Utc::now().to_rfc3339().into(),
+                marker.session_id.clone().into(),
+                marker.attempt_id.clone().into(),
+                expected_generation.into(),
+            ],
+        ))
+        .await
+        .context("failed to update exact traces writer generation")?;
+    Ok(result.rows_affected() == 1)
 }
 
 /// Remove one in-flight marker (stage (d) complete, or prune-side cleanup
@@ -2537,15 +5259,60 @@ pub async fn clear_traces_inflight_marker<C: ConnectionTrait>(
     .context("failed to clear traces in-flight marker")
 }
 
-/// List the LIVE (non-expired at `now_ms`) in-flight markers across all
-/// sessions — the prune-side entry point: any OID/commit named by a
-/// returned marker must be treated as reachable, and (fail-closed) a live
-/// marker for a session should defer pruning that session's chain.
+/// Remove one marker only when the metadata row still belongs to the exact
+/// writer generation that the caller registered.
+pub async fn clear_traces_inflight_marker_if_generation<C: ConnectionTrait>(
+    conn: &C,
+    session_id: &str,
+    attempt_id: &str,
+    generation: &str,
+) -> Result<bool> {
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "DELETE FROM metadata_kv
+             WHERE scope = 'agent_traces_inflight' AND target = ? AND key = ?
+               AND json_extract(value, '$.generation') = ?",
+            [session_id.into(), attempt_id.into(), generation.into()],
+        ))
+        .await
+        .context("failed to clear exact traces writer generation")?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Clear a writer marker only while it still represents an ordinary live
+/// attempt. Rejected-append cleanup upgrades the same row to
+/// `cleanup_pending`; error finalizers must never erase that durable job.
+pub async fn clear_non_cleanup_traces_inflight_marker<C: ConnectionTrait>(
+    conn: &C,
+    session_id: &str,
+    attempt_id: &str,
+    generation: &str,
+) -> Result<bool> {
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "DELETE FROM metadata_kv
+             WHERE scope = 'agent_traces_inflight' AND target = ? AND key = ?
+               AND json_extract(value, '$.generation') = ?
+               AND COALESCE(json_extract(value, '$.cleanup_pending'), 0) = 0",
+            [session_id.into(), attempt_id.into(), generation.into()],
+        ))
+        .await
+        .context("failed to clear exact ordinary traces writer generation")?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// List the LIVE (non-expired at `now_ms`) or durable cleanup-pending
+/// in-flight markers across all sessions — the prune-side entry point: any
+/// OID/commit named by a returned marker must be treated as reachable, and
+/// (fail-closed) either kind of marker for a session should defer pruning
+/// that session's chain. Cleanup ownership deliberately outlives the ordinary
+/// writer TTL until doctor/GC retires it.
 ///
-/// Rows whose JSON does not parse are skipped with a warning: a corrupt
-/// marker cannot name OIDs to protect and has no readable TTL, so keeping
-/// it would block pruning forever. The prune side's ref-vs-catalog
-/// comparison remains the primary defence (see [`TracesInflightMarker`]).
+/// Malformed rows fail the listing closed: their OID ownership and TTL cannot
+/// be trusted, so destructive prune/erasure must stop until
+/// `libra agent doctor` reports the row for manual recovery.
 pub async fn list_live_traces_inflight_markers<C: ConnectionTrait>(
     conn: &C,
     now_ms: i64,
@@ -2558,23 +5325,33 @@ pub async fn list_live_traces_inflight_markers<C: ConnectionTrait>(
     .context("failed to list traces in-flight markers")?;
     let mut live = Vec::new();
     for entry in entries {
-        match serde_json::from_str::<TracesInflightMarker>(&entry.value) {
+        match decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key) {
             Ok(marker) => {
-                if marker.is_live(now_ms) {
+                if marker.cleanup_pending || marker.is_live(now_ms) {
                     live.push(marker);
                 }
             }
-            Err(err) => {
-                tracing::warn!(
-                    session_id = %entry.target,
-                    attempt_id = %entry.key,
-                    error = %err,
-                    "skipping unparseable traces in-flight marker"
-                );
-            }
+            Err(err) => return Err(err),
         }
     }
     Ok(live)
+}
+
+async fn list_all_traces_inflight_markers<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<Vec<TracesInflightMarker>> {
+    let entries = crate::internal::metadata::MetadataKv::list_scope_with_conn(
+        conn,
+        crate::internal::metadata::MetadataScope::AgentTracesInflight,
+    )
+    .await
+    .context("failed to list traces in-flight markers")?;
+    entries
+        .into_iter()
+        .map(|entry| {
+            decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)
+        })
+        .collect()
 }
 
 /// Probe the checkpoint catalog by traces commit hash: returns the
@@ -2751,6 +5528,30 @@ mod tests {
     use tempfile::tempdir;
     use tokio::time::sleep;
 
+    #[test]
+    fn checkpoint_object_helper_rejects_compression_bomb_before_unbounded_inflate() {
+        let repo = tempdir().unwrap();
+        let oversized = vec![0_u8; CHECKPOINT_OBJECT_READ_MAX_INFLATED_BYTES as usize + 1];
+        let (oid, _) = write_git_object_with_status(repo.path(), "tree", &oversized).unwrap();
+        let request = CheckpointObjectIoHelperRequest {
+            repo_path_base64: encode_checkpoint_object_path(repo.path()).unwrap(),
+            operation: CheckpointObjectIoOperation::Read {
+                oid: oid.to_string(),
+                expected_type: "tree".to_string(),
+            },
+        };
+        let frame = serde_json::to_vec(&request).unwrap();
+        let response: CheckpointObjectIoHelperResponse =
+            serde_json::from_slice(&run_checkpoint_object_io_helper(&frame).unwrap()).unwrap();
+        let CheckpointObjectIoHelperResponse::Error { message } = response else {
+            panic!("oversized compressed object was accepted")
+        };
+        assert!(
+            message.contains("exceeding") && message.contains("checkpoint read limit"),
+            "unexpected oversized-object error: {message}"
+        );
+    }
+
     /// plan-20260713 DR-05c-0: the shared rebuild boundary classifies both
     /// auto-rebuildable scopes and fails closed on anything else.
     #[test]
@@ -2808,6 +5609,104 @@ mod tests {
 
     use super::*;
     use crate::{internal::db, utils::storage::local::LocalStorage};
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_index_snapshot_rejects_fifo_and_symlink_inputs_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+
+        let dir = tempdir().unwrap();
+        let fifo = dir.path().join("index-fifo");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_name is NUL-terminated inside this test's tempdir.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        let error = read_cleanup_regular_file(&fifo, 1024, 1024, "test cleanup index")
+            .expect_err("FIFO index must fail closed");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(format!("{error:#}").contains("not a regular file"));
+
+        let target = dir.path().join("real-index");
+        std::fs::write(&target, b"index").unwrap();
+        let symlink = dir.path().join("index-symlink");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+        let error = read_cleanup_regular_file(&symlink, 1024, 1024, "test cleanup index")
+            .expect_err("symlink index must fail closed");
+        assert!(format!("{error:#}").contains("without following symlinks"));
+    }
+
+    #[test]
+    fn cleanup_index_snapshot_rejects_growth_after_held_descriptor_metadata() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("growing-index");
+        std::fs::write(&path, b"1234").unwrap();
+        let path_for_hook = path.clone();
+        let error =
+            read_cleanup_regular_file_inner(&path, 4, 4, "test growing cleanup index", move || {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path_for_hook)
+                    .unwrap()
+                    .write_all(b"5")
+                    .unwrap();
+            })
+            .expect_err("post-metadata growth must fail closed");
+        assert!(format!("{error:#}").contains("grew beyond"));
+    }
+
+    #[test]
+    fn cleanup_helper_child_sleeper_process() {
+        if std::env::var_os("LIBRA_TEST_CLEANUP_HELPER_CHILD_SLEEPER").is_some() {
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cleanup_helper_guard_returns_promptly_and_reaps_repeated_timeouts() {
+        use std::sync::atomic::Ordering;
+
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let reaper = cleanup_helper_reaper_sender().expect("start cleanup child reaper");
+        let reaped_before = CLEANUP_HELPER_REAPED_CHILDREN.load(Ordering::SeqCst);
+        let mut pids = Vec::new();
+        for _ in 0..3 {
+            let child = Command::new(&executable)
+                .arg("cleanup_helper_child_sleeper_process")
+                .arg("--nocapture")
+                .env("LIBRA_TEST_CLEANUP_HELPER_CHILD_SLEEPER", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start sleeper child");
+            pids.push(child.id());
+            let guard = CleanupHelperChild::new(child, reaper.clone());
+            std::thread::sleep(Duration::from_millis(75));
+            let started = Instant::now();
+            drop(guard);
+            assert!(
+                started.elapsed() < Duration::from_millis(250),
+                "timeout cleanup blocked while waiting for a killed helper"
+            );
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let all_reaped = pids
+                .iter()
+                .all(|pid| !Path::new(&format!("/proc/{pid}")).exists());
+            let observed = CLEANUP_HELPER_REAPED_CHILDREN.load(Ordering::SeqCst);
+            if all_reaped && observed >= reaped_before + pids.len() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "killed cleanup helpers were not reaped before the test deadline"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     async fn setup_test_db() -> DatabaseConnection {
         let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -2994,12 +5893,14 @@ mod tests {
 
     fn checkpoint_params<'a>(
         checkpoint_id: &'a str,
+        marker_generation: &'a str,
         blobs: &'a RedactedBytes,
         txn_extra: Option<&'a dyn TracesTxnExtra>,
     ) -> CheckpointCommitParams<'a> {
         CheckpointCommitParams {
             checkpoint_id,
             session_id: "claude_code__s1",
+            marker_generation,
             agent_kind: "claude_code",
             parent_commit: None,
             scope: CheckpointScope::Committed,
@@ -3009,7 +5910,80 @@ mod tests {
             lifecycle_events_jsonl: blobs,
             redaction_report_json: blobs,
             txn_extra,
+            deadline: None,
         }
+    }
+
+    async fn prepare_checkpoint_test_schema(conn: &DatabaseConnection) {
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
+        ))
+        .await
+        .expect("create checkpoint marker registry");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TABLE IF NOT EXISTS agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)"
+                .to_string(),
+        ))
+        .await
+        .expect("create checkpoint cleanup catalog probe");
+    }
+
+    async fn seed_test_writer_fence(
+        conn: &DatabaseConnection,
+        session_id: &str,
+        attempt_id: &str,
+    ) -> TracesWriterFence {
+        let marker = TracesInflightMarker::new(
+            session_id,
+            attempt_id,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        write_traces_inflight_marker(conn, &marker)
+            .await
+            .expect("seed writer marker generation");
+        TracesWriterFence {
+            session_id: session_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            generation: marker.generation.expect("new marker generation"),
+        }
+    }
+
+    async fn append_test_checkpoint(
+        manager: &HistoryManager,
+        checkpoint_id: &str,
+        blobs: &RedactedBytes,
+        txn_extra: Option<&dyn TracesTxnExtra>,
+    ) -> Result<CheckpointCommit> {
+        let marker = TracesInflightMarker::new(
+            "claude_code__s1",
+            checkpoint_id,
+            chrono::Utc::now().timestamp_millis(),
+        );
+        write_traces_inflight_marker(manager.db_conn.as_ref(), &marker).await?;
+        let marker_generation = marker
+            .generation
+            .as_deref()
+            .context("new test marker has no writer generation")?;
+        let result = manager
+            .append_checkpoint_commit(checkpoint_params(
+                checkpoint_id,
+                marker_generation,
+                blobs,
+                txn_extra,
+            ))
+            .await;
+        if let Ok(written) = &result {
+            clear_traces_inflight_marker_if_generation(
+                manager.db_conn.as_ref(),
+                "claude_code__s1",
+                checkpoint_id,
+                &written.marker_generation,
+            )
+            .await?;
+        }
+        result
     }
 
     /// ref_cas_head_changed_rebuilds_commit_before_retry: a competing commit
@@ -3021,18 +5995,19 @@ mod tests {
     async fn ref_cas_head_changed_rebuilds_commit_before_retry() {
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
+        prepare_checkpoint_test_schema(&db_conn).await;
         let mut manager = traces_manager(&dir, db_conn.clone());
         let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
 
         // Seed head H0.
-        let seeded = manager
-            .append_checkpoint_commit(checkpoint_params(
-                "aaaa0000-0000-0000-0000-000000000001",
-                &blobs,
-                None,
-            ))
-            .await
-            .expect("seed checkpoint");
+        let seeded = append_test_checkpoint(
+            &manager,
+            "aaaa0000-0000-0000-0000-000000000001",
+            &blobs,
+            None,
+        )
+        .await
+        .expect("seed checkpoint");
         let h0 = seeded.commit_hash;
 
         // Competing writer, fired from INSIDE the tested append's
@@ -3054,27 +6029,27 @@ mod tests {
                         return Ok(()); // only the first attempt races
                     }
                     let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
-                    let won = interloper
-                        .append_checkpoint_commit(checkpoint_params(
-                            "bbbb0000-0000-0000-0000-000000000002",
-                            &blobs,
-                            None,
-                        ))
-                        .await?;
+                    let won = append_test_checkpoint(
+                        &interloper,
+                        "bbbb0000-0000-0000-0000-000000000002",
+                        &blobs,
+                        None,
+                    )
+                    .await?;
                     *interloper_commit.lock().unwrap() = Some(won.commit_hash);
                     Ok(())
                 })
             }));
         }
 
-        let rebuilt = manager
-            .append_checkpoint_commit(checkpoint_params(
-                "cccc0000-0000-0000-0000-000000000003",
-                &blobs,
-                None,
-            ))
-            .await
-            .expect("append survives the mid-window head move");
+        let rebuilt = append_test_checkpoint(
+            &manager,
+            "cccc0000-0000-0000-0000-000000000003",
+            &blobs,
+            None,
+        )
+        .await
+        .expect("append survives the mid-window head move");
         let h1 = interloper_commit
             .lock()
             .unwrap()
@@ -3141,31 +6116,32 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let db_conn = Arc::new(setup_test_db().await);
+        prepare_checkpoint_test_schema(&db_conn).await;
         let manager = traces_manager(&dir, db_conn.clone());
         let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
 
         // Seed head H0.
-        let seeded = manager
-            .append_checkpoint_commit(checkpoint_params(
-                "aaaa0000-0000-0000-0000-00000000000a",
-                &blobs,
-                None,
-            ))
-            .await
-            .expect("seed");
+        let seeded = append_test_checkpoint(
+            &manager,
+            "aaaa0000-0000-0000-0000-00000000000a",
+            &blobs,
+            None,
+        )
+        .await
+        .expect("seed");
         let h0 = seeded.commit_hash;
 
         // Failing extra: append errors, ref must NOT move (objects on disk
         // are the only residue — the documented GC-only window).
         let failing = FailingExtra;
-        let err = manager
-            .append_checkpoint_commit(checkpoint_params(
-                "bbbb0000-0000-0000-0000-00000000000b",
-                &blobs,
-                Some(&failing),
-            ))
-            .await
-            .expect_err("failing extra must fail the append closed");
+        let err = append_test_checkpoint(
+            &manager,
+            "bbbb0000-0000-0000-0000-00000000000b",
+            &blobs,
+            Some(&failing),
+        )
+        .await
+        .expect_err("failing extra must fail the append closed");
         assert!(
             format!("{err:#}").contains("simulated crash"),
             "got {err:#}"
@@ -3178,14 +6154,14 @@ mod tests {
 
         // Success path: ref + companion row land atomically.
         let marker = MarkerExtra;
-        let committed = manager
-            .append_checkpoint_commit(checkpoint_params(
-                "cccc0000-0000-0000-0000-00000000000c",
-                &blobs,
-                Some(&marker),
-            ))
-            .await
-            .expect("append with marker extra");
+        let committed = append_test_checkpoint(
+            &manager,
+            "cccc0000-0000-0000-0000-00000000000c",
+            &blobs,
+            Some(&marker),
+        )
+        .await
+        .expect("append with marker extra");
         assert_eq!(
             manager.resolve_history_head().await.unwrap().unwrap(),
             committed.commit_hash
@@ -3248,6 +6224,113 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_expired_writer_cannot_adopt_same_id_takeover_marker() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        prepare_checkpoint_test_schema(&db_conn).await;
+        let manager = traces_manager(&dir, db_conn.clone());
+        let marker = TracesInflightMarker::new("fenced-session", "fenced-attempt", 0);
+        write_traces_inflight_marker(&*db_conn, &marker)
+            .await
+            .expect("write expired writer marker");
+        let stale_fence = TracesWriterFence {
+            session_id: marker.session_id.clone(),
+            attempt_id: marker.attempt_id.clone(),
+            generation: marker.generation.clone().expect("stale marker generation"),
+        };
+        let replacement = TracesInflightMarker::new(
+            "fenced-session",
+            "fenced-attempt",
+            chrono::Utc::now().timestamp_millis(),
+        );
+        write_traces_inflight_marker(&*db_conn, &replacement)
+            .await
+            .expect("replace marker with takeover generation");
+        let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
+        let public_error = manager
+            .append_checkpoint_commit(CheckpointCommitParams {
+                checkpoint_id: "fenced-attempt",
+                session_id: "fenced-session",
+                marker_generation: &stale_fence.generation,
+                agent_kind: "claude_code",
+                parent_commit: None,
+                scope: CheckpointScope::Subagent,
+                tool_use_id: None,
+                metadata_json: &blobs,
+                transcript_redacted: &blobs,
+                lifecycle_events_jsonl: &blobs,
+                redaction_report_json: &blobs,
+                txn_extra: None,
+                deadline: None,
+            })
+            .await
+            .expect_err("public append must not adopt a takeover marker generation");
+        assert!(
+            format!("{public_error:#}").contains("fenced or replaced before append"),
+            "unexpected error: {public_error:#}"
+        );
+        let public_fence = manager
+            .load_traces_writer_fence("fenced-session", "fenced-attempt")
+            .await
+            .expect("load takeover writer fence after rejected public append");
+        assert_eq!(
+            public_fence.generation,
+            replacement
+                .generation
+                .as_deref()
+                .expect("takeover marker generation"),
+            "stale public append mutated the takeover marker"
+        );
+        let new_head = write_git_object(&manager.repo_path, "blob", b"stalled writer commit")
+            .expect("write stalled writer object");
+
+        let preclaim_error = manager
+            .persist_attempt_oid_before_write(&stale_fence, &new_head, None)
+            .await
+            .expect_err("replacement generation must fence stale object preclaims");
+        assert!(
+            format!("{preclaim_error:#}").contains("generation was fenced or replaced"),
+            "unexpected error: {preclaim_error:#}"
+        );
+        let current_fence = manager
+            .load_traces_writer_fence("fenced-session", "fenced-attempt")
+            .await
+            .expect("load takeover writer fence after rejected preclaim");
+        assert_eq!(
+            current_fence.generation,
+            replacement
+                .generation
+                .as_deref()
+                .expect("takeover marker generation"),
+            "stale object preclaim mutated the takeover marker"
+        );
+
+        let error = manager
+            .update_ref_if_matches_with_extra(
+                crate::internal::branch::TRACES_BRANCH,
+                None,
+                new_head,
+                None,
+                None,
+                Some(&stale_fence),
+            )
+            .await
+            .expect_err("replacement generation must fence a resumed writer");
+        assert!(
+            format!("{error:#}").contains("generation was fenced or replaced"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            manager
+                .resolve_history_head()
+                .await
+                .expect("read traces head")
+                .is_none(),
+            "fenced writer moved the traces ref"
         );
     }
 
@@ -3376,7 +6459,744 @@ mod tests {
         assert_eq!(back.session_id, "session-a");
         assert_eq!(back.attempt_id, "attempt-1");
         assert_eq!(back.ttl_ms, AGENT_TRACES_INFLIGHT_TTL_MS);
+        assert_eq!(back.schema_version, 3);
+        assert!(
+            back.generation
+                .as_deref()
+                .is_some_and(|generation| uuid::Uuid::parse_str(generation).is_ok())
+        );
         assert!(back.commit.is_none());
         assert!(back.oids.is_empty());
+        assert!(back.created_oids.is_empty());
+        assert!(!back.cleanup_pending);
+    }
+
+    #[tokio::test]
+    async fn rejected_cleanup_job_survives_an_unrelated_live_writer() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
+            ))
+            .await
+            .expect("create marker registry");
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
+            ))
+            .await
+            .expect("create cleanup catalog probe");
+        let manager = traces_manager(&dir, db_conn.clone());
+        let active = TracesInflightMarker::new(
+            "session-active",
+            "attempt-active",
+            chrono::Utc::now().timestamp_millis(),
+        );
+        write_traces_inflight_marker(&*db_conn, &active)
+            .await
+            .expect("write unrelated active marker");
+
+        let (oid, created) = write_git_object_with_status(
+            &dir.path().join(".libra"),
+            "blob",
+            b"rejected-cleanup-candidate",
+        )
+        .expect("write cleanup candidate");
+        assert!(created);
+        let candidates = HashSet::from([oid.to_string()]);
+        let rejected_fence =
+            seed_test_writer_fence(&db_conn, "session-rejected", "attempt-rejected").await;
+        manager
+            .cleanup_rejected_checkpoint_objects(&rejected_fence, &candidates)
+            .await
+            .expect("live peer should defer, not discard, cleanup");
+        let markers = list_all_traces_inflight_markers(&*db_conn)
+            .await
+            .expect("list durable cleanup markers");
+        let pending = markers
+            .iter()
+            .find(|marker| marker.attempt_id == "attempt-rejected")
+            .expect("cleanup job must remain durable");
+        assert!(pending.cleanup_pending);
+        assert_eq!(pending.created_oids, vec![oid.to_string()]);
+        let object_path = dir
+            .path()
+            .join(".libra/objects")
+            .join(&oid.to_string()[..2])
+            .join(&oid.to_string()[2..]);
+        assert!(object_path.exists(), "live peer must defer deletion");
+
+        let mut expired = active;
+        expired.started_at_ms = 0;
+        expired.ttl_ms = 0;
+        write_traces_inflight_marker(&*db_conn, &expired)
+            .await
+            .expect("expire unrelated marker");
+        manager
+            .drain_rejected_checkpoint_cleanup_jobs()
+            .await
+            .expect("drain persisted cleanup after live peer exits");
+        assert!(
+            object_path.exists(),
+            "inline cleanup must leave shared object reclamation to repository GC"
+        );
+        assert!(
+            list_all_traces_inflight_markers(&*db_conn)
+                .await
+                .expect("list post-drain markers")
+                .iter()
+                .all(|marker| marker.attempt_id != "attempt-rejected"),
+            "cleanup ownership marker survived successful drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_cleanup_never_deletes_an_unresolved_preclaim() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        prepare_checkpoint_test_schema(&db_conn).await;
+        let manager = traces_manager(&dir, db_conn.clone());
+        let (oid, created) = write_git_object_with_status(
+            &manager.repo_path,
+            "blob",
+            b"published by a concurrent writer",
+        )
+        .expect("write concurrent object");
+        assert!(created);
+
+        let mut marker = TracesInflightMarker::new("preclaim-session", "preclaim-attempt", 0);
+        marker.ttl_ms = 0;
+        marker.oids.push(oid.to_string());
+        write_traces_inflight_marker(&*db_conn, &marker)
+            .await
+            .expect("write unresolved preclaim marker");
+
+        manager
+            .drain_rejected_checkpoint_cleanup_jobs()
+            .await
+            .expect("retire unresolved preclaim without deleting payload");
+        let oid_text = oid.to_string();
+        assert!(
+            manager
+                .repo_path
+                .join("objects")
+                .join(&oid_text[..2])
+                .join(&oid_text[2..])
+                .exists(),
+            "an unresolved preclaim deleted an object that may belong to another writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_cleanup_preserves_reflog_only_root() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        prepare_checkpoint_test_schema(&db_conn).await;
+        let manager = traces_manager(&dir, db_conn.clone());
+        let (candidate, created) =
+            write_git_object_with_status(&manager.repo_path, "blob", b"reflog-only root")
+                .expect("write reflog candidate");
+        assert!(created);
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                "CREATE TABLE reflog (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ref_name TEXT NOT NULL, old_oid TEXT NOT NULL,
+                    new_oid TEXT NOT NULL, timestamp INTEGER NOT NULL,
+                    committer_name TEXT NOT NULL, committer_email TEXT NOT NULL,
+                    action TEXT NOT NULL, message TEXT NOT NULL,
+                    worktree_id TEXT
+                 )"
+                .to_string(),
+            ))
+            .await
+            .expect("create reflog root table");
+        db_conn
+            .execute(Statement::from_sql_and_values(
+                db_conn.get_database_backend(),
+                "INSERT INTO reflog (
+                    ref_name, old_oid, new_oid, timestamp, committer_name,
+                    committer_email, action, message, worktree_id
+                 ) VALUES ('HEAD', ?, ?, 0, 'Libra', 'history@libra',
+                           'test', 'protect candidate', NULL)",
+                [
+                    candidate.to_string().into(),
+                    "0000000000000000000000000000000000000000".into(),
+                ],
+            ))
+            .await
+            .expect("seed reflog-only root");
+
+        let reflog_fence =
+            seed_test_writer_fence(&db_conn, "reflog-session", "reflog-attempt").await;
+        manager
+            .cleanup_rejected_checkpoint_objects(
+                &reflog_fence,
+                &HashSet::from([candidate.to_string()]),
+            )
+            .await
+            .expect("cleanup with reflog root");
+        manager
+            .drain_rejected_checkpoint_cleanup_jobs()
+            .await
+            .expect("drain reflog-root cleanup job");
+        assert!(
+            list_all_traces_inflight_markers(&*db_conn)
+                .await
+                .expect("list reflog cleanup markers")
+                .iter()
+                .all(|marker| marker.attempt_id != "reflog-attempt")
+        );
+        let candidate = candidate.to_string();
+        assert!(
+            manager
+                .repo_path
+                .join("objects")
+                .join(&candidate[..2])
+                .join(&candidate[2..])
+                .exists(),
+            "reflog-only candidate was deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_cleanup_preserves_worktree_index_only_root() {
+        use git_internal::internal::index::{Index, IndexEntry};
+
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        prepare_checkpoint_test_schema(&db_conn).await;
+        let index_fence = seed_test_writer_fence(&db_conn, "index-session", "index-attempt").await;
+        let manager = traces_manager(&dir, db_conn.clone());
+        let (candidate, created) =
+            write_git_object_with_status(&manager.repo_path, "blob", b"index-only root")
+                .expect("write index candidate");
+        assert!(created);
+        let mut index = Index::new();
+        index.add(IndexEntry::new_from_blob(
+            "staged.txt".to_string(),
+            candidate,
+            15,
+        ));
+        index
+            .save(manager.repo_path.join("index"))
+            .expect("write worktree index");
+
+        manager
+            .cleanup_rejected_checkpoint_objects(
+                &index_fence,
+                &HashSet::from([candidate.to_string()]),
+            )
+            .await
+            .expect("cleanup with index root");
+        manager
+            .drain_rejected_checkpoint_cleanup_jobs()
+            .await
+            .expect("drain index-root cleanup job");
+        assert!(
+            list_all_traces_inflight_markers(&*db_conn)
+                .await
+                .expect("list index cleanup markers")
+                .iter()
+                .all(|marker| marker.attempt_id != "index-attempt")
+        );
+        let candidate = candidate.to_string();
+        assert!(
+            manager
+                .repo_path
+                .join("objects")
+                .join(&candidate[..2])
+                .join(&candidate[2..])
+                .exists(),
+            "index-only candidate was deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_cleanup_rejects_malformed_durable_object_ids_without_panicking() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
+            ))
+            .await
+            .expect("create marker registry");
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
+            ))
+            .await
+            .expect("create cleanup catalog probe");
+        db_conn
+            .execute(Statement::from_sql_and_values(
+                db_conn.get_database_backend(),
+                "INSERT INTO metadata_kv (
+                    scope, target, `key`, value, value_type, created_at, updated_at
+                 ) VALUES ('agent_traces_inflight', ?, ?, ?, 'text', 0, 0)",
+                [
+                    "damaged-session".into(),
+                    "damaged-attempt".into(),
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "session_id": "damaged-session",
+                        "attempt_id": "damaged-attempt",
+                        "started_at_ms": 0,
+                        "ttl_ms": 0,
+                        "oids": ["a"],
+                        "cleanup_pending": true,
+                    })
+                    .to_string()
+                    .into(),
+                ],
+            ))
+            .await
+            .expect("seed malformed durable cleanup marker");
+
+        let error = traces_manager(&dir, db_conn)
+            .drain_rejected_checkpoint_cleanup_jobs()
+            .await
+            .expect_err("malformed cleanup marker must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid object id"), "{message}");
+        assert!(message.contains("libra agent doctor"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn expired_empty_marker_is_reaped_without_ref_traversal() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
+            ))
+            .await
+            .expect("create marker registry");
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
+            ))
+            .await
+            .expect("create cleanup catalog probe");
+        let marker = TracesInflightMarker::new("expired-session", "expired-attempt", 0);
+        write_traces_inflight_marker(&*db_conn, &marker)
+            .await
+            .expect("seed expired empty marker");
+        let manager = traces_manager(&dir, db_conn.clone());
+
+        assert!(
+            manager
+                .repair_expired_traces_inflight_marker(
+                    "expired-session",
+                    "expired-attempt",
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await
+                .expect("repair expired empty marker")
+        );
+        assert!(
+            list_all_traces_inflight_markers(&*db_conn)
+                .await
+                .expect("list markers after repair")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_ref_defers_rejected_cleanup_and_preserves_ownership() {
+        use std::io::Write as _;
+
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
+            ))
+            .await
+            .expect("create marker registry");
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
+            ))
+            .await
+            .expect("create cleanup catalog probe");
+        let repo_path = dir.path().join(".libra");
+        let (candidate, _) = write_git_object_with_status(
+            &repo_path,
+            "blob",
+            b"candidate held while a ref is corrupt",
+        )
+        .expect("write cleanup candidate");
+
+        let corrupt_oid = git_object_hash("blob", b"expected bytes");
+        let corrupt_text = corrupt_oid.to_string();
+        let corrupt_path = repo_path
+            .join("objects")
+            .join(&corrupt_text[..2])
+            .join(&corrupt_text[2..]);
+        std::fs::create_dir_all(corrupt_path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&corrupt_path).unwrap();
+        let mut encoder = flate2::write::ZlibEncoder::new(file, flate2::Compression::default());
+        encoder.write_all(b"blob 15\0different bytes").unwrap();
+        encoder.finish().unwrap();
+        db_conn
+            .execute(Statement::from_sql_and_values(
+                db_conn.get_database_backend(),
+                "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
+                 VALUES ('broken-ref', 'Branch', ?, NULL, NULL)",
+                [corrupt_text.into()],
+            ))
+            .await
+            .expect("seed corrupt ref");
+
+        let manager = traces_manager(&dir, db_conn.clone());
+        let deferred_fence =
+            seed_test_writer_fence(&db_conn, "deferred-session", "deferred-attempt").await;
+        manager
+            .cleanup_rejected_checkpoint_objects(
+                &deferred_fence,
+                &HashSet::from([candidate.to_string()]),
+            )
+            .await
+            .expect("ordinary append cleanup should defer a corrupt unrelated ref");
+        let pending = list_all_traces_inflight_markers(&*db_conn)
+            .await
+            .expect("list deferred marker");
+        assert!(
+            pending.iter().any(|marker| {
+                marker.attempt_id == "deferred-attempt" && marker.cleanup_pending
+            })
+        );
+        assert!(
+            repo_path
+                .join("objects")
+                .join(&candidate.to_string()[..2])
+                .join(&candidate.to_string()[2..])
+                .exists(),
+            "fail-closed cleanup deleted a candidate"
+        );
+        let error = manager
+            .drain_rejected_checkpoint_cleanup_jobs()
+            .await
+            .expect_err("destructive cleanup must fail closed on a corrupt ref");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("failed integrity check") && rendered.contains("payload hashes to"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    struct SlowBoundedStorage;
+
+    #[async_trait::async_trait]
+    impl Storage for SlowBoundedStorage {
+        async fn get(
+            &self,
+            _hash: &ObjectHash,
+        ) -> std::result::Result<(Vec<u8>, ObjectType), git_internal::errors::GitError> {
+            Err(git_internal::errors::GitError::InvalidObjectInfo(
+                "unused slow storage read".to_string(),
+            ))
+        }
+
+        async fn get_with_limit(
+            &self,
+            _hash: &ObjectHash,
+            _limit: u64,
+        ) -> std::result::Result<(Vec<u8>, ObjectType), git_internal::errors::GitError> {
+            sleep(Duration::from_secs(5)).await;
+            Err(git_internal::errors::GitError::InvalidObjectInfo(
+                "slow storage read completed unexpectedly".to_string(),
+            ))
+        }
+
+        async fn put(
+            &self,
+            hash: &ObjectHash,
+            _data: &[u8],
+            _obj_type: ObjectType,
+        ) -> std::result::Result<String, git_internal::errors::GitError> {
+            Ok(hash.to_string())
+        }
+
+        async fn exist(&self, _hash: &ObjectHash) -> bool {
+            false
+        }
+
+        async fn search(&self, _prefix: &str) -> Vec<ObjectHash> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_reachability_read_is_bounded() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        let manager = traces_manager(&dir, db_conn.clone());
+        let root = write_git_object(&manager.repo_path, "blob", &[b'x'; 128])
+            .expect("write oversized ref root");
+        let error = manager
+            .reachable_rejected_objects_with_limit(vec![root], &HashSet::new(), 32)
+            .await
+            .expect_err("bounded reachability must reject an oversized root");
+        assert!(
+            format!("{error:#}").contains("exceeds preview limit of 32 bytes"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_reachability_deadline_interrupts_one_slow_storage_read() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        let manager = HistoryManager::new_with_ref(
+            Arc::new(SlowBoundedStorage),
+            dir.path().join(".libra"),
+            db_conn,
+            crate::internal::branch::TRACES_BRANCH,
+        );
+        let root = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+            .expect("valid test oid");
+        let started = Instant::now();
+        let error = manager
+            .reachable_rejected_objects_with_limits(
+                vec![root],
+                &HashSet::new(),
+                1024,
+                10,
+                Instant::now() + Duration::from_millis(25),
+            )
+            .await
+            .expect_err("slow individual read must honor the traversal deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "one storage read escaped the traversal deadline"
+        );
+        assert!(
+            format!("{error:#}").contains("traversal deadline"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_reachability_production_client_rejects_fifo_without_blocking() {
+        use std::{ffi::CString, io::Write as _, os::unix::ffi::OsStrExt as _};
+
+        use crate::utils::client_storage::ClientStorage;
+
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path().join(".libra");
+        let objects_dir = repo_path.join("objects");
+        let root = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
+            .expect("valid FIFO object id");
+        let root_text = root.to_string();
+        let shard = objects_dir.join(&root_text[..2]);
+        std::fs::create_dir_all(&shard).expect("create FIFO object shard");
+        let fifo = shard.join(&root_text[2..]);
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+        // SAFETY: fifo_name is NUL-terminated and points to a path owned by
+        // this test's temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        // Release the intentionally blocked local read after the deadline
+        // assertion. This lets Tokio's cancelled spawn_blocking task finish so
+        // the test runtime can shut down cleanly.
+        let release_fifo = fifo.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let mut writer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(release_fifo)
+                .expect("open self-held FIFO writer after reader blocks or rejects the FIFO");
+            writer.write_all(b"not-zlib").expect("release FIFO reader");
+        });
+        let db_conn = Arc::new(setup_test_db().await);
+        let manager = HistoryManager::new_with_ref(
+            Arc::new(ClientStorage::init(objects_dir)),
+            repo_path,
+            db_conn,
+            crate::internal::branch::TRACES_BRANCH,
+        );
+        let started = Instant::now();
+        let error = manager
+            .reachable_rejected_objects_with_limits(
+                vec![root],
+                &HashSet::new(),
+                1024,
+                10,
+                Instant::now() + Duration::from_millis(25),
+            )
+            .await
+            .expect_err("production ClientStorage must reject a non-regular loose object");
+        let elapsed = started.elapsed();
+        release.join().expect("join FIFO release writer");
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "ClientStorage blocked while rejecting a FIFO for {elapsed:?}"
+        );
+        assert!(
+            format!("{error:#}").contains("is not a regular file"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_reachability_reads_bounded_objects_from_alternates() {
+        let dir = tempdir().unwrap();
+        let repo_path = dir.path().join(".libra");
+        let objects_dir = repo_path.join("objects");
+        std::fs::create_dir_all(objects_dir.join("info")).unwrap();
+
+        let alternate_repo = dir.path().join("alternate");
+        std::fs::create_dir_all(&alternate_repo).unwrap();
+        let root = write_git_object(&alternate_repo, "blob", b"alternate root")
+            .expect("write alternate-only ref root");
+        let alternate_objects = alternate_repo.join("objects");
+        std::fs::write(
+            objects_dir.join("info/alternates"),
+            format!("{}\n", alternate_objects.display()),
+        )
+        .expect("configure alternate object store");
+
+        let storage = Arc::new(LocalStorage::new_with_alternates(objects_dir));
+        let db_conn = Arc::new(setup_test_db().await);
+        let manager = HistoryManager::new_with_ref(
+            storage,
+            repo_path,
+            db_conn,
+            crate::internal::branch::TRACES_BRANCH,
+        );
+        let reachable = manager
+            .reachable_rejected_objects_with_limit(
+                vec![root],
+                &HashSet::from([root.to_string()]),
+                1024,
+            )
+            .await
+            .expect("bounded alternate read should prove reachability");
+        assert_eq!(reachable, HashSet::from([root.to_string()]));
+    }
+
+    #[tokio::test]
+    async fn rejected_reachability_total_work_is_bounded() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        let manager = traces_manager(&dir, db_conn.clone());
+        let first = write_git_object(&manager.repo_path, "blob", b"first").unwrap();
+        let second = write_git_object(&manager.repo_path, "blob", b"second").unwrap();
+
+        let count_error = manager
+            .reachable_rejected_objects_with_limits(
+                vec![first, second],
+                &HashSet::new(),
+                1024,
+                1,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect_err("visited-object cap must fail closed");
+        assert!(
+            format!("{count_error:#}").contains("1 object traversal limit"),
+            "unexpected error: {count_error:#}"
+        );
+
+        let deadline_error = manager
+            .reachable_rejected_objects_with_limits(
+                vec![first],
+                &HashSet::new(),
+                1024,
+                10,
+                Instant::now(),
+            )
+            .await
+            .expect_err("expired traversal deadline must fail closed");
+        assert!(
+            format!("{deadline_error:#}").contains("traversal deadline"),
+            "unexpected error: {deadline_error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_cleanup_preserves_candidates_reachable_only_from_annotated_tag() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                include_str!("../../../sql/migrations/2026070201_metadata_kv.sql").to_string(),
+            ))
+            .await
+            .expect("create marker registry");
+        db_conn
+            .execute(Statement::from_string(
+                db_conn.get_database_backend(),
+                "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)".to_string(),
+            ))
+            .await
+            .expect("create cleanup catalog probe");
+        let repo_path = dir.path().join(".libra");
+        let (candidate, created) = write_git_object_with_status(
+            &repo_path,
+            "blob",
+            b"candidate preserved by annotated tag",
+        )
+        .expect("write tagged cleanup candidate");
+        assert!(created);
+        let tag_data = format!(
+            "object {candidate}\ntype blob\ntag keep-candidate\ntagger Libra <history@libra> 0 +0000\n\nkeep\n"
+        );
+        let tag = write_git_object(&repo_path, "tag", tag_data.as_bytes())
+            .expect("write annotated tag object");
+        db_conn
+            .execute(Statement::from_sql_and_values(
+                db_conn.get_database_backend(),
+                "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
+                 VALUES ('keep-candidate', 'Tag', ?, NULL, NULL)",
+                [tag.to_string().into()],
+            ))
+            .await
+            .expect("seed annotated tag ref");
+
+        let tag_fence = seed_test_writer_fence(&db_conn, "tag-session", "tag-attempt").await;
+        let manager = traces_manager(&dir, db_conn.clone());
+        manager
+            .cleanup_rejected_checkpoint_objects(
+                &tag_fence,
+                &HashSet::from([candidate.to_string()]),
+            )
+            .await
+            .expect("annotated tag reachability should protect candidate");
+        manager
+            .drain_rejected_checkpoint_cleanup_jobs()
+            .await
+            .expect("drain annotated-tag cleanup job");
+        assert!(
+            list_all_traces_inflight_markers(&*db_conn)
+                .await
+                .expect("list annotated-tag cleanup markers")
+                .iter()
+                .all(|marker| marker.attempt_id != "tag-attempt")
+        );
+        let candidate_string = candidate.to_string();
+        assert!(
+            repo_path
+                .join("objects")
+                .join(&candidate_string[..2])
+                .join(&candidate_string[2..])
+                .exists(),
+            "candidate reachable only through an annotated tag was deleted"
+        );
     }
 }

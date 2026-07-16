@@ -17,7 +17,10 @@ use std::{
 use libra::{
     internal::{
         ai::{
-            history::{CheckpointCommitParams, CheckpointScope, HistoryManager},
+            history::{
+                CheckpointCommitParams, CheckpointScope, HistoryManager, TracesInflightMarker,
+                clear_traces_inflight_marker_if_generation, write_traces_inflight_marker,
+            },
             observed_agents::Redactor,
         },
         branch::{Branch as InternalBranch, TRACES_BRANCH},
@@ -208,10 +211,19 @@ async fn seed_checkpoint_commit(
     let (meta_redacted, _) = redactor.redact(metadata.as_bytes());
     let (events_redacted, _) = redactor.redact(b"{}\n");
     let (report_redacted, _) = redactor.redact(b"{}");
+    let marker = TracesInflightMarker::new(
+        session_id,
+        checkpoint_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    write_traces_inflight_marker(conn, &marker)
+        .await
+        .expect("register seeded checkpoint writer marker");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id,
             session_id,
+            marker_generation: marker.generation.as_deref().expect("new marker generation"),
             agent_kind: "claude_code",
             parent_commit: None,
             scope,
@@ -221,6 +233,7 @@ async fn seed_checkpoint_commit(
             lifecycle_events_jsonl: &events_redacted,
             redaction_report_json: &report_redacted,
             txn_extra: None,
+            deadline: None,
         })
         .await
         .expect("append checkpoint commit");
@@ -243,6 +256,14 @@ async fn seed_checkpoint_commit(
     ))
     .await
     .expect("insert agent_checkpoint");
+    clear_traces_inflight_marker_if_generation(
+        conn,
+        session_id,
+        checkpoint_id,
+        &written.marker_generation,
+    )
+    .await
+    .expect("retire seeded checkpoint writer marker");
 
     written.commit_hash.to_string()
 }

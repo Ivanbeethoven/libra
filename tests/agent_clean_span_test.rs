@@ -16,7 +16,10 @@ use std::sync::{Arc, Mutex};
 
 use libra::{
     internal::ai::{
-        history::{CheckpointCommitParams, CheckpointScope, HistoryManager},
+        history::{
+            CheckpointCommitParams, CheckpointScope, HistoryManager, TracesInflightMarker,
+            clear_traces_inflight_marker_if_generation, register_traces_write_attempt,
+        },
         observed_agents::Redactor,
     },
     utils::client_storage::ClientStorage,
@@ -92,6 +95,14 @@ async fn seed_temporary_checkpoint(
         libra::internal::branch::TRACES_BRANCH,
     );
     let redactor = Redactor::new_default();
+    let marker = TracesInflightMarker::new(
+        "span-session",
+        checkpoint_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    register_traces_write_attempt(conn, &marker, &[])
+        .await
+        .expect("register checkpoint writer marker");
     let (redacted, _) = redactor.redact(b"transcript for the prune span test");
     let (meta_redacted, _) = redactor.redact(br#"{"checkpoint_id":"span"}"#);
     let (events_redacted, _) = redactor.redact(b"{}\n");
@@ -100,6 +111,7 @@ async fn seed_temporary_checkpoint(
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id,
             session_id: "span-session",
+            marker_generation: marker.generation.as_deref().expect("new marker generation"),
             agent_kind: "claude_code",
             parent_commit: None,
             scope: CheckpointScope::Temporary,
@@ -109,6 +121,7 @@ async fn seed_temporary_checkpoint(
             lifecycle_events_jsonl: &events_redacted,
             redaction_report_json: &report_redacted,
             txn_extra: None,
+            deadline: None,
         })
         .await
         .expect("append temporary checkpoint commit");
@@ -128,6 +141,14 @@ async fn seed_temporary_checkpoint(
     ))
     .await
     .expect("insert agent_checkpoint row");
+    clear_traces_inflight_marker_if_generation(
+        conn,
+        "span-session",
+        checkpoint_id,
+        &written.marker_generation,
+    )
+    .await
+    .expect("retire checkpoint writer marker");
 }
 
 /// A prune that removes a temporary checkpoint emits one

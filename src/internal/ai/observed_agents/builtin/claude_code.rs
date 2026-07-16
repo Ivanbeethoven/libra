@@ -10,6 +10,8 @@
 //! are kept (they're typically session-meta records that pre-date the
 //! first message, so dropping them would lose context).
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -438,10 +440,7 @@ pub enum FlushOutcome {
 
 /// Does the file currently end in a complete JSONL record (trailing
 /// newline + parseable last line)?
-fn tail_is_complete(path: &Path) -> bool {
-    tail_is_complete_with_limit(path, FLUSH_TAIL_PROBE_BYTES)
-}
-
+#[cfg(test)]
 fn tail_is_complete_with_limit(path: &Path, max_probe_bytes: u64) -> bool {
     if max_probe_bytes == 0 {
         return false;
@@ -449,6 +448,14 @@ fn tail_is_complete_with_limit(path: &Path, max_probe_bytes: u64) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
+    tail_is_complete_reader_with_limit(&mut file, max_probe_bytes)
+}
+
+fn tail_is_complete_reader(file: &mut fs::File) -> bool {
+    tail_is_complete_reader_with_limit(file, FLUSH_TAIL_PROBE_BYTES)
+}
+
+fn tail_is_complete_reader_with_limit(file: &mut fs::File, max_probe_bytes: u64) -> bool {
     let Ok(len) = file.metadata().map(|meta| meta.len()) else {
         return false;
     };
@@ -484,11 +491,20 @@ fn tail_is_complete_with_limit(path: &Path, max_probe_bytes: u64) -> bool {
     serde_json::from_slice::<serde_json::Value>(last_line).is_ok()
 }
 
+/// Path-based compatibility helper retained for focused DR-01 tests. The
+/// production resolver calls [`flush_wait_file`] with its pinned descriptor.
+pub fn flush_wait(path: &Path, budget: Duration, poll: Duration) -> FlushOutcome {
+    let Ok(file) = fs::File::open(path) else {
+        return FlushOutcome::Settled;
+    };
+    flush_wait_file(&file, budget, poll)
+}
+
 /// Bounded synchronous wait for Claude's async JSONL flush to settle
 /// (plan-20260713 DR-01). Never fails the caller: the outcome is
 /// diagnostic-only, and reads proceed regardless.
-pub fn flush_wait(path: &Path, budget: Duration, poll: Duration) -> FlushOutcome {
-    let Ok(meta) = fs::symlink_metadata(path) else {
+pub fn flush_wait_file(file: &fs::File, budget: Duration, poll: Duration) -> FlushOutcome {
+    let Ok(meta) = file.metadata() else {
         return FlushOutcome::Settled; // absent: nothing to wait for
     };
     // Stale-mtime short-circuit: a transcript untouched for a while is not
@@ -504,7 +520,7 @@ pub fn flush_wait(path: &Path, budget: Duration, poll: Duration) -> FlushOutcome
     let deadline = Instant::now() + budget;
     let mut last_snapshot = None;
     loop {
-        let Ok(current) = fs::metadata(path) else {
+        let Ok(current) = file.metadata() else {
             return FlushOutcome::Settled;
         };
         if current.len() > MAX_TRANSCRIPT_BYTES {
@@ -513,7 +529,11 @@ pub fn flush_wait(path: &Path, budget: Duration, poll: Duration) -> FlushOutcome
             return FlushOutcome::Settled;
         }
         let snapshot = (current.len(), current.modified().ok());
-        if last_snapshot.as_ref() != Some(&snapshot) && tail_is_complete(path) {
+        let tail_complete = file
+            .try_clone()
+            .ok()
+            .is_some_and(|mut probe| tail_is_complete_reader(&mut probe));
+        if last_snapshot.as_ref() != Some(&snapshot) && tail_complete {
             return FlushOutcome::Settled;
         }
         last_snapshot = Some(snapshot);
@@ -528,16 +548,23 @@ impl TranscriptPreparer for ClaudeCodeObservedAgent {
     /// DR-01: bounded flush-wait before the seam opens the transcript.
     /// Always `Ok` — a budget-exhausted tail is read anyway and its final
     /// turn parses `incomplete` (upgradeable later; ADR-DR-07).
-    fn prepare_transcript(&self, session: &AgentSessionCtx) -> Result<()> {
-        if let Some(path) = session.transcript_path.as_deref() {
-            let outcome = flush_wait(path, FLUSH_WAIT_BUDGET, FLUSH_POLL_INTERVAL);
-            if outcome == FlushOutcome::BudgetExhausted {
-                tracing::warn!(
-                    session_id = %session.session_id,
-                    "transcript flush-wait budget exhausted; reading a possibly \
-                     in-flight tail (final turn will parse incomplete)"
-                );
-            }
+    fn prepare_transcript(
+        &self,
+        session: &AgentSessionCtx,
+        file: &fs::File,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let budget = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(FLUSH_WAIT_BUDGET)
+            .min(FLUSH_WAIT_BUDGET);
+        let outcome = flush_wait_file(file, budget, FLUSH_POLL_INTERVAL);
+        if outcome == FlushOutcome::BudgetExhausted {
+            tracing::warn!(
+                session_id = %session.session_id,
+                "transcript flush-wait budget exhausted; reading a possibly \
+                 in-flight tail (final turn will parse incomplete)"
+            );
         }
         Ok(())
     }
@@ -594,33 +621,35 @@ pub fn resolve_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathB
         return Ok(None);
     };
     let candidate = dir.join(format!("{session_id}.jsonl"));
-    let meta = match fs::symlink_metadata(&candidate) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).context("stat candidate Claude session file");
-        }
+    let adapter = ClaudeCodeObservedAgent::new();
+    let Some(directory) =
+        super::super::transcript_source::open_provider_directory_for_discovery(&adapter, &dir)?
+    else {
+        return Ok(None);
     };
-    if meta.file_type().is_symlink() {
-        return Err(anyhow!(
-            "refusing symlinked Claude session file (fail-closed)"
-        ));
+    #[cfg(target_os = "linux")]
+    let pinned_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let pinned_path = PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd()));
+    #[cfg(not(unix))]
+    let pinned_path = dir.clone();
+    let expected_name = format!("{session_id}.jsonl");
+    for entry in fs::read_dir(pinned_path).context("read pinned Claude session directory")? {
+        let entry = entry.context("read pinned Claude session directory entry")?;
+        if entry.file_name() != std::ffi::OsStr::new(&expected_name) {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .context("inspect pinned Claude session source type")?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Err(anyhow!(
+                "refusing non-regular or symlinked Claude session file (fail-closed)"
+            ));
+        }
+        return Ok(Some(candidate));
     }
-    // Containment: the resolved file must stay under the projects root
-    // (defense against slug/`..` surprises; reads still go through the
-    // provider-root seam).
-    let projects_root = claude_home()
-        .map(|home| home.join(".claude").join("projects"))
-        .and_then(|root| root.canonicalize().ok());
-    let canonical = candidate
-        .canonicalize()
-        .context("canonicalize candidate Claude session file")?;
-    match projects_root {
-        Some(root) if canonical.starts_with(&root) => Ok(Some(candidate)),
-        _ => Err(anyhow!(
-            "Claude session file escapes the projects root (fail-closed)"
-        )),
-    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -705,6 +734,24 @@ mod tests {
                 resolve_session_file(cwd, "abcdef00-0000-0000-0000-000000000001").is_err(),
                 "symlink must be rejected"
             );
+
+            // A symlinked project directory is rejected before even probing
+            // the selected filename outside the provider root.
+            std::fs::remove_file(&link).unwrap();
+            std::fs::remove_file(&file).unwrap();
+            std::fs::remove_dir(&dir).unwrap();
+            let outside_dir = home.path().join("outside-project");
+            std::fs::create_dir(&outside_dir).unwrap();
+            std::fs::write(
+                outside_dir.join("abcdef00-0000-0000-0000-000000000002.jsonl"),
+                "{}\n",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(&outside_dir, &dir).unwrap();
+            assert!(
+                resolve_session_file(cwd, "abcdef00-0000-0000-0000-000000000002").is_err(),
+                "symlinked project directory must be rejected"
+            );
         }
     }
 
@@ -788,6 +835,28 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "stale file must not wait"
+        );
+    }
+
+    #[test]
+    fn transcript_preparer_respects_expired_import_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inflight.jsonl");
+        std::fs::write(&path, "{\"type\":\"assistant\",\"partial\"").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let session = AgentSessionCtx {
+            session_id: "claude_code__deadline".to_string(),
+            provider_session_id: "deadline".to_string(),
+            working_dir: dir.path().to_path_buf(),
+            transcript_path: Some(path),
+        };
+        let started = Instant::now();
+        ClaudeCodeObservedAgent::new()
+            .prepare_transcript(&session, &file, Some(Instant::now()))
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "an expired historical-import deadline must skip the 2s flush wait"
         );
     }
 

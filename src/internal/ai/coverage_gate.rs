@@ -19,15 +19,24 @@
 //! Failure policy (ADR-DR-10): any DB error here fails the checkpoint write
 //! *closed* — the caller must not append to `refs/libra/traces` without a
 //! reservation, and a commit-time fence mismatch rolls the whole final
-//! transaction back (ref update included).
+//! transaction back (ref update included). A transient SQLite writer-lock
+//! race is reported as an in-flight skip so the caller emits the same
+//! replayable diagnostic as an explicit foreign reservation.
+
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, DatabaseTransaction, Statement, TransactionTrait,
+};
 
 use crate::internal::ai::{
     history::{TracesCommitCtx, TracesTxnExtra},
-    observed_agents::{COVERAGE_SCHEMA_VERSION, Completeness, NormalizedTurn},
+    observed_agents::{
+        COVERAGE_SCHEMA_VERSION, Completeness, NormalizedTurn, canonical_turn_bytes,
+        redact_turns_with_report,
+    },
 };
 
 /// Live reservation lease length. Generous relative to a single hook write
@@ -82,6 +91,7 @@ struct ExistingClaim {
     state: String,
     lease_expires_at: Option<i64>,
     fence_token: Option<i64>,
+    checkpoint_id: Option<String>,
 }
 
 async fn read_claim(
@@ -93,7 +103,7 @@ async fn read_claim(
         .query_one(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT coverage_digest, completeness, revision, state,
-                    lease_expires_at, fence_token
+                    lease_expires_at, fence_token, checkpoint_id
              FROM agent_coverage_claim
              WHERE session_id = ? AND logical_turn_key = ?
                AND coverage_schema_version = ?",
@@ -115,6 +125,7 @@ async fn read_claim(
         state: row.try_get_by("state")?,
         lease_expires_at: row.try_get_by("lease_expires_at")?,
         fence_token: row.try_get_by("fence_token")?,
+        checkpoint_id: row.try_get_by("checkpoint_id")?,
     }))
 }
 
@@ -143,6 +154,7 @@ async fn try_insert_fresh_claim(
     source_channel: &'static str,
 ) -> Result<Option<ReservedTurnClaim>> {
     let lease_expires_at = lease_deadline(now_ms)?;
+    let reservation_state = reservation_state(source_channel)?;
     let result = conn
         .execute(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -151,7 +163,7 @@ async fn try_insert_fresh_claim(
                 coverage_digest, completeness, revision, state,
                 owner, lease_expires_at, fence_token, source_channel,
                 created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 0, 'reserved_live', ?, ?, 1, ?, ?, ?)
+             ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, 1, ?, ?, ?)
              ON CONFLICT(session_id, logical_turn_key, coverage_schema_version)
              DO NOTHING",
             [
@@ -160,6 +172,7 @@ async fn try_insert_fresh_claim(
                 COVERAGE_SCHEMA_VERSION.into(),
                 digest.into(),
                 turn.completeness.as_db_str().into(),
+                reservation_state.into(),
                 owner.into(),
                 lease_expires_at.into(),
                 source_channel.into(),
@@ -204,17 +217,19 @@ async fn try_reown_claim(
         .context("coverage claim fence token overflow")?;
     let lease_expires_at = lease_deadline(now_ms)?;
     let expected_fence_value: sea_orm::Value = expected_fence.into();
+    let reservation_state = reservation_state(source_channel)?;
     let result = conn
         .execute(Statement::from_sql_and_values(
             conn.get_database_backend(),
             "UPDATE agent_coverage_claim
-             SET state = 'reserved_live', owner = ?, lease_expires_at = ?,
+             SET state = ?, owner = ?, lease_expires_at = ?,
                  fence_token = ?, coverage_digest = ?, completeness = ?,
                  source_channel = ?, updated_at = ?
              WHERE session_id = ? AND logical_turn_key = ?
                AND coverage_schema_version = ?
                AND state = ? AND fence_token IS ?",
             [
+                reservation_state.into(),
                 owner.into(),
                 lease_expires_at.into(),
                 new_fence.into(),
@@ -238,15 +253,35 @@ async fn try_reown_claim(
     }
 }
 
+fn reservation_state(source_channel: &str) -> Result<&'static str> {
+    match source_channel {
+        "import" => Ok("reserved_import"),
+        "live" | "export" => Ok("reserved_live"),
+        other => bail!("unsupported coverage source channel '{other}'"),
+    }
+}
+
 /// Mark a committed-complete-vs-different-complete collision `conflicted`
 /// (ADR-DR-09: never silently overwrite committed complete content).
 async fn try_mark_conflicted(
     conn: &impl ConnectionTrait,
     session_id: &str,
     logical_turn_key: &str,
-    expected_digest: &str,
+    incumbent: &ExistingClaim,
+    incoming_turn: &NormalizedTurn,
+    incoming_source_channel: &'static str,
     now_ms: i64,
-) -> Result<bool> {
+) -> Result<ConflictMarkOutcome> {
+    let mut sanitized_turn = incoming_turn.clone();
+    let redaction_report = redact_turns_with_report(std::slice::from_mut(&mut sanitized_turn));
+    let incoming_digest = sanitized_turn.digest_hex();
+    if incoming_digest == incumbent.coverage_digest {
+        return Ok(ConflictMarkOutcome::EquivalentAfterRedaction);
+    }
+    let incoming_canonical_json = String::from_utf8(canonical_turn_bytes(&sanitized_turn.records))
+        .context("coverage conflict canonical evidence is not UTF-8")?;
+    let incoming_redaction_report_json = serde_json::to_string(&redaction_report)
+        .context("serialize coverage conflict redaction report")?;
     let result = conn
         .execute(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -260,12 +295,46 @@ async fn try_mark_conflicted(
                 session_id.into(),
                 logical_turn_key.into(),
                 COVERAGE_SCHEMA_VERSION.into(),
-                expected_digest.into(),
+                incumbent.coverage_digest.clone().into(),
             ],
         ))
         .await
         .context("mark agent_coverage_claim conflicted")?;
-    Ok(result.rows_affected() == 1)
+    if result.rows_affected() != 1 {
+        return Ok(ConflictMarkOutcome::LostRace);
+    }
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_coverage_conflict (
+            session_id, logical_turn_key, coverage_schema_version,
+            incumbent_revision, incumbent_digest, incumbent_checkpoint_id,
+            incoming_digest, incoming_source_channel, incoming_observed_at,
+            incoming_canonical_json, incoming_redaction_report_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, logical_turn_key, coverage_schema_version) DO NOTHING",
+        [
+            session_id.into(),
+            logical_turn_key.into(),
+            COVERAGE_SCHEMA_VERSION.into(),
+            incumbent.revision.into(),
+            incumbent.coverage_digest.clone().into(),
+            incumbent.checkpoint_id.clone().into(),
+            incoming_digest.into(),
+            incoming_source_channel.into(),
+            now_ms.into(),
+            incoming_canonical_json.into(),
+            incoming_redaction_report_json.into(),
+        ],
+    ))
+    .await
+    .context("persist sanitized coverage conflict challenger")?;
+    Ok(ConflictMarkOutcome::Marked)
+}
+
+enum ConflictMarkOutcome {
+    Marked,
+    EquivalentAfterRedaction,
+    LostRace,
 }
 
 /// Reserve the turns of one live snapshot (ADR-DR-09 arbitration). Bounded:
@@ -293,15 +362,157 @@ pub async fn reserve_turn_claims_for_channel(
     now_ms: i64,
     source_channel: &'static str,
 ) -> Result<LiveReservationOutcome> {
+    let outcome = reserve_turn_claims_for_channel_inner(
+        conn,
+        session_id,
+        turns,
+        owner,
+        now_ms,
+        source_channel,
+        None,
+    )
+    .await;
+    match outcome {
+        Err(error) if is_sqlite_busy(&error) => Ok(LiveReservationOutcome {
+            skipped_inflight: turns.len(),
+            ..LiveReservationOutcome::default()
+        }),
+        outcome => outcome,
+    }
+}
+
+fn is_sqlite_busy(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database schema is locked")
+        || message.contains("database table is locked")
+        || message.contains("database is busy")
+        || message.contains("sqlite_busy")
+}
+
+/// Release every still-owned, uncommitted reservation after a writer aborts
+/// before object construction. Fence tokens advance so a cancelled attempt
+/// cannot later reuse its stale plan.
+pub async fn abandon_reserved_turn_claims(
+    conn: &DatabaseConnection,
+    session_id: &str,
+    owner: &str,
+    source_channel: &'static str,
+    now_ms: i64,
+) -> Result<()> {
+    let state = reservation_state(source_channel)?;
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "UPDATE agent_coverage_claim
+         SET state = 'abandoned', owner = NULL, lease_expires_at = NULL,
+             attempt_checkpoint_id = NULL,
+             fence_token = COALESCE(fence_token, 0) + 1, updated_at = ?
+         WHERE session_id = ? AND state = ? AND owner = ?",
+        [now_ms.into(), session_id.into(), state.into(), owner.into()],
+    ))
+    .await
+    .context("abandon coverage reservations for aborted checkpoint writer")?;
+    Ok(())
+}
+
+pub(crate) async fn reserve_import_turn_claims_until(
+    conn: &DatabaseConnection,
+    session_id: &str,
+    turns: &[NormalizedTurn],
+    owner: &str,
+    now_ms: i64,
+    deadline: Instant,
+) -> Result<LiveReservationOutcome> {
+    // Bound SQLite writer-lock residency and re-establish the tombstone
+    // barrier between batches. Earlier batches remain explicitly owned and
+    // are abandoned by the importer if a later batch reaches the deadline.
+    const IMPORT_RESERVATION_BATCH_TURNS: usize = 64;
+    let mut aggregate = LiveReservationOutcome::default();
+    for batch in turns.chunks(IMPORT_RESERVATION_BATCH_TURNS) {
+        if Instant::now() >= deadline {
+            bail!("historical import coverage reservation exceeded its execution deadline");
+        }
+        let outcome = reserve_turn_claims_for_channel_inner(
+            conn,
+            session_id,
+            batch,
+            owner,
+            now_ms,
+            "import",
+            Some(deadline),
+        )
+        .await?;
+        if cfg!(debug_assertions)
+            && let Ok(value) = std::env::var("LIBRA_TEST_IMPORT_RESERVATION_BATCH_DELAY_MS")
+            && let Ok(delay_ms) = value.parse::<u64>()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        aggregate.reserved.extend(outcome.reserved);
+        aggregate.skipped_covered = aggregate
+            .skipped_covered
+            .saturating_add(outcome.skipped_covered);
+        aggregate.skipped_inflight = aggregate
+            .skipped_inflight
+            .saturating_add(outcome.skipped_inflight);
+        aggregate.conflicted = aggregate.conflicted.saturating_add(outcome.conflicted);
+    }
+    Ok(aggregate)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reserve_turn_claims_for_channel_inner(
+    conn: &DatabaseConnection,
+    session_id: &str,
+    turns: &[NormalizedTurn],
+    owner: &str,
+    now_ms: i64,
+    source_channel: &'static str,
+    deadline: Option<Instant>,
+) -> Result<LiveReservationOutcome> {
+    // ADR-DR-19: reserve the complete snapshot under one SQLite writer
+    // transaction and establish the tombstone barrier before any claim
+    // mutation. This closes both fresh-INSERT and re-own races with erasure.
+    let txn = conn
+        .begin()
+        .await
+        .context("begin coverage reservation transaction")?;
+    let writable = txn
+        .query_one(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT 1 AS writable
+             FROM agent_session s
+             WHERE s.session_id = ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM agent_import_tombstone t
+                 WHERE t.agent_kind = s.agent_kind
+                   AND t.provider_session_id = s.provider_session_id
+               )",
+            [session_id.into()],
+        ))
+        .await
+        .context("verify coverage reservation tombstone barrier")?;
+    if writable.is_none() {
+        txn.rollback().await.ok();
+        bail!("agent session was erased or is unavailable for coverage reservation");
+    }
     let mut outcome = LiveReservationOutcome::default();
     for turn in turns {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            txn.rollback().await.ok();
+            bail!("historical import coverage reservation exceeded its execution deadline");
+        }
         let digest = turn.digest_hex();
         let mut rounds = 0;
         loop {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                txn.rollback().await.ok();
+                bail!("historical import coverage reservation exceeded its execution deadline");
+            }
             rounds += 1;
-            let existing = read_claim(conn, session_id, &turn.logical_turn_key).await?;
+            let existing = read_claim(&txn, session_id, &turn.logical_turn_key).await?;
             let decision = decide_and_attempt(
-                conn,
+                &txn,
                 session_id,
                 turn,
                 &digest,
@@ -339,6 +550,13 @@ pub async fn reserve_turn_claims_for_channel(
             }
         }
     }
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        txn.rollback().await.ok();
+        bail!("historical import coverage reservation exceeded its execution deadline");
+    }
+    txn.commit()
+        .await
+        .context("commit coverage reservation transaction")?;
     Ok(outcome)
 }
 
@@ -352,7 +570,7 @@ enum AttemptOutcome {
 
 #[allow(clippy::too_many_arguments)]
 async fn decide_and_attempt(
-    conn: &DatabaseConnection,
+    conn: &impl ConnectionTrait,
     session_id: &str,
     turn: &NormalizedTurn,
     digest: &str,
@@ -382,8 +600,13 @@ async fn decide_and_attempt(
 
     match existing.state.as_str() {
         "catalog_committed" => {
-            if existing.coverage_digest == digest {
-                // Byte-identical content (any completeness): pure no-op.
+            let completeness_upgrade = existing.completeness == "incomplete"
+                && turn.completeness == Completeness::Complete;
+            if existing.coverage_digest == digest && !completeness_upgrade {
+                // Equivalent content/completeness is a pure no-op. Terminal
+                // evidence is deliberately outside the semantic digest, so a
+                // same-digest incomplete -> complete transition must still
+                // advance the revision and session lifecycle.
                 return Ok(AttemptOutcome::SkipCovered);
             }
             match (existing.completeness.as_str(), turn.completeness) {
@@ -416,18 +639,22 @@ async fn decide_and_attempt(
                 }
                 ("complete", Completeness::Complete) => {
                     // complete → different complete: never auto-overwrite.
-                    let marked = try_mark_conflicted(
+                    let conflict = try_mark_conflicted(
                         conn,
                         session_id,
                         &turn.logical_turn_key,
-                        &existing.coverage_digest,
+                        &existing,
+                        turn,
+                        source_channel,
                         now_ms,
                     )
                     .await?;
-                    Ok(if marked {
-                        AttemptOutcome::Conflicted
-                    } else {
-                        AttemptOutcome::LostRace
+                    Ok(match conflict {
+                        ConflictMarkOutcome::Marked => AttemptOutcome::Conflicted,
+                        ConflictMarkOutcome::EquivalentAfterRedaction => {
+                            AttemptOutcome::SkipCovered
+                        }
+                        ConflictMarkOutcome::LostRace => AttemptOutcome::LostRace,
                     })
                 }
                 // A (different) incomplete snapshot never downgrades or
@@ -440,7 +667,14 @@ async fn decide_and_attempt(
         }
         "reserved_live" | "reserved_import" => {
             let lease_live = existing.lease_expires_at.is_some_and(|t| t > now_ms);
-            if lease_live {
+            // A live hook/export writer may preempt an import reservation
+            // before the import has committed the traces ref (ADR-DR-09).
+            // The conditional re-own increments the fence so the stale import
+            // holder cannot later update ref/claim/identity. Import never
+            // preempts a live writer.
+            let live_preempts_import =
+                existing.state == "reserved_import" && matches!(source_channel, "live" | "export");
+            if lease_live && !live_preempts_import {
                 return Ok(AttemptOutcome::SkipInflight);
             }
             // Expired lease: fenced takeover (stale holder's later writes
@@ -513,11 +747,179 @@ pub struct LiveClaimCommitPlan {
     pub created_at: i64,
     pub now_ms: i64,
     pub claims: Vec<ReservedTurnClaim>,
+    /// Import-only session lifecycle/ownership update, committed with the
+    /// first visible checkpoint instead of during lease acquisition.
+    pub import_session: Option<ImportSessionCommit>,
+    /// Import-only identity cursor/fence update. `None` for live/export.
+    pub import_identity: Option<ImportIdentityCommit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportSessionCommit {
+    pub working_dir: String,
+    pub state: String,
+    pub started_at: i64,
+    pub last_event_at: i64,
+    pub stopped_at: Option<i64>,
+    pub ownership_metadata_json: String,
+    /// Import-scoped typed-field redaction summary, merged into the existing
+    /// session report without discarding live-hook evidence.
+    pub redaction_report_json: String,
+}
+
+pub(crate) async fn merge_import_session_lifecycle(
+    txn: &DatabaseTransaction,
+    session_id: &str,
+    session: &ImportSessionCommit,
+) -> Result<()> {
+    let updated = txn
+        .execute(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "UPDATE agent_session
+             SET working_dir = ?,
+                 started_at = MIN(started_at, ?),
+                 state = CASE
+                   WHEN state = 'quarantined' THEN state
+                   WHEN ? < last_event_at THEN state
+                   ELSE ?
+                 END,
+                 last_event_at = MAX(last_event_at, ?),
+                 stopped_at = CASE
+                   WHEN ? < last_event_at THEN stopped_at
+                   WHEN ? IS NULL THEN NULL
+                   WHEN stopped_at IS NULL THEN ?
+                   ELSE MAX(stopped_at, ?)
+                 END,
+                 metadata_json = json_patch(metadata_json, ?),
+                 redaction_report = json_patch(redaction_report, ?)
+             WHERE session_id = ?",
+            [
+                session.working_dir.clone().into(),
+                session.started_at.into(),
+                session.last_event_at.into(),
+                session.state.clone().into(),
+                session.last_event_at.into(),
+                session.last_event_at.into(),
+                session.stopped_at.into(),
+                session.stopped_at.into(),
+                session.stopped_at.into(),
+                session.ownership_metadata_json.clone().into(),
+                session.redaction_report_json.clone().into(),
+                session_id.into(),
+            ],
+        ))
+        .await
+        .context("commit imported session lifecycle")?;
+    if updated.rows_affected() != 1 {
+        bail!("imported agent session disappeared before lifecycle commit");
+    }
+    Ok(())
+}
+
+/// Import-job state advanced in the same transaction as ref/catalog/claims.
+#[derive(Debug, Clone)]
+pub struct ImportIdentityCommit {
+    pub identity_id: String,
+    pub observed_digest: String,
+    pub owner: String,
+    pub fence_token: i64,
+    pub next_ordinal: i64,
+    pub final_turn: bool,
 }
 
 #[async_trait]
 impl TracesTxnExtra for LiveClaimCommitPlan {
     async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()> {
+        // ADR-DR-19: tombstone is the final transactional write barrier for
+        // every gated writer. It is checked after object construction but in
+        // the SAME transaction as the ref CAS; an erase that wins first makes
+        // this transaction fail before the ref/catalog can advance.
+        let writable = txn
+            .query_one(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "SELECT 1 AS writable
+                 FROM agent_session s
+                 WHERE s.session_id = ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM agent_import_tombstone t
+                     WHERE t.agent_kind = s.agent_kind
+                       AND t.provider_session_id = s.provider_session_id
+                   )",
+                [self.session_id.clone().into()],
+            ))
+            .await
+            .context("verify agent-session tombstone write barrier")?;
+        if writable.is_none() {
+            bail!(
+                "agent session was erased or tombstoned while the checkpoint was in flight; \
+                 rolling back the checkpoint transaction"
+            );
+        }
+
+        if let Some(session) = &self.import_session {
+            merge_import_session_lifecycle(txn, &self.session_id, session).await?;
+        }
+
+        if let Some(identity) = &self.import_identity {
+            let state = if identity.final_turn {
+                "committed"
+            } else {
+                "writing"
+            };
+            let committed_digest: sea_orm::Value = if identity.final_turn {
+                Some(identity.observed_digest.clone()).into()
+            } else {
+                None::<String>.into()
+            };
+            let retained_owner: sea_orm::Value = if identity.final_turn {
+                None::<String>.into()
+            } else {
+                Some(identity.owner.clone()).into()
+            };
+            let retained_lease: sea_orm::Value = if identity.final_turn {
+                None::<i64>.into()
+            } else {
+                Some(
+                    self.now_ms
+                        .checked_add(LIVE_LEASE_MS)
+                        .context("import identity lease timestamp overflow")?,
+                )
+                .into()
+            };
+            let advanced = txn
+                .execute(Statement::from_sql_and_values(
+                    txn.get_database_backend(),
+                    "UPDATE agent_import_identity
+                     SET state = ?, observed_digest = ?,
+                         committed_digest = COALESCE(?, committed_digest),
+                         next_ordinal = ?, attempt_checkpoint_id = ?,
+                         owner = ?, lease_expires_at = ?, updated_at = ?
+                     WHERE identity_id = ? AND owner = ? AND fence_token = ?
+                       AND state IN ('leased','writing')",
+                    [
+                        state.into(),
+                        identity.observed_digest.clone().into(),
+                        committed_digest,
+                        identity.next_ordinal.into(),
+                        self.checkpoint_id.clone().into(),
+                        retained_owner,
+                        retained_lease,
+                        self.now_ms.into(),
+                        identity.identity_id.clone().into(),
+                        identity.owner.clone().into(),
+                        identity.fence_token.into(),
+                    ],
+                ))
+                .await
+                .context("advance agent_import_identity in ref transaction")?;
+            if advanced.rows_affected() != 1 {
+                bail!(
+                    "import identity lease was fenced out while committing turn; \
+                     rolling back checkpoint transaction"
+                );
+            }
+        }
+
         // Catalog row first (claim advance references checkpoint_id). The
         // `ON CONFLICT DO NOTHING` backstop keeps a crash-retry idempotent —
         // but within one transaction the row is always fresh.
@@ -578,7 +980,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
                          owner = NULL, lease_expires_at = NULL, updated_at = ?
                      WHERE session_id = ? AND logical_turn_key = ?
                        AND coverage_schema_version = ?
-                       AND state = 'reserved_live'
+                       AND state = ?
                        AND owner = ? AND fence_token = ?",
                     [
                         claim.next_revision.into(),
@@ -590,6 +992,7 @@ impl TracesTxnExtra for LiveClaimCommitPlan {
                         self.session_id.clone().into(),
                         claim.logical_turn_key.clone().into(),
                         COVERAGE_SCHEMA_VERSION.into(),
+                        reservation_state(self.source_channel)?.into(),
                         self.owner.clone().into(),
                         claim.fence_token.into(),
                     ],
@@ -672,6 +1075,8 @@ mod tests {
             logical_turn_key: key.to_string(),
             ordinal: 0,
             completeness,
+            started_at: None,
+            ended_at: None,
             records: vec![SemanticRecord::User {
                 text: text.to_string(),
             }],
@@ -706,19 +1111,6 @@ mod tests {
         checkpoint_id: &str,
     ) -> Result<()> {
         let txn = sea_orm::TransactionTrait::begin(conn).await?;
-        txn.execute(Statement::from_sql_and_values(
-            txn.get_database_backend(),
-            "INSERT OR IGNORE INTO agent_checkpoint (
-                checkpoint_id, session_id, scope, parent_commit, tree_oid,
-                metadata_blob_oid, traces_commit, created_at
-             ) VALUES (?, ?, 'committed', NULL, 't', 'm', ?, 0)",
-            [
-                checkpoint_id.into(),
-                session_id.into(),
-                format!("commit-{checkpoint_id}").into(),
-            ],
-        ))
-        .await?;
         let plan = LiveClaimCommitPlan {
             source_channel: "live",
             session_id: session_id.to_string(),
@@ -728,6 +1120,8 @@ mod tests {
             created_at: 0,
             now_ms: 1,
             claims: vec![claim.clone()],
+            import_session: None,
+            import_identity: None,
         };
         let ctx = TracesCommitCtx {
             commit_hash: format!("commit-{checkpoint_id}"),
@@ -780,6 +1174,45 @@ mod tests {
         let (state, revision, _) = claim_row(&conn, "u1").await;
         assert_eq!(state, "catalog_committed");
         assert_eq!(revision, 1);
+    }
+
+    #[tokio::test]
+    async fn tombstone_blocks_reservation_and_fences_reserved_commit() {
+        let conn = gate_db().await;
+        let session = "claude_code__s1";
+        let t = turn("erase-turn", "hi", Completeness::Complete);
+        let reserved =
+            reserve_live_turn_claims(&conn, session, std::slice::from_ref(&t), "stale", 0)
+                .await
+                .expect("initial reservation");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "INSERT INTO agent_import_tombstone (
+                tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
+             ) VALUES ('t-coverage', 'claude_code', 's1', 'claude_code__s1', 1)"
+                .to_string(),
+        ))
+        .await
+        .expect("seed tombstone");
+
+        let error = commit_reserved(&conn, session, "stale", &reserved.reserved[0], "cp-erased")
+            .await
+            .expect_err("final transaction must observe tombstone");
+        assert!(error.to_string().contains("tombstoned"));
+        let error = reserve_live_turn_claims(&conn, session, &[t], "new", 2)
+            .await
+            .expect_err("new reservation must observe tombstone");
+        assert!(error.to_string().contains("erased"));
+        let row = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT COUNT(*) AS n FROM agent_checkpoint WHERE checkpoint_id = 'cp-erased'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get_by::<i64, _>("n").unwrap(), 0);
     }
 
     /// live_takeover_increments_fence_and_blocks_(import|stale)_ref_cas:
@@ -885,15 +1318,100 @@ mod tests {
 
         // Reordered/rewritten source: same logical key, different complete
         // content.
-        let reordered = turn("ordinal:0", "second", Completeness::Complete);
-        let outcome = reserve_live_turn_claims(&conn, session, &[reordered], "w2", 1_000)
-            .await
-            .expect("reserve conflict");
+        let secret_key = "AKIAIOSFODNN7EXAMPLE";
+        let secret_value = format!("sk-ant-{}", "a".repeat(40));
+        let mut secret_input = std::collections::BTreeMap::new();
+        secret_input.insert(
+            secret_key.to_string(),
+            crate::internal::ai::observed_agents::CanonValue::Str(secret_value.clone()),
+        );
+        let reordered = NormalizedTurn {
+            logical_turn_key: "ordinal:0".to_string(),
+            ordinal: 0,
+            completeness: Completeness::Complete,
+            started_at: None,
+            ended_at: None,
+            records: vec![SemanticRecord::ToolCall {
+                call_id: Some("call-2".to_string()),
+                input: crate::internal::ai::observed_agents::CanonValue::Object(secret_input),
+                name: "inspect".to_string(),
+            }],
+        };
+        let outcome = reserve_live_turn_claims(
+            &conn,
+            session,
+            std::slice::from_ref(&reordered),
+            "w2",
+            1_000,
+        )
+        .await
+        .expect("reserve conflict");
         assert!(outcome.reserved.is_empty());
         assert_eq!(outcome.conflicted, 1);
         let (state, revision, _) = claim_row(&conn, "ordinal:0").await;
         assert_eq!(state, "conflicted");
         assert_eq!(revision, 1, "committed revision is preserved for doctor");
+        let conflict = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT incumbent_revision, incumbent_digest, incoming_digest,
+                        incoming_source_channel, incoming_canonical_json,
+                        incoming_redaction_report_json
+                 FROM agent_coverage_conflict"
+                    .to_string(),
+            ))
+            .await
+            .expect("query conflict evidence")
+            .expect("conflict evidence row");
+        assert_eq!(
+            conflict.try_get_by::<i64, _>("incumbent_revision").unwrap(),
+            1
+        );
+        let mut expected = reordered.clone();
+        let expected_report = redact_turns_with_report(std::slice::from_mut(&mut expected));
+        let incoming_digest = conflict.try_get_by::<String, _>("incoming_digest").unwrap();
+        assert_eq!(incoming_digest, expected.digest_hex());
+        assert_eq!(
+            conflict
+                .try_get_by::<String, _>("incoming_source_channel")
+                .unwrap(),
+            "live"
+        );
+        let canonical = conflict
+            .try_get_by::<String, _>("incoming_canonical_json")
+            .unwrap();
+        assert!(!canonical.contains(secret_key));
+        assert!(!canonical.contains(&secret_value));
+        assert!(canonical.contains("redacted-key-sha256-"));
+        assert!(canonical.contains("<REDACTED:anthropic-api-key>"));
+        assert_eq!(
+            canonical.as_bytes(),
+            canonical_turn_bytes(&expected.records),
+            "stored candidate must be the exact sanitized payload hashed by the digest"
+        );
+        let stored_report: serde_json::Value = serde_json::from_str(
+            &conflict
+                .try_get_by::<String, _>("incoming_redaction_report_json")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            stored_report,
+            serde_json::to_value(&expected_report).unwrap()
+        );
+        assert!(expected_report.bytes_redacted > 0);
+        assert!(
+            expected_report
+                .matches
+                .iter()
+                .any(|entry| entry.rule_id == "aws-access-key-id")
+        );
+        assert!(
+            expected_report
+                .matches
+                .iter()
+                .any(|entry| entry.rule_id == "anthropic-api-key")
+        );
     }
 
     /// shared_live_snapshot_upgrade_keeps_other_turns_visible (claim level):

@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use super::capability::{
     DeclaredAgentCaps, HookResponseWriter, ModelExtractor, PromptExtractor, SkillEventExtractor,
@@ -25,7 +26,7 @@ use crate::internal::ai::hooks::provider::HookProvider;
 /// (`libra agent enable claude-code`, …) and to a column value in
 /// `agent_session.agent_kind`. Adding a new agent requires a v2 plan and a
 /// migration touching the CHECK constraint on that column.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentKind {
     ClaudeCode,
     Cursor,

@@ -25,7 +25,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -431,6 +431,16 @@ impl ClientStorage {
         ClientStorage { storage, base_path }
     }
 
+    /// Construct a local backend without touching the filesystem.
+    ///
+    /// Historical import uses this after consent: all repository object I/O
+    /// is delegated to deadline-bound helpers, so even object-directory
+    /// creation must not occur synchronously on the foreground thread.
+    pub fn init_local_existing(base_path: PathBuf) -> ClientStorage {
+        let storage = Arc::new(LocalStorage::open_no_create(base_path.clone()));
+        ClientStorage { storage, base_path }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_storage(storage: Arc<dyn Storage>, base_path: PathBuf) -> Self {
         Self { storage, base_path }
@@ -747,6 +757,26 @@ impl ClientStorage {
                 tracing::info!("Waiting for {} background tasks to complete...", pending);
                 waited = 0;
             }
+        }
+    }
+
+    /// Asynchronously wait for the object-index queue without allowing a
+    /// foreground operation to block forever behind a wedged consumer.
+    pub async fn wait_for_background_tasks_until(deadline: Instant) -> bool {
+        loop {
+            if PENDING_TASKS.load(Ordering::Relaxed) == 0 {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            tokio::time::sleep(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(Duration::from_millis(25)),
+            )
+            .await;
         }
     }
 
@@ -1332,9 +1362,12 @@ impl Storage for ClientStorage {
         hash: &ObjectHash,
         limit: u64,
     ) -> Result<(Vec<u8>, ObjectType), GitError> {
-        let storage = self.storage.clone();
-        let hash = *hash;
-        self.block_on_storage(async move { storage.get_with_limit(&hash, limit).await })
+        // This trait method is already async and is used by callers that wrap
+        // each read in a Tokio deadline. Await the backend directly so that
+        // timeout/cancellation can be polled; routing through the synchronous
+        // `block_on_storage` facade would park the caller thread in recv() and
+        // make an outer timeout ineffective on a blocked local/pack read.
+        self.storage.get_with_limit(hash, limit).await
     }
 
     async fn put(

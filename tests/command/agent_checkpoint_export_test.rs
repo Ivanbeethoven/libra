@@ -9,7 +9,10 @@ use std::{path::Path, sync::Arc, time::Duration};
 use libra::{
     internal::{
         ai::{
-            history::{CheckpointCommitParams, CheckpointScope, HistoryManager},
+            history::{
+                CheckpointCommitParams, CheckpointScope, HistoryManager, TracesInflightMarker,
+                clear_traces_inflight_marker_if_generation, write_traces_inflight_marker,
+            },
             observed_agents::Redactor,
         },
         branch::TRACES_BRANCH,
@@ -55,10 +58,19 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
     let (events_redacted, _) = redactor.redact(b"{}\n");
     let (report_redacted, _) = redactor.redact(b"{}");
     let checkpoint_id = "aabbccddeeff00112233445566778899".to_string();
+    let marker = TracesInflightMarker::new(
+        "sess-x",
+        &checkpoint_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    write_traces_inflight_marker(&conn, &marker)
+        .await
+        .expect("register seeded checkpoint writer marker");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id: &checkpoint_id,
             session_id: "sess-x",
+            marker_generation: marker.generation.as_deref().expect("new marker generation"),
             agent_kind: "claude_code",
             parent_commit: None,
             scope: CheckpointScope::Committed,
@@ -68,6 +80,7 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
             lifecycle_events_jsonl: &events_redacted,
             redaction_report_json: &report_redacted,
             txn_extra: None,
+            deadline: None,
         })
         .await
         .expect("append checkpoint");
@@ -87,6 +100,14 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
     ))
     .await
     .expect("insert checkpoint row");
+    clear_traces_inflight_marker_if_generation(
+        &conn,
+        "sess-x",
+        &checkpoint_id,
+        &written.marker_generation,
+    )
+    .await
+    .expect("retire seeded checkpoint writer marker");
     conn.close().await.expect("close seed conn");
     checkpoint_id
 }

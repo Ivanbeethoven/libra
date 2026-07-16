@@ -14,7 +14,8 @@ use libra::{
         ai::{
             history::{
                 AGENT_TRACES_INFLIGHT_TTL_MS, CheckpointCommitParams, CheckpointScope,
-                HistoryManager, TracesInflightMarker, write_traces_inflight_marker,
+                HistoryManager, TracesInflightMarker, clear_traces_inflight_marker_if_generation,
+                write_traces_inflight_marker,
             },
             observed_agents::Redactor,
         },
@@ -119,10 +120,19 @@ async fn seed_checkpoint_commit(
     let (meta_redacted, _) = redactor.redact(metadata.as_bytes());
     let (events_redacted, _) = redactor.redact(b"{}\n");
     let (report_redacted, _) = redactor.redact(b"{}");
+    let marker = TracesInflightMarker::new(
+        session_id,
+        checkpoint_id,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    write_traces_inflight_marker(conn, &marker)
+        .await
+        .expect("register seeded checkpoint writer marker");
     let written = history
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id,
             session_id,
+            marker_generation: marker.generation.as_deref().expect("new marker generation"),
             agent_kind: "claude_code",
             parent_commit: None,
             scope,
@@ -132,9 +142,18 @@ async fn seed_checkpoint_commit(
             lifecycle_events_jsonl: &events_redacted,
             redaction_report_json: &report_redacted,
             txn_extra: None,
+            deadline: None,
         })
         .await
         .expect("append checkpoint commit");
+    clear_traces_inflight_marker_if_generation(
+        conn,
+        session_id,
+        checkpoint_id,
+        &written.marker_generation,
+    )
+    .await
+    .expect("clear seeded checkpoint writer marker");
 
     conn.execute(Statement::from_sql_and_values(
         conn.get_database_backend(),
@@ -171,6 +190,18 @@ async fn checkpoint_exists(conn: &DatabaseConnection, checkpoint_id: &str) -> bo
         .expect("count row");
     let count: i64 = row.try_get_by("n").expect("decode count");
     count == 1
+}
+
+async fn scalar_count(conn: &DatabaseConnection, sql: &str) -> i64 {
+    conn.query_one(Statement::from_string(
+        conn.get_database_backend(),
+        sql.to_string(),
+    ))
+    .await
+    .expect("query count")
+    .expect("count row")
+    .try_get_by("n")
+    .expect("decode count")
 }
 
 async fn checkpoint_traces_commit(
@@ -256,6 +287,321 @@ async fn agent_clean_all_does_not_drop_active_session_checkpoints() {
     assert!(
         checkpoint_exists(&conn, "cp-active-temp").await,
         "--all must not drop temporary checkpoints for active sessions"
+    );
+}
+
+/// plan-20260713 GC-DR-11: pruning a checkpoint reconciles the turn's current
+/// claim/revision and import cursor in the same transaction. Dry-run reports
+/// the candidate without mutating any companion state.
+#[tokio::test]
+async fn agent_clean_claims_gc_reconciles_companion_import_state() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let conn = connect_repo_db(repo.path()).await;
+    let old = chrono::Utc::now().timestamp() - 3 * 86_400;
+    seed_session(&conn, "gc-coverage", "stopped", old, old, old).await;
+    let traces_commit = seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        "cp-gc-coverage",
+        "gc-coverage",
+        CheckpointScope::Committed,
+        old,
+    )
+    .await;
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_coverage_claim (
+            session_id, logical_turn_key, coverage_schema_version,
+            coverage_digest, completeness, revision, state, checkpoint_id,
+            traces_commit, source_channel, created_at, updated_at
+         ) VALUES (?, 'turn-1', 1, 'digest', 'complete', 1,
+                   'conflicted', ?, ?, 'import', ?, ?)",
+        [
+            "gc-coverage".into(),
+            "cp-gc-coverage".into(),
+            traces_commit.clone().into(),
+            old.into(),
+            old.into(),
+        ],
+    ))
+    .await
+    .expect("seed coverage claim");
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_coverage_revision (
+            session_id, logical_turn_key, coverage_schema_version, revision,
+            checkpoint_id, coverage_digest, completeness, source_channel, created_at
+         ) VALUES (?, 'turn-1', 1, 1, ?, 'digest', 'complete', 'import', ?)",
+        ["gc-coverage".into(), "cp-gc-coverage".into(), old.into()],
+    ))
+    .await
+    .expect("seed coverage revision");
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_coverage_conflict (
+            session_id, logical_turn_key, coverage_schema_version,
+            incumbent_revision, incumbent_digest, incumbent_checkpoint_id,
+            incoming_digest, incoming_source_channel, incoming_observed_at,
+            incoming_canonical_json, incoming_redaction_report_json
+         ) VALUES (?, 'turn-1', 1, 1, 'digest', ?, 'challenger', 'import', ?,
+                   '[]', '{\"matches\":[],\"bytes_scanned\":0,\"bytes_redacted\":0}')",
+        ["gc-coverage".into(), "cp-gc-coverage".into(), old.into()],
+    ))
+    .await
+    .expect("seed conflict evidence for final claim");
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_import_identity (
+            identity_id, agent_kind, provider_session_id, source_kind, source_id,
+            schema_version, observed_digest, committed_digest, attempt_checkpoint_id,
+            next_ordinal, state, fence_token, created_at, updated_at
+         ) VALUES ('identity-gc', 'claude_code', 'provider-gc-coverage',
+                   'file', 'projects/gc.jsonl', 1, 'digest', 'digest', ?, 1,
+                   'committed', 1, ?, ?)",
+        ["cp-gc-coverage".into(), old.into(), old.into()],
+    ))
+    .await
+    .expect("seed import identity");
+    conn.close().await.expect("close seed db");
+
+    let dry = run_libra_command(
+        &[
+            "--quiet",
+            "agent",
+            "clean",
+            "--gc",
+            "--dry-run",
+            "--retention-days",
+            "1",
+            "--json",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&dry, "agent clean claims dry-run");
+    assert_eq!(
+        parse_json_stdout(&dry)["data"]["import_identities_pruned"],
+        1,
+        "dry-run must preview the identity made ownerless by its selected final checkpoint"
+    );
+    let conn = connect_repo_db(repo.path()).await;
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_claim").await,
+        1
+    );
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_revision").await,
+        1
+    );
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_conflict").await,
+        1,
+        "dry-run must retain durable conflict evidence"
+    );
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_import_identity").await,
+        1,
+        "dry-run must retain import recovery identity"
+    );
+    conn.close().await.expect("close dry-run db");
+
+    let clean = run_libra_command(
+        &["--quiet", "agent", "clean", "--gc", "--retention-days", "1"],
+        repo.path(),
+    );
+    assert_cli_success(&clean, "agent clean claims gc");
+    let conn = connect_repo_db(repo.path()).await;
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_claim").await,
+        0
+    );
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_revision").await,
+        0
+    );
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_conflict").await,
+        0,
+        "pruning a final incumbent must remove its now-unresolvable challenger evidence"
+    );
+    assert_eq!(
+        scalar_count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_import_identity WHERE identity_id = 'identity-gc'"
+        )
+        .await,
+        0,
+        "GC must physically delete an identity whose final coverage claim was pruned"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let conn = connect_repo_db(repo.path()).await;
+    seed_session(&conn, "gc-conflict-rewind", "stopped", 1, 2, 3).await;
+    let first_commit = seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        "cp-conflict-first",
+        "gc-conflict-rewind",
+        CheckpointScope::Committed,
+        10,
+    )
+    .await;
+    let second_commit = seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        "cp-conflict-second",
+        "gc-conflict-rewind",
+        CheckpointScope::Temporary,
+        20,
+    )
+    .await;
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_coverage_claim (
+            session_id, logical_turn_key, coverage_schema_version,
+            coverage_digest, completeness, revision, state, checkpoint_id,
+            traces_commit, source_channel, created_at, updated_at
+         ) VALUES ('gc-conflict-rewind', 'turn-rewind', 1, 'digest-second',
+                   'complete', 2, 'conflicted', 'cp-conflict-second', ?,
+                   'import', 10, 20)",
+        [second_commit.into()],
+    ))
+    .await
+    .expect("seed current conflicted claim");
+    for (revision, checkpoint_id, digest, created_at) in [
+        (1_i64, "cp-conflict-first", "digest-first", 10_i64),
+        (2_i64, "cp-conflict-second", "digest-second", 20_i64),
+    ] {
+        conn.execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_coverage_revision (
+                session_id, logical_turn_key, coverage_schema_version, revision,
+                checkpoint_id, coverage_digest, completeness, source_channel, created_at
+             ) VALUES ('gc-conflict-rewind', 'turn-rewind', 1, ?, ?, ?,
+                       'complete', 'import', ?)",
+            [
+                revision.into(),
+                checkpoint_id.into(),
+                digest.into(),
+                created_at.into(),
+            ],
+        ))
+        .await
+        .expect("seed coverage revision");
+    }
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_coverage_conflict (
+            session_id, logical_turn_key, coverage_schema_version,
+            incumbent_revision, incumbent_digest, incumbent_checkpoint_id,
+            incoming_digest, incoming_source_channel, incoming_observed_at,
+            incoming_canonical_json, incoming_redaction_report_json
+         ) VALUES ('gc-conflict-rewind', 'turn-rewind', 1, 2, 'digest-second',
+                   'cp-conflict-second', 'digest-challenger', 'import', 21,
+                   '[]', '{\"matches\":[],\"bytes_scanned\":0,\"bytes_redacted\":0}')"
+            .to_string(),
+    ))
+    .await
+    .expect("seed challenger against second revision");
+
+    let repo_path = repo.path().join(".libra");
+    let manager = HistoryManager::new_with_ref(
+        Arc::new(ClientStorage::init(repo_path.join("objects"))),
+        repo_path,
+        Arc::new(conn.clone()),
+        TRACES_BRANCH,
+    );
+    let outcome = manager
+        .prune_checkpoint_commits(&["cp-conflict-second".to_string()])
+        .await
+        .expect("prune conflicted incumbent checkpoint");
+    assert_eq!(outcome.removed_checkpoints, 1);
+    let claim = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT state, revision, checkpoint_id, coverage_digest, traces_commit
+             FROM agent_coverage_claim WHERE session_id = 'gc-conflict-rewind'"
+                .to_string(),
+        ))
+        .await
+        .expect("query rewound claim")
+        .expect("rewound claim row");
+    assert_eq!(
+        claim.try_get_by::<String, _>("state").unwrap(),
+        "catalog_committed"
+    );
+    assert_eq!(claim.try_get_by::<i64, _>("revision").unwrap(), 1);
+    assert_eq!(
+        claim.try_get_by::<String, _>("checkpoint_id").unwrap(),
+        "cp-conflict-first"
+    );
+    assert_eq!(
+        claim.try_get_by::<String, _>("coverage_digest").unwrap(),
+        "digest-first"
+    );
+    let retained_checkpoint = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT traces_commit FROM agent_checkpoint
+             WHERE checkpoint_id = 'cp-conflict-first'"
+                .to_string(),
+        ))
+        .await
+        .expect("query retained checkpoint")
+        .expect("retained checkpoint row")
+        .try_get_by::<String, _>("traces_commit")
+        .expect("decode retained checkpoint commit");
+    assert_eq!(
+        claim.try_get_by::<String, _>("traces_commit").unwrap(),
+        retained_checkpoint,
+        "rewound claim must follow the retained checkpoint's rewritten traces commit"
+    );
+    assert_ne!(
+        retained_checkpoint, first_commit,
+        "prune rewrites retained history rather than preserving the old descendant chain"
+    );
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_conflict").await,
+        0,
+        "challenger tied to the pruned incumbent revision must not survive the rewind"
+    );
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_revision").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn agent_clean_gc_deletes_zero_checkpoint_import_identity() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let conn = connect_repo_db(repo.path()).await;
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_import_identity (
+            identity_id, agent_kind, provider_session_id, source_kind, source_id,
+            schema_version, next_ordinal, state, created_at, updated_at
+         ) VALUES ('zero-checkpoint-identity', 'claude_code', 'never-captured',
+                   'file', 'projects/never.jsonl', 1, 0, 'discovered', ?, ?)",
+        [now.into(), now.into()],
+    ))
+    .await
+    .expect("seed zero-checkpoint import identity");
+    conn.close().await.expect("close seed db");
+
+    let output = run_libra_command(&["agent", "clean", "--gc", "--json"], repo.path());
+    assert_cli_success(&output, "agent clean zero-checkpoint identity gc");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["import_identities_pruned"], 1);
+    let conn = connect_repo_db(repo.path()).await;
+    assert_eq!(
+        scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_import_identity").await,
+        0
     );
 }
 
@@ -614,6 +960,69 @@ async fn agent_clean_rewrites_agent_traces_when_temporary_commit_is_ancestor() {
     assert!(
         !reachable.contains(&original_committed_commit),
         "the old committed commit descended from the temporary checkpoint and must be replaced"
+    );
+}
+
+/// An importer commits its leased identity before reserving turn claims. A
+/// concurrent checkpoint prune in that window must not mistake the absence
+/// of claims for terminal, ownerless recovery state.
+#[tokio::test]
+async fn checkpoint_prune_preserves_leased_import_identity_before_claim_registration() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+
+    let conn = connect_repo_db(repo.path()).await;
+    seed_session(&conn, "prune-race", "stopped", 10, 20, 30).await;
+    let checkpoint_id = "cc000000-0000-4000-8000-000000000003";
+    seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        checkpoint_id,
+        "prune-race",
+        CheckpointScope::Temporary,
+        302,
+    )
+    .await;
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "INSERT INTO agent_import_identity (
+            identity_id, agent_kind, provider_session_id, source_kind, source_id,
+            schema_version, observed_digest, next_ordinal, state, owner,
+            lease_expires_at, fence_token, created_at, updated_at
+         ) VALUES ('identity-prune-race', 'claude_code', 'provider-prune-race',
+                   'file', 'projects/prune-race.jsonl', 1, 'digest', 0,
+                   'leased', 'active-importer', 9999999999999, 1, 1, 1)",
+        Vec::<Value>::new(),
+    ))
+    .await
+    .expect("seed leased import identity before claim registration");
+
+    let repo_path = repo.path().join(".libra");
+    let manager = HistoryManager::new_with_ref(
+        Arc::new(ClientStorage::init(repo_path.join("objects"))),
+        repo_path,
+        Arc::new(conn.clone()),
+        TRACES_BRANCH,
+    );
+    let outcome = manager
+        .prune_checkpoint_commits(&[checkpoint_id.to_string()])
+        .await
+        .expect("prune checkpoint while importer holds its pre-claim lease");
+    assert_eq!(outcome.removed_checkpoints, 1);
+    assert_eq!(
+        outcome.deleted_import_identities, 0,
+        "checkpoint prune must not collect an actively leased import identity"
+    );
+    assert_eq!(
+        scalar_count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_import_identity
+             WHERE identity_id = 'identity-prune-race'
+               AND state = 'leased' AND owner = 'active-importer'"
+        )
+        .await,
+        1,
+        "active identity must survive until its importer reserves claims or releases the lease"
     );
 }
 

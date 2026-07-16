@@ -8,8 +8,8 @@
 use super::*;
 
 /// `libra agent --help` surfaces the EXAMPLES banner so operators see
-/// the canonical invocation per visible sub-command (status, enable,
-/// disable, session, checkpoint, clean, doctor, push, rpc) plus the
+/// the canonical invocation per visible sub-command (status, list, import,
+/// enable, disable, session, checkpoint, clean, doctor, push, rpc) plus the
 /// `--all` clean form, the `--remote` push form, and the JSON variant
 /// without reading the design doc.
 #[test]
@@ -28,6 +28,8 @@ fn test_agent_help_lists_examples_banner() {
     );
     for invocation in [
         "libra agent status",
+        "libra agent list --schema-version 2 --json",
+        "libra agent import --session <id>",
         "libra agent enable --agent claude",
         "libra agent disable --agent claude",
         "libra agent session list",
@@ -46,6 +48,35 @@ fn test_agent_help_lists_examples_banner() {
         assert!(
             stdout.contains(invocation),
             "agent --help should include `{invocation}`, stdout: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_agent_import_help_pins_consent_and_selector_surface() {
+    let repo = tempdir().expect("tempdir for agent import --help");
+    let output = run_libra_command(&["agent", "import", "--help"], repo.path());
+    assert!(
+        output.status.success(),
+        "agent import --help should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for text in [
+        "--session <ID>",
+        "--path <PATH>",
+        "--since <RFC3339>",
+        "--all",
+        "--agent <NAME>",
+        "--limit <N>",
+        "--cursor <CURSOR>",
+        "--yes",
+        "--restore-erased",
+        "Confirm reading/redacting provider session data",
+    ] {
+        assert!(
+            stdout.contains(text),
+            "agent import --help should include `{text}`, stdout: {stdout}"
         );
     }
 }

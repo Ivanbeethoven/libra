@@ -291,6 +291,18 @@ pub enum StableErrorCode {
     /// so callers never silently overrun the concurrency budget (A0-04, E10
     /// `ERR_AGENT_RUN_QUEUE_FULL`).
     AgentRunQueueFull,
+    /// Historical transcript belongs to another repository/provider identity.
+    AgentImportRepositoryConflict,
+    /// Historical transcript has no single verifiable working directory.
+    AgentImportWorkingDirInvalid,
+    /// An explicitly requested agent command schema version is unsupported.
+    AgentSchemaVersionUnsupported,
+    /// One or more selected sessions/turns could not be imported atomically.
+    AgentImportPartialBatch,
+    /// Local anti-resurrection tombstone blocked a historical import.
+    AgentImportErased,
+    /// A transcript File/Bytes source lacked the required authorization proof.
+    AgentTranscriptAuthorizationMissing,
 }
 
 impl Serialize for StableErrorCode {
@@ -349,6 +361,12 @@ impl StableErrorCode {
             Self::AgentRpcTransportFailed => "LBR-AGENT-012",
             Self::AgentRawAccessDenied => "LBR-AGENT-013",
             Self::AgentRunQueueFull => "LBR-AGENT-014",
+            Self::AgentImportRepositoryConflict => "LBR-AGENT-015",
+            Self::AgentImportWorkingDirInvalid => "LBR-AGENT-016",
+            Self::AgentSchemaVersionUnsupported => "LBR-AGENT-017",
+            Self::AgentImportPartialBatch => "LBR-AGENT-018",
+            Self::AgentImportErased => "LBR-AGENT-019",
+            Self::AgentTranscriptAuthorizationMissing => "LBR-AGENT-020",
         }
     }
 
@@ -389,6 +407,7 @@ impl StableErrorCode {
             // early abort. Fits the Internal category (the run could
             // continue if the cap were lifted) per docs/error-codes.md.
             Self::AgentBudgetExceeded => CliErrorCategory::Internal,
+            Self::AgentSchemaVersionUnsupported => CliErrorCategory::Cli,
             Self::AgentExternalAgentsDisabled
             | Self::AgentProtocolVersionMismatch
             | Self::AgentCapabilityUndeclared
@@ -401,7 +420,12 @@ impl StableErrorCode {
             | Self::AgentUntrustedSeedForMutation
             | Self::AgentRpcTransportFailed
             | Self::AgentRawAccessDenied
-            | Self::AgentRunQueueFull => CliErrorCategory::Internal,
+            | Self::AgentRunQueueFull
+            | Self::AgentImportRepositoryConflict
+            | Self::AgentImportWorkingDirInvalid
+            | Self::AgentImportPartialBatch
+            | Self::AgentImportErased
+            | Self::AgentTranscriptAuthorizationMissing => CliErrorCategory::Internal,
         }
     }
 
@@ -548,6 +572,24 @@ impl StableErrorCode {
             }
             Self::AgentRunQueueFull => {
                 "Too many concurrent review/investigate runs are active and the wait queue is full; the run was refused fail-closed."
+            }
+            Self::AgentImportRepositoryConflict => {
+                "Historical agent session belongs to a different repository or provider identity; import refused."
+            }
+            Self::AgentImportWorkingDirInvalid => {
+                "Historical agent session has no single verifiable working directory; import refused."
+            }
+            Self::AgentSchemaVersionUnsupported => {
+                "Requested agent command schema version is not supported by this Libra binary."
+            }
+            Self::AgentImportPartialBatch => {
+                "Historical agent import completed only partially; failed selections remain retryable."
+            }
+            Self::AgentImportErased => {
+                "Historical agent session is locally erased and cannot be automatically re-imported."
+            }
+            Self::AgentTranscriptAuthorizationMissing => {
+                "Transcript source lacks a valid provider-root or trusted-export authorization proof."
             }
         }
     }
@@ -1953,6 +1995,24 @@ mod tests {
             (StableErrorCode::AgentRpcTransportFailed, "LBR-AGENT-012"),
             (StableErrorCode::AgentRawAccessDenied, "LBR-AGENT-013"),
             (StableErrorCode::AgentRunQueueFull, "LBR-AGENT-014"),
+            (
+                StableErrorCode::AgentImportRepositoryConflict,
+                "LBR-AGENT-015",
+            ),
+            (
+                StableErrorCode::AgentImportWorkingDirInvalid,
+                "LBR-AGENT-016",
+            ),
+            (
+                StableErrorCode::AgentSchemaVersionUnsupported,
+                "LBR-AGENT-017",
+            ),
+            (StableErrorCode::AgentImportPartialBatch, "LBR-AGENT-018"),
+            (StableErrorCode::AgentImportErased, "LBR-AGENT-019"),
+            (
+                StableErrorCode::AgentTranscriptAuthorizationMissing,
+                "LBR-AGENT-020",
+            ),
         ] {
             assert_eq!(variant.as_str(), code);
         }
@@ -2090,8 +2150,18 @@ mod tests {
             StableErrorCode::AgentUntrustedSeedForMutation,
             StableErrorCode::AgentRpcTransportFailed,
             StableErrorCode::AgentRawAccessDenied,
+            StableErrorCode::AgentRunQueueFull,
+            StableErrorCode::AgentImportRepositoryConflict,
+            StableErrorCode::AgentImportWorkingDirInvalid,
+            StableErrorCode::AgentImportPartialBatch,
+            StableErrorCode::AgentImportErased,
+            StableErrorCode::AgentTranscriptAuthorizationMissing,
         ] {
             assert_eq!(variant.category(), CliErrorCategory::Internal);
         }
+        assert_eq!(
+            StableErrorCode::AgentSchemaVersionUnsupported.category(),
+            CliErrorCategory::Cli
+        );
     }
 }

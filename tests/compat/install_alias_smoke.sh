@@ -4,7 +4,7 @@ set -eu
 repo_root=${1:?usage: install_alias_smoke.sh <repo-root>}
 installer="$repo_root/install.sh"
 version=v0.18.88
-original_path=$PATH
+system_path=/usr/bin:/bin:/usr/sbin:/sbin
 work=$(mktemp -d "${TMPDIR:-/tmp}/libra-install-alias.XXXXXX")
 trap 'rm -rf "$work"' 0 HUP INT TERM
 
@@ -91,7 +91,7 @@ run_installer() {
         LIBRA_NO_TUI=1 \
         NO_COLOR=1 \
         FAKE_LIBRA_SOURCE="$fake_libra" \
-        PATH="${RUN_PATH:-$fake_bin:$original_path}" \
+        PATH="${RUN_PATH:-$fake_bin:$system_path}" \
         sh "$installer" -v "$version" --no-modify-path "$@" >"$last_log" 2>&1
     then
         fail "$case_name installer invocation failed"
@@ -223,7 +223,7 @@ esac
 exec /bin/ln "$@"
 EOF
 chmod +x "$no_symlink_bin/ln"
-RUN_PATH="$no_symlink_bin:$fake_bin:$original_path" run_installer no_symlink 0
+RUN_PATH="$no_symlink_bin:$fake_bin:$system_path" run_installer no_symlink 0
 no_symlink_dir="$work/no_symlink/home/.libra/bin"
 [ -x "$no_symlink_dir/libra" ] || fail "symlink failure prevented libra installation"
 if [ -e "$no_symlink_dir/lba" ] || [ -L "$no_symlink_dir/lba" ]; then

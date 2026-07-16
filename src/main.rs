@@ -12,6 +12,7 @@
 use std::{
     any::Any,
     fs::OpenOptions,
+    io::{Read, Write},
     panic,
     path::{Path, PathBuf},
     sync::{
@@ -32,6 +33,204 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::EnvFilter;
 
 static STDOUT_BROKEN_PIPE_PANIC: AtomicBool = AtomicBool::new(false);
+const AUTHORIZED_READ_HELPER_ARG: &str = "--libra-internal-authorized-read-helper";
+const AUTHORIZED_READ_HELPER_CAP_ENV: &str = "LIBRA_INTERNAL_AUTHORIZED_READ_CAP";
+const REJECTED_CLEANUP_INDEX_HELPER_INPUT_CAP: u64 = 1024 * 1024;
+const REJECTED_CLEANUP_INDEX_HELPER_OUTPUT_CAP: u64 = 64 * 1024 * 1024;
+
+fn run_checkpoint_object_io_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str() != Some(libra::internal::ai::history::CHECKPOINT_OBJECT_IO_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(libra::internal::ai::history::CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP.saturating_add(1))
+        .read_to_end(&mut input)
+        .is_err()
+        || input.len() as u64 > libra::internal::ai::history::CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP
+    {
+        return Some(2);
+    }
+    let output = match libra::internal::ai::history::run_checkpoint_object_io_helper(&input) {
+        Ok(output)
+            if output.len() as u64
+                <= libra::internal::ai::history::CHECKPOINT_OBJECT_IO_HELPER_OUTPUT_CAP =>
+        {
+            output
+        }
+        Ok(_) | Err(_) => return Some(2),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
+        return Some(1);
+    }
+    Some(0)
+}
+
+fn run_rejected_cleanup_index_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str()
+        != Some(libra::internal::ai::history::REJECTED_CLEANUP_INDEX_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(REJECTED_CLEANUP_INDEX_HELPER_INPUT_CAP.saturating_add(1))
+        .read_to_end(&mut input)
+        .is_err()
+        || input.len() as u64 > REJECTED_CLEANUP_INDEX_HELPER_INPUT_CAP
+    {
+        return Some(2);
+    }
+    if cfg!(debug_assertions)
+        && let Ok(value) = std::env::var("LIBRA_TEST_REJECTED_CLEANUP_INDEX_HELPER_DELAY_MS")
+        && let Ok(delay_ms) = value.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    let output = match libra::internal::ai::history::run_rejected_cleanup_index_helper(&input) {
+        Ok(output) if output.len() as u64 <= REJECTED_CLEANUP_INDEX_HELPER_OUTPUT_CAP => output,
+        Ok(_) | Err(_) => return Some(2),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
+        return Some(1);
+    }
+    Some(0)
+}
+
+fn run_import_discovery_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str() != Some(libra::command::agent::IMPORT_DISCOVERY_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    if cfg!(debug_assertions)
+        && let Ok(value) = std::env::var("LIBRA_TEST_IMPORT_DISCOVERY_HELPER_DELAY_MS")
+        && let Ok(delay_ms) = value.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(libra::command::agent::IMPORT_DISCOVERY_HELPER_FRAME_CAP.saturating_add(1))
+        .read_to_end(&mut input)
+        .is_err()
+        || input.len() as u64 > libra::command::agent::IMPORT_DISCOVERY_HELPER_FRAME_CAP
+    {
+        return Some(2);
+    }
+    let output = match libra::command::agent::run_import_discovery_helper(&input) {
+        Ok(output)
+            if output.len() as u64 <= libra::command::agent::IMPORT_DISCOVERY_HELPER_FRAME_CAP =>
+        {
+            output
+        }
+        Ok(_) | Err(_) => return Some(2),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
+        return Some(1);
+    }
+    Some(0)
+}
+
+fn run_import_preparation_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str() != Some(libra::command::agent::IMPORT_PREPARATION_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(libra::command::agent::IMPORT_PREPARATION_HELPER_INPUT_CAP.saturating_add(1))
+        .read_to_end(&mut input)
+        .is_err()
+        || input.len() as u64 > libra::command::agent::IMPORT_PREPARATION_HELPER_INPUT_CAP
+    {
+        return Some(2);
+    }
+    let output = match libra::command::agent::run_import_preparation_helper(&input) {
+        Ok(output)
+            if output.len() as u64
+                <= libra::command::agent::IMPORT_PREPARATION_HELPER_OUTPUT_CAP =>
+        {
+            output
+        }
+        Ok(_) | Err(_) => return Some(2),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
+        return Some(1);
+    }
+    Some(0)
+}
+
+/// Killable subprocess boundary for held-descriptor transcript reads. This is
+/// handled before CLI/log initialization so stdout contains only the private
+/// binary frame consumed by the parent importer.
+fn run_authorized_read_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str() != Some(AUTHORIZED_READ_HELPER_ARG) || args.next().is_some() {
+        return None;
+    }
+    let cap = match std::env::var(AUTHORIZED_READ_HELPER_CAP_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        Some(cap) if cap <= 16 * 1024 * 1024 => cap,
+        _ => return Some(2),
+    };
+    if cfg!(debug_assertions)
+        && let Ok(path) = std::env::var("LIBRA_TEST_AUTHORIZED_READ_HELPER_PID_FILE")
+        && std::fs::write(path, std::process::id().to_string()).is_err()
+    {
+        return Some(2);
+    }
+    if cfg!(debug_assertions)
+        && let Ok(value) = std::env::var("LIBRA_TEST_AUTHORIZED_READ_HELPER_DELAY_MS")
+        && let Ok(delay_ms) = value.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+
+    let mut bytes = Vec::new();
+    let read = std::io::stdin()
+        .lock()
+        .take(cap.saturating_add(1))
+        .read_to_end(&mut bytes);
+    let raw_bytes = bytes.len() as u64;
+    let (status, payload) = match read {
+        Ok(_) if raw_bytes > cap => (1u8, Vec::new()),
+        Ok(_) => (0u8, bytes),
+        Err(error) => (2u8, error.to_string().into_bytes()),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&[status]).is_err()
+        || stdout.write_all(&raw_bytes.to_le_bytes()).is_err()
+        || stdout.write_all(&payload).is_err()
+        || stdout.flush().is_err()
+    {
+        return Some(1);
+    }
+    Some(0)
+}
 
 /// Process entry point.
 ///
@@ -49,6 +248,36 @@ static STDOUT_BROKEN_PIPE_PANIC: AtomicBool = AtomicBool::new(false);
 /// - On a clean `Err(CliError)`, the exit code is sourced from
 ///   [`CliError::exit_code`] so each error class has a stable code.
 fn main() {
+    if let Some(exit_code) = run_checkpoint_object_io_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    if let Some(exit_code) = run_rejected_cleanup_index_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    if let Some(exit_code) = run_import_discovery_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    if let Some(exit_code) = run_import_preparation_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    if let Some(exit_code) = run_authorized_read_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
     install_broken_pipe_panic_hook();
     init_tracing();
 

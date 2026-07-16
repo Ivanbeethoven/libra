@@ -89,6 +89,24 @@ impl HookRepo {
         self.run(&["agent", "hooks", "claude-code", "stop"], Some(envelope))
     }
 
+    fn hook_with_env(&self, envelope: &str, key: &str, value: &str) -> Output {
+        let mut cmd = self.command();
+        cmd.env(key, value)
+            .args(["agent", "hooks", "claude-code", "stop"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn hook with test environment");
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(envelope.as_bytes())
+            .expect("write hook envelope");
+        child.wait_with_output().expect("wait hook")
+    }
+
     fn spawn_hook(&self) -> std::process::Child {
         let mut cmd = self.command();
         cmd.args(["agent", "hooks", "claude-code", "stop"])
@@ -395,6 +413,77 @@ async fn coverage_gate_inflight_only_fails_visibly() {
     );
 }
 
+/// ADR-DR-09: a live/export writer may preempt an import reservation even
+/// while its lease is nominally live. The fence increments, so the stale
+/// importer cannot later publish its already-constructed ref/catalog plan.
+#[tokio::test]
+async fn live_writer_preempts_reserved_import_and_fences_stale_owner() {
+    let repo = HookRepo::init();
+    let transcript = repo.write_transcript("s-import-preempt.jsonl", TURN_COMPLETE);
+    let start_envelope = json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "sess-import-preempt",
+        "cwd": repo.repo.to_string_lossy(),
+        "transcript_path": transcript.to_string_lossy(),
+    })
+    .to_string();
+    let start = repo.run(
+        &["agent", "hooks", "claude-code", "session-start"],
+        Some(&start_envelope),
+    );
+    assert!(
+        start.status.success(),
+        "session-start: {}",
+        describe(&start)
+    );
+
+    let url = format!(
+        "sqlite://{}?mode=rw",
+        repo.repo.join(".libra").join("libra.db").display()
+    );
+    let conn = Database::connect(url).await.expect("open rw");
+    let inserted = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_coverage_claim (
+                session_id, logical_turn_key, coverage_schema_version,
+                coverage_digest, completeness, revision, state, owner,
+                lease_expires_at, fence_token, source_channel, created_at, updated_at
+             ) SELECT session_id, 'u1', 1, 'import-digest', 'complete', 0,
+                      'reserved_import', 'stale-import', 4102444800000, 7, 'import', 0, 0
+               FROM agent_session WHERE provider_session_id = ?",
+            ["sess-import-preempt".into()],
+        ))
+        .await
+        .expect("insert import reservation");
+    assert_eq!(inserted.rows_affected(), 1);
+    drop(conn);
+
+    let live = repo.hook(&repo.envelope("sess-import-preempt", &transcript));
+    assert!(
+        live.status.success(),
+        "live preemption: {}",
+        describe(&live)
+    );
+    assert_eq!(repo.checkpoints().len(), 1);
+    let claims = repo
+        .query_rows(
+            "SELECT state, fence_token, source_channel FROM agent_coverage_claim \
+             WHERE logical_turn_key = 'u1'",
+        )
+        .await;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].try_get_by::<String, _>("state").unwrap(),
+        "catalog_committed"
+    );
+    assert_eq!(claims[0].try_get_by::<i64, _>("fence_token").unwrap(), 8);
+    assert_eq!(
+        claims[0].try_get_by::<String, _>("source_channel").unwrap(),
+        "live"
+    );
+}
+
 #[tokio::test]
 async fn coverage_gate_db_error_does_not_append() {
     let repo = HookRepo::init();
@@ -435,5 +524,39 @@ async fn coverage_gate_db_error_does_not_append() {
         repo.checkpoints().len(),
         1,
         "no checkpoint may be appended without passing the coverage gate"
+    );
+}
+
+#[tokio::test]
+async fn live_failure_after_marker_registration_releases_claim_and_marker() {
+    let repo = HookRepo::init();
+    let transcript = repo.write_transcript("registered-failure.jsonl", TURN_COMPLETE);
+    let envelope = repo.envelope("sess-registered-failure", &transcript);
+    let failed = repo.hook_with_env(
+        &envelope,
+        "LIBRA_TEST_CHECKPOINT_FAIL_AFTER_REGISTRATION",
+        "1",
+    );
+    assert!(!failed.status.success(), "{}", describe(&failed));
+    assert!(repo.checkpoints().is_empty());
+    let claims = repo
+        .query_rows("SELECT state, owner, lease_expires_at FROM agent_coverage_claim")
+        .await;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].try_get_by::<String, _>("state").unwrap(),
+        "abandoned"
+    );
+    assert!(
+        claims[0]
+            .try_get_by::<Option<String>, _>("owner")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        repo.query_rows("SELECT `key` FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
+            .await
+            .is_empty(),
+        "registered live failure leaked its marker"
     );
 }

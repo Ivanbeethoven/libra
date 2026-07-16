@@ -130,6 +130,17 @@ async fn erase_session_local_removes_rows_and_preserves_audit_log() {
     assert_eq!(
         count(
             &conn,
+            "SELECT COUNT(*) AS n FROM agent_import_tombstone \
+             WHERE erased_session_id = 'sess-erase' \
+               AND provider_session_id = 'provider-sess-erase'"
+        )
+        .await,
+        1,
+        "erasure must retain the local anti-resurrection identity"
+    );
+    assert_eq!(
+        count(
+            &conn,
             "SELECT COUNT(*) AS n FROM agent_session WHERE session_id = 'sess-keep'"
         )
         .await,
@@ -216,6 +227,16 @@ async fn agent_erasure_local_tombstone() {
         0,
         "tombstoned session's checkpoints gone"
     );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_import_tombstone \
+             WHERE erased_session_id = 'sess-tomb'"
+        )
+        .await,
+        1,
+        "local import tombstone must survive deletion of agent_session"
+    );
 
     // Idempotency: re-erasing a session that is already gone is a no-op —
     // the tombstone is stable and never revives the deleted rows.
@@ -230,6 +251,16 @@ async fn agent_erasure_local_tombstone() {
     assert_eq!(
         second.removed_checkpoints, 0,
         "re-erase removes nothing (tombstone is stable)"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_import_tombstone \
+             WHERE erased_session_id = 'sess-tomb'"
+        )
+        .await,
+        1,
+        "idempotent re-erase must preserve the existing tombstone"
     );
 
     // The append-only audit log survives every erase.

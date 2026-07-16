@@ -655,12 +655,24 @@ pub fn lifecycle_event_canonical_json(
     event: &LifecycleEvent,
     ctx: &CanonicalEventContext,
 ) -> Value {
+    lifecycle_event_canonical_json_with_identity(event, ctx, event.event_id(), false)
+}
+
+/// Canonical serializer variant for synthesized provider-neutral events whose
+/// stable identity and partial status come from an external replay contract
+/// rather than a hook envelope timestamp.
+pub(crate) fn lifecycle_event_canonical_json_with_identity(
+    event: &LifecycleEvent,
+    ctx: &CanonicalEventContext,
+    event_id: Uuid,
+    partial: bool,
+) -> Value {
     let mut obj = Map::new();
     obj.insert(
         "schema_version".to_string(),
         json!(LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION),
     );
-    obj.insert("event_id".to_string(), json!(event.event_id().to_string()));
+    obj.insert("event_id".to_string(), json!(event_id.to_string()));
     obj.insert("kind".to_string(), json!(event.event_kind()));
     obj.insert("agent_kind".to_string(), json!(ctx.agent_kind));
     obj.insert("session_id".to_string(), json!(ctx.session_id));
@@ -673,9 +685,9 @@ pub fn lifecycle_event_canonical_json(
         "source".to_string(),
         event.source.clone().unwrap_or(Value::Null),
     );
-    // Only fully-validated events reach persistence; partially-parsed ones
-    // are skipped-and-logged upstream and never serialised.
-    obj.insert("partial".to_string(), json!(false));
+    // Hook events pass false; historical replay uses true for a growing final
+    // turn so its canonical sidecar agrees with the coverage claim.
+    obj.insert("partial".to_string(), json!(partial));
     obj.insert("provenance".to_string(), ctx.provenance.clone());
 
     // Per-kind optional fields, present only when the event carries them.

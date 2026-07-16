@@ -77,7 +77,16 @@ pub trait PromptExtractor: ObservedAgent {
 /// Optional capability: pre-persist transcript preparation (E1
 /// `transcript_preparer`), e.g. flushing provider-side buffers.
 pub trait TranscriptPreparer: ObservedAgent {
-    fn prepare_transcript(&self, session: &AgentSessionCtx) -> Result<()>;
+    /// Prepare a transcript through the descriptor already authorized by the
+    /// source resolver. Implementations must not reopen `session` paths.
+    /// Historical import supplies its absolute deadline so synchronous
+    /// provider settling cannot extend the command budget.
+    fn prepare_transcript(
+        &self,
+        session: &AgentSessionCtx,
+        file: &std::fs::File,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<()>;
 }
 
 /// Optional capability: token usage extraction (E1 `token_calculator`).

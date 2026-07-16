@@ -719,12 +719,21 @@ pub async fn ingest_agent_traces_payload(
     let concurrent_active =
         session_concurrent_active(conn, backend, event.kind, &session_id, &envelope.cwd).await?;
     let metadata_json = build_agent_session_metadata_json(&envelope, concurrent_active);
+    // ADR-DR-19: make the tombstone check and the session UPSERT one SQLite
+    // statement.  A separate preflight query would leave a check/write race
+    // with `erase_session_local`; the conditional INSERT instead either wins
+    // before erasure (and is subsequently deleted) or observes the tombstone
+    // and affects zero rows.
     let upsert_sql = "
         INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
             metadata_json, redaction_report, started_at, last_event_at, stopped_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM agent_import_tombstone
+            WHERE agent_kind = ? AND provider_session_id = ?
+        )
         ON CONFLICT(agent_kind, provider_session_id) DO UPDATE SET
             state = excluded.state,
             last_event_at = excluded.last_event_at,
@@ -739,24 +748,33 @@ pub async fn ingest_agent_traces_payload(
     ";
     let stopped_at: Option<i64> =
         matches!(event.kind, LifecycleEventKind::SessionEnd).then_some(now);
-    conn.execute(Statement::from_sql_and_values(
-        backend,
-        upsert_sql,
-        [
-            session_id.clone().into(),
-            agent_kind.into(),
-            envelope.session_id.clone().into(),
-            new_state.into(),
-            envelope.cwd.clone().into(),
-            metadata_json.into(),
-            redaction_report_json.clone().into(),
-            now.into(),
-            now.into(),
-            stopped_at.into(),
-        ],
-    ))
-    .await
-    .with_context(|| format!("failed to upsert agent_session for command '{command}'"))?;
+    let upsert = conn
+        .execute(Statement::from_sql_and_values(
+            backend,
+            upsert_sql,
+            [
+                session_id.clone().into(),
+                agent_kind.into(),
+                envelope.session_id.clone().into(),
+                new_state.into(),
+                envelope.cwd.clone().into(),
+                metadata_json.into(),
+                redaction_report_json.clone().into(),
+                now.into(),
+                now.into(),
+                stopped_at.into(),
+                agent_kind.into(),
+                envelope.session_id.clone().into(),
+            ],
+        ))
+        .await
+        .with_context(|| format!("failed to upsert agent_session for command '{command}'"))?;
+    if upsert.rows_affected() == 0 {
+        bail!(
+            "agent session was erased and is protected by an anti-resurrection tombstone; \
+             restore it explicitly before accepting new hook events"
+        );
+    }
 
     // entire.md §6.3 state machine: both `TurnEnd` (Stop — end of a turn,
     // session stays `active`) and `SessionEnd` (final) materialise a
@@ -939,11 +957,72 @@ async fn session_concurrent_active(
 /// the adapter advertises no readable transcript.
 ///
 /// Write sequence + crash windows (AG-20, see the write-sequence matrix in
-/// `docs/development/tracing/agent.md`): an in-flight marker is (best-effort)
-/// persisted BEFORE stage (a) and cleared AFTER stage (d); between ref CAS
+/// `docs/development/tracing/agent.md`): an in-flight marker is registered
+/// fail-closed with the session/tombstone/coverage fence BEFORE stage (a) and
+/// cleared AFTER stage (d); between ref CAS
 /// (c) and catalog INSERT (d) the catalog is probed by `traces_commit` so a
 /// retry — or a doctor repair that already backfilled the row — never
 /// double-inserts.
+async fn cleanup_failed_registered_checkpoint(
+    conn: &sea_orm::DatabaseConnection,
+    marker: &crate::internal::ai::history::TracesInflightMarker,
+    provider_session_id: &str,
+    claim_channel: &'static str,
+    claim_owner: Option<&str>,
+    export_lease: Option<(&str, i64)>,
+) {
+    if let Some(owner) = claim_owner
+        && let Err(error) = crate::internal::ai::coverage_gate::abandon_reserved_turn_claims(
+            conn,
+            &marker.session_id,
+            owner,
+            claim_channel,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+    {
+        tracing::warn!(
+            checkpoint_id = %marker.attempt_id,
+            error = %format!("{error:#}"),
+            "failed to release claims after checkpoint write failure"
+        );
+    }
+    if let Some((owner, fence_token)) = export_lease
+        && let Err(error) = crate::internal::ai::export_job::release(
+            conn,
+            "opencode",
+            provider_session_id,
+            owner,
+            fence_token,
+            "dirty",
+            None,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+    {
+        tracing::warn!(
+            checkpoint_id = %marker.attempt_id,
+            error = %format!("{error:#}"),
+            "failed to release export job after checkpoint write failure"
+        );
+    }
+    if let Some(generation) = marker.generation.as_deref()
+        && let Err(error) = crate::internal::ai::history::clear_non_cleanup_traces_inflight_marker(
+            conn,
+            &marker.session_id,
+            &marker.attempt_id,
+            generation,
+        )
+        .await
+    {
+        tracing::warn!(
+            checkpoint_id = %marker.attempt_id,
+            error = %format!("{error:#}"),
+            "failed to clear ordinary marker after checkpoint write failure"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn write_committed_checkpoint(
     conn: &sea_orm::DatabaseConnection,
@@ -961,7 +1040,8 @@ async fn write_committed_checkpoint(
         history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
         observed_agents::{
             AgentKind, RedactedBytes, Redactor, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
-            agent_for, normalize_claude_transcript, resolve_transcript_source,
+            agent_for, normalize_claude_transcript, normalize_codex_rollout,
+            resolve_transcript_source,
         },
     };
 
@@ -1061,10 +1141,14 @@ async fn write_committed_checkpoint(
     // - reserved claims commit inside the ref-CAS transaction below.
     // Providers without a normalizer keep the legacy ungated path.
     let mut live_reservation: Option<(String, i64, Vec<coverage_gate::ReservedTurnClaim>)> = None;
-    if agent_kind == "claude_code"
+    if matches!(agent_kind, "claude_code" | "codex")
         && let Some(raw) = transcript_raw_for_extraction.as_deref()
     {
-        let mut turns = normalize_claude_transcript(raw);
+        let mut turns = if agent_kind == "claude_code" {
+            normalize_claude_transcript(raw)
+        } else {
+            normalize_codex_rollout(raw)
+        };
         // coverage-v1 §1 pipeline order: typed normalize → typed-field
         // redact → canonicalize/digest. Claims must never hash (or store
         // digests of) unredacted content.
@@ -1409,25 +1493,85 @@ async fn write_committed_checkpoint(
     );
     write_span.record("stage", "marker");
 
-    // Window A/B guard: persist the in-flight marker BEFORE stage (a).
-    // Best-effort — a marker failure warns and continues (the checkpoint
-    // must not be lost over its advisory guard), but when the call
-    // succeeds the marker IS durably in SQLite before any blob exists.
+    // Window A/B guard: session/tombstone/coverage fences and marker creation
+    // commit together BEFORE stage (a). Any failure aborts object creation.
     let marker = history::TracesInflightMarker::new(
         libra_session_id,
         &checkpoint_id,
         Utc::now().timestamp_millis(),
     );
-    if let Err(err) = history::write_traces_inflight_marker(conn, &marker).await {
-        tracing::warn!(
-            checkpoint_id = %checkpoint_id,
-            error = %format!("{err:#}"),
-            "failed to persist traces in-flight marker; continuing without window guard"
-        );
+    let marker_generation = marker
+        .generation
+        .as_deref()
+        .context("new checkpoint marker has no writer generation")?;
+    let registration_fences = live_reservation
+        .as_ref()
+        .map(|(owner, _, claims)| {
+            claims
+                .iter()
+                .map(|claim| history::TracesCoverageFence {
+                    logical_turn_key: &claim.logical_turn_key,
+                    owner,
+                    fence_token: claim.fence_token,
+                    reservation_state: "reserved_live",
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let failure_claim_owner = live_reservation.as_ref().map(|(owner, _, _)| owner.clone());
+    let failure_export_lease = export_release
+        .as_ref()
+        .map(|(owner, fence_token, _)| (owner.clone(), *fence_token));
+    if let Err(error) =
+        history::register_traces_write_attempt(conn, &marker, &registration_fences).await
+    {
+        cleanup_failed_registered_checkpoint(
+            conn,
+            &marker,
+            &envelope.session_id,
+            claim_channel,
+            failure_claim_owner.as_deref(),
+            failure_export_lease
+                .as_ref()
+                .map(|(owner, fence_token)| (owner.as_str(), *fence_token)),
+        )
+        .await;
+        return Err(error.context("register fail-closed traces checkpoint attempt"));
+    }
+    if cfg!(debug_assertions)
+        && std::env::var_os("LIBRA_TEST_CHECKPOINT_FAIL_AFTER_REGISTRATION").is_some()
+    {
+        cleanup_failed_registered_checkpoint(
+            conn,
+            &marker,
+            &envelope.session_id,
+            claim_channel,
+            failure_claim_owner.as_deref(),
+            failure_export_lease
+                .as_ref()
+                .map(|(owner, fence_token)| (owner.as_str(), *fence_token)),
+        )
+        .await;
+        bail!("test checkpoint failure after writer registration");
     }
 
     let objects_dir = repo_path.join("objects");
-    std::fs::create_dir_all(&objects_dir).context("create objects dir for checkpoint commit")?;
+    if let Err(error) =
+        std::fs::create_dir_all(&objects_dir).context("create objects dir for checkpoint commit")
+    {
+        cleanup_failed_registered_checkpoint(
+            conn,
+            &marker,
+            &envelope.session_id,
+            claim_channel,
+            failure_claim_owner.as_deref(),
+            failure_export_lease
+                .as_ref()
+                .map(|(owner, fence_token)| (owner.as_str(), *fence_token)),
+        )
+        .await;
+        return Err(error);
+    }
     let storage = std::sync::Arc::new(crate::utils::client_storage::ClientStorage::init(
         objects_dir,
     ));
@@ -1462,6 +1606,17 @@ async fn write_committed_checkpoint(
                 None
             }
             Err(err) => {
+                cleanup_failed_registered_checkpoint(
+                    conn,
+                    &marker,
+                    &envelope.session_id,
+                    claim_channel,
+                    failure_claim_owner.as_deref(),
+                    failure_export_lease
+                        .as_ref()
+                        .map(|(owner, fence_token)| (owner.as_str(), *fence_token)),
+                )
+                .await;
                 return Err(anyhow!(
                     "failed to resolve HEAD while writing checkpoint: {err}"
                 ));
@@ -1471,26 +1626,37 @@ async fn write_committed_checkpoint(
     // DR-05c-0: reserved claims + the catalog row commit INSIDE the ref-CAS
     // transaction (ADR-DR-10) — ref, catalog, revisions and claim advances
     // are atomic; a fence violation rolls all of them back.
-    let claim_plan =
-        live_reservation.map(
-            |(owner, now_ms, claims)| coverage_gate::LiveClaimCommitPlan {
-                source_channel: claim_channel,
-                session_id: libra_session_id.to_string(),
-                checkpoint_id: checkpoint_id.clone(),
-                owner,
-                parent_commit: parent_commit.clone(),
-                created_at: now,
-                now_ms,
-                claims,
-            },
-        );
+    // Even a metadata-only/fallback checkpoint carries an empty claim plan:
+    // the plan injects both the tombstone barrier and catalog INSERT into the
+    // same transaction as the traces-ref CAS. No live writer may use the old
+    // ref-first/catalog-later path after ADR-DR-19.
+    let (owner, claim_now_ms, claims) = live_reservation.unwrap_or_else(|| {
+        (
+            format!("live-barrier:{}", uuid::Uuid::new_v4()),
+            Utc::now().timestamp_millis(),
+            Vec::new(),
+        )
+    });
+    let claim_plan = coverage_gate::LiveClaimCommitPlan {
+        source_channel: claim_channel,
+        session_id: libra_session_id.to_string(),
+        checkpoint_id: checkpoint_id.clone(),
+        owner,
+        parent_commit: parent_commit.clone(),
+        created_at: now,
+        now_ms: claim_now_ms,
+        claims,
+        import_session: None,
+        import_identity: None,
+    };
 
     // Stages (a)–(c): blobs, trees, commit, ref CAS.
     write_span.record("stage", "append");
-    let written = manager
+    let written = match manager
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id: &checkpoint_id,
             session_id: libra_session_id,
+            marker_generation,
             agent_kind,
             parent_commit: parent_commit.as_deref(),
             scope: CheckpointScope::Committed,
@@ -1499,12 +1665,28 @@ async fn write_committed_checkpoint(
             transcript_redacted: &transcript_redacted,
             lifecycle_events_jsonl: &lifecycle_events_redacted,
             redaction_report_json: &redaction_report_redacted,
-            txn_extra: claim_plan
-                .as_ref()
-                .map(|plan| plan as &dyn history::TracesTxnExtra),
+            txn_extra: Some(&claim_plan),
+            deadline: None,
         })
         .await
-        .context("failed to append checkpoint commit on traces")?;
+        .context("failed to append checkpoint commit on traces")
+    {
+        Ok(written) => written,
+        Err(error) => {
+            cleanup_failed_registered_checkpoint(
+                conn,
+                &marker,
+                &envelope.session_id,
+                claim_channel,
+                failure_claim_owner.as_deref(),
+                failure_export_lease
+                    .as_ref()
+                    .map(|(owner, fence_token)| (owner.as_str(), *fence_token)),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     write_span.record("cas_retries", written.cas_retries);
     write_span.record("object_count", written.object_count);
     write_span.record("stage", "ref_cas_done");
@@ -1517,7 +1699,13 @@ async fn write_committed_checkpoint(
         written.tree_oid.to_string(),
         written.metadata_blob_oid.to_string(),
     ];
-    if let Err(err) = history::write_traces_inflight_marker(conn, &committed_marker).await {
+    if let Err(err) = history::update_traces_inflight_marker_if_generation(
+        conn,
+        &committed_marker,
+        &written.marker_generation,
+    )
+    .await
+    {
         tracing::warn!(
             checkpoint_id = %checkpoint_id,
             error = %format!("{err:#}"),
@@ -1529,31 +1717,17 @@ async fn write_committed_checkpoint(
     // row inside the ref-CAS transaction (ADR-DR-10); only the legacy
     // (ungated) path inserts it here.
     write_span.record("stage", "catalog");
-    if claim_plan.is_some() {
-        write_span.record("stage", "catalog_in_txn");
-    } else {
-        let inserted = insert_agent_checkpoint_row_idempotent(
-            conn,
-            &AgentCheckpointRow {
-                checkpoint_id: &checkpoint_id,
-                session_id: libra_session_id,
-                parent_commit: parent_commit.as_deref(),
-                tree_oid: &written.tree_oid.to_string(),
-                metadata_blob_oid: &written.metadata_blob_oid.to_string(),
-                traces_commit: &written.commit_hash.to_string(),
-                created_at: now,
-            },
-        )
-        .await?;
-        if !inserted {
-            write_span.record("stage", "catalog_deduped");
-        }
-    }
+    write_span.record("stage", "catalog_in_txn");
 
     // Stage (d) complete — release the window guard (best-effort; an
     // orphaned marker expires via its TTL).
-    if let Err(err) =
-        history::clear_traces_inflight_marker(conn, libra_session_id, &checkpoint_id).await
+    if let Err(err) = history::clear_non_cleanup_traces_inflight_marker(
+        conn,
+        libra_session_id,
+        &checkpoint_id,
+        &written.marker_generation,
+    )
+    .await
     {
         tracing::warn!(
             checkpoint_id = %checkpoint_id,
@@ -1592,6 +1766,74 @@ async fn write_committed_checkpoint(
     // Phase 3 enhancement that adds per-rule counters to metadata.
     let _ = redaction_matches;
     Ok(())
+}
+
+struct SubagentCommitPlan {
+    checkpoint_id: String,
+    session_id: String,
+    parent_checkpoint_id: Option<String>,
+    parent_commit: Option<String>,
+    tool_use_id: Option<String>,
+    subagent_session_id: Option<String>,
+    description: Option<String>,
+    created_at: i64,
+}
+
+#[async_trait::async_trait]
+impl crate::internal::ai::history::TracesTxnExtra for SubagentCommitPlan {
+    async fn apply(
+        &self,
+        txn: &sea_orm::DatabaseTransaction,
+        ctx: &crate::internal::ai::history::TracesCommitCtx,
+    ) -> Result<()> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let writable = txn
+            .query_one(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "SELECT 1 AS writable
+                 FROM agent_session s
+                 WHERE s.session_id = ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM agent_import_tombstone t
+                     WHERE t.agent_kind = s.agent_kind
+                       AND t.provider_session_id = s.provider_session_id
+                   )",
+                [self.session_id.clone().into()],
+            ))
+            .await
+            .context("verify subagent tombstone write barrier")?;
+        if writable.is_none() {
+            bail!(
+                "agent session was erased or tombstoned while the subagent checkpoint was in flight"
+            );
+        }
+        txn.execute(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "INSERT INTO agent_checkpoint (
+                checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
+                tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
+                subagent_session_id, description, created_at
+             ) VALUES (?, ?, ?, 'subagent', ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(checkpoint_id) DO NOTHING",
+            [
+                self.checkpoint_id.clone().into(),
+                self.session_id.clone().into(),
+                self.parent_checkpoint_id.clone().into(),
+                self.parent_commit.clone().into(),
+                ctx.tree_oid.clone().into(),
+                ctx.metadata_blob_oid.clone().into(),
+                ctx.commit_hash.clone().into(),
+                self.tool_use_id.clone().into(),
+                self.subagent_session_id.clone().into(),
+                self.description.clone().into(),
+                self.created_at.into(),
+            ],
+        ))
+        .await
+        .context("insert subagent checkpoint in traces ref transaction")?;
+        Ok(())
+    }
 }
 
 /// A0-02: materialise an independent `scope='subagent'` checkpoint at a
@@ -1745,17 +1987,29 @@ async fn write_subagent_checkpoint(
         &checkpoint_id,
         Utc::now().timestamp_millis(),
     );
-    if let Err(err) = history::write_traces_inflight_marker(conn, &marker).await {
-        tracing::warn!(
-            checkpoint_id = %checkpoint_id,
-            error = %format!("{err:#}"),
-            "failed to persist subagent traces in-flight marker; continuing"
-        );
-    }
+    let marker_generation = marker
+        .generation
+        .as_deref()
+        .context("new subagent checkpoint marker has no writer generation")?;
+    history::register_traces_write_attempt(conn, &marker, &[])
+        .await
+        .context("register fail-closed subagent checkpoint attempt")?;
 
     let objects_dir = repo_path.join("objects");
-    std::fs::create_dir_all(&objects_dir)
-        .context("create objects dir for subagent checkpoint commit")?;
+    if let Err(error) = std::fs::create_dir_all(&objects_dir)
+        .context("create objects dir for subagent checkpoint commit")
+    {
+        if let Some(generation) = marker.generation.as_deref() {
+            let _ = history::clear_non_cleanup_traces_inflight_marker(
+                conn,
+                libra_session_id,
+                &checkpoint_id,
+                generation,
+            )
+            .await;
+        }
+        return Err(error);
+    }
     let storage = std::sync::Arc::new(crate::utils::client_storage::ClientStorage::init(
         objects_dir,
     ));
@@ -1765,11 +2019,22 @@ async fn write_subagent_checkpoint(
         std::sync::Arc::new(conn.clone()),
         crate::internal::branch::TRACES_BRANCH,
     );
+    let commit_plan = SubagentCommitPlan {
+        checkpoint_id: checkpoint_id.clone(),
+        session_id: libra_session_id.to_string(),
+        parent_checkpoint_id: parent_checkpoint_id.clone(),
+        parent_commit: parent_commit.clone(),
+        tool_use_id: tool_use_id.clone(),
+        subagent_session_id: subagent_session_id.clone(),
+        description: Some(description.clone()),
+        created_at: now,
+    };
 
-    let written = manager
+    let written = match manager
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id: &checkpoint_id,
             session_id: libra_session_id,
+            marker_generation,
             agent_kind,
             parent_commit: parent_commit.as_deref(),
             scope: CheckpointScope::Subagent,
@@ -1778,12 +2043,28 @@ async fn write_subagent_checkpoint(
             transcript_redacted: &transcript_redacted,
             lifecycle_events_jsonl: &lifecycle_events_redacted,
             redaction_report_json: &redaction_report_redacted,
-            // Subagent boundary checkpoints are not per-turn content and
-            // stay outside the coverage gate (plan-20260713 ADR-DR-05).
-            txn_extra: None,
+            // Boundary checkpoints stay outside per-turn coverage, but their
+            // tombstone barrier and catalog row are transaction-injected.
+            txn_extra: Some(&commit_plan),
+            deadline: None,
         })
         .await
-        .context("failed to append subagent checkpoint commit on traces")?;
+        .context("failed to append subagent checkpoint commit on traces")
+    {
+        Ok(written) => written,
+        Err(error) => {
+            if let Some(generation) = marker.generation.as_deref() {
+                let _ = history::clear_non_cleanup_traces_inflight_marker(
+                    conn,
+                    libra_session_id,
+                    &checkpoint_id,
+                    generation,
+                )
+                .await;
+            }
+            return Err(error);
+        }
+    };
 
     let mut committed_marker = marker.clone();
     committed_marker.commit = Some(written.commit_hash.to_string());
@@ -1791,7 +2072,13 @@ async fn write_subagent_checkpoint(
         written.tree_oid.to_string(),
         written.metadata_blob_oid.to_string(),
     ];
-    if let Err(err) = history::write_traces_inflight_marker(conn, &committed_marker).await {
+    if let Err(err) = history::update_traces_inflight_marker_if_generation(
+        conn,
+        &committed_marker,
+        &written.marker_generation,
+    )
+    .await
+    {
         tracing::warn!(
             checkpoint_id = %checkpoint_id,
             error = %format!("{err:#}"),
@@ -1799,26 +2086,13 @@ async fn write_subagent_checkpoint(
         );
     }
 
-    insert_subagent_checkpoint_row_idempotent(
+    if let Err(err) = history::clear_non_cleanup_traces_inflight_marker(
         conn,
-        &SubagentCheckpointRow {
-            checkpoint_id: &checkpoint_id,
-            session_id: libra_session_id,
-            parent_commit: parent_commit.as_deref(),
-            parent_checkpoint_id: parent_checkpoint_id.as_deref(),
-            subagent_session_id: subagent_session_id.as_deref(),
-            tool_use_id: tool_use_id.as_deref(),
-            description: Some(&description),
-            tree_oid: &written.tree_oid.to_string(),
-            metadata_blob_oid: &written.metadata_blob_oid.to_string(),
-            traces_commit: &written.commit_hash.to_string(),
-            created_at: now,
-        },
+        libra_session_id,
+        &checkpoint_id,
+        &written.marker_generation,
     )
-    .await?;
-
-    if let Err(err) =
-        history::clear_traces_inflight_marker(conn, libra_session_id, &checkpoint_id).await
+    .await
     {
         tracing::warn!(
             checkpoint_id = %checkpoint_id,
@@ -2955,6 +3229,54 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_tombstone_blocks_stale_hook_session_resurrection() {
+        let (_dir, conn) = ingest_fresh_conn().await;
+        let backend = conn.get_database_backend();
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO agent_import_tombstone (
+                tombstone_id, agent_kind, provider_session_id,
+                erased_session_id, erased_at
+             ) VALUES (?, 'claude_code', ?, ?, ?)",
+            [
+                "tombstone-stale-hook".into(),
+                "S-erased".into(),
+                "claude__S-erased".into(),
+                1_i64.into(),
+            ],
+        ))
+        .await
+        .expect("seed erasure tombstone");
+
+        let payload = ingest_envelope("SessionStart", "S-erased", json!({}));
+        let err = ingest_agent_traces_payload(
+            &payload,
+            super::super::provider::ProviderHookCommand::SessionStart,
+            LifecycleEventKind::SessionStart,
+            claude_provider(),
+            &conn,
+            None,
+        )
+        .await
+        .expect_err("stale hook must not resurrect an erased session");
+        assert!(
+            err.to_string().contains("anti-resurrection tombstone"),
+            "unexpected error: {err:#}"
+        );
+
+        let row = conn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT COUNT(*) AS n FROM agent_session WHERE provider_session_id = ?",
+                ["S-erased".into()],
+            ))
+            .await
+            .expect("query session count")
+            .expect("count row");
+        assert_eq!(row.try_get_by::<i64, _>("n").expect("decode count"), 0);
     }
 
     #[tokio::test]

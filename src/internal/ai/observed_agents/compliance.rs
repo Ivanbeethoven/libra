@@ -106,11 +106,22 @@ pub async fn retention_findings_days() -> Result<u32> {
 
 /// Resolve `agent.max_transcript_read_bytes` (default 256 MiB, must be > 0).
 pub async fn max_transcript_read_bytes() -> Result<u64> {
-    positive_u64_setting(
-        read_setting(MAX_TRANSCRIPT_READ_BYTES_KEY).await?,
+    Ok(max_transcript_read_bytes_setting().await?.0)
+}
+
+/// Resolve the transcript-read setting and report whether the value was
+/// explicitly configured. Adapter paths use this to diagnose an operator
+/// value above their own hard safety cap without warning on the broader
+/// compliance default.
+pub async fn max_transcript_read_bytes_setting() -> Result<(u64, bool)> {
+    let raw = read_setting(MAX_TRANSCRIPT_READ_BYTES_KEY).await?;
+    let explicitly_configured = raw.is_some();
+    let value = positive_u64_setting(
+        raw,
         MAX_TRANSCRIPT_READ_BYTES_KEY,
         DEFAULT_MAX_TRANSCRIPT_READ_BYTES,
-    )
+    )?;
+    Ok((value, explicitly_configured))
 }
 
 /// The read scope recorded in an audit row.

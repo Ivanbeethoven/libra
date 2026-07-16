@@ -30,7 +30,12 @@ use crate::{
 pub const AGENT_LIST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Args, Debug)]
-pub struct ListArgs {}
+pub struct ListArgs {
+    /// Machine schema version (1 keeps the frozen legacy shape; 2 adds
+    /// versioned discovery/import/export method availability).
+    #[arg(long, value_name = "N", default_value_t = AGENT_LIST_SCHEMA_VERSION)]
+    pub schema_version: u32,
+}
 
 #[derive(Debug, Serialize)]
 struct ListOutput {
@@ -42,7 +47,7 @@ struct ListOutput {
 /// `stability`/`hook_installable`/`installed`/`transcript_readable`/
 /// `external_binary` + the roster fields `supported`/`support_wave`/
 /// `launchable_*`; the install-state wire key is `installed`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ListAgentRow {
     slug: &'static str,
     agent_kind: &'static str,
@@ -65,7 +70,85 @@ struct ListAgentRow {
     capabilities: DeclaredAgentCaps,
 }
 
-pub async fn execute_safe(_args: ListArgs, output: &OutputConfig) -> CliResult<()> {
+#[derive(Debug, Serialize)]
+struct ListOutputV2 {
+    schema_version: u32,
+    agents: Vec<ListAgentRowV2>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListAgentRowV2 {
+    #[serde(flatten)]
+    base: ListAgentRow,
+    methods: Vec<AgentMethod>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentMethod {
+    name: &'static str,
+    supported: bool,
+    available: bool,
+    unavailable_reason: Option<&'static str>,
+}
+
+fn methods_for(
+    kind: AgentKind,
+    secure_file_import_available: bool,
+    opencode_available: bool,
+) -> Vec<AgentMethod> {
+    let file_backed = matches!(kind, AgentKind::ClaudeCode | AgentKind::Codex);
+    let export_backed = kind == AgentKind::OpenCode;
+    vec![
+        AgentMethod {
+            name: "transcript_discoverable",
+            supported: file_backed,
+            available: file_backed && secure_file_import_available,
+            unavailable_reason: if file_backed && !secure_file_import_available {
+                Some("secure provider-root file opening is unavailable on this platform")
+            } else if !file_backed {
+                Some(
+                    "OpenCode has no bounded local transcript discovery; select an explicit session id",
+                )
+            } else {
+                None
+            },
+        },
+        AgentMethod {
+            name: "importable",
+            supported: file_backed || export_backed,
+            available: (file_backed && secure_file_import_available)
+                || (export_backed && opencode_available),
+            unavailable_reason: if file_backed && !secure_file_import_available {
+                Some("secure provider-root file opening is unavailable on this platform")
+            } else if export_backed && !opencode_available {
+                Some("trusted OpenCode exporter or required offline sandbox unavailable")
+            } else {
+                None
+            },
+        },
+        AgentMethod {
+            name: "export_bridge",
+            supported: export_backed,
+            available: export_backed && opencode_available,
+            unavailable_reason: if export_backed && !opencode_available {
+                Some("trusted OpenCode exporter or required offline sandbox unavailable")
+            } else if !export_backed {
+                Some("agent uses an authorized transcript file")
+            } else {
+                None
+            },
+        },
+    ]
+}
+
+pub async fn execute_safe(args: ListArgs, output: &OutputConfig) -> CliResult<()> {
+    if !matches!(args.schema_version, 1 | 2) {
+        return Err(CliError::command_usage(format!(
+            "unsupported agent list schema version {}; supported versions are 1 and 2",
+            args.schema_version
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::AgentSchemaVersionUnsupported));
+    }
     let mut agents = Vec::with_capacity(AgentKind::all().len());
     for kind in AgentKind::all() {
         let row = registration_for(*kind);
@@ -118,6 +201,34 @@ pub async fn execute_safe(_args: ListArgs, output: &OutputConfig) -> CliResult<(
         agents,
     };
     if output.is_json() {
+        if args.schema_version == 2 {
+            let opencode_available = crate::internal::ai::observed_agents::opencode_export::trusted_opencode_binary()
+                .await
+                .is_ok()
+                && crate::internal::ai::observed_agents::opencode_export::trusted_bwrap_available();
+            let agents = payload
+                .agents
+                .iter()
+                .cloned()
+                .map(|base| {
+                    let kind = AgentKind::from_db_str(base.agent_kind).ok_or_else(|| {
+                        CliError::internal("agent list registry emitted an unknown db kind")
+                    })?;
+                    Ok(ListAgentRowV2 {
+                        methods: methods_for(kind, cfg!(unix), opencode_available),
+                        base,
+                    })
+                })
+                .collect::<CliResult<Vec<_>>>()?;
+            return emit_json_data(
+                "agent_list",
+                &ListOutputV2 {
+                    schema_version: 2,
+                    agents,
+                },
+                output,
+            );
+        }
         return emit_json_data("agent_list", &payload, output);
     }
     if output.quiet {
@@ -156,4 +267,26 @@ pub async fn execute_safe(_args: ListArgs, output: &OutputConfig) -> CliResult<(
             .join(", ")
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_v2_reports_file_import_unavailable_without_secure_open_support() {
+        let methods = methods_for(AgentKind::ClaudeCode, false, false);
+        for name in ["transcript_discoverable", "importable"] {
+            let method = methods
+                .iter()
+                .find(|method| method.name == name)
+                .expect("file-backed method");
+            assert!(method.supported);
+            assert!(!method.available);
+            assert_eq!(
+                method.unavailable_reason,
+                Some("secure provider-root file opening is unavailable on this platform")
+            );
+        }
+    }
 }

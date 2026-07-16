@@ -49,6 +49,7 @@ impl BridgeRepo {
         std::fs::create_dir_all(&trusted_dir).unwrap();
         // A fake `opencode` that ignores argv and prints the fixed export.
         let exporter = trusted_dir.join("opencode");
+        let export_body = export_body.replace("__REPO__", &repo.to_string_lossy());
         std::fs::write(&exporter, format!("#!/bin/sh\n{export_body}\n")).unwrap();
         std::fs::set_permissions(&exporter, std::fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -168,6 +169,32 @@ impl BridgeRepo {
         self.run(&["agent", "hooks", "opencode", "stop"], Some(&envelope))
     }
 
+    fn stop_with_env(&self, session_id: &str, key: &str, value: &str) -> Output {
+        let envelope = json!({
+            "hook_event_name": "session.idle",
+            "session_id": session_id,
+            "cwd": self.repo.to_string_lossy(),
+        })
+        .to_string();
+        let mut cmd = self.command();
+        cmd.env(key, value)
+            .args(["agent", "hooks", "opencode", "stop"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .expect("spawn opencode hook with test environment");
+        use std::io::Write;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin piped")
+            .write_all(envelope.as_bytes())
+            .expect("write hook envelope");
+        child.wait_with_output().expect("wait opencode hook")
+    }
+
     fn checkpoints(&self) -> Vec<Value> {
         let out = self.run(&["agent", "checkpoint", "list", "--json"], None);
         assert!(out.status.success(), "checkpoint list: {}", describe(&out));
@@ -222,6 +249,65 @@ fn describe(out: &Output) -> String {
 /// to golden vector 1.
 const EXPORT_HELLO: &str = r#"printf '%s' '{"info":{"id":"ses_x"},"messages":[{"info":{"role":"user","id":"msg_u1"},"parts":[{"type":"text","text":"hi"}]},{"info":{"role":"assistant","id":"msg_a1"},"parts":[{"type":"text","text":"hello"}]}]}'"#;
 
+const EXPORT_IMPORT: &str = r#"printf '%s' '{"info":{"id":"ses_import","directory":"__REPO__","status":"stopped","time":{"created":1784077200000,"updated":1784077260000}},"messages":[{"info":{"role":"user","id":"msg_u1","time":{"created":1784077210000}},"parts":[{"type":"text","text":"historical"}]},{"info":{"role":"assistant","id":"msg_a1","time":{"created":1784077250000}},"parts":[{"type":"text","text":"imported"}]}]}'"#;
+
+/// M4 DR-05: the explicit-ID import command consumes the trusted sandboxed
+/// export bridge and persists an import-channel checkpoint, not an export-job
+/// side effect or a file-backed source.
+#[tokio::test]
+async fn opencode_historical_import_e2e_uses_trusted_export_bytes() {
+    let Some(repo) = BridgeRepo::init(EXPORT_IMPORT).await else {
+        return;
+    };
+    let output = repo.run(
+        &[
+            "agent",
+            "import",
+            "--session",
+            "ses_import",
+            "--agent",
+            "opencode",
+            "--yes",
+            "--json",
+        ],
+        None,
+    );
+    assert!(output.status.success(), "import: {}", describe(&output));
+    let claims = repo
+        .query_rows("SELECT state, source_channel FROM agent_coverage_claim")
+        .await;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].try_get_by::<String, _>("source_channel").unwrap(),
+        "import"
+    );
+    assert!(
+        repo.query_rows("SELECT job_id FROM agent_export_job")
+            .await
+            .is_empty(),
+        "historical import must not create an idle/export generation job"
+    );
+    let sessions = repo
+        .query_rows("SELECT started_at, last_event_at, stopped_at FROM agent_session")
+        .await;
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].try_get_by::<i64, _>("started_at").unwrap(),
+        1_784_077_200,
+        "real OpenCode info.time.created must drive lifecycle start"
+    );
+    assert_eq!(
+        sessions[0].try_get_by::<i64, _>("last_event_at").unwrap(),
+        1_784_077_260
+    );
+    assert_eq!(
+        sessions[0]
+            .try_get_by::<Option<i64>, _>("stopped_at")
+            .unwrap(),
+        Some(1_784_077_260)
+    );
+}
+
 /// opencode_export_whole_session_idempotent: two idles over unchanged export
 /// content append exactly one checkpoint; the export job converges.
 #[tokio::test]
@@ -261,6 +347,52 @@ async fn opencode_export_whole_session_idempotent() {
     let observed: i64 = jobs[0].try_get_by("observed_generation").unwrap();
     let processed: i64 = jobs[0].try_get_by("processed_generation").unwrap();
     assert_eq!(observed, processed, "export job converged (clean)");
+}
+
+#[tokio::test]
+async fn opencode_registered_failure_releases_dirty_job_claim_and_marker() {
+    let Some(repo) = BridgeRepo::init(EXPORT_HELLO).await else {
+        return;
+    };
+    let failed = repo.stop_with_env(
+        "ses_registered_failure",
+        "LIBRA_TEST_CHECKPOINT_FAIL_AFTER_REGISTRATION",
+        "1",
+    );
+    assert!(!failed.status.success(), "{}", describe(&failed));
+    assert!(repo.checkpoints().is_empty());
+    let claims = repo
+        .query_rows("SELECT state, owner FROM agent_coverage_claim WHERE source_channel = 'export'")
+        .await;
+    assert_eq!(claims.len(), 1);
+    assert_eq!(
+        claims[0].try_get_by::<String, _>("state").unwrap(),
+        "abandoned"
+    );
+    assert!(
+        claims[0]
+            .try_get_by::<Option<String>, _>("owner")
+            .unwrap()
+            .is_none()
+    );
+    let jobs = repo
+        .query_rows("SELECT state, owner, lease_expires_at FROM agent_export_job")
+        .await;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].try_get_by::<String, _>("state").unwrap(), "dirty");
+    assert!(
+        jobs[0]
+            .try_get_by::<Option<String>, _>("owner")
+            .unwrap()
+            .is_none(),
+        "failed export job retained its lease owner"
+    );
+    assert!(
+        repo.query_rows("SELECT `key` FROM metadata_kv WHERE scope = 'agent_traces_inflight'")
+            .await
+            .is_empty(),
+        "registered export failure leaked its marker"
+    );
 }
 
 /// opencode_export_plaintext_never_in_persist_or_logs: a secret in the

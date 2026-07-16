@@ -1,12 +1,13 @@
 # `libra agent`
 
-Manage external-agent capture for tools such as Claude Code and Gemini.
+Manage external-agent capture for Claude Code, Codex, and OpenCode.
 
 ## Synopsis
 
 ```bash
 libra agent status
-libra agent list [--json]
+libra agent list [--schema-version <1|2>] [--json]
+libra agent import (--session <id> | --path <path> | --since <rfc3339> | --all) [--agent <name>] [--limit <n>] [--cursor <n>] --yes
 libra agent enable [--agent <name>]...
 libra agent add [<name>...]
 libra agent disable [--agent <name>]...
@@ -44,6 +45,7 @@ for any other non-roster agent — return an actionable unsupported error.
 |------------|-------------|
 | `status` | Report captured external-agent session status |
 | `list` | List the supported agents with their capability matrix (roster, hooks, install state) |
+| `import` | Discover and import historical Claude/Codex transcript files or one trusted, sandboxed OpenCode export after explicit consent |
 | `enable` | Enable one or more external agents and install hooks |
 | `add` | Alias of `enable`: `add <name>` ≡ `enable --agent <name>` |
 | `disable` | Disable one or more external agents and uninstall hooks |
@@ -75,17 +77,22 @@ for any other non-roster agent — return an actionable unsupported error.
 | Flag | Subcommand | Description |
 |------|------------|-------------|
 | `--agent <name>` | `enable`, `disable` | Select agent names; omit to target the supported roster (`add`/`remove` take the names positionally) |
+| `--schema-version <1\|2>` | `list` | Select the machine schema. Version 1 is the frozen legacy row; version 2 adds `methods[]` entries for `transcript_discoverable`, `importable`, and `export_bridge` availability |
+| `--session <id>` / `--path <path>` / `--since <rfc3339>` / `--all` | `import` | Select exactly one historical-import scope. `--path` also requires `--agent`; OpenCode supports explicit `--session` through its export bridge |
+| `--yes` | `import` | Required for JSON/non-TTY imports; confirms that Libra may read private provider session content, redact it, and write typed projections to this repository |
+| `--restore-erased` | `import` | Explicitly remove a local anti-resurrection tombstone and retry import. Requires `--yes` and appends an audit row |
+| `--limit <n>` / `--cursor <n>` | `import` | Bounded discovery page (default 20, hard maximum 100) and the next zero-based cursor returned by the preceding page; one invocation also has a 64 MiB cumulative raw-input cap. The per-source cap is `min(agent.max_transcript_read_bytes, 16 MiB adapter hard cap)`; an explicit larger config prints the actual effective cap |
 | `--limit <n>` | `session list`, `checkpoint list` | Maximum rows per page (default 50, hard cap 500 — larger values clamp with a stderr note; `0` is treated as `1`) |
 | `--cursor <cursor>` | `session list`, `checkpoint list` | Opaque keyset cursor from the previous page's `next_cursor`; do not construct by hand |
 | `--extract-transcript <path>` | `session show` | Copy the captured transcript path from session metadata to a local file |
 | `--all` | `clean` | Clean all stopped-session checkpoints instead of only the most recent |
-| `--repair` | `doctor` | Repair detected checkpoint-store inconsistencies (rebuild stale/missing catalog rows from `refs/libra/traces`, re-enqueue missing `object_index` rows); detection-only when omitted |
+| `--repair` | `doctor` | Repair detected checkpoint-store inconsistencies (rebuild stale/missing catalog rows, re-enqueue missing `object_index` rows, safely drain valid expired ordinary writer markers, and immediately drain `cleanup_pending` markers regardless of ordinary TTL); malformed markers remain `manual_required`; detection-only when omitted |
 | `--remote <name>` | `push` | Select the remote used for pushing agent trace refs |
 | `--force-rewrite` | `push` | Allow the non-fast-forward push that follows a local `clean` prune (the traces ref is Libra-managed and rewritten as a whole chain); uses force-with-lease against the last tip this repository pushed — never an unconditional force — so a remote rewritten elsewhere still fails closed |
 | `--dry-run` | `checkpoint rewind` | Show the impact without modifying files; this is the default |
 | `--allow-raw` / `--raw` | `checkpoint export` | Authorize + request a raw (un-redacted) export; without `--allow-raw` a `--raw` request is refused (`LBR-AGENT-013`) and audited |
 | `--justification <text>` / `-o <path>` | `checkpoint export` | Audit justification and output file for a raw export |
-| `--gc` / `--retention-days <n>` / `--dry-run` | `clean` | Retention GC across three windows: (1) drop checkpoints from stopped sessions older than `agent.retention.transcript_days` (default 90; override with `--retention-days`); (2) prune reviewer stderr diagnostic logs of terminal review/investigate runs older than `agent.retention.stderr_days` (default 30) while keeping each run's aggregate record; (3) **A0-09** remove whole terminal review/investigate run directories (`findings.md`, `manifest.json`, `state.json`, reviewer logs) older than `agent.retention.findings_days` (default 90). The objectized findings blob is content-addressed and left for a future repo-wide object GC (per-run retention never deletes a shared object). Non-terminal/undated runs are skipped fail-safe; `agent_audit_log` is never touched. `--dry-run` reports what each window *would* remove (JSON `dry_run`/`findings_runs_pruned`) without deleting anything |
+| `--gc` / `--retention-days <n>` / `--dry-run` | `clean` | Retention GC across three windows: (1) drop checkpoints from stopped sessions older than `agent.retention.transcript_days` (default 90; override with `--retention-days`); (2) prune reviewer stderr diagnostic logs of terminal review/investigate runs older than `agent.retention.stderr_days` (default 30) while keeping each run's aggregate record; (3) **A0-09** remove whole terminal review/investigate run directories (`findings.md`, `manifest.json`, `state.json`, reviewer logs) older than `agent.retention.findings_days` (default 90). The objectized findings blob is content-addressed and left for a future repo-wide object GC (per-run retention never deletes a shared object). Non-terminal/undated runs are skipped fail-safe; `agent_audit_log` is never touched. `--dry-run` reports what each window and companion cleanup *would* remove (including JSON `findings_runs_pruned` and `import_identities_pruned`) without deleting anything |
 | `--apply` | `checkpoint rewind` | Restore the working tree for the selected checkpoint |
 
 ## JSON Output
@@ -109,10 +116,155 @@ from the listing. Each row carries `slug`, `agent_kind`, `stability`,
 `hook_installable`, `installed`, `launchable_review`, `launchable_investigate`,
 `external_binary`, `config_paths`, `protected_dirs`, `capabilities`. The row
 shape is a frozen contract for automation.
-Claude Code advertises `capabilities.transcript_preparer=true`: before an
-authorized transcript is opened, Libra may briefly wait for a trailing JSONL
-record to finish flushing. The wait and tail probe are bounded; paths outside
-the provider root are rejected before the preparer runs.
+Claude Code advertises `capabilities.transcript_preparer=true`: after Libra
+securely opens and pins an authorized transcript descriptor, it may briefly
+wait for a trailing JSONL record to finish flushing through that same
+descriptor. The wait and tail probe are bounded; the preparer never reopens a
+provider path.
+
+Request `agent list --schema-version 2 --json` only when the caller understands
+the extension. Its `methods[]` array reports support and current availability
+for transcript discovery, historical import, and the OpenCode export bridge;
+the default version 1 payload remains shape-compatible and never gains those
+fields implicitly. OpenCode reports `transcript_discoverable` unsupported
+because batch discovery is unavailable; explicit-ID `importable` and
+`export_bridge` availability depend on its trusted offline exporter/sandbox.
+Claude/Codex discovery and import are reported unavailable when the platform
+cannot provide Libra's secure provider-root file-open primitive.
+Unsupported schema versions fail as a usage error (exit 129, category `cli`)
+with `LBR-AGENT-017`.
+
+`agent import` has its own schema version 1 result with `results`, `skipped`,
+`partial_results`, `failures`, and `next_cursor`. Every item has one status:
+`imported`, `noop`, `partial`, `skipped`, or `failed`. `results` contains only
+fully completed selections; discovered cross-repository or erased candidates
+are reported under `skipped` with a hashed session id and stable reason code,
+while the same condition for an explicit selector remains a failure. A failed selection that made durable turn progress
+is reported under `partial_results` and is never included in `succeeded`. A batch that commits some selections but cannot import all
+of them exits non-zero with `LBR-AGENT-018`; the structured error details keep
+the successful summaries and a per-selection failure list whose session ids
+are hashed, preserve `schema_version`, and preserve a nullable `next_cursor`
+instead of coercing `null` to zero. Single-selection ownership, cwd, erased, and source-authorization
+failures retain `LBR-AGENT-015`, `016`, `019`, and `020` respectively.
+
+Historical import is repository-scoped and fail-closed. Libra requires one
+unambiguous transcript `cwd`, resolves its Libra storage, and imports only when
+it is the current repository. A sibling linked worktree is valid because it
+shares that canonical Libra storage; a different repository is not. File sources must stay under the selected
+provider's protected root and are opened once with descriptor-relative
+no-follow semantics on Unix. Provider roots are opened component-by-component,
+and batch discovery opens each Claude source and every Codex year/month/day
+component relative to pinned directory descriptors before consent, so a root,
+nested directory, or source-file symlink cannot escape the provider root. Platforms without an
+equivalent secure open fail closed. Only typed coverage-v1 user/assistant/tool records are serialized,
+after field-level redaction. Raw provider envelopes, provider-home source
+paths, and unknown fields are not persisted; the verified repository
+`working_dir` remains the documented compatibility exception. Replays are idempotent; an incomplete turn
+may advance to one complete revision without changing the checkpoint's
+structural repository parent. If a different complete payload later claims
+the same logical turn, the claim is parked as `conflicted` and Libra retains
+exactly the first challenger in `agent_coverage_conflict`: its typed canonical
+payload is redacted before persistence and stored with its digest, source
+channel, observation time, and deterministic redaction report. Later
+challengers do not replace that first evidence; raw provider envelopes and
+secret-shaped matched bytes are never stored. The incumbent revision remains
+append-only and current until an operator resolves the conflict. Local session erasure writes a durable
+anti-resurrection tombstone before deleting the catalog; automatic discovery
+and in-flight writers cannot rebuild it. `--restore-erased --yes` is the only
+local bypass and is audited.
+
+Before the first content read/export, interactive confirmation identifies the
+selected agent scope, current-repository-only boundary, candidate count/limit,
+redaction write, and the fact that a later `libra agent push` may upload the
+redacted traces. `--yes` acknowledges only that privacy disclosure; it does
+not relax source-root, repository, size, deadline, or platform checks. Import
+batch processing is best-effort across sessions and reports exact durable
+per-session progress when a later turn fails. The 64 MiB batch budget is
+charged from bytes actually read through the held descriptor for successful,
+malformed, unauthorized, and oversized candidates alike, including file
+growth after authorization. The 120-second absolute deadline starts before
+discovery, is checked during traversal, parsing, reservation, object building,
+and CAS persistence. Libra does not cancel an SQLite commit after it starts:
+it checks the deadline immediately before each commit, then observes that
+commit to a definite outcome. A fully committed final turn is therefore
+reported as success even if the clock crosses the deadline while the commit
+result is being observed; every uncommitted lease/marker is abandoned on a
+deadline failure. If that recovery transaction itself fails, the command
+chains the cleanup error and an actionable `agent doctor --repair` hint instead
+of reporting only the original failure.
+Discovery traversal/open and authorized file-descriptor reads run in private,
+kill-on-timeout helper processes (the read helper consumes the already-open
+descriptor) under the same absolute deadline; a blocked filesystem operation
+cannot silently extend the 120-second command budget.
+After consent, provider preparation (including secure open, parsing,
+redaction, and cwd/storage ownership checks), checkpoint loose-object writes,
+and the commit/tree reads used while splicing the traces ref also run behind
+killable helpers. Object reads accept only the requested `commit`/`tree` type,
+verify the full OID and declared length, and enforce a 16 MiB inflated-payload
+cap before allocation, so a hostile compressed object cannot turn the command
+deadline into unbounded memory use.
+
+Each potentially new OID is recorded as a provisional preclaim in the durable
+attempt marker before its loose-object write. It becomes deletion-eligible
+ownership only after this writer wins the no-clobber publish and durably moves
+the OID into the marker's `created_oids` set. A crash in between is deliberately
+leak-safe: an unresolved preclaim is never deleted. Loose objects are compressed into a unique
+file in the shared private `objects/info/libra-tmp` directory and promoted without overwrite; an
+already-present final path is decompressed and byte-validated before reuse.
+A bounded scavenger examines at most 64 entries in that private directory and
+removes only regular files older than 24 hours whose names exactly match
+`.<40-or-64-lowercase-hex-oid>.tmp-<decimal-pid>-<uuid>`; unrelated files and directories are
+retained. File and directory fsyncs are performed only with `--sync-data` or
+`LIBRA_SYNC_DATA`; no-clobber atomic publication is always enforced.
+Append, failure finalization, and erase do not run a repository-wide
+reachability drain. A rejected append durably marks its exact generation
+`cleanup_pending`; `agent doctor --repair` (and future repository GC) performs
+the bounded all-root diagnostic and retires ownership immediately without
+waiting for the ordinary writer TTL. A same-session cleanup job makes erase
+refuse until that maintenance retires the job; erase never runs the drain
+itself. Inline recovery never
+unlinks a shared loose object or deletes its `object_index` row: worktree-index
+writers do not share the SQLite lock, so physical reclamation is left to
+repository GC and its grace/locking policy. The diagnostic reachability proof
+includes refs, reflogs, every registered worktree index, and active sequencer
+state; it snapshots roots outside the SQLite writer transaction, traverses,
+then revalidates the complete snapshot under the final ownership-retirement transaction.
+Every marker registration also carries a random writer `generation`; object
+preclaims, ownership finalization, the final ref CAS, and marker cleanup all
+compare that generation so an expired writer cannot adopt or delete a
+same-checkpoint takeover marker.
+It reads loose, packed, and alternate objects with a
+64 MiB per-object load bound, re-verifies every OID, and also stops after
+250,000 visited objects or 30 seconds (including each individual storage read).
+Registered index reads run in a killable helper under that same aggregate deadline;
+registry/index files are opened no-follow/nonblocking, required to be regular,
+read once from the held descriptor with a `limit + 1` growth check, and parsed/checksummed
+from those exact bytes. They are limited to 256 files and 64 MiB aggregate. Hitting any bound is a
+fail-closed deferral: candidate ownership remains durable for diagnosis and a
+later retry; a completed drain retires attempt ownership while leaving orphaned
+payload reclamation to repository GC.
+Zero-progress provisional sessions are reaped from their persisted
+`import_provisional` flag after lease takeover, and live/export failures after
+marker registration release their claims/job lease and clear only ordinary
+markers (never a `cleanup_pending` job).
+
+`agent clean --gc` physically deletes terminal, ownerless import identities
+after their final coverage state is pruned, including zero-checkpoint identity
+rows. It does not reset them to a replayable `discovered` state. Dry-run uses a
+rolled-back coverage simulation so `import_identities_pruned` matches the
+identical real GC run without mutating catalog state.
+Conflict evidence follows its claim rather than becoming an independent
+retention root. Erasing a session or pruning its final coverage claim cascades
+the retained challenger away; dry-run simulates the same deletion. When a
+checkpoint-history rebuild/prune rewinds the current claim to an older
+surviving revision, stale challenger evidence is deleted and the claim returns
+to its non-conflicted committed state.
+
+The tombstone is local only. Agent capture rows already mirrored to D1/R2 are
+not deleted and the tombstone is not propagated; `libra cloud restore` or a
+cross-machine re-sync can therefore resurrect locally erased capture until
+cloud delete/tombstone propagation is implemented. Do not use this local
+control as the sole cross-device erasure mechanism.
 
 `agent session list --json` and `agent checkpoint list --json` return one
 page per call: `data` carries a `schema_version`, the rows under `sessions`
@@ -149,6 +301,15 @@ libra agent status
 
 # Show the agent capability matrix (supported roster, hooks, install state)
 libra agent list
+
+# Negotiate the versioned import/export method matrix
+libra agent list --schema-version 2 --json
+
+# Import one historical Claude Code session after explicit privacy consent
+libra agent import --session <provider-session-id> --agent claude-code --yes
+
+# Import a bounded page of Codex rollouts modified since a timestamp
+libra agent import --since 2026-07-01T00:00:00Z --agent codex --limit 20 --yes --json
 
 # Enable Claude Code capture and install its hooks (alias of enable)
 libra agent add claude-code
@@ -284,8 +445,8 @@ on them:
 
 ### Doctor checkpoint-store repair (`--repair`)
 
-`libra agent doctor` scans the checkpoint store for three inconsistency
-classes (AG-20 repair matrix); without `--repair` it is strictly read-only
+`libra agent doctor` scans the checkpoint store and writer-marker registry
+(AG-20 repair matrix); without `--repair` it is strictly read-only
 and reports what `--repair` would do:
 
 | `inconsistency_type` | Meaning | `--repair` action |
@@ -294,11 +455,14 @@ and reports what `--repair` would do:
 | `missing_objects` | Checkpoint objects genuinely missing from the store (and the ref cannot rebuild them) — the check covers the full E4 tree: `manifest.json`, `events/lifecycle.jsonl`, `transcript/<agent_kind>.jsonl` incl. chunks, `redaction_report.json`, `content_hash.txt`, the intermediate trees, and every manifest-declared blob | None — reported `manual_required`; doctor never takes destructive action (try `libra fsck --heal` or a cloud/backup restore) |
 | `missing_catalog_row` | A checkpoint reachable from `refs/libra/traces` has no catalog row (crash window B) | Re-INSERT the row via the writer's probe-first idempotent path, reconstructed from the commit's `metadata.json` (v1 and v2 shapes) |
 | `missing_object_index` | Checkpoint objects missing from `object_index` (invisible to `libra cloud sync`) — covers the traces commit plus the full E4 object set | Idempotent re-insert with the writer's row semantics (trees as `tree`, transcript blobs as `agent_transcript`, sidecars as `blob`) |
+| `expired_inflight_marker` | A valid traces writer marker outlived its TTL, including provisional preclaims and proven-created loose-object OIDs | Fence the expired writer in the final ref transaction, run the serialized repository-root proof, and retire the marker; inline recovery never unlinks shared payloads or removes `object_index` rows, leaving physical reclamation to repository GC |
+| `invalid_inflight_marker` | Marker JSON, row identity, commit, or OID is malformed | None — reported `manual_required`; automatic deletion is unsafe because ownership cannot be decoded |
+| `conflicted_coverage_claim` | Two different complete payloads claimed the same logical turn; doctor reports only a hashed turn identity plus the incumbent revision/digest and the retained first challenger's digest/source/time/redaction evidence | None — reported `manual_required`; inspect both durable sanitized candidates and choose an explicit recovery rather than silently discarding provenance. `--repair` never chooses a winner |
 
 Additional rules:
 
 - **Legacy-v1 checkpoints** (pre-AG-20 layout without `manifest.json`) are
-  counted in `legacy_v1_checkpoints`, never enter the three classes, and are
+  counted in `legacy_v1_checkpoints`, never enter checkpoint-object repair classes, and are
   never rewritten by `--repair`.
 - Checkpoints named by a **live traces in-flight marker** are writers
   mid-flight, not inconsistencies, and are skipped.

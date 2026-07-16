@@ -34,7 +34,7 @@
 use std::{fs, path::Path, sync::Arc};
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 
 use super::CleanArgs;
@@ -78,10 +78,112 @@ struct CleanReport {
     /// plan-20260713 DR-04b (GC-DR-12): expired `agent_export_job` rows
     /// scavenged by TTL under `--gc`.
     export_jobs_pruned: u64,
+    /// Terminal import identities with no remaining coverage/capture state.
+    import_identities_pruned: u64,
     /// A0-09: whether this was a `--dry-run` preview (nothing was deleted; all
     /// counts are what *would* be removed).
     dry_run: bool,
     note: &'static str,
+}
+
+const OWNERLESS_IMPORT_IDENTITY_PREDICATE: &str =
+    "state IN ('discovered','partial','committed','failed')
+ AND owner IS NULL
+ AND NOT EXISTS (
+     SELECT 1
+     FROM agent_session s
+     JOIN agent_coverage_claim c ON c.session_id = s.session_id
+     WHERE s.agent_kind = agent_import_identity.agent_kind
+       AND s.provider_session_id = agent_import_identity.provider_session_id
+ )";
+
+/// Count the ownerless import identities that would remain after the exact
+/// checkpoint set selected by a dry-run loses its coverage revisions/claims.
+/// The simulation is isolated in a rolled-back SQLite transaction, so the
+/// preview shares the real GC's relational semantics without changing refs,
+/// objects, or durable catalog rows.
+async fn preview_import_identity_prune_count(
+    conn: &DatabaseConnection,
+    checkpoint_ids: &[String],
+) -> CliResult<u64> {
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|error| CliError::fatal(format!("begin import identity GC preview: {error}")))?;
+    let backend = txn.get_database_backend();
+    for checkpoint_id in checkpoint_ids {
+        txn.execute(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM agent_coverage_conflict
+             WHERE incumbent_checkpoint_id = ?
+                OR EXISTS (
+                  SELECT 1 FROM agent_coverage_claim c
+                  WHERE c.session_id = agent_coverage_conflict.session_id
+                    AND c.logical_turn_key = agent_coverage_conflict.logical_turn_key
+                    AND c.coverage_schema_version = agent_coverage_conflict.coverage_schema_version
+                    AND c.checkpoint_id = ?
+                )",
+            [checkpoint_id.clone().into(), checkpoint_id.clone().into()],
+        ))
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "simulate coverage conflict pruning for import identity preview: {error}"
+            ))
+        })?;
+        txn.execute(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM agent_coverage_revision WHERE checkpoint_id = ?",
+            [checkpoint_id.clone().into()],
+        ))
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "simulate coverage revision pruning for import identity preview: {error}"
+            ))
+        })?;
+    }
+    // Claims whose original current checkpoint is selected disappear iff no
+    // unselected revision survives. Processing after all revision deletes is
+    // equivalent to the real per-checkpoint repoint/delete loop for the final
+    // existence of each claim.
+    for checkpoint_id in checkpoint_ids {
+        txn.execute(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM agent_coverage_claim
+             WHERE checkpoint_id = ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM agent_coverage_revision r
+                 WHERE r.session_id = agent_coverage_claim.session_id
+                   AND r.logical_turn_key = agent_coverage_claim.logical_turn_key
+                   AND r.coverage_schema_version = agent_coverage_claim.coverage_schema_version
+               )",
+            [checkpoint_id.clone().into()],
+        ))
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "simulate coverage claim pruning for import identity preview: {error}"
+            ))
+        })?;
+    }
+    let sql = format!(
+        "SELECT COUNT(*) AS n FROM agent_import_identity WHERE {OWNERLESS_IMPORT_IDENTITY_PREDICATE}"
+    );
+    let count = txn
+        .query_one(Statement::from_string(backend, sql))
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "count import identities after dry-run coverage simulation: {error}"
+            ))
+        })?
+        .and_then(|row| row.try_get_by::<i64, _>("n").ok())
+        .unwrap_or(0) as u64;
+    txn.rollback().await.map_err(|error| {
+        CliError::fatal(format!("rollback import identity GC preview: {error}"))
+    })?;
+    Ok(count)
 }
 
 pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<()> {
@@ -101,6 +203,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
                 stderr_runs_pruned: 0,
                 findings_runs_pruned: 0,
                 export_jobs_pruned: 0,
+                import_identities_pruned: 0,
                 dry_run: args.dry_run,
                 note: "agent_checkpoint table not present (run `libra init`?)",
             },
@@ -233,6 +336,30 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
         0
     };
 
+    let swept_import_identities_pruned =
+        if args.gc && table_exists(&conn, "agent_import_identity").await? {
+            if args.dry_run {
+                preview_import_identity_prune_count(&conn, &checkpoint_ids).await?
+            } else {
+                let sql = format!(
+                    "DELETE FROM agent_import_identity WHERE {OWNERLESS_IMPORT_IDENTITY_PREDICATE}"
+                );
+                conn.execute(Statement::from_string(backend, sql))
+                    .await
+                    .map_err(|error| {
+                        CliError::fatal(format!("failed to prune stale import identities: {error}"))
+                    })?
+                    .rows_affected()
+            }
+        } else {
+            0
+        };
+    let import_identities_pruned = swept_import_identities_pruned
+        + prune
+            .as_ref()
+            .map(|prune| prune.deleted_import_identities)
+            .unwrap_or(0);
+
     let findings_runs_pruned = match findings_cutoff {
         Some(Some(cutoff)) => {
             gc_expired_findings_runs(&sessions_root, cutoff, args.dry_run).await?
@@ -261,6 +388,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
             stderr_runs_pruned,
             findings_runs_pruned,
             export_jobs_pruned,
+            import_identities_pruned,
             dry_run: args.dry_run,
             note,
         },

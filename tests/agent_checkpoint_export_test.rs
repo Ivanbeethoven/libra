@@ -880,7 +880,8 @@ async fn inflight_marker_lifecycle_and_expiry() {
     // Re-writing the same (session, attempt) refreshes rather than
     // duplicates (UNIQUE(scope,target,key) upsert).
     let mut refreshed = live.clone();
-    refreshed.commit = Some("abc123".to_string());
+    let refreshed_commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    refreshed.commit = Some(refreshed_commit.to_string());
     history::write_traces_inflight_marker(&conn, &refreshed)
         .await
         .expect("refresh marker");
@@ -888,7 +889,7 @@ async fn inflight_marker_lifecycle_and_expiry() {
         .await
         .expect("list live after refresh");
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].commit.as_deref(), Some("abc123"));
+    assert_eq!(listed[0].commit.as_deref(), Some(refreshed_commit));
 
     let cleared = history::clear_traces_inflight_marker(&conn, "sess-marker", "attempt-live")
         .await

@@ -794,6 +794,26 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026071403_agent_import_tombstone.sql"),
             include_str!("../../../sql/migrations/2026071403_agent_import_tombstone_down.sql"),
         ),
+        // M4 compatibility hardening: 2026071403 was already released before
+        // the old-writer anti-resurrection triggers were added. Keep its up
+        // migration immutable and install the triggers monotonically so
+        // repositories already at 1403 receive the barrier on upgrade.
+        sql_migration(
+            2026071404,
+            "agent_tombstone_compat_barrier",
+            include_str!("../../../sql/migrations/2026071404_agent_tombstone_compat_barrier.sql"),
+            include_str!(
+                "../../../sql/migrations/2026071404_agent_tombstone_compat_barrier_down.sql"
+            ),
+        ),
+        // M4 conflict recovery: preserve the first complete challenger in a
+        // bounded side table when coverage arbitration parks a claim.
+        sql_migration(
+            2026071405,
+            "agent_coverage_conflict",
+            include_str!("../../../sql/migrations/2026071405_agent_coverage_conflict.sql"),
+            include_str!("../../../sql/migrations/2026071405_agent_coverage_conflict_down.sql"),
+        ),
     ]
 }
 
@@ -922,9 +942,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 25);
+        assert_eq!(runner.len(), 29);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026071401));
+        assert_eq!(runner.max_registered_version(), Some(2026071405));
     }
 
     #[test]

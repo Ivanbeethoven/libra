@@ -28,11 +28,12 @@
 //! re-open-by-path TOCTOU on the read side.
 
 use std::{
-    io::Read,
-    path::{Path, PathBuf},
+    io::{Read, Seek},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
+use thiserror::Error;
 
 use crate::internal::ai::observed_agents::{AgentSessionCtx, ObservedAgent};
 
@@ -40,6 +41,12 @@ use crate::internal::ai::observed_agents::{AgentSessionCtx, ObservedAgent};
 /// the existing Claude adapter hard cap so DR-04a does not silently enlarge the
 /// hook-path memory ceiling.
 pub const TRANSCRIPT_READ_HARD_CAP_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Debug, Error)]
+pub enum TranscriptReadError {
+    #[error("transcript exceeds {cap} byte cap; refusing to load")]
+    ExceedsCap { cap: u64 },
+}
 
 /// Proof token that a [`TranscriptSource::File`] was opened from inside the
 /// provider's own transcript root. Its field is private, so it can only be
@@ -107,23 +114,81 @@ pub struct AuthorizedTranscriptFile {
 }
 
 impl AuthorizedTranscriptFile {
+    pub(crate) fn into_rewound_inner(mut self) -> Result<std::fs::File> {
+        self.file
+            .seek(std::io::SeekFrom::Start(0))
+            .context("rewind authorized transcript before reader handoff")?;
+        Ok(self.file)
+    }
+
     /// Read the transcript from the already-open descriptor, refusing to load
     /// anything larger than `cap` (matching the existing adapter baseline,
     /// which errors on oversize rather than silently truncating). Reads never
     /// re-open by path, so a concurrent path swap cannot change the bytes.
     pub fn read_bounded(&mut self, cap: u64) -> Result<Vec<u8>> {
+        self.read_bounded_counted(cap).0
+    }
+
+    /// Count every byte pulled from the held descriptor even when the read is
+    /// rejected (for example, the `cap + 1` oversize sentinel). Historical
+    /// batch import uses this to enforce its cumulative budget across failed
+    /// as well as successfully parsed candidates.
+    pub(crate) fn read_bounded_counted(&mut self, cap: u64) -> (Result<Vec<u8>>, u64) {
+        if let Err(error) = self
+            .file
+            .seek(std::io::SeekFrom::Start(0))
+            .context("rewind authorized transcript before read")
+        {
+            return (Err(error), 0);
+        }
         let mut buf = Vec::new();
         // Read one past the cap so an oversize file is detected, not silently
         // truncated; `take` still bounds memory on the hook path.
-        self.file
+        if let Err(error) = self
+            .file
             .by_ref()
             .take(cap.saturating_add(1))
             .read_to_end(&mut buf)
-            .context("read authorized transcript handle")?;
-        if buf.len() as u64 > cap {
-            anyhow::bail!("transcript exceeds {cap} byte cap; refusing to load");
+            .context("read authorized transcript handle")
+        {
+            let bytes_read = buf.len() as u64;
+            return (Err(error), bytes_read);
         }
-        Ok(buf)
+        let bytes_read = buf.len() as u64;
+        if bytes_read > cap {
+            return (
+                Err(TranscriptReadError::ExceedsCap { cap }.into()),
+                bytes_read,
+            );
+        }
+        (Ok(buf), bytes_read)
+    }
+
+    fn len(&self) -> Result<u64> {
+        self.file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .context("inspect authorized transcript size")
+    }
+
+    fn descriptor(&self) -> &std::fs::File {
+        &self.file
+    }
+
+    /// Read a bounded preview and rewind the already-authorized descriptor.
+    /// Used only after import consent to derive a provider session id for an
+    /// explicit `--path`; the subsequent writer still consumes this exact
+    /// held handle rather than reopening the path.
+    pub fn preview_bounded(&mut self, cap: u64) -> Result<Vec<u8>> {
+        let start = self
+            .file
+            .stream_position()
+            .context("read authorized transcript position")?;
+        let bytes = self.read_bounded(cap)?;
+        self.file
+            .seek(std::io::SeekFrom::Start(start))
+            .context("rewind authorized transcript handle after preview")?;
+        Ok(bytes)
     }
 }
 
@@ -141,6 +206,20 @@ pub enum TranscriptSource {
         bytes: Vec<u8>,
         auth: ExportAuthorized,
     },
+}
+
+impl TranscriptSource {
+    /// Authorized raw size used by the command's cumulative batch budget.
+    /// This inspects the held descriptor or in-memory export; it never
+    /// reopens a provider path.
+    pub fn authorized_len(&self) -> Result<u64> {
+        match self {
+            Self::File { file, .. } => file.len(),
+            Self::Bytes { bytes, .. } => {
+                u64::try_from(bytes.len()).context("export byte length exceeds u64")
+            }
+        }
+    }
 }
 
 /// Resolve the provider root that contains `canonical_path`, if any. Mirrors
@@ -164,6 +243,330 @@ fn provider_root_containing(adapter: &dyn ObservedAgent, canonical_path: &Path) 
     })
 }
 
+fn configured_provider_roots(adapter: &dyn ObservedAgent) -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("LIBRA_TEST_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+    else {
+        return Vec::new();
+    };
+    adapter
+        .protected_dirs()
+        .iter()
+        .map(|dir| {
+            if *dir == ".codex" {
+                match std::env::var_os("CODEX_HOME").map(PathBuf::from) {
+                    Some(path) if path.is_absolute() => path,
+                    _ => home.join(dir),
+                }
+            } else {
+                home.join(dir)
+            }
+        })
+        .collect()
+}
+
+/// Open a provider transcript relative to a pinned provider root while
+/// rejecting every symlink/magic component. Unix uses descriptor-relative
+/// `openat(O_NOFOLLOW)` for each component; platforms without equivalent
+/// semantics fail closed (ADR-DR-13/GC-DR-14).
+#[cfg(unix)]
+fn open_absolute_directory_no_follow(path: &Path) -> Result<std::fs::File> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    if !path.is_absolute() {
+        anyhow::bail!("provider root must be absolute");
+    }
+    let slash = CString::new("/").context("construct root directory name")?;
+    // SAFETY: slash is NUL-terminated and a successful descriptor is owned
+    // immediately below.
+    let root_fd = unsafe {
+        libc::open(
+            slash.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open filesystem root");
+    }
+    // SAFETY: `root_fd` is a fresh descriptor returned by `open`.
+    let mut current = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(root_fd) };
+    for component in path.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => {
+                let name = CString::new(name.as_bytes())
+                    .context("provider root component contains NUL")?;
+                // SAFETY: `current` is a live directory descriptor and name
+                // is NUL-terminated. A successful fd is owned immediately.
+                let fd = unsafe {
+                    libc::openat(
+                        current.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("securely open provider root component (no-follow)");
+                }
+                // SAFETY: `fd` is a fresh descriptor returned by `openat`.
+                current = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+            }
+            _ => anyhow::bail!("provider root contains a non-normal component"),
+        }
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn open_beneath_no_follow(root: &Path, relative: &Path) -> Result<std::fs::File> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    let mut current = open_absolute_directory_no_follow(root)
+        .context("securely open provider transcript root (no-follow)")?;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty() {
+        anyhow::bail!("provider transcript path does not name a file");
+    }
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("provider transcript path contains a non-normal component");
+        };
+        let name = CString::new(name.as_bytes())
+            .context("provider transcript path component contains NUL")?;
+        let final_component = index + 1 == components.len();
+        let flags = libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if final_component {
+                // Prevent a FIFO/device candidate from blocking before the
+                // descriptor's file type can be checked.
+                libc::O_RDONLY | libc::O_NONBLOCK
+            } else {
+                libc::O_RDONLY | libc::O_DIRECTORY
+            };
+        // SAFETY: `current` owns a live directory fd, `name` is NUL-terminated,
+        // and a successful return is immediately wrapped in an owned File.
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("securely open provider transcript component (no-follow)");
+        }
+        // SAFETY: `fd` is a fresh descriptor returned by openat above.
+        let opened = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let meta = opened
+            .metadata()
+            .context("inspect securely opened provider transcript component")?;
+        if final_component {
+            if !meta.is_file() {
+                anyhow::bail!("provider transcript source is not a regular file");
+            }
+            return Ok(opened);
+        }
+        if !meta.is_dir() {
+            anyhow::bail!("provider transcript path component is not a directory");
+        }
+        current = opened;
+    }
+    anyhow::bail!("provider transcript path did not resolve to a file")
+}
+
+#[cfg(not(unix))]
+fn open_beneath_no_follow(_root: &Path, _relative: &Path) -> Result<std::fs::File> {
+    anyhow::bail!(
+        "secure provider transcript opening is unavailable on this platform; import fails closed"
+    )
+}
+
+/// Open a provider-owned directory for pre-consent discovery without ever
+/// following a symlinked component. The returned descriptor pins the
+/// directory while callers enumerate it.
+#[cfg(unix)]
+pub(crate) fn open_provider_directory_for_discovery(
+    adapter: &dyn ObservedAgent,
+    path: &Path,
+) -> Result<Option<std::fs::File>> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    if !path.is_absolute() {
+        return Ok(None);
+    }
+    for root in configured_provider_roots(adapter) {
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let mut current = match open_absolute_directory_no_follow(&root) {
+            Ok(directory) => directory,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error).context("securely open provider discovery root (no-follow)");
+            }
+        };
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                anyhow::bail!("provider discovery directory contains a non-normal component");
+            };
+            let name = CString::new(name.as_bytes())
+                .context("provider discovery directory component contains NUL")?;
+            // SAFETY: `current` owns a live directory fd and `name` is
+            // NUL-terminated. A successful fd is immediately owned.
+            let fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                return Err(error)
+                    .context("securely open provider discovery component (no-follow)");
+            }
+            // SAFETY: `fd` is a fresh descriptor returned by `openat`.
+            current = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        }
+        return Ok(Some(current));
+    }
+    Ok(None)
+}
+
+/// Address a held directory descriptor for safe enumeration while retaining
+/// the descriptor for the entire walk. Every descendant lookup is therefore
+/// rooted at the object opened by [`open_provider_directory_for_discovery`],
+/// even if an attacker swaps the provider's pathname concurrently.
+#[cfg(target_os = "linux")]
+pub(crate) fn pinned_provider_directory_path(directory: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn pinned_provider_directory_path(directory: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+
+    PathBuf::from(format!("/dev/fd/{}", directory.as_raw_fd()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pinned_provider_directory_path(_directory: &std::fs::File) -> PathBuf {
+    PathBuf::new()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_provider_directory_for_discovery(
+    _adapter: &dyn ObservedAgent,
+    _path: &Path,
+) -> Result<Option<std::fs::File>> {
+    anyhow::bail!(
+        "secure provider directory discovery is unavailable on this platform; import fails closed"
+    )
+}
+
+fn securely_open_provider_file(
+    adapter: &dyn ObservedAgent,
+    path: &Path,
+) -> Result<Option<(std::fs::File, String)>> {
+    if !path.is_absolute() {
+        return Ok(None);
+    }
+    for root in configured_provider_roots(adapter) {
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let file = open_beneath_no_follow(&root, relative)?;
+        let source_id = relative.to_string_lossy().into_owned();
+        return Ok(Some((file, source_id)));
+    }
+    Ok(None)
+}
+
+/// Preserve the pre-M4 live-capture behavior on platforms that do not expose
+/// Unix descriptor-relative no-follow traversal. Historical import calls the
+/// strict resolver below and still fails closed there; this compatibility
+/// path is only for an already-running provider hook capture.
+#[cfg(not(unix))]
+fn compatibly_open_provider_file(
+    adapter: &dyn ObservedAgent,
+    path: &Path,
+) -> Result<Option<(std::fs::File, String)>> {
+    let canonical = path
+        .canonicalize()
+        .context("canonicalize live provider transcript")?;
+    let Some(root) = provider_root_containing(adapter, &canonical) else {
+        return Ok(None);
+    };
+    let relative = canonical
+        .strip_prefix(&root)
+        .context("bound live provider transcript to protected root")?;
+    let file = std::fs::File::open(&canonical).context("open live provider transcript")?;
+    if !file
+        .metadata()
+        .context("inspect live provider transcript")?
+        .is_file()
+    {
+        anyhow::bail!("live provider transcript source is not a regular file");
+    }
+    Ok(Some((file, relative.to_string_lossy().into_owned())))
+}
+
+fn open_provider_file_for_capture(
+    adapter: &dyn ObservedAgent,
+    path: &Path,
+    strict_import: bool,
+) -> Result<Option<(std::fs::File, String)>> {
+    #[cfg(unix)]
+    {
+        let _ = strict_import;
+        securely_open_provider_file(adapter, path)
+    }
+    #[cfg(not(unix))]
+    {
+        if strict_import {
+            securely_open_provider_file(adapter, path)
+        } else {
+            compatibly_open_provider_file(adapter, path)
+        }
+    }
+}
+
+fn import_test_pause_before_secure_open() -> Result<()> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let Ok(ready_path) = std::env::var("LIBRA_TEST_IMPORT_SECURE_OPEN_READY_FILE") else {
+        return Ok(());
+    };
+    let continue_path = std::env::var("LIBRA_TEST_IMPORT_SECURE_OPEN_CONTINUE_FILE")
+        .context("secure-open pause requires a continue-file path")?;
+    std::fs::write(&ready_path, b"ready").context("publish test-only secure-open import pause")?;
+    while !Path::new(&continue_path).exists() {
+        // Deliberately ignore the in-process deadline: this models an
+        // uninterruptible filesystem open. Historical import must remain
+        // bounded because this code executes only in its killable helper.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
+}
+
 /// Migration-period provider-root containment precheck (ADR-DR-13). Returns
 /// true when `path` canonicalises to a location inside the adapter's own
 /// transcript root. Not a final TOCTOU boundary on its own — the resolver
@@ -173,21 +576,6 @@ pub fn transcript_path_within_provider_root(adapter: &dyn ObservedAgent, path: &
         return false;
     };
     provider_root_containing(adapter, &canonical_path).is_some()
-}
-
-/// Derive a provider-root-relative source identity for `path`. Falls back to
-/// the file name when the path is not (or no longer) under the root, so we
-/// never persist an absolute home path.
-fn provider_root_relative_source_id(adapter: &dyn ObservedAgent, path: &Path) -> String {
-    if let Ok(canonical_path) = path.canonicalize()
-        && let Some(root) = provider_root_containing(adapter, &canonical_path)
-        && let Ok(rel) = canonical_path.strip_prefix(&root)
-    {
-        return rel.to_string_lossy().into_owned();
-    }
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 /// The unified writer read entry point (ADR-DR-02).
@@ -202,42 +590,44 @@ fn provider_root_relative_source_id(adapter: &dyn ObservedAgent, path: &Path) ->
 ///   fail-open-on-absent semantics while staying fail-closed on untrusted
 ///   paths.
 /// - `Err(_)` only on an unexpected I/O error opening a trusted, present path.
-pub fn resolve_transcript_source(
+fn resolve_transcript_source_with_policy(
     adapter: &dyn ObservedAgent,
     ctx: &AgentSessionCtx,
+    strict_import: bool,
+    preparation_deadline: Option<std::time::Instant>,
 ) -> Result<Option<TranscriptSource>> {
     let Some(path) = ctx.transcript_path.as_deref() else {
         return Ok(None);
     };
-    // Authorize before invoking any provider hook: preparers may inspect the
-    // file (Claude's flush-wait does), so an untrusted hook-supplied path must
-    // never reach them. Re-check after preparation to narrow the component-
-    // swap window before the final open.
-    if !transcript_path_within_provider_root(adapter, path) {
-        return Ok(None);
+    if strict_import {
+        import_test_pause_before_secure_open()?;
     }
-    // DR-01 (ADR-DR-02/07): the optional flush-wait side-effect hook runs
-    // BEFORE the safe open, so the handle sees a settled tail whenever the
-    // budget allows. Always non-fatal.
-    if let Some(preparer) = adapter.as_transcript_preparer()
-        && let Err(err) = preparer.prepare_transcript(ctx)
-    {
-        tracing::warn!(error = %format!("{err:#}"), "transcript preparer failed; continuing");
-    }
-    if !transcript_path_within_provider_root(adapter, path) {
-        // The path moved outside the trusted root while the preparer ran.
-        return Ok(None);
-    }
-    match std::fs::File::open(path) {
-        Ok(file) => {
-            let source_id = provider_root_relative_source_id(adapter, path);
+    match open_provider_file_for_capture(adapter, path, strict_import) {
+        Ok(Some((file, source_id))) => {
+            let authorized = AuthorizedTranscriptFile { file };
+            // DR-01/ADR-DR-13: preparation consumes the exact pinned
+            // descriptor. It cannot reopen a path that may have been swapped
+            // after authorization.
+            if let Some(preparer) = adapter.as_transcript_preparer()
+                && let Err(err) =
+                    preparer.prepare_transcript(ctx, authorized.descriptor(), preparation_deadline)
+            {
+                tracing::warn!(error = %format!("{err:#}"), "transcript preparer failed; continuing");
+            }
             Ok(Some(TranscriptSource::File {
-                file: AuthorizedTranscriptFile { file },
+                file: authorized,
                 source_id,
                 auth: ProviderRootAuthorized(()),
             }))
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(None) => Ok(None),
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
         Err(err) => Err(err).with_context(|| {
             format!(
                 "open authorized transcript for '{}'",
@@ -245,6 +635,34 @@ pub fn resolve_transcript_source(
             )
         }),
     }
+}
+
+/// Resolve a source for existing live hook capture. Unix receives the same
+/// descriptor-relative no-follow protection as import; other platforms keep
+/// the prior canonical-path compatibility behavior.
+pub fn resolve_transcript_source(
+    adapter: &dyn ObservedAgent,
+    ctx: &AgentSessionCtx,
+) -> Result<Option<TranscriptSource>> {
+    resolve_transcript_source_with_policy(adapter, ctx, false, None)
+}
+
+/// Resolve a historical-import source. Platforms without an equivalent to
+/// Unix descriptor-relative no-follow traversal fail closed rather than
+/// weakening the import authorization boundary.
+pub fn resolve_import_transcript_source(
+    adapter: &dyn ObservedAgent,
+    ctx: &AgentSessionCtx,
+) -> Result<Option<TranscriptSource>> {
+    resolve_transcript_source_with_policy(adapter, ctx, true, None)
+}
+
+pub(crate) fn resolve_import_transcript_source_until(
+    adapter: &dyn ObservedAgent,
+    ctx: &AgentSessionCtx,
+    deadline: std::time::Instant,
+) -> Result<Option<TranscriptSource>> {
+    resolve_transcript_source_with_policy(adapter, ctx, true, Some(deadline))
 }
 
 #[cfg(test)]
@@ -286,7 +704,12 @@ mod tests {
     }
 
     impl TranscriptPreparer for CountingPreparer {
-        fn prepare_transcript(&self, _session: &AgentSessionCtx) -> Result<()> {
+        fn prepare_transcript(
+            &self,
+            _session: &AgentSessionCtx,
+            _file: &std::fs::File,
+            _deadline: Option<std::time::Instant>,
+        ) -> Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -426,6 +849,115 @@ mod tests {
             }
             _ => panic!("expected File source"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn provider_root_component_symlink_is_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let _g = HomeGuard::set(home.path());
+        std::fs::create_dir_all(home.path().join(".claude").join("projects")).unwrap();
+        std::fs::write(outside.path().join("s.jsonl"), b"OUTSIDE").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            home.path().join(".claude").join("projects").join("swapped"),
+        )
+        .unwrap();
+        let path = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("swapped")
+            .join("s.jsonl");
+        let agent = ClaudeCodeObservedAgent::new();
+        assert!(
+            resolve_import_transcript_source(&agent, &test_ctx(Some(path))).is_err(),
+            "descriptor-relative traversal must reject a symlinked component"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn provider_root_intermediate_component_symlink_is_rejected() {
+        let container = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real_home = outside.path().join("home");
+        make_claude_transcript(&real_home, "outside.jsonl", b"OUTSIDE");
+        let linked_home = container.path().join("linked-home");
+        std::os::unix::fs::symlink(&real_home, &linked_home).unwrap();
+        let transcript = linked_home.join(".claude/projects/proj/outside.jsonl");
+        let _guard = HomeGuard::set(&linked_home);
+        let agent = ClaudeCodeObservedAgent::new();
+
+        assert!(
+            resolve_import_transcript_source(&agent, &test_ctx(Some(transcript))).is_err(),
+            "an intermediate symlink in the absolute provider root must fail closed"
+        );
+        assert!(
+            open_provider_directory_for_discovery(
+                &agent,
+                &linked_home.join(".claude/projects/proj")
+            )
+            .is_err(),
+            "pre-consent discovery must reject the same intermediate symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pinned_provider_directory_survives_root_rename_and_symlink_swap() {
+        let container = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let home = container.path().join("home");
+        let project = home.join(".claude/projects/proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("original.jsonl"), b"ORIGINAL").unwrap();
+        std::fs::write(outside.path().join("outside.jsonl"), b"OUTSIDE").unwrap();
+        let _guard = HomeGuard::set(&home);
+        let agent = ClaudeCodeObservedAgent::new();
+        let directory = open_provider_directory_for_discovery(&agent, &project)
+            .unwrap()
+            .expect("open pinned project directory");
+
+        std::fs::rename(home.join(".claude"), home.join(".claude-original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), home.join(".claude")).unwrap();
+        let pinned = pinned_provider_directory_path(&directory);
+        let names = std::fs::read_dir(pinned)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![std::ffi::OsString::from("original.jsonl")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn fifo_source_is_rejected_without_blocking() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt, time::Duration};
+
+        let home = tempfile::tempdir().unwrap();
+        let _g = HomeGuard::set(home.path());
+        let path = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("proj")
+            .join("blocked.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        let agent = ClaudeCodeObservedAgent::new();
+        assert!(resolve_import_transcript_source(&agent, &test_ctx(Some(path))).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "FIFO authorization must not wait for a writer"
+        );
     }
 
     #[test]

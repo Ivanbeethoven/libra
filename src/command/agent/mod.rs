@@ -3,7 +3,7 @@
 //! Every subcommand dispatches to a real handler: `status`/`list` (capability
 //! matrix), `enable`/`add` and `disable`/`remove` (hook install/uninstall
 //! aliases), `session`, `checkpoint`, `clean`, `doctor`, `push`, `hooks`, and
-//! `rpc`. See `docs/development/commands/_general.md` section 9 and
+//! `import`, and `rpc`. See `docs/development/commands/_general.md` section 9 and
 //! `docs/development/tracing/agent.md` for the external-agent capture surface.
 
 use clap::{Args, Subcommand};
@@ -23,6 +23,7 @@ mod checkpoint;
 mod clean;
 mod doctor;
 mod hooks;
+mod import;
 mod list;
 mod push;
 // `libra review` is a TOP-LEVEL command (AG-22; `Commands::Review` in
@@ -37,6 +38,13 @@ mod rpc;
 mod session;
 mod skill;
 mod status;
+
+#[doc(hidden)]
+pub use import::{
+    IMPORT_DISCOVERY_HELPER_ARG, IMPORT_DISCOVERY_HELPER_FRAME_CAP, IMPORT_PREPARATION_HELPER_ARG,
+    IMPORT_PREPARATION_HELPER_INPUT_CAP, IMPORT_PREPARATION_HELPER_OUTPUT_CAP,
+    run_import_discovery_helper, run_import_preparation_helper,
+};
 
 /// A0-06: derive a safe display/record name from a `review/investigate attach`
 /// path. Only the basename is kept (never the full path — no directory-tree
@@ -57,8 +65,8 @@ pub(crate) fn sanitize_attachment_name(path: &std::path::Path) -> String {
 /// `--help` examples shown in `libra agent --help` output.
 ///
 /// `agent` is the operator surface for the external Agent capture
-/// pipeline. It exposes eight visible sub-commands (status, enable,
-/// disable, session, checkpoint, clean, doctor, push, rpc) plus a
+/// pipeline. It exposes the visible status, list, import, enable, disable,
+/// session, checkpoint, clean, doctor, push, skill, and rpc commands plus a
 /// hidden `hooks` entry point invoked by installed provider hooks.
 /// The banner pins the canonical invocation per sub-command plus the
 /// `--all` clean form, a named `--remote` push, and a JSON variant
@@ -70,6 +78,8 @@ EXAMPLES:
     libra agent status                              Show captured-session counts and recent checkpoint summary
     libra agent list                                Show the agent capability matrix (supported roster, hooks, install state)
     libra agent list --json                         Capability matrix as JSON (stable schema for automation)
+    libra agent list --schema-version 2 --json      Capability matrix with transcript import/export methods
+    libra agent import --session <id> --agent claude-code --yes  Import one historical transcript after consent
     libra agent add claude-code                     Enable Claude Code capture and install its hooks (alias of enable)
     libra agent add                                 Enable every supported agent
     libra agent remove claude-code                  Disable Claude Code capture and uninstall its hooks (alias of disable)
@@ -111,6 +121,10 @@ pub enum AgentSubcommand {
     /// List known agents with their capability matrix (AG-17).
     #[command(about = "List agents with their capability matrix")]
     List(list::ListArgs),
+
+    /// Import historical external-agent transcripts after explicit consent.
+    #[command(about = "Import historical external-agent transcripts")]
+    Import(import::ImportArgs),
 
     /// Enable an external Agent and install its hooks.
     #[command(about = "Enable an external agent and install its hooks")]
@@ -331,6 +345,7 @@ pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<(
     match args.command {
         AgentSubcommand::Status(args) => status::execute_safe(args, output).await,
         AgentSubcommand::List(args) => list::execute_safe(args, output).await,
+        AgentSubcommand::Import(args) => import::execute_safe(args, output).await,
         AgentSubcommand::Enable(args) => enable_agents(&args.agents, output),
         AgentSubcommand::Add(args) => enable_agents(&args.agents, output),
         AgentSubcommand::Disable(args) => disable_agents(&args.agents, output),

@@ -50,7 +50,8 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
-            2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403
+            2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
+            2026071405
         ]
     );
     assert_eq!(
@@ -83,13 +84,15 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_export_job",
             "agent_import_identity",
             "agent_import_tombstone",
+            "agent_tombstone_compat_barrier",
+            "agent_coverage_conflict",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 27);
-    assert_eq!(runner.max_registered_version(), Some(2026071403));
+    assert_eq!(runner.len(), 29);
+    assert_eq!(runner.max_registered_version(), Some(2026071405));
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,7 +1082,8 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
-            2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403
+            2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
+            2026071405
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1122,14 +1126,406 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     // plan-20260713 DR-05c-0: per-turn coverage claim/revision gate.
     assert!(table_exists(&conn, "agent_coverage_claim").await);
     assert!(table_exists(&conn, "agent_coverage_revision").await);
+    assert!(table_exists(&conn, "agent_coverage_conflict").await);
     assert!(index_exists(&conn, "idx_agent_coverage_claim_logical_key").await);
     assert!(index_exists(&conn, "idx_agent_coverage_claim_session_state").await);
     assert!(index_exists(&conn, "idx_agent_coverage_claim_checkpoint_id").await);
     assert!(index_exists(&conn, "idx_agent_coverage_revision_checkpoint_id").await);
+    assert!(index_exists(&conn, "idx_agent_coverage_conflict_observed_at").await);
     // plan-20260713 DR-04b: OpenCode export-bridge job state.
     assert!(table_exists(&conn, "agent_export_job").await);
     assert!(index_exists(&conn, "idx_agent_export_job_session").await);
     assert!(index_exists(&conn, "idx_agent_export_job_ttl").await);
+    // plan-20260713 M4: historical import identity + local erase barrier.
+    assert!(table_exists(&conn, "agent_import_identity").await);
+    assert!(index_exists(&conn, "idx_agent_import_identity_key").await);
+    assert!(table_exists(&conn, "agent_import_tombstone").await);
+    assert!(index_exists(&conn, "idx_agent_import_tombstone_provider").await);
+    assert!(index_exists(&conn, "idx_agent_import_tombstone_erased_session").await);
+}
+
+/// M4 migration gate: both import tables roll back in reverse order and
+/// reapply cleanly, while the older export-job schema remains intact.
+#[tokio::test]
+async fn agent_import_identity_tombstone_up_down_up_round_trip() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+
+    runner.run_pending(&conn).await.expect("M4 up #1");
+    assert!(table_exists(&conn, "agent_import_identity").await);
+    assert!(table_exists(&conn, "agent_import_tombstone").await);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_session_update").await);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_checkpoint_insert").await);
+
+    let rolled = runner
+        .rollback_to(&conn, 2026071401)
+        .await
+        .expect("rollback M4 import migrations");
+    assert_eq!(rolled, vec![2026071405, 2026071404, 2026071403, 2026071402]);
+    assert!(!table_exists(&conn, "agent_import_identity").await);
+    assert!(!table_exists(&conn, "agent_import_tombstone").await);
+    assert!(!table_exists(&conn, "agent_coverage_conflict").await);
+    assert!(!trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
+    assert!(!trigger_exists(&conn, "agent_tombstone_block_session_update").await);
+    assert!(!trigger_exists(&conn, "agent_tombstone_block_checkpoint_insert").await);
+    assert!(table_exists(&conn, "agent_export_job").await);
+
+    let reapplied = runner.run_pending(&conn).await.expect("M4 up #2");
+    assert_eq!(
+        reapplied,
+        vec![2026071402, 2026071403, 2026071404, 2026071405]
+    );
+    assert!(table_exists(&conn, "agent_import_identity").await);
+    assert!(table_exists(&conn, "agent_import_tombstone").await);
+    assert!(table_exists(&conn, "agent_coverage_conflict").await);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_session_update").await);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_checkpoint_insert").await);
+}
+
+/// Repositories that shipped at 2026071403 already have the tombstone table
+/// but not the old-writer compatibility triggers. The monotonic follow-up
+/// migration must install those triggers instead of relying on edited 1403
+/// DDL that MigrationRunner will correctly skip.
+#[tokio::test]
+async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("apply current migration registry");
+    let rolled = runner
+        .rollback_to(&conn, 2026071403)
+        .await
+        .expect("construct released 1403 schema shape");
+    assert_eq!(rolled, vec![2026071405, 2026071404]);
+    assert!(table_exists(&conn, "agent_import_tombstone").await);
+    assert!(!trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
+    assert!(!trigger_exists(&conn, "agent_tombstone_block_session_update").await);
+    assert!(!trigger_exists(&conn, "agent_tombstone_block_checkpoint_insert").await);
+
+    let applied = runner
+        .run_pending(&conn)
+        .await
+        .expect("upgrade existing 1403 schema");
+    assert_eq!(applied, vec![2026071404, 2026071405]);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_session_update").await);
+    assert!(trigger_exists(&conn, "agent_tombstone_block_checkpoint_insert").await);
+}
+
+#[tokio::test]
+async fn agent_import_tombstone_rollback_refuses_nonempty_barrier() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("apply M4 migrations");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_import_tombstone (
+            tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
+         ) VALUES ('t1', 'claude_code', 'provider-erased', 'claude__provider-erased', 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed anti-resurrection barrier");
+
+    let error = runner
+        .rollback_to(&conn, 2026071402)
+        .await
+        .expect_err("non-empty tombstone rollback must be irreversible in practice");
+    assert!(
+        format!("{error:#}").contains("cannot roll back agent tombstones"),
+        "unexpected rollback error: {error:#}"
+    );
+    assert!(table_exists(&conn, "agent_import_tombstone").await);
+    let count: i64 = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) AS n FROM agent_import_tombstone".to_string(),
+        ))
+        .await
+        .expect("query tombstone")
+        .expect("count row")
+        .try_get_by("n")
+        .expect("decode count");
+    assert_eq!(count, 1, "rollback failure lost tombstone data");
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026071404),
+        "failed down migration removed its schema registry row"
+    );
+}
+
+#[tokio::test]
+async fn agent_coverage_conflict_rollback_refuses_nonempty_evidence() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("apply M4 migrations");
+    let backend = conn.get_database_backend();
+    conn.execute(Statement::from_string(
+        backend,
+        "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
+    ))
+    .await
+    .expect("seed minimal ai_thread FK target");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at, schema_version
+         ) VALUES ('conflict-down-session', 'claude_code', 'conflict-down-provider',
+                   'active', '/tmp', '{}', '{}', 1, 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed conflict session");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO agent_coverage_claim (
+            session_id, logical_turn_key, coverage_schema_version,
+            coverage_digest, completeness, revision, state, source_channel,
+            created_at, updated_at
+         ) VALUES ('conflict-down-session', 'turn-1', 1, 'incumbent',
+                   'complete', 1, 'conflicted', 'live', 1, 2)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed conflicted claim");
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO agent_coverage_conflict (
+            session_id, logical_turn_key, coverage_schema_version,
+            incumbent_revision, incumbent_digest, incumbent_checkpoint_id,
+            incoming_digest, incoming_source_channel, incoming_observed_at,
+            incoming_canonical_json, incoming_redaction_report_json
+         ) VALUES ('conflict-down-session', 'turn-1', 1, 1, 'incumbent', NULL,
+                   'challenger', 'live', 2, '[]',
+                   '{\"matches\":[],\"bytes_scanned\":0,\"bytes_redacted\":0}')"
+            .to_string(),
+    ))
+    .await
+    .expect("seed durable challenger evidence");
+
+    let error = runner
+        .rollback_to(&conn, 2026071404)
+        .await
+        .expect_err("non-empty conflict rollback must refuse evidence loss");
+    assert!(
+        format!("{error:#}").contains("cannot roll back agent coverage conflicts"),
+        "unexpected rollback error: {error:#}"
+    );
+    assert!(table_exists(&conn, "agent_coverage_conflict").await);
+    let count: i64 = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) AS n FROM agent_coverage_conflict".to_string(),
+        ))
+        .await
+        .expect("query conflict evidence")
+        .expect("count row")
+        .try_get_by("n")
+        .expect("decode count");
+    assert_eq!(count, 1, "rollback failure lost challenger evidence");
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026071405),
+        "failed conflict down migration removed its schema registry row"
+    );
+}
+
+#[tokio::test]
+async fn agent_import_identity_rollback_refuses_nonempty_recovery_state() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner
+        .run_pending(&conn)
+        .await
+        .expect("apply M4 migrations");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_import_identity (
+            identity_id, agent_kind, provider_session_id, source_kind, source_id,
+            schema_version, next_ordinal, state, created_at, updated_at
+         ) VALUES ('identity-down-guard', 'claude_code', 'provider-down-guard',
+                   'file', 'relative/source', 1, 0, 'failed', 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed import recovery identity");
+
+    let error = runner
+        .rollback_to(&conn, 2026071401)
+        .await
+        .expect_err("non-empty import identity rollback must refuse data loss");
+    assert!(
+        format!("{error:#}").contains("cannot roll back agent import identities"),
+        "unexpected rollback error: {error:#}"
+    );
+    assert!(table_exists(&conn, "agent_import_identity").await);
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current version"),
+        Some(2026071402),
+        "failed identity down migration removed its schema registry row"
+    );
+}
+
+/// M4 schema failure matrix: stable identity, state machine, provider
+/// tombstone key, and erased-session lookup key all fail closed.
+#[tokio::test]
+async fn agent_import_schema_constraints_fail_closed() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    run_builtin_migrations(&conn)
+        .await
+        .expect("apply builtin migrations");
+    let backend = conn.get_database_backend();
+    // This registry-only fixture intentionally does not replay the bootstrap
+    // schema, while `agent_session.thread_id` carries a soft FK to ai_thread.
+    // Supply the minimal FK target so the rollback-barrier assertions exercise
+    // normal foreign-key enforcement instead of disabling it.
+    conn.execute(Statement::from_string(
+        backend,
+        "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
+    ))
+    .await
+    .expect("seed minimal ai_thread FK target");
+
+    let identity_sql = "INSERT INTO agent_import_identity (
+        identity_id, agent_kind, provider_session_id, source_kind, source_id,
+        schema_version, next_ordinal, state, created_at, updated_at
+     ) VALUES (?, 'claude_code', 'provider-1', 'file', 'relative/source', 1, 0, ?, 1, 1)";
+    conn.execute(Statement::from_sql_and_values(
+        backend,
+        identity_sql,
+        ["identity-1".into(), "discovered".into()],
+    ))
+    .await
+    .expect("seed valid identity");
+    assert!(
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            identity_sql,
+            ["identity-2".into(), "discovered".into()],
+        ))
+        .await
+        .is_err(),
+        "stable import identity key must be unique"
+    );
+    assert!(
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO agent_import_identity (
+                identity_id, agent_kind, provider_session_id, source_kind, source_id,
+                schema_version, next_ordinal, state, created_at, updated_at
+             ) VALUES ('identity-bad', 'codex', 'provider-2', 'file', 'x', 1, 0,
+                       'resurrecting', 1, 1)",
+            Vec::<sea_orm::Value>::new(),
+        ))
+        .await
+        .is_err(),
+        "unknown import state must violate CHECK"
+    );
+
+    let tombstone_sql = "INSERT INTO agent_import_tombstone (
+        tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
+     ) VALUES (?, 'claude_code', ?, ?, 1)";
+    conn.execute(Statement::from_string(
+        backend,
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at, schema_version
+         ) VALUES ('session-a', 'claude_code', 'provider-a', 'active', '/tmp',
+                   '{}', '{}', 1, 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed session that will be tombstoned");
+    conn.execute(Statement::from_sql_and_values(
+        backend,
+        tombstone_sql,
+        ["tomb-1".into(), "provider-a".into(), "session-a".into()],
+    ))
+    .await
+    .expect("seed tombstone");
+    assert!(
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            tombstone_sql,
+            ["tomb-2".into(), "provider-a".into(), "session-b".into()],
+        ))
+        .await
+        .is_err(),
+        "provider tombstone key must be unique"
+    );
+    assert!(
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            tombstone_sql,
+            ["tomb-3".into(), "provider-b".into(), "session-a".into()],
+        ))
+        .await
+        .is_err(),
+        "erased session id must remain uniquely classifiable"
+    );
+    assert!(
+        conn.execute(Statement::from_string(
+            backend,
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, redaction_report, started_at, last_event_at, schema_version
+             ) VALUES ('session-recreated', 'claude_code', 'provider-a', 'active', '/tmp',
+                       '{}', '{}', 2, 2, 1)"
+                .to_string(),
+        ))
+        .await
+        .is_err(),
+        "an older writer must not recreate a tombstoned provider session"
+    );
+    assert!(
+        conn.execute(Statement::from_string(
+            backend,
+            "UPDATE agent_session SET last_event_at = 2 WHERE session_id = 'session-a'".to_string(),
+        ))
+        .await
+        .is_err(),
+        "an older writer must not advance a session after its tombstone"
+    );
+    assert!(
+        conn.execute(Statement::from_string(
+            backend,
+            "INSERT INTO agent_checkpoint (
+                checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
+                traces_commit, created_at
+             ) VALUES ('checkpoint-after-erase', 'session-a', 'committed',
+                       'tree', 'metadata', 'commit', 2)"
+                .to_string(),
+        ))
+        .await
+        .is_err(),
+        "an older writer must not publish a checkpoint after erasure"
+    );
 }
 
 /// OC-Phase 2 P2.5 regression guard: `approved_permission` survives an
@@ -1159,10 +1555,10 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026071403, 2026071402, 2026071401, 2026071301, 2026070803, 2026070802, 2026070801,
-            2026070701, 2026070601, 2026070501, 2026070401, 2026070301, 2026070202, 2026070201,
-            2026062301, 2026061401, 2026060801, 2026060401, 2026060201, 2026053101, 2026052301,
-            2026050801, 2026050601
+            2026071405, 2026071404, 2026071403, 2026071402, 2026071401, 2026071301, 2026070803,
+            2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301,
+            2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201,
+            2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -1189,7 +1585,7 @@ async fn approved_permission_up_down_up_round_trip() {
             2026050601, 2026050801, 2026052301, 2026053101, 2026060201, 2026060401, 2026060801,
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
-            2026071402, 2026071403
+            2026071402, 2026071403, 2026071404, 2026071405
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);
@@ -1223,6 +1619,17 @@ async fn index_exists(conn: &DatabaseConnection, name: &str) -> bool {
     ))
     .await
     .expect("query")
+    .is_some()
+}
+
+async fn trigger_exists(conn: &DatabaseConnection, name: &str) -> bool {
+    conn.query_one(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "SELECT 1 AS one FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+        [name.into()],
+    ))
+    .await
+    .expect("query sqlite_master trigger")
     .is_some()
 }
 

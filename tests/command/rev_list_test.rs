@@ -205,7 +205,10 @@ fn test_rev_list_rejects_tag_object_that_points_to_tree() {
 
     assert_eq!(output.status.code(), Some(129));
     assert!(stderr.contains("not a valid object name"));
-    assert!(stderr.contains("tag points to tree"));
+    assert!(
+        stderr.contains("tag points to tree"),
+        "expected typed tag-target detail, got: {stderr}"
+    );
     assert_eq!(report.error_code, "LBR-CLI-003");
 }
 

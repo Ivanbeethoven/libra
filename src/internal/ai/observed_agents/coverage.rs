@@ -18,9 +18,17 @@
 //! - Canonical bytes use minimal escaping, raw UTF-8 and recursive key
 //!   sorting by Unicode code point (coverage-v1.md §4).
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    time::Instant,
+};
 
-use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, Deserializer, MapAccess, SeqAccess, Visitor},
+    ser::{SerializeMap, SerializeSeq},
+};
 use sha2::{Digest, Sha256};
 
 /// Coverage schema version this module implements (`coverage-v1.md`).
@@ -44,6 +52,32 @@ pub enum CanonValue {
     Str(String),
     Array(Vec<CanonValue>),
     Object(BTreeMap<String, CanonValue>),
+}
+
+impl Serialize for CanonValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_unit(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::Int(value) => serializer.serialize_i64(*value),
+            Self::Float(bits) => serializer.serialize_f64(f64::from_bits(*bits)),
+            Self::Str(value) => serializer.serialize_str(value),
+            Self::Array(items) => {
+                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    sequence.serialize_element(item)?;
+                }
+                sequence.end()
+            }
+            Self::Object(items) => {
+                let mut map = serializer.serialize_map(Some(items.len()))?;
+                for (key, value) in items {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 impl CanonValue {
@@ -214,7 +248,8 @@ fn write_canon_value(out: &mut Vec<u8>, value: &CanonValue) {
 /// One semantic record of a normalized turn (coverage-v1.md §3). Exactly the
 /// digest allowlist — provenance (model/usage/timestamps/paths) never appears
 /// here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticRecord {
     User {
         text: String,
@@ -307,7 +342,8 @@ pub fn coverage_digest_hex(records: &[SemanticRecord]) -> String {
 }
 
 /// Turn completeness (coverage-v1.md §6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Completeness {
     Incomplete,
     Complete,
@@ -323,11 +359,15 @@ impl Completeness {
 }
 
 /// One normalized logical turn (coverage-v1.md §2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedTurn {
     pub logical_turn_key: String,
     pub ordinal: usize,
     pub completeness: Completeness,
+    /// Provider-derived audit chronology. These fields are provenance only
+    /// and never participate in coverage canonicalization or digests.
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
     pub records: Vec<SemanticRecord>,
 }
 
@@ -335,6 +375,31 @@ impl NormalizedTurn {
     pub fn digest_hex(&self) -> String {
         coverage_digest_hex(&self.records)
     }
+}
+
+fn timestamp_seconds(value: Option<&CanonValue>) -> Option<i64> {
+    match value? {
+        CanonValue::Int(value) if *value > 10_000_000_000 => Some(*value / 1_000),
+        CanonValue::Int(value) => Some(*value),
+        CanonValue::Str(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|timestamp| timestamp.timestamp()),
+        _ => None,
+    }
+}
+
+fn observe_turn_timestamp(turn: &mut NormalizedTurn, timestamp: Option<i64>) {
+    let Some(timestamp) = timestamp else {
+        return;
+    };
+    turn.started_at = Some(
+        turn.started_at
+            .map_or(timestamp, |current| current.min(timestamp)),
+    );
+    turn.ended_at = Some(
+        turn.ended_at
+            .map_or(timestamp, |current| current.max(timestamp)),
+    );
 }
 
 /// Does this (semantic-position) value contain any fractional number?
@@ -371,6 +436,19 @@ fn valid_provider_turn_id(id: &str) -> bool {
 
 fn ordinal_key(ordinal: usize) -> String {
     format!("ordinal:{ordinal}")
+}
+
+fn make_logical_turn_keys_unique(turns: &mut [NormalizedTurn]) {
+    let mut seen = BTreeSet::new();
+    for turn in turns {
+        if !seen.insert(turn.logical_turn_key.clone()) {
+            // Provider identifiers cannot contain ':', so a normalized
+            // ordinal key cannot collide with a validated provider key. The
+            // ordinal itself is unique after each normalizer's retain pass.
+            turn.logical_turn_key = ordinal_key(turn.ordinal);
+            seen.insert(turn.logical_turn_key.clone());
+        }
+    }
 }
 
 /// Extract plain text out of a strict message `content` value (string form or
@@ -444,6 +522,24 @@ fn user_content_has_human_text(content: &CanonValue) -> bool {
 /// lines mark the enclosing turn `incomplete` and are skipped; they never
 /// contribute partial content to a digest.
 pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
+    // INVARIANT: `None` disables the only early-exit condition.
+    let Some(turns) = normalize_claude_transcript_inner(data, None) else {
+        return Vec::new();
+    };
+    turns
+}
+
+pub(crate) fn normalize_claude_transcript_until(
+    data: &[u8],
+    deadline: Instant,
+) -> Option<Vec<NormalizedTurn>> {
+    normalize_claude_transcript_inner(data, Some(deadline))
+}
+
+fn normalize_claude_transcript_inner(
+    data: &[u8],
+    deadline: Option<Instant>,
+) -> Option<Vec<NormalizedTurn>> {
     let mut turns: Vec<NormalizedTurn> = Vec::new();
 
     fn open_turn(turns: &mut Vec<NormalizedTurn>, key: Option<String>) -> &mut NormalizedTurn {
@@ -455,6 +551,8 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
             logical_turn_key,
             ordinal,
             completeness: Completeness::Complete,
+            started_at: None,
+            ended_at: None,
             records: Vec::new(),
         });
         turns.last_mut().expect("just pushed") // INVARIANT: push above
@@ -468,6 +566,9 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
     }
 
     for line in data.split(|b| *b == b'\n') {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
@@ -481,6 +582,7 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
             }
         };
         let entry_type = entry.get("type").and_then(CanonValue::as_str).unwrap_or("");
+        let entry_timestamp = timestamp_seconds(entry.get("timestamp"));
         let uuid = entry
             .get("uuid")
             .and_then(CanonValue::as_str)
@@ -601,6 +703,11 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
             }
             _ => {} // summary / system / other line kinds: not semantic
         }
+        if matches!(entry_type, "user" | "assistant")
+            && let Some(turn) = turns.last_mut()
+        {
+            observe_turn_timestamp(turn, entry_timestamp);
+        }
     }
 
     // Drop turns that ended up with no semantic records (e.g. a poisoned
@@ -617,7 +724,279 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
             turn.ordinal = i;
         }
     }
+    make_logical_turn_keys_unique(&mut turns);
+    Some(turns)
+}
+
+/// Split a Codex rollout JSONL stream into coverage-v1 turns.
+///
+/// Codex records semantic messages under `type=response_item` / `payload`.
+/// A user message opens a turn, assistant messages and function-call records
+/// attach to it, and `task_started` / `turn_started` contributes a stable
+/// provider turn id when present. `event_msg` mirrors are provenance-only and
+/// are intentionally ignored so the same user/assistant text is not counted
+/// twice. Malformed semantic records poison only the current turn.
+pub fn normalize_codex_rollout(data: &[u8]) -> Vec<NormalizedTurn> {
+    // INVARIANT: `None` disables the only early-exit condition.
+    let Some(turns) = normalize_codex_rollout_inner(data, None) else {
+        return Vec::new();
+    };
     turns
+}
+
+pub(crate) fn normalize_codex_rollout_until(
+    data: &[u8],
+    deadline: Instant,
+) -> Option<Vec<NormalizedTurn>> {
+    normalize_codex_rollout_inner(data, Some(deadline))
+}
+
+fn normalize_codex_rollout_inner(
+    data: &[u8],
+    deadline: Option<Instant>,
+) -> Option<Vec<NormalizedTurn>> {
+    let mut turns: Vec<NormalizedTurn> = Vec::new();
+    let mut pending_turn_id: Option<String> = None;
+
+    fn open_turn(turns: &mut Vec<NormalizedTurn>, key: Option<String>) -> &mut NormalizedTurn {
+        let ordinal = turns.len();
+        turns.push(NormalizedTurn {
+            logical_turn_key: key
+                .filter(|id| valid_provider_turn_id(id))
+                .unwrap_or_else(|| ordinal_key(ordinal)),
+            ordinal,
+            completeness: Completeness::Complete,
+            started_at: None,
+            ended_at: None,
+            records: Vec::new(),
+        });
+        turns.last_mut().expect("just pushed") // INVARIANT: push above
+    }
+
+    fn current_or_open(turns: &mut Vec<NormalizedTurn>) -> &mut NormalizedTurn {
+        if turns.is_empty() {
+            return open_turn(turns, None);
+        }
+        turns.last_mut().expect("non-empty checked") // INVARIANT: checked above
+    }
+
+    fn text_blocks(content: &CanonValue, violation: &mut bool) -> String {
+        match content {
+            CanonValue::Str(text) => text.clone(),
+            CanonValue::Array(blocks) => {
+                let mut parts = Vec::new();
+                for block in blocks {
+                    if !matches!(block, CanonValue::Object(_)) {
+                        *violation = true;
+                        continue;
+                    }
+                    if let Some("input_text" | "output_text" | "text") =
+                        block.get("type").and_then(CanonValue::as_str)
+                    {
+                        match block.get("text") {
+                            Some(CanonValue::Str(text)) => parts.push(text.clone()),
+                            _ => *violation = true,
+                        }
+                    }
+                }
+                parts.join("\n")
+            }
+            _ => {
+                *violation = true;
+                String::new()
+            }
+        }
+    }
+
+    for line in data.split(|byte| *byte == b'\n') {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let entry = match parse_canon_value(line) {
+            Ok(entry) => entry,
+            Err(_) => {
+                current_or_open(&mut turns).completeness = Completeness::Incomplete;
+                continue;
+            }
+        };
+        let entry_type = entry.get("type").and_then(CanonValue::as_str).unwrap_or("");
+        let entry_timestamp = timestamp_seconds(entry.get("timestamp"));
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        if entry_type == "event_msg" {
+            let kind = payload
+                .get("type")
+                .and_then(CanonValue::as_str)
+                .unwrap_or("");
+            if matches!(kind, "task_started" | "turn_started") {
+                pending_turn_id = payload
+                    .get("turn_id")
+                    .and_then(CanonValue::as_str)
+                    .filter(|id| valid_provider_turn_id(id))
+                    .map(str::to_string);
+            }
+            continue;
+        }
+        if entry_type != "response_item" {
+            continue;
+        }
+
+        match payload
+            .get("type")
+            .and_then(CanonValue::as_str)
+            .unwrap_or("")
+        {
+            "message" => {
+                let mut violation = false;
+                let role = match payload.get("role") {
+                    Some(CanonValue::Str(role)) => role.as_str(),
+                    _ => {
+                        violation = true;
+                        ""
+                    }
+                };
+                let text = payload
+                    .get("content")
+                    .map(|content| text_blocks(content, &mut violation))
+                    .unwrap_or_else(|| {
+                        violation = true;
+                        String::new()
+                    });
+                match role {
+                    "user" => {
+                        let turn = open_turn(&mut turns, pending_turn_id.take());
+                        if violation {
+                            turn.completeness = Completeness::Incomplete;
+                        }
+                        turn.records.push(SemanticRecord::User { text });
+                    }
+                    "assistant" => {
+                        let turn = current_or_open(&mut turns);
+                        if violation {
+                            turn.completeness = Completeness::Incomplete;
+                        }
+                        if !text.is_empty() {
+                            turn.records.push(SemanticRecord::Assistant { text });
+                        }
+                    }
+                    _ if violation => {
+                        current_or_open(&mut turns).completeness = Completeness::Incomplete;
+                    }
+                    _ => {}
+                }
+            }
+            kind @ ("function_call" | "custom_tool_call") => {
+                let mut violation = false;
+                let name = match payload.get("name") {
+                    Some(CanonValue::Str(name)) => name.clone(),
+                    _ => {
+                        violation = true;
+                        String::new()
+                    }
+                };
+                let call_id = match payload.get("call_id") {
+                    Some(CanonValue::Str(id)) => Some(id.clone()),
+                    Some(CanonValue::Null) | None => None,
+                    Some(_) => {
+                        violation = true;
+                        None
+                    }
+                };
+                let mut input = match kind {
+                    "function_call" => match payload.get("arguments") {
+                        Some(CanonValue::Str(raw)) => match parse_canon_value(raw.as_bytes()) {
+                            Ok(value) => value,
+                            Err(_) => {
+                                violation = true;
+                                CanonValue::Str(raw.clone())
+                            }
+                        },
+                        Some(value) => {
+                            violation = true;
+                            value.clone()
+                        }
+                        None => {
+                            violation = true;
+                            CanonValue::Null
+                        }
+                    },
+                    "custom_tool_call" => match payload.get("input") {
+                        Some(CanonValue::Str(raw)) => CanonValue::Str(raw.clone()),
+                        Some(value) => {
+                            violation = true;
+                            value.clone()
+                        }
+                        None => {
+                            violation = true;
+                            CanonValue::Null
+                        }
+                    },
+                    _ => CanonValue::Null,
+                };
+                if contains_float(&input) {
+                    sanitize_floats(&mut input);
+                    violation = true;
+                }
+                let turn = current_or_open(&mut turns);
+                if violation {
+                    turn.completeness = Completeness::Incomplete;
+                }
+                turn.records.push(SemanticRecord::ToolCall {
+                    call_id,
+                    input,
+                    name,
+                });
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                let mut violation = false;
+                let call_id = match payload.get("call_id") {
+                    Some(CanonValue::Str(id)) => Some(id.clone()),
+                    Some(CanonValue::Null) | None => None,
+                    Some(_) => {
+                        violation = true;
+                        None
+                    }
+                };
+                let content = match payload.get("output") {
+                    Some(CanonValue::Str(output)) => output.clone(),
+                    Some(CanonValue::Null) | None => String::new(),
+                    Some(_) => {
+                        violation = true;
+                        String::new()
+                    }
+                };
+                let turn = current_or_open(&mut turns);
+                if violation {
+                    turn.completeness = Completeness::Incomplete;
+                }
+                turn.records.push(SemanticRecord::ToolResult {
+                    call_id,
+                    content,
+                    is_error: false,
+                });
+            }
+            _ => {}
+        }
+        if entry_type == "response_item"
+            && let Some(turn) = turns.last_mut()
+        {
+            observe_turn_timestamp(turn, entry_timestamp);
+        }
+    }
+
+    turns.retain(|turn| !turn.records.is_empty() || turn.completeness == Completeness::Incomplete);
+    for (ordinal, turn) in turns.iter_mut().enumerate() {
+        if turn.logical_turn_key == ordinal_key(turn.ordinal) {
+            turn.logical_turn_key = ordinal_key(ordinal);
+        }
+        turn.ordinal = ordinal;
+    }
+    make_logical_turn_keys_unique(&mut turns);
+    Some(turns)
 }
 
 /// Split an `opencode export` JSON document into normalized turns
@@ -634,6 +1013,24 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
 /// upgrades it — ADR-DR-16); wrong-typed semantic fields fail closed exactly
 /// like the Claude splitter.
 pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
+    // INVARIANT: `None` disables the only early-exit condition.
+    let Some(turns) = normalize_opencode_export_inner(data, None) else {
+        return Vec::new();
+    };
+    turns
+}
+
+pub(crate) fn normalize_opencode_export_until(
+    data: &[u8],
+    deadline: Instant,
+) -> Option<Vec<NormalizedTurn>> {
+    normalize_opencode_export_inner(data, Some(deadline))
+}
+
+fn normalize_opencode_export_inner(
+    data: &[u8],
+    deadline: Option<Instant>,
+) -> Option<Vec<NormalizedTurn>> {
     let mut turns: Vec<NormalizedTurn> = Vec::new();
     let Ok(document) = parse_canon_value(data) else {
         // Whole-document parse failure (truncated export, duplicate keys):
@@ -642,9 +1039,11 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
             logical_turn_key: ordinal_key(0),
             ordinal: 0,
             completeness: Completeness::Incomplete,
+            started_at: None,
+            ended_at: None,
             records: Vec::new(),
         });
-        return turns;
+        return Some(turns);
     };
     let Some(messages) = document.get("messages").and_then(CanonValue::as_array) else {
         // Valid JSON but structurally NOT an export document (missing or
@@ -654,9 +1053,11 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
             logical_turn_key: ordinal_key(0),
             ordinal: 0,
             completeness: Completeness::Incomplete,
+            started_at: None,
+            ended_at: None,
             records: Vec::new(),
         });
-        return turns;
+        return Some(turns);
     };
 
     fn open_turn(turns: &mut Vec<NormalizedTurn>, key: Option<String>) -> &mut NormalizedTurn {
@@ -674,6 +1075,8 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
             logical_turn_key,
             ordinal,
             completeness: Completeness::Complete,
+            started_at: None,
+            ended_at: None,
             records: Vec::new(),
         });
         turns.last_mut().expect("just pushed") // INVARIANT: push above
@@ -686,6 +1089,9 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
     }
 
     for message in messages {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
         // Structural validation: a message must be an object with an object
         // `info` carrying a string `role`, and an array `parts`. Anything
         // else poisons the enclosing turn instead of defaulting away
@@ -711,6 +1117,10 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
                 None
             }
         };
+        let message_timestamp = info.and_then(|info| info.get("time")).and_then(|time| {
+            timestamp_seconds(time.get("created"))
+                .or_else(|| timestamp_seconds(time.get("updated")))
+        });
         let parts: &[CanonValue] = match message.get("parts") {
             Some(CanonValue::Array(parts)) => parts,
             _ => {
@@ -830,6 +1240,9 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
                 }
             }
         }
+        if let Some(turn) = turns.last_mut() {
+            observe_turn_timestamp(turn, message_timestamp);
+        }
     }
 
     turns.retain(|turn| !turn.records.is_empty() || turn.completeness == Completeness::Incomplete);
@@ -841,7 +1254,8 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
             turn.ordinal = i;
         }
     }
-    turns
+    make_logical_turn_keys_unique(&mut turns);
+    Some(turns)
 }
 
 /// Redact every allowlisted string field of the normalized turns IN PLACE —
@@ -850,32 +1264,90 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
 /// secret-free content, and every path (live/import/export) applying the
 /// same default redactor reproduces the same digest.
 pub fn redact_turns(turns: &mut [NormalizedTurn]) {
+    let _ = redact_turns_with_report(turns);
+}
+
+/// Redact normalized turns and return the aggregate typed-field evidence for
+/// persistence by audit-sensitive callers such as historical import.
+pub fn redact_turns_with_report(
+    turns: &mut [NormalizedTurn],
+) -> crate::internal::ai::observed_agents::RedactionReport {
     let redactor = crate::internal::ai::observed_agents::Redactor::new_default();
-    let redact_string = |s: &mut String| {
-        let (bytes, _report) = redactor.redact(s.as_bytes());
+    let mut aggregate = crate::internal::ai::observed_agents::RedactionReport::default();
+    fn merge_report(
+        aggregate: &mut crate::internal::ai::observed_agents::RedactionReport,
+        report: crate::internal::ai::observed_agents::RedactionReport,
+    ) {
+        aggregate.bytes_scanned = aggregate.bytes_scanned.saturating_add(report.bytes_scanned);
+        aggregate.bytes_redacted = aggregate
+            .bytes_redacted
+            .saturating_add(report.bytes_redacted);
+        aggregate.matches.extend(report.matches);
+    }
+    fn redact_string(
+        s: &mut String,
+        redactor: &crate::internal::ai::observed_agents::Redactor,
+        aggregate: &mut crate::internal::ai::observed_agents::RedactionReport,
+    ) {
+        let (bytes, report) = redactor.redact(s.as_bytes());
         *s = String::from_utf8_lossy(bytes.as_ref()).into_owned();
-    };
-    fn redact_value(value: &mut CanonValue, redact_string: &impl Fn(&mut String)) {
+        merge_report(aggregate, report);
+    }
+    fn redact_value(
+        value: &mut CanonValue,
+        redactor: &crate::internal::ai::observed_agents::Redactor,
+        aggregate: &mut crate::internal::ai::observed_agents::RedactionReport,
+    ) {
         match value {
-            CanonValue::Str(s) => redact_string(s),
+            CanonValue::Str(s) => redact_string(s, redactor, aggregate),
             CanonValue::Array(items) => {
                 for item in items {
-                    redact_value(item, redact_string);
+                    redact_value(item, redactor, aggregate);
                 }
             }
             CanonValue::Object(map) => {
-                for item in map.values_mut() {
-                    redact_value(item, redact_string);
+                let mut redacted = BTreeMap::new();
+                for (original_key, mut item) in std::mem::take(map) {
+                    redact_value(&mut item, redactor, aggregate);
+                    let (_, key_report) = redactor.redact(original_key.as_bytes());
+                    let key_matched = !key_report.matches.is_empty();
+                    merge_report(aggregate, key_report);
+                    let original_digest = hex::encode(Sha256::digest(original_key.as_bytes()));
+                    let mut output_key = if key_matched {
+                        format!("redacted-key-sha256-{original_digest}")
+                    } else {
+                        original_key
+                    };
+                    if redacted.contains_key(&output_key) {
+                        let collision_base =
+                            format!("redacted-collision-key-sha256-{original_digest}");
+                        output_key = collision_base.clone();
+                        let mut ordinal = 0_u64;
+                        while redacted.contains_key(&output_key) {
+                            ordinal += 1;
+                            output_key = format!("{collision_base}-{ordinal}");
+                        }
+                    }
+                    redacted.insert(output_key, item);
                 }
+                *map = redacted;
             }
             _ => {}
         }
     }
     for turn in turns {
+        let (_, key_report) = redactor.redact(turn.logical_turn_key.as_bytes());
+        if !key_report.matches.is_empty() {
+            let digest = hex::encode(Sha256::digest(turn.logical_turn_key.as_bytes()));
+            turn.logical_turn_key = format!("redacted-id-sha256-{digest}");
+            merge_report(&mut aggregate, key_report);
+        } else {
+            merge_report(&mut aggregate, key_report);
+        }
         for record in &mut turn.records {
             match record {
                 SemanticRecord::User { text } | SemanticRecord::Assistant { text } => {
-                    redact_string(text);
+                    redact_string(text, &redactor, &mut aggregate);
                 }
                 SemanticRecord::ToolCall {
                     call_id,
@@ -883,22 +1355,84 @@ pub fn redact_turns(turns: &mut [NormalizedTurn]) {
                     name,
                 } => {
                     if let Some(call_id) = call_id {
-                        redact_string(call_id);
+                        redact_string(call_id, &redactor, &mut aggregate);
                     }
-                    redact_value(input, &redact_string);
-                    redact_string(name);
+                    redact_value(input, &redactor, &mut aggregate);
+                    redact_string(name, &redactor, &mut aggregate);
                 }
                 SemanticRecord::ToolResult {
                     call_id, content, ..
                 } => {
                     if let Some(call_id) = call_id {
-                        redact_string(call_id);
+                        redact_string(call_id, &redactor, &mut aggregate);
                     }
-                    redact_string(content);
+                    redact_string(content, &redactor, &mut aggregate);
                 }
             }
         }
     }
+    aggregate
+}
+
+fn canon_to_json(value: &CanonValue) -> serde_json::Value {
+    match value {
+        CanonValue::Null | CanonValue::Float(_) => serde_json::Value::Null,
+        CanonValue::Bool(value) => serde_json::Value::Bool(*value),
+        CanonValue::Int(value) => serde_json::Value::Number((*value).into()),
+        CanonValue::Str(value) => serde_json::Value::String(value.clone()),
+        CanonValue::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canon_to_json).collect())
+        }
+        CanonValue::Object(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), canon_to_json(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// Serialize one already-normalized/redacted turn into the provider-tagged,
+/// allowlist-only import projection required by ADR-DR-04/12. Unknown source
+/// fields cannot enter this shape because it is rebuilt solely from the typed
+/// coverage model.
+pub fn safe_turn_projection(agent_kind: &str, turn: &NormalizedTurn) -> serde_json::Value {
+    let records = turn
+        .records
+        .iter()
+        .map(|record| match record {
+            SemanticRecord::User { text } => serde_json::json!({
+                "type": "user", "text": text,
+            }),
+            SemanticRecord::Assistant { text } => serde_json::json!({
+                "type": "assistant", "text": text,
+            }),
+            SemanticRecord::ToolCall {
+                call_id,
+                input,
+                name,
+            } => serde_json::json!({
+                "type": "tool_call", "call_id": call_id,
+                "name": name, "input": canon_to_json(input),
+            }),
+            SemanticRecord::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => serde_json::json!({
+                "type": if *is_error { "tool_error" } else { "tool_result" },
+                "call_id": call_id, "content": content,
+            }),
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema_version": COVERAGE_SCHEMA_VERSION,
+        "agent_kind": agent_kind,
+        "logical_turn_key": turn.logical_turn_key,
+        "ordinal": turn.ordinal,
+        "completeness": turn.completeness.as_db_str(),
+        "records": records,
+    })
 }
 
 #[cfg(test)]
@@ -970,6 +1504,50 @@ mod tests {
             coverage_digest_hex(&records),
             "f1e76bf75df5d6b0f67a46806abb256cd6de30eaea30e45254a8a66cf5183356"
         );
+    }
+
+    /// M4 DR-05a: Codex historical rollout and Claude live capture must feed
+    /// the same coverage-v1 digest for the same semantic turn. Event mirrors
+    /// and unknown provenance fields must not duplicate or contaminate it.
+    #[test]
+    fn codex_rollout_matches_claude_digest_and_drops_unknown_fields() {
+        let rollout = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"mirrored","private":"AKIAAAAAAAAAAAAAAAAA"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi","unknown":"drop-me"}],"provider_only":"drop-me"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}],"encrypted_content":"drop-me"}}"#,
+        );
+        let turns = normalize_codex_rollout(rollout.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].logical_turn_key, "turn-1");
+        assert_eq!(turns[0].completeness, Completeness::Complete);
+        assert_eq!(
+            turns[0].digest_hex(),
+            "df991cd9a1ac5c12c32b8cdf0254c3dfbbf26485b505a5afc83a90d1128ebc54"
+        );
+
+        let projection = safe_turn_projection("codex", &turns[0]).to_string();
+        assert!(!projection.contains("unknown"));
+        assert!(!projection.contains("provider_only"));
+        assert!(!projection.contains("encrypted_content"));
+        assert!(!projection.contains("AKIAAAAAAAAAAAAAAAAA"));
+    }
+
+    /// Wrong-typed Codex semantic fields poison only their own turn. This is
+    /// the historical-import equivalent of the live Claude fail-closed guard.
+    #[test]
+    fn codex_rollout_wrong_typed_semantics_fail_turn_closed() {
+        let rollout = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":"clean"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":7}]}}"#,
+        );
+        let turns = normalize_codex_rollout(rollout.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].completeness, Completeness::Incomplete);
     }
 
     /// Codex M1 R2 blocker 1: wrong-typed SEMANTIC fields (assistant text
@@ -1305,5 +1883,163 @@ mod tests {
         let c = normalize_claude_transcript(complete.as_bytes());
         assert_eq!(t[0].logical_turn_key, c[0].logical_turn_key);
         assert_ne!(t[0].digest_hex(), c[0].digest_hex());
+    }
+
+    #[test]
+    fn secret_shaped_provider_turn_ids_are_hashed_consistently_without_collision() {
+        let secret_a = "AKIAIOSFODNN7EXAMPLE";
+        let secret_b = "AKIAIOSFODNN7EXAMPLF";
+        let claude = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "user", "uuid": secret_a,
+                "message": {"role": "user", "content": "hi"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "uuid": "answer",
+                "message": {"role": "assistant", "content": "hello"}
+            })
+        );
+        let codex = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "turn_started", "turn_id": secret_a}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": "hi"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "message", "role": "assistant", "content": "hello"}
+            })
+        );
+        let opencode = serde_json::json!({
+            "messages": [
+                {"info": {"role": "user", "id": secret_a},
+                 "parts": [{"type": "text", "text": "hi"}]},
+                {"info": {"role": "assistant", "id": "answer"},
+                 "parts": [{"type": "text", "text": "hello"}]}
+            ]
+        })
+        .to_string();
+        let mut sources = [
+            normalize_claude_transcript(claude.as_bytes()),
+            normalize_codex_rollout(codex.as_bytes()),
+            normalize_opencode_export(opencode.as_bytes()),
+        ];
+        for turns in &mut sources {
+            let report = redact_turns_with_report(turns);
+            assert!(report.bytes_redacted > 0);
+            assert!(!report.matches.is_empty());
+            assert!(!turns[0].logical_turn_key.contains(secret_a));
+        }
+        assert_eq!(
+            sources[0][0].logical_turn_key,
+            sources[1][0].logical_turn_key
+        );
+        assert_eq!(
+            sources[0][0].logical_turn_key,
+            sources[2][0].logical_turn_key
+        );
+        assert_eq!(sources[0][0].digest_hex(), sources[1][0].digest_hex());
+        assert_eq!(sources[0][0].digest_hex(), sources[2][0].digest_hex());
+
+        let other = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user", "uuid": secret_b,
+                "message": {"role": "user", "content": "hi"}
+            })
+        );
+        let mut other = normalize_claude_transcript(other.as_bytes());
+        redact_turns(&mut other);
+        assert_ne!(sources[0][0].logical_turn_key, other[0].logical_turn_key);
+    }
+
+    #[test]
+    fn redaction_covers_secret_shaped_tool_input_keys_deterministically() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let rollout = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": "inspect"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "function_call", "name": "inspect",
+                    "arguments": serde_json::json!({secret: "value"}).to_string()}
+            })
+        );
+        let mut first = normalize_codex_rollout(rollout.as_bytes());
+        let mut second = first.clone();
+        let first_report = redact_turns_with_report(&mut first);
+        let second_report = redact_turns_with_report(&mut second);
+        let first_json = String::from_utf8(canonical_turn_bytes(&first[0].records))
+            .expect("canonical coverage is UTF-8");
+
+        assert!(!first_json.contains(secret));
+        assert!(first_json.contains("redacted-key-sha256-"));
+        assert!(first_report.bytes_redacted > 0);
+        assert!(
+            first_report
+                .matches
+                .iter()
+                .any(|entry| entry.rule_id == "aws-access-key-id")
+        );
+        assert_eq!(first, second);
+        assert_eq!(first_report, second_report);
+    }
+
+    #[test]
+    fn codex_malformed_or_wrong_typed_tool_arguments_poison_the_turn() {
+        for arguments in [
+            serde_json::Value::String("{\"path\":\"truncated".to_string()),
+            serde_json::json!({"path": "wrong wire type"}),
+        ] {
+            let rollout = format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": "inspect"}
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {"type": "function_call", "name": "inspect",
+                        "arguments": arguments}
+                })
+            );
+            let turns = normalize_codex_rollout(rollout.as_bytes());
+            assert_eq!(turns.len(), 1);
+            assert_eq!(turns[0].completeness, Completeness::Incomplete);
+        }
+    }
+
+    #[test]
+    fn codex_custom_tool_call_accepts_its_freeform_input_field() {
+        let rollout = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": "inspect"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "custom_tool_call", "name": "shell",
+                    "call_id": "call-1", "input": "printf hello"}
+            })
+        );
+        let turns = normalize_codex_rollout(rollout.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].completeness, Completeness::Complete);
+        assert!(matches!(
+            &turns[0].records[1],
+            SemanticRecord::ToolCall {
+                input: CanonValue::Str(input),
+                ..
+            } if input == "printf hello"
+        ));
     }
 }

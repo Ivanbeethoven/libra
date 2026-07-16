@@ -18,7 +18,7 @@
 //!   by session cascade — the provider session may not exist locally.
 
 use anyhow::{Context, Result, anyhow};
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 
 /// Lease length for one export run: must cover the export subprocess
 /// deadline (≤3s, GC-DR-04) plus parse/redact/claim with margin.
@@ -56,9 +56,26 @@ pub async fn observe_idle(
     owner: &str,
     now_ms: i64,
 ) -> Result<IdleOutcome> {
+    let txn = conn
+        .begin()
+        .await
+        .context("begin export generation transaction")?;
+    let tombstoned = txn
+        .query_one(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT 1 FROM agent_import_tombstone
+             WHERE agent_kind = ? AND provider_session_id = ?",
+            [agent_kind.into(), provider_session_id.into()],
+        ))
+        .await
+        .context("check export tombstone barrier")?;
+    if tombstoned.is_some() {
+        txn.rollback().await.ok();
+        anyhow::bail!("erased agent session cannot create or advance an export job");
+    }
     // Ensure the row exists (first idle creates it).
-    conn.execute(Statement::from_sql_and_values(
-        conn.get_database_backend(),
+    txn.execute(Statement::from_sql_and_values(
+        txn.get_database_backend(),
         "INSERT INTO agent_export_job (
             job_id, agent_kind, provider_session_id, observed_generation,
             processed_generation, state, created_at, updated_at, ttl_expires_at
@@ -77,8 +94,8 @@ pub async fn observe_idle(
     .context("insert agent_export_job row")?;
 
     // Unconditional observed bump — every idle counts exactly once.
-    conn.execute(Statement::from_sql_and_values(
-        conn.get_database_backend(),
+    txn.execute(Statement::from_sql_and_values(
+        txn.get_database_backend(),
         "UPDATE agent_export_job
          SET observed_generation = observed_generation + 1, updated_at = ?,
              ttl_expires_at = ?
@@ -99,9 +116,9 @@ pub async fn observe_idle(
     // clean generation (Codex M3 R1 P1-4).
     let new_fence_seed = now_ms; // any monotonic-ish base; real fence below
     let _ = new_fence_seed;
-    let acquired = conn
+    let acquired = txn
         .execute(Statement::from_sql_and_values(
-            conn.get_database_backend(),
+            txn.get_database_backend(),
             "UPDATE agent_export_job
              SET owner = ?, lease_expires_at = ?,
                  fence_token = COALESCE(fence_token, 0) + 1,
@@ -121,12 +138,15 @@ pub async fn observe_idle(
         .await
         .context("acquire export lease")?;
     if acquired.rows_affected() != 1 {
+        txn.commit()
+            .await
+            .context("commit recorded export generation")?;
         return Ok(IdleOutcome::RecordedOnly);
     }
 
-    let row = conn
+    let row = txn
         .query_one(Statement::from_sql_and_values(
-            conn.get_database_backend(),
+            txn.get_database_backend(),
             "SELECT job_id, fence_token, observed_generation FROM agent_export_job
              WHERE agent_kind = ? AND provider_session_id = ? AND owner = ?",
             [agent_kind.into(), provider_session_id.into(), owner.into()],
@@ -134,13 +154,17 @@ pub async fn observe_idle(
         .await
         .context("read acquired export job")?
         .ok_or_else(|| anyhow!("export job vanished after lease acquisition"))?;
-    Ok(IdleOutcome::Runner {
+    let outcome = IdleOutcome::Runner {
         job_id: row.try_get_by("job_id")?,
         fence_token: row
             .try_get_by::<Option<i64>, _>("fence_token")?
             .unwrap_or(0),
         target_generation: row.try_get_by("observed_generation")?,
-    })
+    };
+    txn.commit()
+        .await
+        .context("commit export generation lease")?;
+    Ok(outcome)
 }
 
 /// Advance `processed_generation` to `target` under owner+fence. Returns
@@ -161,9 +185,14 @@ pub async fn advance_processed(
             conn.get_database_backend(),
             "UPDATE agent_export_job
              SET processed_generation = ?, updated_at = ?
-             WHERE agent_kind = ? AND provider_session_id = ?
+         WHERE agent_kind = ? AND provider_session_id = ?
                AND owner = ? AND fence_token = ?
-               AND processed_generation < ?",
+               AND processed_generation < ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM agent_import_tombstone t
+                 WHERE t.agent_kind = agent_export_job.agent_kind
+                   AND t.provider_session_id = agent_export_job.provider_session_id
+               )",
             [
                 target.into(),
                 now_ms.into(),
@@ -277,7 +306,12 @@ pub async fn release(
          SET owner = NULL, lease_expires_at = NULL, state = ?,
              last_error_code = ?, updated_at = ?
          WHERE agent_kind = ? AND provider_session_id = ?
-           AND owner = ? AND fence_token = ?",
+           AND owner = ? AND fence_token = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM agent_import_tombstone t
+             WHERE t.agent_kind = agent_export_job.agent_kind
+               AND t.provider_session_id = agent_export_job.provider_session_id
+           )",
         [
             state.into(),
             last_error_code.into(),
@@ -373,6 +407,33 @@ mod tests {
         release(&conn, kind, sid, "r1", fence_token, "idle", None, 6_000)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tombstone_blocks_export_job_creation_and_generation_advance() {
+        let conn = job_db().await;
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "INSERT INTO agent_import_tombstone (
+                tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
+             ) VALUES ('t-export', 'opencode', 'erased', 'opencode__erased', 1)"
+                .to_string(),
+        ))
+        .await
+        .expect("seed tombstone");
+        let error = observe_idle(&conn, "opencode", "erased", "runner", 1)
+            .await
+            .expect_err("erased export job must be blocked");
+        assert!(error.to_string().contains("erased"));
+        let row = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT COUNT(*) AS n FROM agent_export_job".to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get_by::<i64, _>("n").unwrap(), 0);
     }
 
     /// Codex M3 R1 P1-4: a delayed contender whose observed bump was already

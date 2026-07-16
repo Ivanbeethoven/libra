@@ -25,7 +25,10 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 
-use super::super::adapter::{AgentKind, AgentSessionCtx, AgentStability, ObservedAgent};
+use super::super::{
+    adapter::{AgentKind, AgentSessionCtx, AgentStability, ObservedAgent},
+    agent_for, open_provider_directory_for_discovery, pinned_provider_directory_path,
+};
 
 const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -313,6 +316,7 @@ fn codex_sessions_root() -> Option<std::path::PathBuf> {
 /// prefix could skip a newer partition and return a stale match); a missing
 /// directory lists empty; any other I/O failure propagates so callers can
 /// diagnose it instead of reading "not found".
+#[cfg(any(not(unix), test))]
 fn sorted_desc_entries(
     dir: &std::path::Path,
     keep: impl Fn(&str) -> bool,
@@ -364,6 +368,7 @@ fn valid_month(name: &str) -> Option<u32> {
     fixed_ascii_u32(name, 2).filter(|month| (1..=12).contains(month))
 }
 
+#[cfg(not(unix))]
 fn real_directory(path: &std::path::Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(anyhow!(
@@ -376,6 +381,286 @@ fn real_directory(path: &std::path::Path) -> Result<bool> {
             Err(err).with_context(|| format!("stat Codex rollout directory {}", path.display()))
         }
     }
+}
+
+#[cfg(unix)]
+fn sorted_desc_entries_at(
+    directory: &std::fs::File,
+    logical_dir: &std::path::Path,
+    keep: impl Fn(&str) -> bool,
+    budget: &mut RolloutScanBudget,
+) -> Result<Vec<std::ffi::OsString>> {
+    budget.check_time(logical_dir)?;
+    let pinned_dir = pinned_provider_directory_path(directory);
+    let read = fs::read_dir(&pinned_dir)
+        .with_context(|| format!("read pinned rollout directory {}", logical_dir.display()))?;
+    let mut names = Vec::new();
+    for (scanned, entry) in read.enumerate() {
+        if scanned >= ROLLOUT_MAX_ENTRIES_PER_DIR {
+            return Err(anyhow!(
+                "rollout directory {} exceeds the {} entry scan bound; refusing a possibly \
+                 stale answer (GC-DR-08 bounded discovery)",
+                logical_dir.display(),
+                ROLLOUT_MAX_ENTRIES_PER_DIR
+            ));
+        }
+        budget.charge_entry(logical_dir)?;
+        let entry = entry.with_context(|| {
+            format!(
+                "read pinned rollout directory entry in {}",
+                logical_dir.display()
+            )
+        })?;
+        let name = entry.file_name();
+        if keep(&name.to_string_lossy()) {
+            names.push(name);
+        }
+    }
+    names.sort_unstable_by(|left, right| right.cmp(left));
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn inspect_rollout_entry_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    logical_path: &std::path::Path,
+) -> Result<Option<libc::mode_t>> {
+    use std::{
+        ffi::CString,
+        mem::MaybeUninit,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    let name = CString::new(name.as_bytes()).context("Codex rollout entry name contains NUL")?;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the pinned parent fd and NUL-terminated basename remain live,
+    // and AT_SYMLINK_NOFOLLOW makes the type check refer to the entry itself.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error)
+            .with_context(|| format!("inspect Codex rollout entry {}", logical_path.display()));
+    }
+    // SAFETY: successful fstatat initialized the stat structure.
+    let mode = unsafe { stat.assume_init() }.st_mode & libc::S_IFMT;
+    if mode == libc::S_IFLNK {
+        return Err(anyhow!(
+            "refusing symlinked Codex rollout entry {} (fail-closed)",
+            logical_path.display()
+        ));
+    }
+    Ok(Some(mode))
+}
+
+#[cfg(unix)]
+fn pause_codex_discovery_before_open_for_test() -> Result<()> {
+    let Ok(ready_path) = std::env::var("LIBRA_TEST_CODEX_DISCOVERY_OPEN_READY_FILE") else {
+        return Ok(());
+    };
+    let continue_path = std::env::var("LIBRA_TEST_CODEX_DISCOVERY_OPEN_CONTINUE_FILE")
+        .context("Codex discovery open failpoint requires a continue-file path")?;
+    fs::write(&ready_path, b"ready").context("write Codex discovery open ready file")?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::path::Path::new(&continue_path).exists() {
+        if Instant::now() >= deadline {
+            return Err(anyhow!("timed out waiting to resume Codex discovery open"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_rollout_directory_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    logical_path: &std::path::Path,
+) -> Result<Option<std::fs::File>> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let Some(mode) = inspect_rollout_entry_at(directory, name, logical_path)? else {
+        return Ok(None);
+    };
+    if mode != libc::S_IFDIR {
+        return Ok(None);
+    }
+    pause_codex_discovery_before_open_for_test()?;
+    let name = CString::new(name.as_bytes()).context("Codex rollout entry name contains NUL")?;
+    // SAFETY: the parent descriptor is pinned, the basename is
+    // NUL-terminated, and a successful descriptor is transferred once.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).with_context(|| {
+            format!(
+                "open Codex rollout directory {} without following links",
+                logical_path.display()
+            )
+        });
+    }
+    // SAFETY: fd is freshly returned by openat and transferred once.
+    let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !opened
+        .metadata()
+        .with_context(|| {
+            format!(
+                "inspect opened rollout directory {}",
+                logical_path.display()
+            )
+        })?
+        .is_dir()
+    {
+        return Err(anyhow!(
+            "Codex rollout directory {} changed type while opening",
+            logical_path.display()
+        ));
+    }
+    Ok(Some(opened))
+}
+
+#[cfg(unix)]
+fn open_rollout_file_at(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    logical_path: &std::path::Path,
+) -> Result<std::fs::File> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let mode = inspect_rollout_entry_at(directory, name, logical_path)?
+        .ok_or_else(|| anyhow!("Codex rollout disappeared during discovery"))?;
+    if mode != libc::S_IFREG {
+        return Err(anyhow!(
+            "refusing non-file Codex rollout {} (fail-closed)",
+            logical_path.display()
+        ));
+    }
+    let name = CString::new(name.as_bytes()).context("Codex rollout entry name contains NUL")?;
+    // SAFETY: the parent descriptor is pinned, the basename is
+    // NUL-terminated, and a successful descriptor is transferred once.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).with_context(|| {
+            format!(
+                "open Codex rollout {} without following links",
+                logical_path.display()
+            )
+        });
+    }
+    // SAFETY: fd is freshly returned by openat and transferred once.
+    let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !opened
+        .metadata()
+        .with_context(|| format!("inspect opened Codex rollout {}", logical_path.display()))?
+        .is_file()
+    {
+        return Err(anyhow!(
+            "Codex rollout {} changed type while opening",
+            logical_path.display()
+        ));
+    }
+    Ok(opened)
+}
+
+#[cfg(unix)]
+fn find_codex_rollout_bounded_unix(
+    root: &std::path::Path,
+    directory: &std::fs::File,
+    suffix: &str,
+    budget: &mut RolloutScanBudget,
+) -> Result<Option<std::path::PathBuf>> {
+    let mut files_seen = 0usize;
+    for year in sorted_desc_entries_at(directory, root, |n| valid_year(n).is_some(), budget)? {
+        let Some(year_number) = valid_year(&year.to_string_lossy()) else {
+            continue;
+        };
+        let year_path = root.join(&year);
+        let Some(year_dir) = open_rollout_directory_at(directory, &year, &year_path)? else {
+            continue;
+        };
+        for month in
+            sorted_desc_entries_at(&year_dir, &year_path, |n| valid_month(n).is_some(), budget)?
+        {
+            let Some(month_number) = valid_month(&month.to_string_lossy()) else {
+                continue;
+            };
+            let month_path = year_path.join(&month);
+            let Some(month_dir) = open_rollout_directory_at(&year_dir, &month, &month_path)? else {
+                continue;
+            };
+            for day in sorted_desc_entries_at(
+                &month_dir,
+                &month_path,
+                |name| {
+                    fixed_ascii_u32(name, 2).is_some_and(|day| {
+                        chrono::NaiveDate::from_ymd_opt(year_number, month_number, day).is_some()
+                    })
+                },
+                budget,
+            )? {
+                let day_path = month_path.join(&day);
+                let Some(day_dir) = open_rollout_directory_at(&month_dir, &day, &day_path)? else {
+                    continue;
+                };
+                let names = sorted_desc_entries_at(
+                    &day_dir,
+                    &day_path,
+                    |name| name.starts_with("rollout-"),
+                    budget,
+                )?;
+                files_seen = files_seen
+                    .checked_add(names.len())
+                    .ok_or_else(|| anyhow!("rollout discovery file counter overflow"))?;
+                if files_seen > ROLLOUT_MAX_FILES_SCANNED {
+                    return Err(anyhow!(
+                        "rollout discovery scanned more than {ROLLOUT_MAX_FILES_SCANNED} files; \
+                         refusing a possibly stale answer (GC-DR-08 bounded discovery)"
+                    ));
+                }
+                for name in names {
+                    if name.to_string_lossy().ends_with(suffix) {
+                        let candidate = day_path.join(&name);
+                        let _opened = open_rollout_file_at(&day_dir, &name, &candidate)?;
+                        return Ok(Some(candidate));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Locate the newest Codex rollout JSONL for `session_id` under
@@ -429,11 +714,21 @@ pub fn find_codex_rollout_bounded(
     let Some(root) = codex_sessions_root() else {
         return Ok(None);
     };
+    let adapter = agent_for(AgentKind::Codex);
+    let Some(directory) = open_provider_directory_for_discovery(adapter, &root)? else {
+        return Ok(None);
+    };
     let mut budget = RolloutScanBudget::new(limits.max_entries_scanned, limits.deadline);
     let suffix = format!("-{session_id}.jsonl");
+    #[cfg(unix)]
+    return find_codex_rollout_bounded_unix(&root, &directory, &suffix, &mut budget);
+    #[cfg(not(unix))]
+    let pinned_root = root.clone();
+    #[cfg(not(unix))]
     let mut files_seen = 0usize;
-    for year in sorted_desc_entries(&root, |n| valid_year(n).is_some(), &mut budget)? {
-        let year_dir = root.join(&year);
+    #[cfg(not(unix))]
+    for year in sorted_desc_entries(&pinned_root, |n| valid_year(n).is_some(), &mut budget)? {
+        let year_dir = pinned_root.join(&year);
         if !real_directory(&year_dir)? {
             continue;
         }
@@ -487,12 +782,16 @@ pub fn find_codex_rollout_bounded(
                                 candidate.display()
                             ));
                         }
-                        return Ok(Some(candidate));
+                        let relative = candidate
+                            .strip_prefix(&pinned_root)
+                            .context("bound pinned Codex rollout path")?;
+                        return Ok(Some(root.join(relative)));
                     }
                 }
             }
         }
     }
+    #[cfg(not(unix))]
     Ok(None)
 }
 
@@ -751,6 +1050,32 @@ mod tests {
                 "symlinked date partition must be rejected"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn codex_rollout_discovery_rejects_symlinked_sessions_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_home = tmp.path().join("codex-home");
+        let outside = tmp.path().join("outside-sessions");
+        let sid = "0199a213-81a0-7800-8aa2-58a4a352b424";
+        let day = outside.join("2026/07/15");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-07-15T01-00-00-{sid}.jsonl")),
+            "{}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, codex_home.join("sessions")).unwrap();
+        let _guard = CodexHomeGuard::set(&tmp.path().join("home"), &codex_home);
+
+        let error = find_codex_rollout(sid).expect_err("sessions root symlink must fail closed");
+        assert!(
+            format!("{error:#}").contains("no-follow"),
+            "unexpected error: {error:#}"
+        );
     }
 
     use std::path::PathBuf;

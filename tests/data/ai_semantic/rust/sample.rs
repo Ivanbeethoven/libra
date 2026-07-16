@@ -10,12 +10,10 @@ impl Widget {
     fn label(&self) -> &str {
         &self.name
     }
+    fn new(name: &str) -> Self { Self { name: name.to_string() } }
 }
-
 pub fn make_widget(name: &str) -> Widget {
-    Widget {
-        name: name.to_string(),
-    }
+    Widget::new(name)
 }
 
 fn handle() {}

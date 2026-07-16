@@ -72,7 +72,7 @@ impl LocalStorage {
     /// alternate base may be missing or read-only, and auto-creating it would
     /// mask a dangling alternate. No alternates of its own (the chain is
     /// pre-flattened by the caller).
-    fn open_no_create(base_path: PathBuf) -> Self {
+    pub(crate) fn open_no_create(base_path: PathBuf) -> Self {
         Self {
             base_path,
             hash_kind: Some(get_hash_kind()),

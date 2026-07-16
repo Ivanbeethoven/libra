@@ -341,7 +341,7 @@ async fn test_init_from_git_repository_empty_git_repo_fails() {
 
     assert!(
         Command::new("git")
-            .args(["init", git_dir.to_str().unwrap()])
+            .args(["init", "-b", "main", git_dir.to_str().unwrap()])
             .status()
             .unwrap()
             .success()

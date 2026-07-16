@@ -1260,6 +1260,7 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 | AG-20 pagination | 新增 `idx_agent_session_started_paging` on `agent_session(started_at DESC, session_id)`；新增 `idx_agent_checkpoint_created_paging` on `agent_checkpoint(created_at DESC, checkpoint_id)`（tiebreaker 为 `session_id`/`checkpoint_id` 升序，非 `id DESC`；实测见 `sql/migrations/2026070802_agent_checkpoint_paging.sql`） | D1 mirror 已生效；同步 D1 同名索引 | drop index | `EXPLAIN QUERY PLAN` 命中索引 |
 | AG-20 checkpoint idempotency | `agent_checkpoint` INSERT 改 UPSERT/探测；必要时新增 unique guard | D1 mirror 同步 UPSERT 语义（`cloud sync`） | 保留旧 reader；down 不得删除数据 | crash replay 不主键冲突 |
 | AG-20 doctor repair | 视实现需要新增 `agent_checkpoint_repair_log` | D1 mirror 已生效；repair 同步 + tombstone 传播待建 | repair log 可保留不回滚 | 三类不一致可诊断/修复 |
+| DR-05/M4 import tombstone | `agent_import_identity` + `agent_import_tombstone` + anti-resurrection triggers | 删除传播待建 | identity 可在测试中 down；tombstone 仅在表为空时可 down，已有 erase 记录则事务性拒绝，必须前滚 | empty up/down/up + non-empty rollback refusal |
 | AG-24a audit | 新增 `agent_audit_log` append-only 表 | D1 mirror 已生效；不可变 audit 摘要同步待建 | down 不得删除审计数据；只能停止新写入 | raw export 写 audit；clean/GC 不删 audit |
 
 Forward DDL 必须 idempotent；每个 forward migration 如有 `_down.sql`，不得删除用户 transcript/checkpoint/audit 数据。涉及 `agent_session`、`agent_checkpoint`、`agent_usage_stats` 行 shape 的变更必须 bump DB row `schema_version` 并提供 backfill SQL；external JSON `schema_version` 与 RPC `protocol_version` 不随 DB migration 自动变化。
@@ -1818,6 +1819,138 @@ rg -n "claudecode|claude-code|libra-agent-|agent list|agent add|agent remove|Lif
 
 ```
 
+## Historical transcript import（DR-05 / M4）
+
+`libra agent import` 是外部 capture 的历史回填入口，支持 Claude Code、
+Codex 的 provider-root 文件，以及按显式 session id 调用受信 OpenCode
+export bridge。selector 必须在 `--session`、`--path`、`--since`、`--all`
+中四选一；batch discovery 默认 20、硬上限 100，并通过 `--cursor` 分页；每源
+`min(agent.max_transcript_read_bytes, 16 MiB adapter hard cap)`、每批累计原始输入
+64 MiB，整批还有 120 秒绝对 deadline；显式配置高于 hard cap 时必须诊断实际
+有效值。累计预算按
+held fd/export 实际读取字节计费（成功、malformed、unauthorized、oversized 候选
+都计费；不信任打开前 metadata，授权后增长也计入）；deadline 在 discovery 前
+开始，并贯穿 traversal/read/parse、分批 reservation、object construction 与 CAS，
+超时会停止后续阶段并释放/abandon 当前 owner 的全部未提交 identity、coverage
+reservation 与 marker；恢复事务自身失败时必须把 cleanup error 与 doctor 修复方向
+链入原错误，禁止静默丢弃。事务 commit 不使用可取消的外层 timeout：每次 commit 前
+立即检查 deadline，随后等待明确提交结果；最终 ref/catalog/claim/identity 已原子
+提交时，即使结果返回时越过 deadline，也必须报告成功，不能伪报 partial。
+discovery 遍历/打开与 held-fd 读取分别在可由同一绝对 deadline 杀死的私有 helper
+进程中执行，阻塞的 provider filesystem syscall 不能突破命令总预算。
+JSON/non-TTY 必须显式 `--yes`，且确认发生在 transcript 内容读取或 exporter
+调用之前；TTY 提示固定包含 agent、当前仓库范围、候选数/上限、脱敏写入及
+`agent push` 可能上传脱敏 traces 的风险。
+
+文件授权沿用 `TranscriptSource` seam，但最终边界是 Unix 上逐 component 的
+`openat(O_NOFOLLOW|O_NONBLOCK)` 和单次 held fd；provider root 自 `/` 起逐段
+no-follow 打开并 pin，preparer 只消费该 fd，不重新按路径打开；根外路径、
+symlink、FIFO 及缺少等价安全打开的平台 fail-closed。Claude batch discovery
+在 consent 前通过 pinned no-follow project-directory fd 枚举并相对 fd 打开每个
+source；Codex 的 year/month/day 与 rollout 文件也逐层相对 held fd 打开，绝不先
+跟随嵌套目录 symlink。writer 只持久化
+coverage-v1 typed allowlist projection，顺序
+固定为 normalize → typed-field redact → digest → object/ref/catalog。原始 envelope、
+unknown provider field、绝对 provider-home source path 不进入 syncable metadata；
+verified repository `working_dir` 保留 ADR-DR-15 compatibility exception。
+
+每个 source 由 `agent_import_identity` 管理 lease/fence/progress；每个 logical turn
+仍由共享 `agent_coverage_claim`/`agent_coverage_revision` 管理跨 live/export/import
+去重与 incomplete→complete 升级。identity、claim、catalog 与 ref CAS 在最终事务
+共同验 fence；live/export 可递增 fence 抢占 `reserved_import`，import 不抢占 live。
+revision 不写入 `parent_checkpoint_id`，也不改变结构仓库 parent。
+
+complete-vs-different-complete 不再只有 claim 上的状态位：迁移 `2026071405` 增加
+`agent_coverage_conflict`，以 claim 的
+`(session_id, logical_turn_key, coverage_schema_version)` 为一对一外键，只保留首个
+challenger。冲突事务在 claim 切到 `conflicted` 的同时，持久化 challenger 的 typed
+canonical redacted payload、digest、source channel、observed_at 与确定性
+`incoming_redaction_report_json`；raw envelope 和命中原文不得进入该表。后续冲突用
+`ON CONFLICT DO NOTHING` 保留首证据。doctor 只输出哈希化 turn identity、incumbent
+revision/digest 与 challenger digest/source/time/redaction 摘要，并保持
+`manual_required`；repair 不自动选边。该表不建立独立保留期：session erase/final
+claim prune 通过外键或显式 prune 同事务删除，dry-run 在回滚模拟中执行相同删除；
+checkpoint history rebuild 将 claim 回退至更早存活 revision 时清除 stale conflict，
+并恢复 `catalog_committed` 状态。down migration 若表非空必须 fail-closed，防止降级
+静默丢弃冲突 provenance。
+
+归属门要求 transcript 中恰有一个可 canonicalize 的 `cwd`，其 Libra storage 必须
+等于当前仓库（同一 storage 的 sibling linked worktree 合法）；provider session id 必须由已授权 source 内容唯一证明，不能只信
+文件名。复用 `(agent_kind, provider_session_id)` session 前再次核对 session id、
+规范化 Libra storage/repository identity 与 source fingerprint；live session 即使从
+仓库子目录启动也按 storage identity 正确复用。无明确终态证据时 session 保持
+`active`，最后一轮强制为可升级 `incomplete`。`erase_session_local` 在 prune/delete 之前写
+`agent_import_tombstone` 并 fence import/export/coverage owner；tombstone 以
+`(agent_kind, provider_session_id)` 阻断导入，并保留无外键 `erased_session_id` 供
+只读投影。创建/复用 session、claim reservation、import identity、export generation、
+committed/subagent ref+catalog transaction 都检查该屏障。自动 discovery/import 不复活；
+import 的 attempt marker 与 reservation/tombstone 检查同事务创建；live/export/
+subagent 也在对象构造前原子校验 session/tombstone/coverage fence 并 fail-closed
+创建 marker。即使 catalog 仍为空，erase 也会因 live marker fail-closed。
+tombstone 拒绝最终 ref/catalog 事务后，writer 将本次新建 OID 写入不受普通 TTL
+遗忘的 durable cleanup marker；只有在没有其它 live writer 且经全部仓库 GC roots 完成
+诊断证明后才退役 ownership。`cleanup_pending` 表示 writer 已退出，因此不等待普通
+TTL 即可由 `agent doctor --repair` 处理；同 session 的 durable ownership 未退役时，
+erase 只会 fail-closed 拒绝，不会自行运行 drain。inline recovery 不 unlink 共享 loose object，也不删除
+`object_index` 行（worktree index writer 不共享 SQLite lock）；物理回收交给仓库 GC 的
+grace/locking 策略。每个可能新建的 OID 在真正写 loose object **之前**先作为 provisional
+preclaim 持久化到 attempt marker；只有本 writer 的 no-clobber publish 成功，并在
+后续事务中写入 `created_oids`，该 OID 才可被恢复清理删除。publish 后、确认前崩溃
+选择安全泄漏，未确认 preclaim 只退役 marker、绝不删除对象。过期普通 marker 会由
+显式 `agent doctor --repair`/GC 提升为恢复候选并做同一套可达性清理；正常
+append、失败 finalizer 与 erase 不执行全仓库 drain。损坏 marker 必须校验 metadata target/key、
+commit 和每个 OID，返回带 `libra agent doctor` 修复方向的错误，不得切片 panic；
+doctor 直接报告损坏 marker 为 `manual_required`，并可对有效过期普通 marker 及任意
+TTL 状态的 `cleanup_pending` marker 执行同一套全仓库 root 可达性 drain；过期普通
+marker 被显式维护清理后，writer 的最终 ref/catalog
+事务必须重新校验 marker fence，不能恢复后继续 CAS。loose object 先写共享私有目录
+`objects/info/libra-tmp` 中的唯一临时文件，再用不覆盖
+发布；已存在 final path 必须解压、校验 object hash/声明长度并逐字节匹配，不能把
+崩溃留下的部分文件当作命中复用；后续写入每次最多检查私有目录 64 项并清理超过
+24 小时且名称精确匹配 `.<40-or-64-lowercase-hex-oid>.tmp-<decimal-pid>-<uuid>` 的普通文件，
+其它文件/目录保留。文件与目录 fsync 只在 `--sync-data`/`LIBRA_SYNC_DATA` 启用时执行。
+marker schema v3 为每次注册加入随机 writer `generation`；对象 preclaim、写后
+ownership 确认、最终 ref/catalog CAS 与成功/失败清理都精确比较 generation，禁止
+过期 writer 把同 checkpoint ID 的 takeover marker 当成自己的 marker。
+诊断性 reachability 的 GC roots 覆盖 refs、reflog、全部已注册
+worktree index 与 sequencer/rebase 状态；先在 SQLite writer transaction 外快照、
+遍历，再在最终 ownership 退役事务内复核 DB 与 filesystem roots，避免持锁完成长遍历。
+通过有界 storage 读取覆盖
+loose、pack 与 alternate，对每个对象设置 64 MiB load-cost 上限并复算 OID；全遍历
+另受 250,000 个访问对象与 30 秒 deadline 约束，单次 storage read 也使用剩余
+deadline；worktree registry/index 快照也在该总 deadline 下的可杀 helper 内完成，
+以 no-follow/nonblocking 打开普通文件、从持有 descriptor 做 `limit + 1` 有界读取，
+并只解析/校验这批精确字节，拒绝 FIFO/symlink、增长和路径 reopen 竞态；index 最多
+256 个且总读取不超过 64 MiB。任一损坏、单对象超限或总量超限
+都会保留 cleanup ownership 并 fail-closed 延后。
+import provisional session 的清理由持久化 `import_provisional=true` 且零 checkpoint
+决定，不依赖当前进程是否创建该行；lease takeover 会 fence 并清理旧普通 attempt
+marker。live/export/subagent 在 marker 注册后的任一失败都必须运行 finalizer：释放
+仍归属本 owner 的 claim/export job，并仅清普通 marker，保留 cleanup job；
+只有 `--restore-erased --yes` 会在确认原 session catalog 已删除后，于同一事务追加
+`restore_erased_import` audit 并移除本地 tombstone。D1/R2 mirror 的
+delete/tombstone propagation 仍 deferred，cloud restore 复活风险保持下表记账。
+
+Machine negotiation：`agent list --json` 默认冻结 schema v1；显式
+`--schema-version 2` 才增加 versioned `methods[]`（`transcript_discoverable`、
+`importable`、`export_bridge`）。import batch schema v1 返回 `results`/`skipped`/
+`partial_results`/`failures`/`next_cursor`，逐项状态为 `imported`/`noop`/`partial`/
+`skipped`/`failed`；自动发现的跨仓库/已擦除候选进入脱敏 `skipped`，显式 selector
+仍失败。`results` 仅计完整成功 selection，耐久
+部分进度单列且不计入 `succeeded`。OpenCode 的 batch discovery 明确 unsupported，只有显式 session export
+可 import。unsupported schema 是 exit 129/category `cli`。partial 非零退出并保留
+`schema_version`、nullable `next_cursor` 与逐项脱敏 stable-code detail；若同一 session 的后续 turn 失败，已耐久提交的 turn
+数量也作为 partial summary 返回。retention prune 在同一事务删除/回退相关 coverage
+revision/current claim，并清理 import checkpoint cursor，避免 dangling current pointer。
+最终 coverage 消失后，对应终态、无 owner 的 `agent_import_identity` 必须物理删除；
+`agent clean --gc` 也会收走零 checkpoint identity，不能重置为 `discovered` 导致复活。
+dry-run 必须在回滚事务中模拟选定 checkpoint 的 coverage 删除，使
+`import_identities_pruned` 与同参数真实 GC 精确一致且不产生持久变更。
+`2026071402` down migration 只允许空表；存在任意 import recovery state 时必须拒绝
+回滚，避免测试/开发 rollback 静默丢失恢复身份。已发布的 `2026071403` tombstone
+migration 保持不变；`2026071404` 以 schema trigger 补上旧 binary 的 session/checkpoint
+写入兼容屏障，其 down migration 在存在 tombstone 时拒绝移除屏障。
+
 ## 常见陷阱与纠偏
 
 | 陷阱 | 风险 | 纠偏 |
@@ -1858,7 +1991,7 @@ rg -n "claudecode|claude-code|libra-agent-|agent list|agent add|agent remove|Lif
 | Agent 覆盖 | 非首批 supported roster 扩展 | 第一批 `claude-code` / `codex` / `opencode` 已 supported + hook-installable + launchable read-only review/investigate；Gemini/Cursor/Copilot/FactoryAI 仍 unsupported/not launchable。 | 本文第一批支持项目 / future roster expansion |
 | 架构测试 | 新 provider 增量守卫 | `compat_agent_architecture_guard` / `compat_agent_capability_matrix_pin` 已落地；新增 provider 时继续同步 SQL CHECK、registry、docs 和 tests/INDEX。 | entire `agent/architecture_test.go` / ongoing guard |
 | 测试装配 | 无当前 AG target 孤儿 | `tests/command/agent_checkpoint_test.rs` 已接入 `command_test`，AG-19/20/22/23/24a top-level targets 已在 `tests/INDEX.md` 登记。 | 漂移修正 / AG-20 |
-| 数据模型 | cloud mirror tombstone propagation for agent capture data | D1/R2 agent capture mirror **已实现并默认生效**：`libra cloud sync` 每次经 `sync_agent_capture_tables`（`src/command/cloud.rs`）把 `agent_session`/`agent_checkpoint` upsert 到 D1，`libra cloud restore` 经 `restore_agent_capture_from_d1` 读回。**deferred 的是 delete/tombstone propagation**：本地 `erase_session_local` 只删本地 `refs/libra/traces`+DB+object_index，**不**删除 D1/R2 mirror 行、也不写 tombstone，因此 `libra cloud restore` 或跨机 re-sync 会**复活已本地擦除的 capture**，直到 tombstone 传播落地。**A0-10 文档守卫已收口**：`compat_agent_docs_contract::agent_doc_declares_cloud_tombstone_deferred` 钉住本行「mirror 已生效、delete/tombstone propagation deferred、restore 可复活」措辞不可漂移；`command_test::agent_erasure_local_tombstone` 证明本地 erase 幂等且不触碰 cloud；L3 `agent_cloud_tombstone_test` 在真实 D1 上：把一行 mirror 到 D1、本地 erase 同一 session 后，D1 mirror 行**仍在**（证明无 tombstone 传播；无 cloud env 时 skipped）。 | AG-24a / future cloud mirror tombstone |
+| 数据模型 | cloud mirror tombstone propagation for agent capture data | D1/R2 agent capture mirror **已实现并默认生效**：`libra cloud sync` 每次经 `sync_agent_capture_tables`（`src/command/cloud.rs`）把 `agent_session`/`agent_checkpoint` upsert 到 D1，`libra cloud restore` 经 `restore_agent_capture_from_d1` 读回。M4 已让本地 `erase_session_local` 写 `agent_import_tombstone` 并 fence 本地 import/export/coverage writer；**deferred 的仍是 cloud delete/tombstone propagation**：本地 erase 不删除 D1/R2 mirror 行，tombstone 也不上传，因此 `libra cloud restore` 或跨机 re-sync 仍可**复活已本地擦除的 capture**，直到传播落地。**A0-10 文档守卫已收口**：`compat_agent_docs_contract::agent_doc_declares_cloud_tombstone_deferred` 钉住「mirror 已生效、delete/tombstone propagation deferred、restore 可复活」措辞不可漂移；`command_test::agent_erasure_local_tombstone` 证明本地 erase 幂等且不触碰 cloud；L3 `agent_cloud_tombstone_test` 在真实 D1 上证明本地 erase 后 D1 mirror 行仍在。 | AG-24a / M4 local barrier + future cloud tombstone |
 | 多 Agent | `review/investigate --checkpoint <id>` scoped review（review 目标物化） | **A0-06 已实现** findings 对象化 + manual attach：`findings_oid` 在 finalize 写入内容寻址 blob（`agent_findings` object_index tag，doctor 可修复），`review/investigate attach <run_id> <file>` 命令面把外部文件脱敏后对象化并记入 `manual_attach`。**仍 deferred**：`--checkpoint <id>` scoped review 保持 fail-closed（`checkpoint_scope_unimplemented_error`）——checkpoint 捕获的是 transcript 而非代码 worktree，把它物化为 review 目标需要独立设计，fail-closed 拒绝是正确行为（避免静默 review 错误内容）。 | E8-libra / A0-06 + future scoped-review materialization |
 | 外部插件安全 | （已实现）未来可选：per-agent env 透传粒度 | **A0-08 已实现**：`agent.external_agents.trusted_dirs`（默认 `["~/.libra/agents"]`，JSON 数组存 config_kv）+ `libra agent rpc trust --dir <path>`（canonicalize + 目录本身非 world-writable + 追加 allowlist）；`record_trust`/`revalidate_trust` 强制二进制 canonical path 必须在受信目录下（否则 `LBR-AGENT-005`）。`agent.external_agents.env_allowlist_extra`：额外 exact-name env 透传，`env_name_is_forbidden` 硬拒绝 wildcard 及 `*_API_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`/`LIBRA_STORAGE_*`/`LIBRA_D1_*`（spawn 处二次校验）。 | 落地执行补充规格 §2 |
 | 合规实现 | 仓库级 object GC（可达性分析后回收对象化 findings blob） | **A0-09 已实现** findings-GC run-state 部分：`clean --gc` 现同时处理 transcript / stderr / findings 三窗口。`gc_expired_findings_runs`（clean.rs）按 `agent.retention.findings_days`（默认 90）删除**过期 terminal** review/investigate run 目录（`.libra/sessions/agent-runs/<run_id>/`，含 findings.md/manifest/state/reviewer 日志）；non-terminal / 未到期 / 时间戳不可解析 fail-safe 跳过；`agent_audit_log` 绝不纳入。新增 `--dry-run` 预览。**有意 deferred**：对象化 findings blob 与其 `object_index` 行是内容寻址、可能与 branch/index/reflog 可达对象共享，per-run retention 不删除；安全回收须仓库级可达性分析（future `libra gc`）。 | AG-24a / A0-09 |
