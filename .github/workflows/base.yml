@@ -258,6 +258,18 @@ jobs:
         run: |
           cargo test --features keyring --test auth_keyring_backend -- --test-threads=1
 
+      # plan-20260714 §A.11: auto-upgrade integration targets. Trust-root and
+      # endpoint injection is compile-time only (the `test-upgrade` feature),
+      # so a release build cannot alter the trust root even with LIBRA_TEST=1.
+      - name: Run auto-upgrade tests (--features test-upgrade)
+        env:
+          LIBRA_SKIP_WEB_BUILD: "1"
+          LIBRA_TEST: "1"
+        run: |
+          cargo test --features test-upgrade \
+            --test upgrade_auto_test \
+            --test upgrade_publish_contract_test -- --test-threads=1
+
       - name: Upload TUI scenario artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4

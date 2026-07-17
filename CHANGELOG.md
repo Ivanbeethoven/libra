@@ -4,6 +4,21 @@
 
 ### Added
 
+- **Auto-upgrade integration tests and docs (v0.19.2, plan-20260714 §A.9/
+  §A.11)**: two new `test-upgrade`-gated integration targets —
+  `upgrade_auto_test` (end-to-end signature+decision chain, revocation-replay
+  and same-version-identity anti-rollback, the real-binary `__upgrade-probe`
+  self-check across a process boundary, and install/rollback transactions) and
+  `upgrade_publish_contract_test` (matrix coverage, URL binding, size bounds,
+  channel, and renew-preserves-pause/revocations). Registered with
+  `required-features = ["test-upgrade"]`, indexed in `tests/INDEX.md`, and run
+  in a dedicated CI step; `release.yml` gains a guard that fails the release if
+  the `test-upgrade` feature is ever spliced into a release build. New
+  `docs/auto-upgrade.md` plus README and config-doc coverage of supported
+  platforms, the official-install requirement, network/throttle behavior, and
+  recovery/rollback. The subsystem remains inert until the release-key
+  ceremony (see the note below).
+
 - **Auto-upgrade orchestration and startup hooks (v0.19.1, plan-20260714
   §A.7/§A.8/§A.10)**: new `internal::upgrade::orchestrator` wires the whole
   flow. `startup_recovery_gate` runs before repo preflight and drives any

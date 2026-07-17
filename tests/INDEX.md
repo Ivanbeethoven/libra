@@ -197,6 +197,17 @@
 | `protocol_timeout_recovery` | 3 | git:// connect/idle timeout recovery via a local hung/refused listener (self-contained) | `src/internal/protocol/git_client.rs` |
 | `protocol_capability_negotiation` | 3 | Fetch want-line advertises only decoder-supported capabilities (ofs-delta yes; thin-pack/report-status no) | `src/internal/protocol/mod.rs` |
 
+## Wave 1F — Feature-gated deterministic (compile-time feature, no secrets)
+
+Deterministic L1 targets excluded from a bare `cargo test --all` only because
+they require a compile-time feature (not a runtime secret). CI runs them in
+dedicated feature-on steps.
+
+| target | wave | one-line purpose | relevant src |
+|---|---|---|---|
+| `upgrade_auto_test` | 1 | plan-20260714 §A.11 auto-upgrade end-to-end: signature+decision chain, anti-rollback/revocation replay, real-binary `__upgrade-probe` self-check, install/rollback transaction (`--features test-upgrade`) | `src/internal/upgrade/`, `src/command/upgrade.rs` |
+| `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs` |
+
 ## Wave 4 — Live AI (test-live-ai / DEEPSEEK_API_KEY)
 
 | target | wave | one-line purpose | relevant src |

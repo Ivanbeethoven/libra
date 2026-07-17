@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.19.1"
+version = "0.19.2"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -440,6 +440,19 @@ path = "tests/compat/compat_status_wave0_register.rs"
 name = "otlp_telemetry"
 path = "tests/otlp_telemetry.rs"
 required-features = ["otlp"]
+
+# Auto-upgrade integration tests (plan-20260714 §A.11): trust-root/endpoint
+# injection is compile-time only via `test-upgrade`, so a bare `cargo test
+# --all` excludes them and a release build cannot alter the trust root.
+[[test]]
+name = "upgrade_auto_test"
+path = "tests/upgrade_auto_test.rs"
+required-features = ["test-upgrade"]
+
+[[test]]
+name = "upgrade_publish_contract_test"
+path = "tests/upgrade_publish_contract_test.rs"
+required-features = ["test-upgrade"]
 
 [[test]]
 name = "auth_keyring_backend"

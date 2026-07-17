@@ -66,6 +66,20 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ matrix.target.rust }}-${{ hashFiles('**/Cargo.lock') }}
 
+      # plan-20260714 §A.11: release binaries must NEVER enable the
+      # `test-upgrade` feature (its compile-time trust-root/endpoint injection
+      # would let a build override the production trust root). The build below
+      # passes an explicit feature list; this guard fails the release if the
+      # test feature is ever spliced into the release build command.
+      - name: Reject test-upgrade feature in release build
+        if: matrix.target.os != 'windows'
+        shell: bash
+        run: |
+          if grep -nE -- '--features[^\n]*test-upgrade' .github/workflows/release.yml; then
+            echo "::error::release.yml must not build with the test-upgrade feature"
+            exit 1
+          fi
+
       - name: Build Binary (Unix)
         if: matrix.target.os != 'windows'
         shell: bash
