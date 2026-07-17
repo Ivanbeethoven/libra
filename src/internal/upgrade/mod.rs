@@ -19,6 +19,7 @@ pub mod http;
 pub mod lock;
 pub mod manifest;
 pub mod marker;
+pub mod orchestrator;
 pub mod platform;
 pub mod probe;
 pub mod settings;

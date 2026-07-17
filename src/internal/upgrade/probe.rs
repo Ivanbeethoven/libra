@@ -162,6 +162,77 @@ async fn run_probe(program: &Path, args: &[&str], timeout: Duration) -> ProbeOut
     }
 }
 
+/// Synchronous, bounded variant used on the recovery path (which is not
+/// inside an async task): spawn `program __upgrade-probe --kind <kind>
+/// --expected-version <v>` in its own process group, poll `try_wait` up to
+/// `timeout`, and on timeout kill the whole group and reap it. Blocking, so
+/// callers on an async runtime must invoke it under `spawn_blocking`.
+///
+/// # Errors
+/// Only a spawn failure returns `Err`; a nonzero/​signalled/timed-out probe is
+/// a healthy=false [`ProbeOutcome`], never an error.
+pub fn run_sync_probe(
+    program: &Path,
+    kind: &str,
+    expected_version: &str,
+    timeout: Duration,
+) -> std::io::Result<ProbeOutcome> {
+    let mut command = std::process::Command::new(program);
+    command
+        .args([
+            "__upgrade-probe",
+            "--kind",
+            kind,
+            "--expected-version",
+            expected_version,
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: setpgid(0,0) in the child before exec puts the probe in its
+        // own group so a hung descendant can be killed as a unit; it touches
+        // no parent state and cannot fail meaningfully here.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command.spawn()?;
+    #[cfg(unix)]
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                return Ok(if status.success() {
+                    ProbeOutcome::Passed
+                } else {
+                    ProbeOutcome::Failed {
+                        detail: describe_status(status),
+                    }
+                });
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    #[cfg(unix)]
+                    kill_process_group(pid);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(ProbeOutcome::TimedOut);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 fn describe_status(status: std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt;
@@ -270,5 +341,39 @@ mod tests {
         // Must never attempt to signal pid 0/1 (no panic, no-op).
         kill_process_group(0);
         kill_process_group(1);
+    }
+
+    #[test]
+    fn sync_probe_passes_fails_and_times_out() {
+        let (_g, ok) = script("exit 0");
+        assert_eq!(
+            run_sync_probe(&ok, "post-install", "1.2.3", DEFAULT_PROBE_TIMEOUT).unwrap(),
+            ProbeOutcome::Passed
+        );
+        let (_g2, bad) = script("exit 5");
+        assert!(matches!(
+            run_sync_probe(&bad, "version", "1.2.3", DEFAULT_PROBE_TIMEOUT).unwrap(),
+            ProbeOutcome::Failed { .. }
+        ));
+        let (_g3, hang) = script("sleep 300 & sleep 300");
+        let start = std::time::Instant::now();
+        assert_eq!(
+            run_sync_probe(&hang, "version", "1.2.3", Duration::from_millis(400)).unwrap(),
+            ProbeOutcome::TimedOut
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn sync_probe_missing_binary_errors() {
+        assert!(
+            run_sync_probe(
+                Path::new("/nonexistent/xyz-probe"),
+                "version",
+                "1.2.3",
+                DEFAULT_PROBE_TIMEOUT
+            )
+            .is_err()
+        );
     }
 }

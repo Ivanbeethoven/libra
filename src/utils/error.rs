@@ -1229,6 +1229,17 @@ pub fn emit_warning(message: impl std::fmt::Display) {
     eprintln!("warning: {message}");
 }
 
+/// Emit an advisory warning to stderr WITHOUT tripping the
+/// `--exit-code-on-warning` tracker.
+///
+/// This exists for out-of-band advisories that must never change the exit
+/// status of the user's actual command — notably the auto-upgrade check
+/// (plan-20260714 §A.8), which runs alongside a normal command and whose
+/// success or failure must not turn that command into a warning exit.
+pub fn emit_advisory_warning(message: impl std::fmt::Display) {
+    eprintln!("warning: {message}");
+}
+
 /// Transitional best-effort classifier for legacy string-only error paths.
 ///
 /// New command implementations should set [`StableErrorCode`] explicitly with

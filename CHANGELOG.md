@@ -4,6 +4,29 @@
 
 ### Added
 
+- **Auto-upgrade orchestration and startup hooks (v0.19.1, plan-20260714
+  §A.7/§A.8/§A.10)**: new `internal::upgrade::orchestrator` wires the whole
+  flow. `startup_recovery_gate` runs before repo preflight and drives any
+  crashed install transaction to a terminal state (a fatal, unrecoverable
+  transaction stops the process before the user's command; a rollback emits
+  an advisory). `run_auto_upgrade_check` implements the `upgrade.mode=auto`
+  check — throttle gate, signed-manifest fetch, decision, candidate download
+  + self-check, and install under the §A.5 lock with the post-install probe —
+  and is fully failure-isolated so it can never break or fail the user's
+  command (a new `emit_advisory_warning` reports without tripping
+  `--exit-code-on-warning`). Both hooks short-circuit with no I/O until the
+  compiled trust table is populated, so auto-upgrade is inert by construction
+  until the release-key ceremony. A synchronous bounded `run_sync_probe`
+  backs the recovery-path self-check. Wired into `cli.rs` startup.
+
+### Note
+
+- The auto-upgrade subsystem (plan-20260714 Part A) is code-complete through
+  orchestration but remains **inert**: `PRODUCTION_TRUSTED_KEYS` is empty
+  pending the official release-key ceremony, and the signing/publish jobs and
+  `install.sh` official-marker path are not yet wired. Until then Libra never
+  checks for or installs upgrades regardless of `upgrade.mode`.
+
 - **Auto-upgrade decision pipeline and candidate self-check entry (v0.19.0,
   plan-20260714 §A.7/§A.10)**: new `internal::upgrade::flow` composes the
   pure decision — verify → anti-rollback/time → platform support (Windows
