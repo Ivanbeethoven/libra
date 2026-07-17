@@ -23,7 +23,7 @@ use git_internal::{
 use serde::Serialize;
 
 use super::{
-    merge, stash, status_untracked,
+    merge, rename_detect, stash, status_untracked,
     unmerged::{self, UnmergedEntry},
 };
 use crate::{
@@ -574,22 +574,50 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         .collect();
     let mut maybe_index = Some(worktree.index);
 
-    // Resolve rename detection: `--no-renames` wins (off); otherwise `--renames`
-    // (or `--find-renames`) enables it at the given threshold (default 50).
-    let rename_threshold = if args.no_renames {
+    // Resolve rename detection (§B.5): rename detection is ON by default
+    // (matching Git); `--no-renames` disables it; `--renames`/`--find-renames`
+    // set the threshold percentage (default 50). `--cached`/`--check-dirty`
+    // (Libra dirty-cache extensions) run without rename detection.
+    let rename_percent: Option<u8> = if args.no_renames || args.cached || args.check_dirty {
         None
-    } else if args.renames || args.find_renames.is_some() {
-        Some(args.find_renames.unwrap_or(50))
+    } else if let Some(explicit) = args.find_renames {
+        Some(explicit)
     } else {
-        None
+        Some(50)
     };
 
-    // Apply rename detection before collapsing untracked dirs / porcelain metadata.
-    if let Some(threshold) = rename_threshold
-        && threshold > 0
+    // Apply rename detection before collapsing untracked dirs / porcelain
+    // metadata. Staged snapshot: old = HEAD tree, new = index stage-0.
+    // Unstaged snapshot: old = index stage-0, new = worktree (§B.4.1).
+    if let Some(percent) = rename_percent
+        && percent > 0
     {
-        detect_renames_in_changes(&mut staged, threshold, head_oid.as_ref()).await?;
-        detect_renames_in_changes(&mut unstaged, threshold, head_oid.as_ref()).await?;
+        let head_blobs = head_oid
+            .as_ref()
+            .map(load_head_tree_blobs)
+            .unwrap_or_default();
+        let index_blobs = maybe_index
+            .as_ref()
+            .map(load_index_stage0_blobs)
+            .unwrap_or_default();
+        // Git 0..=60000 similarity scale; percent × 600 (100% → exact-only).
+        let config = rename_detect::RenameDetectConfig {
+            threshold: (percent as u32).min(100) * 600,
+            rename_limit: 1000,
+            comparison_budget: Some(rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS),
+        };
+        detect_renames_in_changes(
+            &mut staged,
+            &config,
+            RenameBlobSide::Known(&head_blobs),
+            RenameBlobSide::Known(&index_blobs),
+        );
+        detect_renames_in_changes(
+            &mut unstaged,
+            &config,
+            RenameBlobSide::Known(&index_blobs),
+            RenameBlobSide::Worktree,
+        );
     }
 
     let stash_count = if args.show_stash {
@@ -713,123 +741,198 @@ fn pathspec_error_to_cli(error: PathspecError) -> CliError {
     }
 }
 
-/// Detect renames between deleted and new files in `changes`.
-///
-/// Matches are selected greedily by best similarity score. A file may only
-/// participate in one rename pair. The threshold is a percentage (0-100).
-async fn detect_renames_in_changes(
-    changes: &mut Changes,
-    threshold: u8,
-    head_oid: Option<&ObjectHash>,
-) -> CliResult<()> {
-    if changes.deleted.is_empty() || changes.new.is_empty() {
-        return Ok(());
-    }
-
-    let head_blobs = head_oid.map(load_head_tree_blobs).unwrap_or_default();
-
-    // Pre-compute blob hashes for new files.
-    let mut new_hashes: HashMap<usize, ObjectHash> = HashMap::new();
-    for (idx, path) in changes.new.iter().enumerate() {
-        let abs = util::workdir_to_absolute(path);
-        if let Ok(hash) = calc_file_blob_hash(&abs) {
-            new_hashes.insert(idx, hash);
-        }
-    }
-
-    let mut used_new: HashSet<usize> = HashSet::new();
-    let mut remaining_deleted: Vec<PathBuf> = Vec::new();
-    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
-
-    for deleted in &changes.deleted {
-        let deleted_name = file_name_lossy(deleted);
-        let deleted_head_blob = head_blobs.get(deleted).cloned();
-
-        let mut best: Option<(usize, u8)> = None;
-        for (idx, new_path) in changes.new.iter().enumerate() {
-            if used_new.contains(&idx) {
-                continue;
-            }
-            let score = if deleted_head_blob
-                .as_ref()
-                .zip(new_hashes.get(&idx))
-                .is_some_and(|(a, b)| a == b)
-            {
-                100
-            } else {
-                let new_name = file_name_lossy(new_path);
-                filename_similarity(&deleted_name, &new_name)
-            };
-            if score >= threshold {
-                match best {
-                    None => best = Some((idx, score)),
-                    Some((_, current)) if score > current => best = Some((idx, score)),
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some((idx, _)) = best {
-            used_new.insert(idx);
-            renamed.push((deleted.clone(), changes.new[idx].clone()));
-        } else {
-            remaining_deleted.push(deleted.clone());
-        }
-    }
-
-    let mut remaining_new: Vec<PathBuf> = changes
-        .new
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !used_new.contains(idx))
-        .map(|(_, p)| p.clone())
-        .collect();
-
-    // Sort both remaining lists to preserve deterministic output.
-    remaining_deleted.sort();
-    remaining_new.sort();
-    renamed.sort_by(|a, b| a.1.cmp(&b.1));
-
-    changes.deleted = remaining_deleted;
-    changes.new = remaining_new;
-    changes.renamed.extend(renamed);
-    Ok(())
+/// Where one side of a rename snapshot draws its blob identities from.
+enum RenameBlobSide<'a> {
+    /// HEAD tree or index stage-0: repo-relative path → (oid, mode), a
+    /// content-addressed fact (`KnownObjectId`, §B.4.1).
+    Known(&'a HashMap<PathBuf, (ObjectHash, u32)>),
+    /// The worktree: OID is streamed from the file during this call
+    /// (`ComputedWorktreeThisCall`).
+    Worktree,
 }
 
-fn load_head_tree_blobs(head_oid: &ObjectHash) -> HashMap<PathBuf, ObjectHash> {
+/// Content provider for inexact scoring: HEAD/index blobs are read from the
+/// object store by OID (de-duplicated, budgeted), worktree files are read
+/// under the separate worktree budget (§B.7). The engine caches spanhashes
+/// per path, so each path is requested at most once per side.
+struct StatusContentSource {
+    old_is_worktree: bool,
+    new_is_worktree: bool,
+    objects: rename_detect::ObjectReadBudget,
+    worktree: rename_detect::WorktreeReadBudget,
+}
+
+impl StatusContentSource {
+    fn read(
+        &mut self,
+        path: &Path,
+        blob: &rename_detect::BlobRef,
+        from_worktree: bool,
+    ) -> rename_detect::ContentOutcome {
+        use rename_detect::{BlobEvidence, ContentOutcome, SkipReason};
+        match blob.evidence {
+            BlobEvidence::KnownObjectId { oid } if !from_worktree => self.objects.read_blob(&oid),
+            _ if from_worktree => {
+                let abs = util::workdir_to_absolute(path);
+                self.worktree.read_worktree_blob(&abs)
+            }
+            // A worktree-computed OID on the object side, or an Unknown blob:
+            // no trustworthy object to read.
+            _ => ContentOutcome::Skipped(SkipReason::ObjectUnavailable),
+        }
+    }
+}
+
+impl rename_detect::RenameContentSource for StatusContentSource {
+    fn old_content(
+        &mut self,
+        path: &Path,
+        blob: &rename_detect::BlobRef,
+    ) -> rename_detect::ContentOutcome {
+        let from_worktree = self.old_is_worktree;
+        self.read(path, blob, from_worktree)
+    }
+
+    fn new_content(
+        &mut self,
+        path: &Path,
+        blob: &rename_detect::BlobRef,
+    ) -> rename_detect::ContentOutcome {
+        let from_worktree = self.new_is_worktree;
+        self.read(path, blob, from_worktree)
+    }
+}
+
+/// Build one side of a [`rename_detect::RenameSnapshot`] from a change list.
+///
+/// `paths` are in the change list's own base (repo- or cwd-relative); each is
+/// mapped to a repo-relative key via [`util::to_workdir_path`] so the HEAD/
+/// index lookups and worktree reads are correct from any working directory
+/// (fixing the historical subdirectory bug). The returned map is keyed by the
+/// repo-relative path.
+fn build_rename_side(
+    paths: &[PathBuf],
+    side: &RenameBlobSide<'_>,
+) -> HashMap<PathBuf, rename_detect::BlobRef> {
+    use rename_detect::{BlobEvidence, BlobKind, BlobRef};
+    let mut map = HashMap::new();
+    for path in paths {
+        let repo_key = util::to_workdir_path(path);
+        let blob = match side {
+            RenameBlobSide::Known(known) => {
+                let Some((oid, mode)) = known.get(&repo_key).copied() else {
+                    continue;
+                };
+                BlobRef {
+                    kind: BlobKind::from_mode(mode),
+                    mode,
+                    size: None,
+                    evidence: BlobEvidence::KnownObjectId { oid },
+                }
+            }
+            RenameBlobSide::Worktree => {
+                let abs = util::workdir_to_absolute(&repo_key);
+                let (kind, mode) = match std::fs::symlink_metadata(&abs) {
+                    Ok(meta) if meta.file_type().is_symlink() => (BlobKind::Symlink, 0o120000),
+                    Ok(_) => (BlobKind::Regular, 0o100644),
+                    Err(_) => continue,
+                };
+                let Ok(oid) = calc_file_blob_hash(&abs) else {
+                    continue;
+                };
+                BlobRef {
+                    kind,
+                    mode,
+                    size: None,
+                    evidence: BlobEvidence::ComputedWorktreeThisCall { oid },
+                }
+            }
+        };
+        map.insert(repo_key, blob);
+    }
+    map
+}
+
+/// Detect renames between the `deleted` (old) and `new` sides of `changes`
+/// using the diffcore engine (exact by OID → unique basename → bounded
+/// exhaustive inexact, §B.4.2). Matched pairs are recorded in
+/// `changes.renamed` and pruned from `deleted`/`new`. Paths keep the change
+/// list's original base for display; detection runs on repo-relative keys.
+fn detect_renames_in_changes(
+    changes: &mut Changes,
+    config: &rename_detect::RenameDetectConfig,
+    old_side: RenameBlobSide<'_>,
+    new_side: RenameBlobSide<'_>,
+) {
+    if changes.deleted.is_empty() || changes.new.is_empty() {
+        return;
+    }
+    let snapshot = rename_detect::RenameSnapshot {
+        old_map: build_rename_side(&changes.deleted, &old_side),
+        new_map: build_rename_side(&changes.new, &new_side),
+    };
+    let mut source = StatusContentSource {
+        old_is_worktree: matches!(old_side, RenameBlobSide::Worktree),
+        new_is_worktree: matches!(new_side, RenameBlobSide::Worktree),
+        objects: rename_detect::ObjectReadBudget::with_defaults(),
+        worktree: rename_detect::WorktreeReadBudget::with_defaults(),
+    };
+    let outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    if outcome.matches.is_empty() {
+        return;
+    }
+
+    // Map repo-relative matches back to the change list's display base and
+    // prune consumed endpoints.
+    let mut consumed_old: HashSet<PathBuf> = HashSet::new();
+    let mut consumed_new: HashSet<PathBuf> = HashSet::new();
+    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for m in &outcome.matches {
+        let old_display = util::workdir_to_current(&m.old);
+        let new_display = util::workdir_to_current(&m.new);
+        consumed_old.insert(old_display.clone());
+        consumed_new.insert(new_display.clone());
+        renamed.push((old_display, new_display));
+    }
+    changes.deleted.retain(|p| !consumed_old.contains(p));
+    changes.new.retain(|p| !consumed_new.contains(p));
+    changes.deleted.sort();
+    changes.new.sort();
+    renamed.sort_by(|a, b| a.1.cmp(&b.1));
+    changes.renamed.extend(renamed);
+}
+
+/// Numeric Unix mode for a `TreeItemMode` (`100644`/`100755`/`120000`/
+/// `160000`), matching Git's stored blob modes.
+fn tree_item_mode_to_unix(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::Blob => 0o100644,
+        TreeItemMode::BlobExecutable => 0o100755,
+        TreeItemMode::Link => 0o120000,
+        TreeItemMode::Commit => 0o160000,
+        TreeItemMode::Tree => 0o040000,
+    }
+}
+
+/// HEAD tree blobs keyed by repo-relative path → (oid, mode) (§B.4.1 old side
+/// of the staged snapshot).
+fn load_head_tree_blobs(head_oid: &ObjectHash) -> HashMap<PathBuf, (ObjectHash, u32)> {
     let commit = Commit::load(head_oid);
     let tree = Tree::load(&commit.tree_id);
     tree.get_plain_items_with_mode()
         .into_iter()
-        .map(|(path, hash, _mode)| (path, hash))
+        .map(|(path, hash, mode)| (path, (hash, tree_item_mode_to_unix(mode))))
         .collect()
 }
 
-fn file_name_lossy(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-/// Simple filename similarity based on longest common subsequence length.
-fn filename_similarity(a: &str, b: &str) -> u8 {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    let mut prev = vec![0u16; b.len() + 1];
-    let mut curr = vec![0u16; b.len() + 1];
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            if a[i - 1] == b[j - 1] {
-                curr[j] = prev[j - 1] + 1;
-            } else {
-                curr[j] = curr[j - 1].max(prev[j]);
-            }
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    let lcs = prev[b.len()] as usize;
-    let max_len = a.len().max(b.len());
-    (lcs.saturating_mul(100) / max_len.max(1)).min(100) as u8
+/// Index stage-0 blobs keyed by repo-relative path → (oid, mode) (index side
+/// of both snapshots).
+fn load_index_stage0_blobs(index: &Index) -> HashMap<PathBuf, (ObjectHash, u32)> {
+    index
+        .tracked_entries(0)
+        .into_iter()
+        .map(|entry| (PathBuf::from(&entry.name), (entry.hash, entry.mode)))
+        .collect()
 }
 
 pub(crate) fn load_status_index() -> CliResult<Index> {

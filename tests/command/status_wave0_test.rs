@@ -158,3 +158,93 @@ fn porcelain_v1_rename_output_stays_add_delete() {
     let rendered = String::from_utf8(output).expect("porcelain v1 should be utf-8");
     assert_eq!(rendered, "D  a.txt\nA  b.txt\n");
 }
+
+// ── R0-2/R0-4: engine-backed rename detection, default-on (§B.4/§B.5) ─────────
+
+/// A staged move of unchanged content is an exact rename, detected by default
+/// (rename detection is ON without any flag, matching Git).
+#[test]
+fn rename_exact_staged_detected_by_default() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("renamed:") && out.contains("a.txt") && out.contains("b.txt"),
+        "default status should report the rename: {out}"
+    );
+    // The endpoints must NOT also appear as a separate delete + new file.
+    assert!(
+        !out.contains("deleted: a.txt") && !out.contains("new file: b.txt"),
+        "rename endpoints must not double as add/delete: {out}"
+    );
+}
+
+/// A staged move with a small content edit is still a rename (inexact,
+/// spanhash similarity above the 50% default threshold).
+#[test]
+fn rename_inexact_content_change_detected() {
+    let base: String = (0..40).map(|i| format!("line {i}\n")).collect();
+    let repo = create_repo_with_committed_file("orig.txt", &base);
+    let mv = run_libra_command(&["mv", "orig.txt", "moved.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+    // Edit one line of the moved file, then re-stage it.
+    let edited = base.replace("line 5\n", "line five changed\n");
+    fs::write(repo.path().join("moved.txt"), edited).unwrap();
+    let add = run_libra_command(&["add", "moved.txt"], repo.path());
+    assert_cli_success(&add, "restage edited moved file");
+
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("renamed:") && out.contains("orig.txt") && out.contains("moved.txt"),
+        "inexact rename should still be detected: {out}"
+    );
+}
+
+/// `--no-renames` disables detection, so the same move renders as a delete +
+/// add pair.
+#[test]
+fn rename_no_renames_flag_splits_add_delete() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["status", "--no-renames"]);
+    assert!(
+        out.contains("deleted:") && out.contains("a.txt") && out.contains("b.txt"),
+        "--no-renames should split into delete + new file: {out}"
+    );
+    assert!(
+        !out.contains("renamed:"),
+        "--no-renames must not report a rename: {out}"
+    );
+}
+
+/// Detection runs on repo-relative keys, so a rename is found even when
+/// `status` is invoked from a subdirectory (the historical subdir bug).
+#[test]
+fn rename_from_subdirectory_detected() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir(repo.path().join("sub")).unwrap();
+    fs::write(
+        repo.path().join("sub/a.txt"),
+        "subdir rename content\nsecond line here\n",
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "sub/a.txt"], repo.path());
+    assert_cli_success(&add, "stage subdir file");
+    let commit = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&commit, "commit subdir file");
+    let mv = run_libra_command(&["mv", "sub/a.txt", "sub/b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv in subdir");
+
+    // Invoke status FROM the subdirectory.
+    let out = status_stdout(&repo.path().join("sub"), &["status"]);
+    assert!(
+        out.contains("renamed:") && out.contains("a.txt") && out.contains("b.txt"),
+        "rename must be detected from a subdirectory: {out}"
+    );
+}

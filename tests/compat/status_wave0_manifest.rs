@@ -10,6 +10,10 @@
 pub const STATUS_WAVE0_TESTS: &[&str] = &[
     "porcelain_v1_rename_output_stays_add_delete",
     "porcelain_v2_unmerged_u_line",
+    "rename_exact_staged_detected_by_default",
+    "rename_from_subdirectory_detected",
+    "rename_inexact_content_change_detected",
+    "rename_no_renames_flag_splits_add_delete",
     "resolved_conflict_with_stage0_emits_no_u_line",
     "unmerged_stage_presence_to_xy_mapping",
 ];

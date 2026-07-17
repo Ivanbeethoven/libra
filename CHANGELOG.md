@@ -2,7 +2,29 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`libra status` rename detection is now on by default (v0.19.3,
+  plan-20260714 Part B R0-2/R0-4)**: a staged or unstaged delete+add pair with
+  similar content is reported as a rename without any flag, matching Git's
+  default. Matching moves to the shared diffcore engine
+  (`command::rename_detect`) — exact by blob id, then unique basename, then a
+  bounded inexact spanhash pass with per-side rename limit (1000) and a
+  similarity-comparison budget — replacing the previous greedy basename-LCS
+  matcher. Detection now runs on repo-relative keys, so renames are found
+  correctly when `status` is invoked from a subdirectory. `--no-renames`
+  disables it (and wins over `--find-renames`/`--renames`); the dirty-cache
+  `--cached`/`--check-dirty` extensions run without rename detection. Staged
+  snapshots pair HEAD tree ↔ index stage-0; unstaged pair index stage-0 ↔
+  worktree, per Git's content-addressing.
+
 ### Added
+
+- **`diff.renameLimit` / `diff.renameComparisonBudget` documentation
+  (plan-20260714 R0-1)**: documents the per-side inexact-pass limit and the
+  similarity-comparison budget (both non-negative, `0` = unlimited, invalid
+  fails closed with `LBR-CLI-002`) in `docs/commands/diff.md` and the zh-CN
+  translation.
 
 - **Auto-upgrade integration tests and docs (v0.19.2, plan-20260714 §A.9/
   §A.11)**: two new `test-upgrade`-gated integration targets —
