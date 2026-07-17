@@ -1604,7 +1604,12 @@ mod tests {
         assert_option_value(&args, "--tmpfs", "/tmp");
     }
 
+    // The `/tmp`-anchored mount expectations only hold where `/tmp` is a real
+    // directory: on macOS it is a symlink to `/private/tmp`, so canonicalized
+    // roots never sit beneath the literal `/tmp` tmpfs. bwrap itself is
+    // Linux-only, so gate the arg-shape assertions to Linux.
     #[test]
+    #[cfg(target_os = "linux")]
     fn create_bwrap_command_args_creates_exact_tmp_mount_destinations() {
         let temp = tempfile::Builder::new()
             .prefix("libra-bwrap-mount-test-")
@@ -1733,7 +1738,10 @@ mod tests {
         assert!(args.contains(&"--die-with-parent".to_string()));
     }
 
+    // Linux-only for the same `/tmp`-symlink reason as
+    // `create_bwrap_command_args_creates_exact_tmp_mount_destinations`.
     #[test]
+    #[cfg(target_os = "linux")]
     fn create_bwrap_command_args_binds_workspace_roots_and_protected_subpaths() {
         let temp = tempfile::Builder::new()
             .prefix("libra-bwrap-protected-test-")
@@ -2115,6 +2123,8 @@ mod tests {
         ]
     }
 
+    // Only used by the Linux-gated bwrap arg-shape tests above.
+    #[cfg(target_os = "linux")]
     fn assert_mount(args: &[String], flag: &str, path: &Path) {
         let value = path.to_string_lossy();
         assert!(
