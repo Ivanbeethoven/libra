@@ -291,6 +291,11 @@ pub enum StableErrorCode {
     /// so callers never silently overrun the concurrency budget (A0-04, E10
     /// `ERR_AGENT_RUN_QUEUE_FULL`).
     AgentRunQueueFull,
+    /// The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`)
+    /// is unreadable, corrupt, or written by an unsupported schema version
+    /// (plan-20260714 §A.3). Unsupported `config` spellings targeting the
+    /// reserved `upgrade.*` namespace are plain usage errors (`LBR-CLI-002`).
+    UpgradeSettingsInvalid,
 }
 
 impl Serialize for StableErrorCode {
@@ -349,6 +354,7 @@ impl StableErrorCode {
             Self::AgentRpcTransportFailed => "LBR-AGENT-012",
             Self::AgentRawAccessDenied => "LBR-AGENT-013",
             Self::AgentRunQueueFull => "LBR-AGENT-014",
+            Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
         }
     }
 
@@ -362,7 +368,7 @@ impl StableErrorCode {
             Self::RepoNotFound | Self::RepoCorrupt | Self::RepoStateInvalid => {
                 CliErrorCategory::Repo
             }
-            Self::ConfigSchemaFuture => CliErrorCategory::Config,
+            Self::ConfigSchemaFuture | Self::UpgradeSettingsInvalid => CliErrorCategory::Config,
             Self::ConflictUnresolved
             | Self::ConflictOperationBlocked
             // Policy refusals ride the Conflict category (no dedicated
@@ -548,6 +554,9 @@ impl StableErrorCode {
             }
             Self::AgentRunQueueFull => {
                 "Too many concurrent review/investigate runs are active and the wait queue is full; the run was refused fail-closed."
+            }
+            Self::UpgradeSettingsInvalid => {
+                "The reserved upgrade settings file ({LIBRA_HOME}/upgrade/settings.json) is unreadable or corrupt; rewrite it with libra config set --global upgrade.mode <auto|manual|off>."
             }
         }
     }
@@ -1911,6 +1920,14 @@ mod tests {
         assert_eq!(StableErrorCode::WarningEmitted.as_str(), "LBR-WARN-001");
         assert_eq!(StableErrorCode::AddNothingStaged.as_str(), "LBR-ADD-001");
         assert_eq!(StableErrorCode::Unsupported.as_str(), "LBR-UNSUPPORTED-001",);
+        assert_eq!(
+            StableErrorCode::UpgradeSettingsInvalid.as_str(),
+            "LBR-UPGRADE-001",
+        );
+        assert_eq!(
+            StableErrorCode::UpgradeSettingsInvalid.category(),
+            CliErrorCategory::Config,
+        );
         assert_eq!(StableErrorCode::BisectNotActive.as_str(), "LBR-BISECT-001");
         assert_eq!(StableErrorCode::BisectRunFailed.as_str(), "LBR-BISECT-002");
         assert_eq!(

@@ -373,6 +373,31 @@ libra config list --gpg-keys
 - `--global` 使用 `~/.libra/config.db`
 - `--system` 使用 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）；级联优先级最低，写入通常需要提升权限，且该作用域拒绝 vault 加密密钥（见设计动机）
 
+## 保留命名空间 `upgrade.*`
+
+自动升级配置是保留命名空间，存储在
+`{LIBRA_HOME}/upgrade/settings.json`（默认 `~/.libra/upgrade/settings.json`；
+可用 `LIBRA_HOME` 环境变量覆盖基目录；当 `LIBRA_CONFIG_GLOBAL_DB` 隔离全局
+配置数据库时，settings 也随之落到该数据库所在目录），绝不落入 SQLite 存储。
+仅支持以下单值、`--global` 操作：
+
+| 操作 | 行为 |
+| --- | --- |
+| `set --global upgrade.mode <v>` | 仅接受 `auto`/`manual`/`off`（大小写不敏感）；其它值为用法错误。原子写入。 |
+| `get --global upgrade.mode` | 读取存储的模式；文件缺失读作 `off`；文件损坏为硬错误（`LBR-UPGRADE-001`）。 |
+| `unset --global upgrade.mode` | 将 `mode` 重置为 `off` 并**保留**文件。 |
+| `list --global [--show-origin]` | 渲染文件承载的条目，origin 为 `file:{path}`。 |
+
+所有其它可到达该命名空间的拼写均以用法错误 fail-closed（`LBR-CLI-002`，
+exit 129）：local/system 作用域、`--add`、`--get-all`、`--unset-all`、
+`--type` 类型转换、`--encrypt`/`--plaintext`/`--stdin`、
+`--remove-section`/`--rename-section`、`--default`、多个 action 拼写组合、
+带空白的 key/value 拼写（不做空白归一化），以及能匹配 `upgrade.mode` 的
+`--get-regexp` 模式。`config import` 会跳过 `upgrade.*` 条目并给出警告；
+`list` 与不匹配的 `--get-regexp` 模式会抑制 SQLite 中任何陈旧的
+`upgrade.*` 行，确保 settings 文件是唯一事实来源。settings 文件损坏为
+`LBR-UPGRADE-001`。
+
 运行时由配置支撑的环境变量解析顺序是：
 
 1. CLI 参数

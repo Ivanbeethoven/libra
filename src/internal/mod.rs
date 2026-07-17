@@ -50,4 +50,5 @@ pub mod sparse;
 pub mod tag;
 pub mod tree_plumbing;
 pub mod tui;
+pub mod upgrade;
 pub mod vault;

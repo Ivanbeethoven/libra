@@ -4,6 +4,25 @@
 
 ### Added
 
+- **Reserved `upgrade.mode` config namespace (v0.18.94, plan-20260714 §A.3)**:
+  the auto-upgrade switch now lives in `{LIBRA_HOME}/upgrade/settings.json`
+  (atomic writes, `0700`/`0600` permissions on Unix), backed by a single
+  Rust-side `resolve_libra_home()` that mirrors `install.sh`'s
+  `LIBRA_HOME`/`HOME` rules. `libra config` routes every spelling that can
+  reach `upgrade.*` through a reserved-namespace router: only single-value
+  `set`/`get`/`unset` with `--global` are supported (`unset` resets to `off`
+  and keeps the file; missing file reads as `off`; corrupt or unreadable files
+  fail with the new `LBR-UPGRADE-001` stable code), `list --show-origin`
+  renders the `file:{path}` origin, and local/system scopes, `--add`,
+  `--get-all`, `--unset-all`, type conversion, section operations, conflicting
+  action-flag combinations, padded spellings, and `--get-regexp` patterns
+  matching `upgrade.mode` fail closed as usage errors (`LBR-CLI-002`).
+  `config import` skips reserved keys with a warning, and `list` plus
+  non-matching `--get-regexp` suppress stale SQLite `upgrade.*` rows. When
+  `LIBRA_CONFIG_GLOBAL_DB` isolates the global config database, the upgrade
+  settings follow it. The mode itself only selects the upgrade policy
+  (`auto`/`manual`/`off`); the upgrade engine lands in follow-up slices.
+
 - **Optional `lba` installer shorthand (v0.18.88)**: `install.sh` now creates
   a movable relative `lba -> libra` symlink by default. Same-version reruns
   repair a missing alias, `--no-alias` and `LIBRA_NO_ALIAS=1` opt out, and
