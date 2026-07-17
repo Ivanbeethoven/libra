@@ -112,7 +112,9 @@ libra status --no-column
 
 ### `--find-renames [PERCENT]`
 
-在 staged 和 unstaged 变更中检测 renames。当一个被删除的文件与一个新文件具有相同的 blob 哈希，或它们的文件名足够相似时，它们会作为 rename 对（`old -> new`）报告，而不是分开的 delete/add 条目。可选值是最小相似度百分比（0-100）；默认 50。
+设置 rename 检测的相似度阈值。rename 检测**默认开启**（50%，与 Git 一致），因此仅在需要改变阈值或在 `status.renames=false` 后重新启用时才需要 `--find-renames`。当被删除文件与新文件足够相似时，它们会作为一个 rename 对（`renamed: old -> new`）报告，而不是分开的 delete/add 条目。可选值是最小相似度百分比（0-100）；`100` 表示仅 exact。
+
+renames 由共享 diffcore 引擎匹配：先按 blob id 找 exact，再按唯一 basename，最后是带 per-side 上限（1000）与相似度比较预算的有界 inexact spanhash 扫描。staged rename 配对 HEAD tree 与 index；unstaged rename 配对 index 与工作树。检测在仓库根相对路径上运行，因此即使从子目录调用 `status` 也能正确检测 rename。
 
 ```bash
 libra status --find-renames
@@ -121,11 +123,12 @@ libra status --find-renames=75
 
 ### `--renames` / `--no-renames`
 
-切换 rename 检测。`--renames` 以默认（或 `--find-renames` 给出的）阈值启用它；`--no-renames` 禁用它，并在组合时覆盖 `--renames`/`--find-renames`。
+切换 rename 检测。`--renames` 以默认（或 `--find-renames` 给出的）阈值启用它；`--no-renames` 禁用它，并覆盖 `--renames`/`--find-renames`、`status.renames` 与默认开启行为。`status.renames` 配置（回退到 `diff.renames`）经严格 local → global → system 级联设置默认：`false` 禁用检测，truthy 值或未设置则以 50% 启用。`copy`/`copies` 被拒绝（尚不支持 copy 检测），不会降级为普通 rename。非法值在任何输出前以 `LBR-CLI-002` fail-closed。Libra dirty-cache 扩展（`--cached`/`--check-dirty`）不运行 rename 检测。
 
 ```bash
 libra status --renames
 libra status --no-renames
+libra config status.renames false   # 默认禁用
 ```
 
 ### `--scan` / `--cached` / `--check-dirty`（Libra 扩展，lore.md 1.1）

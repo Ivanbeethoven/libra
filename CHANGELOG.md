@@ -4,6 +4,15 @@
 
 ### Changed
 
+- **`status.renames` config cascade (v0.19.4, plan-20260714 Part B R0-7)**:
+  `libra status` now honors `status.renames` (falling back to `diff.renames`)
+  through the strict local → global → system cascade to set the rename-
+  detection default — `false` disables it, a truthy or unset value enables it
+  at 50%. `copy`/`copies` are rejected (copy detection is unsupported) instead
+  of silently degrading, and invalid values fail closed with `LBR-CLI-002`
+  before output. CLI flags (`--no-renames`/`--find-renames`/`--renames`)
+  always win over config. Documented in `docs/commands/status.md` (+ zh-CN).
+
 - **`libra status` rename detection is now on by default (v0.19.3,
   plan-20260714 Part B R0-2/R0-4)**: a staged or unstaged delete+add pair with
   similar content is reported as a rename without any flag, matching Git's

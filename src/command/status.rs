@@ -206,6 +206,14 @@ pub struct StatusArgs {
     /// [`apply_status_config_defaults`], never by the CLI.
     #[clap(skip = true)]
     pub relative_paths: bool,
+
+    /// Resolved rename-detection default from `status.renames` (falling back
+    /// to `diff.renames`), config-only. `None` = unset (feature default 50%
+    /// applies); `Some(false)` = disabled; `Some(true)` = enabled at 50%.
+    /// CLI flags (`--no-renames`/`--find-renames`/`--renames`) always win.
+    /// Populated by [`apply_status_config_defaults`], never by the CLI.
+    #[clap(skip)]
+    pub renames_config: Option<bool>,
 }
 
 impl StatusArgs {
@@ -279,6 +287,34 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
     let show_stash = read_bool("status.showStash").await?;
     let relative_paths = read_bool("status.relativePaths").await?;
 
+    // Rename detection default (§B.5): `status.renames`, falling back to
+    // `diff.renames`. Accepts a Git boolean or `copy`/`copies`; `copy` is
+    // fail-closed in R0 (copy detection is not supported yet) rather than
+    // silently degrading to rename detection.
+    async fn read_renames(key: &str) -> CliResult<Option<bool>> {
+        match read_value(key).await? {
+            None => Ok(None),
+            Some(value) => {
+                let lower = value.trim().to_ascii_lowercase();
+                if lower == "copy" || lower == "copies" {
+                    return Err(CliError::command_usage(format!(
+                        "copy detection is not supported for '{key}'; use true or false"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint("set the value to true or false"));
+                }
+                match parse_git_config_bool(&value) {
+                    Some(enabled) => Ok(Some(enabled)),
+                    None => Err(invalid(key, &value, "a Git boolean or copy/copies")),
+                }
+            }
+        }
+    }
+    let renames_config = match read_renames("status.renames").await? {
+        Some(value) => Some(value),
+        None => read_renames("diff.renames").await?,
+    };
+
     if args.untracked_files.is_none() {
         args.untracked_files = untracked;
     }
@@ -294,6 +330,7 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
         args.show_stash = true;
     }
     args.relative_paths = relative_paths.unwrap_or(true);
+    args.renames_config = renames_config;
     Ok(())
 }
 
@@ -574,16 +611,23 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         .collect();
     let mut maybe_index = Some(worktree.index);
 
-    // Resolve rename detection (§B.5): rename detection is ON by default
-    // (matching Git); `--no-renames` disables it; `--renames`/`--find-renames`
-    // set the threshold percentage (default 50). `--cached`/`--check-dirty`
-    // (Libra dirty-cache extensions) run without rename detection.
+    // Resolve rename detection (§B.5). Precedence: CLI flags always win —
+    // `--no-renames` disables, `--find-renames[=N]`/`--renames` enable at the
+    // given (or default 50%) threshold. Otherwise the resolved
+    // `status.renames`/`diff.renames` config applies (`false` disables). When
+    // nothing is set, rename detection is ON at 50%, matching Git.
+    // `--cached`/`--check-dirty` (Libra dirty-cache extensions) never run it.
     let rename_percent: Option<u8> = if args.no_renames || args.cached || args.check_dirty {
         None
     } else if let Some(explicit) = args.find_renames {
         Some(explicit)
-    } else {
+    } else if args.renames {
         Some(50)
+    } else {
+        match args.renames_config {
+            Some(false) => None,
+            Some(true) | None => Some(50),
+        }
     };
 
     // Apply rename detection before collapsing untracked dirs / porcelain

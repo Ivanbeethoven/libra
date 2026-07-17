@@ -221,6 +221,39 @@ fn rename_no_renames_flag_splits_add_delete() {
     );
 }
 
+/// `status.renames=false` disables detection through the config cascade,
+/// even though the feature default is on (§B.5).
+#[test]
+fn rename_config_status_renames_false_disables() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let cfg = run_libra_command(&["config", "status.renames", "false"], repo.path());
+    assert_cli_success(&cfg, "set status.renames=false");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        !out.contains("renamed:") && out.contains("deleted:"),
+        "status.renames=false should disable rename detection: {out}"
+    );
+}
+
+/// A CLI `--find-renames` always wins over a config `status.renames=false`.
+#[test]
+fn rename_config_cli_find_renames_overrides_false() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let cfg = run_libra_command(&["config", "status.renames", "false"], repo.path());
+    assert_cli_success(&cfg, "set status.renames=false");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    let out = status_stdout(repo.path(), &["status", "--find-renames"]);
+    assert!(
+        out.contains("renamed:"),
+        "--find-renames must override status.renames=false: {out}"
+    );
+}
+
 /// Detection runs on repo-relative keys, so a rename is found even when
 /// `status` is invoked from a subdirectory (the historical subdir bug).
 #[test]

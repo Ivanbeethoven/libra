@@ -169,10 +169,17 @@ libra status --no-column
 
 ### `--find-renames [PERCENT]`
 
-Detect renames among staged and unstaged changes. When a deleted file and a new file have the
-same blob hash, or their file names are sufficiently similar, they are reported as a rename
-pair (`old -> new`) instead of separate delete/add entries. The optional value is the minimum
-similarity percentage (0-100); the default is 50.
+Set the rename-detection similarity threshold. Rename detection is **on by default** at 50%
+(matching Git), so `--find-renames` is only needed to change the threshold or to re-enable
+detection after `status.renames=false`. When a deleted file and a new file are similar enough,
+they are reported as one rename pair (`renamed: old -> new`) instead of separate delete/add
+entries. The optional value is the minimum similarity percentage (0-100); `100` is exact-only.
+
+Renames are matched by the shared diffcore engine: exact matches are found by blob id, then a
+unique-basename pass, then a bounded inexact spanhash pass with a per-side rename limit (1000)
+and a similarity-comparison budget. Staged renames pair the HEAD tree with the index; unstaged
+renames pair the index with the worktree. Detection runs on repository-root-relative paths, so
+renames are found correctly even when `status` is invoked from a subdirectory.
 
 ```bash
 libra status --find-renames
@@ -182,12 +189,18 @@ libra status --find-renames=75
 ### `--renames` / `--no-renames`
 
 Toggle rename detection. `--renames` enables it at the default (or `--find-renames`)
-threshold; `--no-renames` disables it and overrides `--renames`/`--find-renames` when
-combined.
+threshold; `--no-renames` disables it and overrides `--renames`/`--find-renames`,
+`status.renames`, and the on-by-default behavior. The `status.renames` config (falling back to
+`diff.renames`) sets the default through the strict local → global → system cascade: `false`
+disables detection, a truthy value or an unset key enables it at 50%. `copy`/`copies` are
+rejected (copy detection is not yet supported) rather than degrading to plain renames. Invalid
+values fail closed with `LBR-CLI-002` before any output. The Libra dirty-cache extensions
+(`--cached`/`--check-dirty`) run without rename detection.
 
 ```bash
 libra status --renames
 libra status --no-renames
+libra config status.renames false   # disable by default
 ```
 
 ### `--scan` / `--cached` / `--check-dirty` (Libra extensions, lore.md 1.1)
