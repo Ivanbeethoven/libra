@@ -435,6 +435,35 @@ async fn handle_op_restore(
         return Ok(());
     }
 
+    // Part C W0 (§C.11): op restore rewrites and prunes SHARED branch refs.
+    // Refuse if any affected branch is checked out in ANOTHER worktree — moving
+    // its tip or deleting it would corrupt that worktree's HEAD/working tree.
+    // `branch_checked_out_elsewhere` excludes the current worktree, so restoring
+    // this worktree's own branch stays allowed.
+    {
+        let keep = restore_keep_set(&target_graph);
+        let pruned = local_branches_to_prune(&db, &keep)
+            .await
+            .map_err(|e| CliError::fatal(format!("failed to inspect branches: {e}")))?;
+        let mut affected: Vec<String> = target_graph
+            .refs
+            .iter()
+            .filter(|r| r.ref_kind == "branch")
+            .map(|r| r.ref_name.clone())
+            .collect();
+        affected.extend(pruned);
+        for branch in &affected {
+            let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+            if let Some(other) = Head::branch_checked_out_elsewhere(short).await {
+                return Err(CliError::fatal(format!(
+                    "cannot restore: branch '{short}' is checked out at worktree '{other}'"
+                ))
+                .with_stable_code(StableErrorCode::Unsupported)
+                .with_hint("switch that worktree to another branch first, or run restore there"));
+            }
+        }
+    }
+
     let restore_meta = OperationMeta {
         command_name: "op restore".to_string(),
         description: format!("restore to {}", &target_op_id[..8.min(target_op_id.len())]),

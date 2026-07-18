@@ -209,6 +209,55 @@ fn test_op_restore_prunes_branches_absent_from_target_view() {
 }
 
 #[test]
+/// Part C W0 (§C.11): `op restore` refuses to prune/rewrite a branch that is
+/// checked out in ANOTHER worktree — it would leave that worktree's HEAD
+/// dangling. The guard fires before any write.
+fn test_op_restore_refuses_branch_checked_out_in_another_worktree() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Base operation whose view contains the default branch but not `ephemeral`.
+    assert_cli_success(&run_libra_command(&["branch", "keep"], p), "branch keep");
+    let base_op = latest_operation_id(p);
+    assert_cli_success(
+        &run_libra_command(&["branch", "ephemeral"], p),
+        "branch ephemeral",
+    );
+
+    // A linked worktree checks out `ephemeral` (the branch restore would prune).
+    let parent = tempdir().unwrap();
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], p),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "ephemeral"], &wt),
+        "wt switch ephemeral",
+    );
+
+    // Restoring to base_op would prune `ephemeral`, but it is checked out in the
+    // linked worktree — the restore must be refused before any write.
+    let restore = run_libra_command(&["op", "restore", &base_op], p);
+    assert_ne!(
+        restore.status.code(),
+        Some(0),
+        "op restore must refuse to prune a branch checked out elsewhere"
+    );
+    assert!(
+        String::from_utf8_lossy(&restore.stderr).contains("checked out"),
+        "names the collision: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    // `ephemeral` must still exist (no write happened).
+    let after = run_libra_command(&["branch"], p);
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("ephemeral"),
+        "no branch was pruned"
+    );
+}
+
+#[test]
 /// `op restore --dry-run` previews the branches it would prune but performs no
 /// writes — the branch absent from the target view must still exist afterward.
 fn test_op_restore_dry_run_previews_prune_without_deleting() {

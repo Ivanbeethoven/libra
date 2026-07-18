@@ -4,6 +4,13 @@
 
 ### Changed
 
+- **`op restore` refuses a branch checked out in another worktree (v0.19.20,
+  plan-20260714 Part C W0 §C.11)**: `op restore` rewrites and prunes shared
+  branch refs to reproduce a past operation's view; it now fails closed, before
+  any write, if any branch it would move or prune is checked out in a different
+  worktree (that worktree's HEAD would dangle). Restoring this worktree's own
+  branch is still allowed.
+
 - **`checkout`/`switch --ignore-other-worktrees` no longer bypasses the
   same-branch guard (v0.19.19, plan-20260714 Part C W0 §C.11,
   intentionally-different from Git)**: Libra never allows the same shared branch
