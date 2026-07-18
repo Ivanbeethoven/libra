@@ -344,6 +344,56 @@ fn status_cache_modes_refused_in_linked_but_plain_status_works() {
     }
 }
 
+/// Part C W0 (§C.11): destructive branch writers (`branch -d`, `branch -m`,
+/// `branch reset`) refuse to touch a branch that is checked out in ANOTHER
+/// worktree — otherwise that worktree's HEAD would dangle or its working tree
+/// would silently diverge (Git parity).
+#[test]
+fn branch_writers_refuse_branch_checked_out_in_another_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    // The linked worktree checks out `feature`.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // From the main worktree, deleting/renaming/resetting `feature` is refused.
+    for argv in [
+        vec!["branch", "-D", "feature"],
+        vec!["branch", "-m", "feature", "feature2"],
+        vec!["branch", "reset", "feature", "main"],
+    ] {
+        let out = run_libra_command(&argv, main);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{argv:?} must be refused while feature is checked out elsewhere"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("checked out"),
+            "{argv:?} should name the other worktree: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A branch checked out NOWHERE else is still freely mutable.
+    assert_cli_success(
+        &run_libra_command(&["branch", "spare"], main),
+        "create spare branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "-D", "spare"], main),
+        "delete a free branch works",
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

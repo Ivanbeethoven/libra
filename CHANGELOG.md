@@ -4,6 +4,16 @@
 
 ### Changed
 
+- **Destructive branch writers refuse a branch checked out in another worktree
+  (v0.19.16, plan-20260714 Part C W0 §C.11)**: `branch -d`/`-D` (delete),
+  `branch -m`/`-M` (rename), and `branch reset` now fail closed when the target
+  branch is checked out in a DIFFERENT worktree, instead of leaving that
+  worktree's HEAD dangling (delete/rename) or silently diverging its working
+  tree from its branch (reset) — matching Git, which refuses these across
+  worktrees. The current worktree's own branch is still caught by the existing
+  "currently on"/"reset current branch" checks, and a branch checked out
+  nowhere else remains freely mutable.
+
 - **`status --scan`/`--cached`/`--check-dirty` fail closed in a linked worktree
   (v0.19.15, plan-20260714 Part C W0)**: these dirty-cache modes read/prune the
   repository-global `working_dirty`/`working_dirty_meta`, so they now refuse to
