@@ -43,7 +43,10 @@ Agent 机制是更高层的架构。它把 worktree 当作由 Libra 调度器（
 
 - 共享的 `.libra` 目录包含 SQLite 数据库、对象存储、配置以及
   `worktrees.json`。
-- 每个关联 worktree 都包含一个 `.libra` symlink，指回共享的存储目录。
+- 每个关联 worktree（新隔离布局）包含它自己真实的 `.libra` gitdir——
+  本地目录（非 symlink），保存该 worktree 私有的 HEAD、index 和 HEAD
+  reflog，并记录 `commondir` 指针（指回共享存储）与稳定 `worktree_id`。
+  由更早版本创建的 worktree 可能仍是旧的 `.libra` symlink 共享布局。
 - `worktrees.json` 存储规范化路径、主 worktree 标记、锁
   状态以及可选的锁定原因。
 - 状态写入是原子的：Libra 先写入一个临时 JSON 文件，再将其重命名

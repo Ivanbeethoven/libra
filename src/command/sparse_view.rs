@@ -63,6 +63,15 @@ pub enum SparseViewCommand {
 
 pub async fn execute_safe(args: SparseViewArgs, output: &OutputConfig) -> CliResult<()> {
     crate::utils::util::require_repo().map_err(|_| CliError::repo_not_found())?;
+    // Part C W0 (§C.11 transition guard): `sparse_view` rows and
+    // `sparse.enabled` are repository-global, but the matcher/hydrate acts on
+    // the current workdir — so one worktree set/clear/enable would change
+    // another's ls-files/diff/materialization. All subcommands fail closed in a
+    // linked worktree until W1 scopes the SparseViewStore call chain.
+    crate::command::ensure_main_worktree_because(
+        "sparse-view",
+        "sparse view state is not yet worktree-scoped",
+    )?;
     match args.command {
         SparseViewCommand::Set { patterns } => {
             validate_patterns(&patterns)?;

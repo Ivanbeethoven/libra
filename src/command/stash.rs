@@ -303,6 +303,14 @@ pub async fn execute(stash_cmd: Stash) {
 /// errors and exiting. Dispatches to stash sub-commands (push, pop, list,
 /// apply, drop, show, branch, clear).
 pub async fn execute_safe(stash_cmd: Stash, output: &OutputConfig) -> CliResult<()> {
+    // Part C W0 (§C.4.3): the stash stack (`refs/stash` + push/apply/pop index
+    // and worktree snapshots) is repository-shared with no per-worktree scoping
+    // yet, so every stash subcommand (including `stash branch`) fails closed in
+    // a linked worktree until W2 lands the scoped apply/CAS-drop protocol.
+    crate::command::ensure_main_worktree_because(
+        "stash",
+        "the stash stack and its index/worktree snapshots are not yet worktree-scoped",
+    )?;
     let result = run_stash(stash_cmd, output).await.map_err(CliError::from)?;
     render_stash_output(&result, output)
 }

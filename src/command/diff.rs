@@ -2361,7 +2361,7 @@ async fn run_diff(
     if let Some(threshold) = config.rename_threshold {
         // `--check` scans added lines for whitespace errors and ignores the
         // whitespace-ignore flags, so the rename body must stay unfiltered.
-        let inexact_rename_skipped = apply_rename_detection(
+        let rename_skips = apply_rename_detection(
             &mut files,
             &first_map,
             &second_map,
@@ -2369,14 +2369,22 @@ async fn run_diff(
             &second_modes,
             &ext_worktree_entries,
             threshold,
+            config.rename_limit,
+            config.rename_comparison_budget,
             regen_context,
             ws_normalize,
             ignore_blank,
             diff_algorithm,
         );
-        if inexact_rename_skipped {
+        if rename_skips.inexact_skipped_by_limit {
+            crate::utils::error::emit_legacy_stderr(format!(
+                "warning: skipped inexact rename detection because more than {} sources or destinations changed (diff.renameLimit); exact renames were still detected",
+                config.rename_limit,
+            ));
+        }
+        if rename_skips.inexact_discarded_by_budget {
             crate::utils::error::emit_legacy_stderr(
-                "warning: skipped inexact rename detection because more than 1000 sources or destinations changed; exact renames were still detected",
+                "warning: inexact rename detection exceeded diff.renameComparisonBudget; scored candidates were discarded and only exact renames were detected",
             );
         }
     }
@@ -3555,63 +3563,10 @@ fn color_moved_active(args: &DiffArgs) -> Result<bool, DiffError> {
     }
 }
 
-/// Chunk `data` the way Git's rename spanhash does — a chunk ends at a newline or
-/// after 64 bytes; a `\r` in a `\r\n` is ignored for text — and accumulate the
-/// byte count per chunk-hash. We hash each chunk with FNV-1a rather than Git's
-/// weaker `HASHBASE` rolling hash: for real content the similarity is identical
-/// (equal chunks always match; FNV collisions are astronomically rare), but a
-/// contrived input engineered to collide under Git's hash can score differently.
-fn spanhash_counts(data: &[u8]) -> HashMap<u64, u64> {
-    let is_text = !data.contains(&0);
-    let mut counts: HashMap<u64, u64> = HashMap::new();
-    let mut chunk: Vec<u8> = Vec::new();
-    let mut i = 0;
-    while i < data.len() {
-        let c = data[i];
-        if is_text && c == b'\r' && i + 1 < data.len() && data[i + 1] == b'\n' {
-            i += 1;
-            continue;
-        }
-        chunk.push(c);
-        i += 1;
-        if chunk.len() >= 64 || c == b'\n' {
-            *counts.entry(fnv1a(&chunk)).or_default() += chunk.len() as u64;
-            chunk.clear();
-        }
-    }
-    if !chunk.is_empty() {
-        *counts.entry(fnv1a(&chunk)).or_default() += chunk.len() as u64;
-    }
-    counts
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-/// Git's similarity score (0..60000): common chunk bytes * 60000 / max file size.
-/// Two empty files are identical (full score). The displayed percent is
-/// `score / 600`.
-fn similarity_score(old: &[u8], new: &[u8]) -> u32 {
-    let max_size = old.len().max(new.len()) as u64;
-    if max_size == 0 {
-        return 60000;
-    }
-    let old_counts = spanhash_counts(old);
-    let new_counts = spanhash_counts(new);
-    let mut common: u64 = 0;
-    for (hash, &old_bytes) in &old_counts {
-        if let Some(&new_bytes) = new_counts.get(hash) {
-            common += old_bytes.min(new_bytes);
-        }
-    }
-    ((common * 60000) / max_size) as u32
-}
+// Rename similarity scoring (spanhash + Git's 0..60000 score) lives in the
+// shared engine module (plan-20260714 §B.4.2) so `status` and `diff` cannot
+// drift apart.
+use super::rename_detect::similarity_score;
 
 /// Detect renames among the deleted + added files and fold each matched pair into
 /// a single rename entry (`-M`). Exact (same blob id) pairs are matched first,
@@ -3627,11 +3582,13 @@ fn apply_rename_detection(
     second_modes: &HashMap<PathBuf, u32>,
     worktree_entries: &HashMap<PathBuf, ObjectHash>,
     threshold: u32,
+    rename_limit: usize,
+    comparison_budget: Option<u64>,
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
     diff_algorithm: &DiffAlgorithm,
-) -> bool {
+) -> RenameDetectionSkips {
     let same_file_type = |old_path: &str, new_path: &str| {
         let old_type = first_modes
             .get(&PathBuf::from(old_path))
@@ -3664,7 +3621,7 @@ fn apply_rename_detection(
         .filter(|&i| files[i].status == "added")
         .collect();
     if deleted.is_empty() || added.is_empty() {
-        return false;
+        return RenameDetectionSkips::default();
     }
 
     let mut used_del = vec![false; files.len()];
@@ -3708,7 +3665,7 @@ fn apply_rename_detection(
     let remaining_added = added.iter().filter(|&&ai| !used_add[ai]).count();
     const MAX_SCORE: u32 = 60000;
     let inexact_skipped = threshold < MAX_SCORE
-        && inexact_rename_detection_exceeds_limit(remaining_deleted, remaining_added);
+        && inexact_rename_detection_exceeds_limit(remaining_deleted, remaining_added, rename_limit);
 
     let mut old_contents: HashMap<usize, Vec<u8>> = HashMap::new();
     let mut new_contents: HashMap<usize, Vec<u8>> = HashMap::new();
@@ -3736,33 +3693,61 @@ fn apply_rename_detection(
     // Git skips inexact detection entirely, so a 100%-similar but non-identical
     // pair (e.g. reordered lines) must NOT be folded.
     let basename = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+    let mut budget_discarded = false;
     if threshold < MAX_SCORE && !inexact_skipped {
-        // (score, same_basename, di, ai)
-        let mut candidates: Vec<(u32, bool, usize, usize)> = Vec::new();
-        for &di in &deleted {
-            if used_del[di] {
+        // Per-destination top-K bounded edge set (K=4, plan-20260714 §B.4.2.5)
+        // keeps memory at O(K × destinations) even for `-l0`-style uncapped
+        // candidate sets. Edge order: score desc, same-basename first, then
+        // (deleted, added) index ascending — diff's historical tie-break.
+        const PER_DEST_TOP_K: usize = 4;
+        let mut comparisons: u64 = 0;
+        // per added-index: (score, same_basename, di, ai) best-first
+        let mut per_dest: HashMap<usize, Vec<(u32, bool, usize, usize)>> = HashMap::new();
+        'outer: for &ai in &added {
+            if used_add[ai] {
                 continue;
             }
-            let Some(old) = old_contents.get(&di) else {
+            let Some(new) = new_contents.get(&ai) else {
                 continue;
             };
-            for &ai in &added {
-                if used_add[ai] {
+            for &di in &deleted {
+                if used_del[di] {
                     continue;
                 }
                 if !same_file_type(&files[di].path, &files[ai].path) {
                     continue;
                 }
-                let Some(new) = new_contents.get(&ai) else {
+                let Some(old) = old_contents.get(&di) else {
                     continue;
                 };
+                if let Some(budget) = comparison_budget
+                    && comparisons >= budget
+                {
+                    // 触顶规则：丢弃整个 inexact 阶段已评结果，仅保留 exact。
+                    budget_discarded = true;
+                    per_dest.clear();
+                    break 'outer;
+                }
+                comparisons += 1;
                 let score = similarity_score(old, new);
                 if score >= threshold {
                     let same_base = basename(&files[di].path) == basename(&files[ai].path);
-                    candidates.push((score, same_base, di, ai));
+                    let edges = per_dest.entry(ai).or_default();
+                    edges.push((score, same_base, di, ai));
+                    edges.sort_by(|a, b| {
+                        b.0.cmp(&a.0)
+                            .then(b.1.cmp(&a.1))
+                            .then(a.2.cmp(&b.2))
+                            .then(a.3.cmp(&b.3))
+                    });
+                    if edges.len() > PER_DEST_TOP_K {
+                        edges.truncate(PER_DEST_TOP_K);
+                    }
                 }
             }
         }
+        let mut candidates: Vec<(u32, bool, usize, usize)> =
+            per_dest.into_values().flatten().collect();
         candidates.sort_by(|a, b| {
             b.0.cmp(&a.0)
                 .then(b.1.cmp(&a.1))
@@ -3778,8 +3763,12 @@ fn apply_rename_detection(
         }
     }
 
+    let skips = RenameDetectionSkips {
+        inexact_skipped_by_limit: inexact_skipped,
+        inexact_discarded_by_budget: budget_discarded,
+    };
     if pairs.is_empty() {
-        return inexact_skipped;
+        return skips;
     }
 
     // Build the rename entries, then drop the consumed del/add entries.
@@ -3823,13 +3812,30 @@ fn apply_rename_detection(
         }
     }
     *files = rebuilt;
-    inexact_skipped
+    skips
 }
 
-const DEFAULT_RENAME_LIMIT: usize = 1000;
+/// Which inexact-rename degradations fired during [`apply_rename_detection`];
+/// exact renames are always still detected.
+#[derive(Debug, Default, Clone, Copy)]
+struct RenameDetectionSkips {
+    /// A side exceeded `diff.renameLimit` (per-side OR, Git semantics).
+    inexact_skipped_by_limit: bool,
+    /// `diff.renameComparisonBudget` was exhausted; every scored inexact
+    /// edge was discarded (§B.4.2.5 触顶规则).
+    inexact_discarded_by_budget: bool,
+}
 
-fn inexact_rename_detection_exceeds_limit(sources: usize, destinations: usize) -> bool {
-    sources > DEFAULT_RENAME_LIMIT || destinations > DEFAULT_RENAME_LIMIT
+pub(super) const DEFAULT_RENAME_LIMIT: usize = 1000;
+
+/// Per-side rename-limit gate (Git's `diff.renameLimit`); `limit == 0`
+/// disables the cap.
+fn inexact_rename_detection_exceeds_limit(
+    sources: usize,
+    destinations: usize,
+    limit: usize,
+) -> bool {
+    limit > 0 && (sources > limit || destinations > limit)
 }
 
 /// Render one rename entry (patch + metadata). A byte-identical rename emits only
@@ -6862,9 +6868,26 @@ mod test {
 
     #[test]
     fn inexact_rename_detection_obeys_git_default_limit() {
-        assert!(!inexact_rename_detection_exceeds_limit(1000, 1000));
-        assert!(inexact_rename_detection_exceeds_limit(1001, 1));
-        assert!(inexact_rename_detection_exceeds_limit(1, 1001));
+        assert!(!inexact_rename_detection_exceeds_limit(
+            1000,
+            1000,
+            DEFAULT_RENAME_LIMIT
+        ));
+        assert!(inexact_rename_detection_exceeds_limit(
+            1001,
+            1,
+            DEFAULT_RENAME_LIMIT
+        ));
+        assert!(inexact_rename_detection_exceeds_limit(
+            1,
+            1001,
+            DEFAULT_RENAME_LIMIT
+        ));
+        // `diff.renameLimit = 0` disables the per-side cap entirely.
+        assert!(!inexact_rename_detection_exceeds_limit(100_000, 100_000, 0));
+        // A tighter configured limit gates smaller candidate sets.
+        assert!(inexact_rename_detection_exceeds_limit(33, 1, 32));
+        assert!(!inexact_rename_detection_exceeds_limit(32, 32, 32));
     }
 
     #[test]

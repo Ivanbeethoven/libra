@@ -170,6 +170,17 @@ impl ScopedEnvVar {
         }
         Self { key, previous }
     }
+
+    /// Remove `key` for the guard's lifetime, restoring the previous value on drop.
+    pub fn unset(key: impl Into<String>) -> Self {
+        let key = key.into();
+        let previous = env::var_os(&key);
+        // SAFETY: command tests mutate process env only in controlled test flows.
+        unsafe {
+            env::remove_var(&key);
+        }
+        Self { key, previous }
+    }
 }
 
 impl Drop for ScopedEnvVar {

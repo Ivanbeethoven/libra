@@ -3772,8 +3772,18 @@ async fn init_mcp_server(working_dir: &std::path::Path) -> Arc<LibraMcpServer> {
 /// follows `.libra` symlinks to the main repository's storage. Falls back to
 /// `<working_dir>/.libra` if resolution fails.
 pub(crate) fn resolve_storage_root(working_dir: &std::path::Path) -> std::path::PathBuf {
-    try_get_storage_path(Some(working_dir.to_path_buf()))
-        .unwrap_or_else(|_| working_dir.join(".libra"))
+    try_get_storage_path(Some(working_dir.to_path_buf())).unwrap_or_else(|error| {
+        // Part C §C.4.1: the code runtime degrades rather than aborting, but the
+        // degradation must NOT be silent — a `<working_dir>/.libra` fallback on a
+        // linked worktree with a broken `commondir` would route at a phantom
+        // storage root. Annotate loudly so the split-brain is diagnosable.
+        tracing::warn!(
+            working_dir = %working_dir.display(),
+            %error,
+            "storage-root resolution failed; falling back to <working_dir>/.libra — if this is a linked worktree, run `libra worktree repair`"
+        );
+        working_dir.join(".libra")
+    })
 }
 
 /// CEX-S2-12 "single sub-agent behind flag" concurrency cap.

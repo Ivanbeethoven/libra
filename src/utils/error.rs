@@ -303,6 +303,11 @@ pub enum StableErrorCode {
     AgentImportErased,
     /// A transcript File/Bytes source lacked the required authorization proof.
     AgentTranscriptAuthorizationMissing,
+    /// The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`)
+    /// is unreadable, corrupt, or written by an unsupported schema version
+    /// (plan-20260714 §A.3). Unsupported `config` spellings targeting the
+    /// reserved `upgrade.*` namespace are plain usage errors (`LBR-CLI-002`).
+    UpgradeSettingsInvalid,
 }
 
 impl Serialize for StableErrorCode {
@@ -367,6 +372,7 @@ impl StableErrorCode {
             Self::AgentImportPartialBatch => "LBR-AGENT-018",
             Self::AgentImportErased => "LBR-AGENT-019",
             Self::AgentTranscriptAuthorizationMissing => "LBR-AGENT-020",
+            Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
         }
     }
 
@@ -380,7 +386,7 @@ impl StableErrorCode {
             Self::RepoNotFound | Self::RepoCorrupt | Self::RepoStateInvalid => {
                 CliErrorCategory::Repo
             }
-            Self::ConfigSchemaFuture => CliErrorCategory::Config,
+            Self::ConfigSchemaFuture | Self::UpgradeSettingsInvalid => CliErrorCategory::Config,
             Self::ConflictUnresolved
             | Self::ConflictOperationBlocked
             // Policy refusals ride the Conflict category (no dedicated
@@ -590,6 +596,9 @@ impl StableErrorCode {
             }
             Self::AgentTranscriptAuthorizationMissing => {
                 "Transcript source lacks a valid provider-root or trusted-export authorization proof."
+            }
+            Self::UpgradeSettingsInvalid => {
+                "The reserved upgrade settings file ({LIBRA_HOME}/upgrade/settings.json) is unreadable or corrupt; rewrite it with libra config set --global upgrade.mode <auto|manual|off>."
             }
         }
     }
@@ -1259,6 +1268,17 @@ macro_rules! cli_error {
 /// works correctly.
 pub fn emit_warning(message: impl std::fmt::Display) {
     record_warning();
+    eprintln!("warning: {message}");
+}
+
+/// Emit an advisory warning to stderr WITHOUT tripping the
+/// `--exit-code-on-warning` tracker.
+///
+/// This exists for out-of-band advisories that must never change the exit
+/// status of the user's actual command — notably the auto-upgrade check
+/// (plan-20260714 §A.8), which runs alongside a normal command and whose
+/// success or failure must not turn that command into a warning exit.
+pub fn emit_advisory_warning(message: impl std::fmt::Display) {
     eprintln!("warning: {message}");
 }
 
@@ -1953,6 +1973,14 @@ mod tests {
         assert_eq!(StableErrorCode::WarningEmitted.as_str(), "LBR-WARN-001");
         assert_eq!(StableErrorCode::AddNothingStaged.as_str(), "LBR-ADD-001");
         assert_eq!(StableErrorCode::Unsupported.as_str(), "LBR-UNSUPPORTED-001",);
+        assert_eq!(
+            StableErrorCode::UpgradeSettingsInvalid.as_str(),
+            "LBR-UPGRADE-001",
+        );
+        assert_eq!(
+            StableErrorCode::UpgradeSettingsInvalid.category(),
+            CliErrorCategory::Config,
+        );
         assert_eq!(StableErrorCode::BisectNotActive.as_str(), "LBR-BISECT-001");
         assert_eq!(StableErrorCode::BisectRunFailed.as_str(), "LBR-BISECT-002");
         assert_eq!(

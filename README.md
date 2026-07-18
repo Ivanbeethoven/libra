@@ -64,6 +64,25 @@ repairs a missing alias without replacing the binary. Use `--no-alias` or
 `LIBRA_NO_ALIAS=1` to opt out; an existing user-owned `lba` is never
 overwritten. See [installer behavior and options](docs/installation.md).
 
+#### Auto-upgrade (opt-in)
+
+Official script installs can opt in to automatic upgrades:
+
+```bash
+libra config set --global upgrade.mode auto   # auto | manual | off (default off)
+```
+
+When `auto` is set, Libra checks a signed release manifest at
+`https://download.libra.tools` alongside your normal commands and installs a
+newer signed release in the background; the check is throttled, budget-limited,
+and never affects your command's outcome. First-phase support is Linux
+x86_64/aarch64 and macOS aarch64; Windows is published but auto-upgrade returns
+`UnsupportedPlatform` and leaves the binary untouched. Third-party and manual
+installs (Homebrew, from-source, package managers) never auto-upgrade and are
+never marked official. Failed upgrades roll back to the previous version
+automatically. The mode lives in `{LIBRA_HOME}/upgrade/settings.json`, not in
+the SQLite config. See [auto-upgrade](docs/auto-upgrade.md).
+
 ### Initialize Your First Repository
 
 ```bash

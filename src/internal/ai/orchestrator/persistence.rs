@@ -4329,8 +4329,21 @@ fn session_jsonl_store_for_thread(
     thread_id: Uuid,
 ) -> Option<SessionJsonlStore> {
     let working_dir = mcp_server.working_dir.as_ref()?;
-    let storage_root = try_get_storage_path(Some(working_dir.clone()))
-        .unwrap_or_else(|_| working_dir.join(".libra"));
+    // FAIL-CLOSED (Part C §C.4.1): never mint a phantom `<working_dir>/.libra`
+    // when storage resolution fails — a session store rooted at a library-less
+    // gitdir would read/write the wrong (or an empty) transcript tree. A
+    // resolution failure here simply means "no session store", so return None.
+    let storage_root = match try_get_storage_path(Some(working_dir.clone())) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(
+                working_dir = %working_dir.display(),
+                %error,
+                "cannot resolve storage root for the session store; skipping (run `libra worktree repair` if this is a linked worktree)"
+            );
+            return None;
+        }
+    };
     let session_store = SessionStore::from_storage_path(&storage_root);
     let working_dir_str = working_dir.to_string_lossy().to_string();
 

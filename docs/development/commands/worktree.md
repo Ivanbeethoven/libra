@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra worktree` 的目标是管理同一仓库状态的附加工作目录。实现需要明确 Libra worktree 与 Git 不同：多个 worktree 共享同一个 `.libra` 数据库、HEAD、refs 和索引；remove 默认保留磁盘目录，只有 `--delete-dir` 执行 Git 风格删除。
+`libra worktree` 的目标是管理同一仓库状态的附加工作目录。实现需要明确 Libra worktree 的隔离布局：多个 worktree 共享同一个 `.libra` SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但每个 linked worktree 拥有自己真实的 `.libra` gitdir（本地目录，非 symlink），保存私有 HEAD、index 和 HEAD reflog，并记录 `commondir` 指针与稳定 `worktree_id`；sequencer/merge/rebase 等 mutable 状态目前对 linked worktree 仍拒绝（W1/W2 落地前）。由更早版本创建的 worktree 可能仍是旧共享 `.libra` symlink 布局。remove 默认保留磁盘目录，只有 `--delete-dir` 执行 Git 风格删除。
 
 ## 对比 Git 与兼容性
 
@@ -49,7 +49,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/worktree.md`。
 - Synopsis：`libra worktree <subcommand>`（`add | list | lock | unlock | move | prune | remove | umount | repair`）。
-- 公开参数/子命令包括：`add <path>`、`list [--porcelain]`、`lock <path> [--reason <TEXT>]`、`unlock <path>`、`move <src> <dest>`、`prune`、`remove <path> [--delete-dir]`、`umount <path> [--cleanup]`（Unix，别名 `unmount`）、`repair`。`list --porcelain` 经共享 `format_worktree_porcelain`（worktree.rs，被 worktree-fuse.rs 复用）输出每个 worktree 的 `worktree <path>`、共享 `HEAD <sha>`（仓库有提交时）、被锁定时 `locked [reason]`，条目间空行分隔；Libra worktree 共享 HEAD/index/refs，故**有意省略** Git 的 per-worktree `branch`/`detached` 行（Libra 无 per-worktree HEAD）。
+- 公开参数/子命令包括：`add <path>`、`list [--porcelain]`、`lock <path> [--reason <TEXT>]`、`unlock <path>`、`move <src> <dest>`、`prune`、`remove <path> [--delete-dir]`、`umount <path> [--cleanup]`（Unix，别名 `unmount`）、`repair`。`list --porcelain` 经共享 `format_worktree_porcelain`（worktree.rs，被 worktree-fuse.rs 复用）为每个 worktree 输出 `worktree <path>`、该 worktree 自己 scope 的 `HEAD <sha>` 与 `branch <ref>`/`detached` 行（经 `Head::head_for_worktree_scope` 按 `worktree_id` 解析）、被锁定时 `locked [reason]`，条目间空行分隔；HEAD 无法解析（legacy symlink 布局或缺失/损坏 scope）的 entry 省略 HEAD 行，绝不把其它 worktree 的 sha 标给它。
 - 在 `worktree-fuse` 特性下（`src/command/worktree-fuse.rs`），`add` 子命令额外提供：`-f`/`--fuse`、`--branch <BRANCH>`、`-b`/`--create-branch <CREATE_BRANCH>`、`--from <FROM>`、`--privileged`、`--allow-other`。
 
 

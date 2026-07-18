@@ -43,6 +43,7 @@
 | `compat_rev_parse_peel_selectors` | 1 | Guards strict typed/recursive object peel, tree paths, `@`, numeric reflog selectors, full tag refs, annotated-tag branch filtering/show-ref dereference, and SHA-256 hash-kind neutrality | `src/utils/util.rs`, `src/command/rev_parse.rs`, `src/command/cat_file.rs`, `src/command/read_tree.rs`, `src/internal/reflog.rs` |
 | `compat_libra_hooks_lifecycle` | 1 | Guards sandboxed `.libra/hooks` lifecycle ordering/argv/stdin, commit and merge message mutation, advisory order/warning exit, no-op suppression, escape valves, deterministic resolution, caller-env secret stripping, fail-closed file validation, protected-mount cleanup, metadata protection, and worktree-bound writes | `src/internal/repo_hooks.rs`, `src/internal/ai/sandbox/`, `src/command/commit.rs`, `src/command/checkout.rs`, `src/command/switch.rs`, `src/command/merge.rs`, `src/command/rebase.rs`, `src/command/pull.rs` |
 | `compat_import_export_roundtrip` | 1 | Guards P1-11 fast-export/import fidelity (ranges, multiple refs, annotated tags, notes/tree translation, quoted paths, inline/C/R/N, reset deletion, type/config/transaction failure), bundle selectors/checksum/idempotent unbundle, SHA-256, and bidirectional system-Git interoperability when available | `src/command/fast_export.rs`, `src/command/fast_import.rs`, `src/command/bundle.rs` |
+| `compat_status_wave0_register` | 1 | plan-20260714 B.9 registration gate: `STATUS_WAVE0_TESTS` manifest ↔ `command::status_wave0::*` bidirectional set equality + strict ordering, so the wave-0 status module cannot be silently dropped from CI | `tests/command/status_wave0_test.rs`, `tests/compat/status_wave0_manifest.rs` |
 | `compat_clone_shallow_integrity` | 1 | Guards local Libra `clone/fetch --depth` fail-closed behavior and `rev-parse --is-shallow-repository` shallow metadata reporting | `src/command/clone.rs`, `src/command/fetch.rs`, `src/command/rev_parse.rs` |
 | `compat_checkout_branch_startpoint` | 1 | Guards `checkout -b/-B <branch> <start-point>` and `switch -C <branch> <start-point>` keep HEAD on the symbolic branch and preserve HEAD on invalid start-points | `src/command/checkout.rs`, `src/command/switch.rs` |
 | `compat_previous_branch_shortcut` | 1 | Guards worktree-scoped `checkout -` / `switch -` branch and detached-target toggling, cross-command reflog history, and fail-closed missing/deleted targets | `src/command/checkout.rs`, `src/command/switch.rs`, `src/internal/reflog.rs` |
@@ -196,6 +197,17 @@
 | `network_remotes_test` | 3 | Real-network smoke tests against GitHub | `src/internal/protocol/`, `src/git_protocol.rs` |
 | `protocol_timeout_recovery` | 3 | git:// connect/idle timeout recovery via a local hung/refused listener (self-contained) | `src/internal/protocol/git_client.rs` |
 | `protocol_capability_negotiation` | 3 | Fetch want-line advertises only decoder-supported capabilities (ofs-delta yes; thin-pack/report-status no) | `src/internal/protocol/mod.rs` |
+
+## Wave 1F — Feature-gated deterministic (compile-time feature, no secrets)
+
+Deterministic L1 targets excluded from a bare `cargo test --all` only because
+they require a compile-time feature (not a runtime secret). CI runs them in
+dedicated feature-on steps.
+
+| target | wave | one-line purpose | relevant src |
+|---|---|---|---|
+| `upgrade_auto_test` | 1 | plan-20260714 §A.11 auto-upgrade end-to-end: signature+decision chain, anti-rollback/revocation replay, real-binary `__upgrade-probe` self-check, install/rollback transaction (`--features test-upgrade`) | `src/internal/upgrade/`, `src/command/upgrade.rs` |
+| `upgrade_publish_contract_test` | 1 | plan-20260714 §A.9/§A.11 manifest/publish contract: matrix coverage, URL binding, size bounds, renew preserves pause/revocations (`--features test-upgrade`) | `src/internal/upgrade/manifest.rs` |
 
 ## Wave 4 — Live AI (test-live-ai / DEEPSEEK_API_KEY)
 

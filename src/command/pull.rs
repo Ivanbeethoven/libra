@@ -341,6 +341,16 @@ pub async fn execute(args: PullArgs) {
 /// Returns [`CliError`] when the pull target cannot be resolved, fetch fails,
 /// histories cannot be merged safely, or refs/worktree updates fail.
 pub async fn execute_safe(args: PullArgs, output: &OutputConfig) -> CliResult<()> {
+    // Part C W0 (§C.4.4/§C.11): `pull` is a composite mutating command — its
+    // fetch writes the shared `FETCH_HEAD` and its merge/rebase uses the still
+    // repository-global sequencer/merge state. It fails closed in a linked
+    // worktree (in ANY of its modes) until W1/W2 route its fetch + merge/rebase
+    // through explicitly worktree-scoped APIs, rather than letting it bypass the
+    // public merge/rebase entry guards.
+    crate::command::ensure_main_worktree_because(
+        "pull",
+        "pull's shared FETCH_HEAD and merge/rebase state are not yet worktree-scoped",
+    )?;
     let result = run_pull(args, output).await.map_err(CliError::from)?;
     render_pull_output(&result, output)
 }

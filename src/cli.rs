@@ -1701,6 +1701,36 @@ fn classify_parse_error(argv: &[String], err: &clap::Error) -> CliError {
     cli_error
 }
 
+/// Run the `upgrade.mode=auto` check and surface its outcome (§A.8). It never
+/// errors and reports only in human mode, through an advisory warning that
+/// does not affect the command's exit status, so it cannot disturb the user's
+/// command.
+async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
+    use crate::internal::upgrade::orchestrator::{AutoUpgradeReport, run_auto_upgrade_check};
+
+    let local_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let report = run_auto_upgrade_check(local_now).await;
+    if output.is_json() || output.quiet {
+        return;
+    }
+    match report {
+        AutoUpgradeReport::Installed(version) => {
+            utils::error::emit_advisory_warning(format!(
+                "auto-upgraded Libra to {version}; the new version takes effect on the next command"
+            ));
+        }
+        AutoUpgradeReport::RolledBack => {
+            utils::error::emit_advisory_warning(
+                "an auto-upgrade failed its self-check and was rolled back to the current version",
+            );
+        }
+        AutoUpgradeReport::Skipped => {}
+    }
+}
+
 /// Async CLI dispatcher — the actual orchestrator behind every Libra invocation.
 ///
 /// Functional scope:
@@ -1735,6 +1765,14 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Some(args) => args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         None => env::args().collect::<Vec<_>>(),
     };
+    // Auto-upgrade candidate self-check (§A.7): recognized at the very front,
+    // before any argv rewrite, warning-tracker/env side effect, clap parse,
+    // repo preflight, schema migration or background task. It runs ONLY a
+    // side-effect-free identity self-check and exits; it never forwards to a
+    // real user command.
+    if let Some(probe) = command::upgrade::parse_probe_argv(&argv) {
+        return command::upgrade::run_probe(probe);
+    }
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);
@@ -1760,6 +1798,11 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         command::diff::record_algorithm_selector_events(diff_args, &argv);
     }
     apply_global_runtime_flags(&args)?;
+    // Auto-upgrade transaction recovery gate (§A.7/§A.10): a crashed install
+    // must be resolved before any repo preflight or user command runs. Inert
+    // (no I/O) until release keys are provisioned; a fatal, unrecoverable
+    // transaction exits here rather than running the user's command.
+    crate::internal::upgrade::orchestrator::startup_recovery_gate().await?;
     enforce_global_config_schema_policy(&args.command).await?;
     if let Commands::Tag(tag_args) = &args.command {
         command::tag::validate_cli_args(tag_args)?;
@@ -1796,7 +1839,14 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     );
     output.apply_color_override();
 
-    // parse the command and execute the corresponding function with it's args
+    // Auto-upgrade check (§A.8): when `upgrade.mode=auto` (and release keys
+    // exist), check for and install a newer signed release. It is fully
+    // isolated — it never returns an error and never trips
+    // `--exit-code-on-warning` — so it cannot affect the user's command; it
+    // is inert (no I/O) until keys are provisioned.
+    run_auto_upgrade_check_hook(&output).await;
+
+    // parse the command and execute the corresponding function with its args
     match args.command {
         Commands::Init(cmd_args) => {
             let original_dir = utils::util::cur_dir();

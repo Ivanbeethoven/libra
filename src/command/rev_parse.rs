@@ -511,14 +511,17 @@ async fn resolve_rev_parse(spec: &str, args: &RevParseArgs) -> CliResult<RevPars
     }
 
     if args.is_inside_git_dir {
-        // "true" when the current directory is inside `.libra` (Libra's
-        // equivalent of Git's GIT_DIR), "false" anywhere else in the worktree.
-        let storage = util::try_get_storage_path(None).map_err(map_repo_path_error)?;
+        // "true" when the current directory is inside THIS worktree's `.libra`
+        // (Libra's equivalent of Git's GIT_DIR), "false" anywhere else in the
+        // worktree. Part C §C.5: a linked worktree has its own local gitdir, so
+        // this must test the local gitdir — not the shared common storage, which
+        // would misreport a cwd inside the linked `.libra` as outside GIT_DIR.
+        let gitdir = util::try_get_worktree_gitdir(None).map_err(map_repo_path_error)?;
         let cwd = util::cur_dir();
         return Ok(RevParseOutput {
             mode: "is_inside_git_dir",
             input: None,
-            value: util::is_sub_path(&cwd, &storage).to_string(),
+            value: util::is_sub_path(&cwd, &gitdir).to_string(),
         });
     }
 
@@ -539,7 +542,11 @@ async fn resolve_rev_parse(spec: &str, args: &RevParseArgs) -> CliResult<RevPars
     }
 
     if args.git_dir {
-        let dir = util::try_get_storage_path(None).map_err(map_repo_path_error)?;
+        // Part C §C.5: `--git-dir` is THIS worktree's local gitdir. For the main
+        // worktree local == common storage (unchanged); a linked worktree gets
+        // its own `.libra` so scripts that locate the index/EDITMSG via
+        // `--git-dir` hit the correct per-worktree gitdir, not the main store.
+        let dir = util::try_get_worktree_gitdir(None).map_err(map_repo_path_error)?;
         return Ok(RevParseOutput {
             mode: "git_dir",
             input: None,
@@ -548,7 +555,7 @@ async fn resolve_rev_parse(spec: &str, args: &RevParseArgs) -> CliResult<RevPars
     }
 
     if args.absolute_git_dir {
-        let dir = util::try_get_storage_path(None).map_err(map_repo_path_error)?;
+        let dir = util::try_get_worktree_gitdir(None).map_err(map_repo_path_error)?;
         // `--git-dir` already yields an absolute path in Libra; canonicalize to
         // guarantee Git's "canonicalized absolute path" contract, falling back
         // to the resolved path if canonicalization fails.

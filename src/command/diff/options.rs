@@ -7,6 +7,12 @@ const DEFAULT_RENAME_SCORE: u32 = 30000;
 pub(super) struct ResolvedDiffConfig {
     pub(super) context: usize,
     pub(super) rename_threshold: Option<u32>,
+    /// `diff.renameLimit`: per-side inexact candidate cap; `0` disables the
+    /// cap. Defaults to Git's 1000.
+    pub(super) rename_limit: usize,
+    /// `diff.renameComparisonBudget`: total inexact similarity comparisons;
+    /// `None` (unset or `0`) keeps diff unlimited (plan-20260714 §B.7).
+    pub(super) rename_comparison_budget: Option<u64>,
     pub(super) prefixes: DiffPrefixes,
 }
 
@@ -30,11 +36,53 @@ pub(super) async fn resolve_diff_config(args: &DiffArgs) -> Result<ResolvedDiffC
         None => configured_diff_renames().await?,
     };
     let prefixes = configured_diff_prefixes(args).await?;
+    // Read after the prefix keys: the pinned read-failure contract
+    // (`diff_prefix_read_failure_names_the_key_before_progress`) names
+    // `diff.srcPrefix` as the first key to surface an unreadable cascade.
+    let rename_limit = configured_diff_rename_limit()
+        .await?
+        .unwrap_or(super::DEFAULT_RENAME_LIMIT);
+    let rename_comparison_budget = configured_diff_rename_comparison_budget().await?;
     Ok(ResolvedDiffConfig {
         context,
         rename_threshold,
+        rename_limit,
+        rename_comparison_budget,
         prefixes,
     })
+}
+
+/// `diff.renameLimit`: non-negative integer; `0` disables the per-side cap;
+/// invalid values fail closed.
+async fn configured_diff_rename_limit() -> Result<Option<usize>, DiffError> {
+    let Some(value) = read_diff_config("diff.renameLimit").await? else {
+        return Ok(None);
+    };
+    crate::internal::config::parse_git_config_int(&value.to_ascii_lowercase())
+        .filter(|number| *number >= 0)
+        .and_then(|number| usize::try_from(number).ok())
+        .map(Some)
+        .ok_or(DiffError::InvalidDiffConfig {
+            key: "diff.renameLimit",
+            value,
+        })
+}
+
+/// `diff.renameComparisonBudget`: non-negative integer; `0` (and unset) mean
+/// "no budget" so diff keeps its historical unlimited semantics; invalid
+/// values fail closed (plan-20260714 §B.7).
+async fn configured_diff_rename_comparison_budget() -> Result<Option<u64>, DiffError> {
+    let Some(value) = read_diff_config("diff.renameComparisonBudget").await? else {
+        return Ok(None);
+    };
+    let parsed = crate::internal::config::parse_git_config_int(&value.to_ascii_lowercase())
+        .filter(|number| *number >= 0)
+        .and_then(|number| u64::try_from(number).ok())
+        .ok_or(DiffError::InvalidDiffConfig {
+            key: "diff.renameComparisonBudget",
+            value,
+        })?;
+    Ok((parsed > 0).then_some(parsed))
 }
 
 /// Read one `diff.*` config default through the strict local→global→system

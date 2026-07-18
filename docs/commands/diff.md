@@ -252,6 +252,20 @@ built-in staged diff and ignores `diff.external`. `--src-prefix` and
 `--dst-prefix` override their respective configured values; when both are given,
 irrelevant prefix defaults are not read. `-R` swaps the resulting pair.
 
+### Rename detection budgets
+
+`diff.renameLimit` (like Git) bounds the quadratic inexact-rename pass: when the
+number of rename sources *or* destinations exceeds the limit, exact renames are
+still reported but the inexact pass is skipped and a warning is emitted. The
+value is a non-negative integer through the strict local → global → system
+cascade; `0` means "no per-side limit"; the default is 1000. `diff.renameComparisonBudget`
+caps the total number of similarity comparisons in the inexact pass: a
+non-negative integer where `0` means "unlimited" (the default). When the budget
+is exhausted, the exhaustive-pass results are discarded and only exact plus
+unique-basename renames survive, with a warning. Both values fail closed with
+`LBR-CLI-002` on an invalid (non-integer/negative) setting before any diff
+output.
+
 ## Human Output
 
 Supported output modes:

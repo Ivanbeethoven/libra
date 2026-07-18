@@ -988,6 +988,15 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
         );
     }
+    // Part C W0 (§C.11): standalone `fetch` is composite — it writes the shared
+    // `FETCH_HEAD` (repository-global), so it fails closed in a linked worktree
+    // (before any FETCH_HEAD/ref side-effect) until W1 makes `FETCH_HEAD`
+    // worktree-local. This is the same guard as `pull`; it cannot be bypassed by
+    // switching entry points.
+    crate::command::ensure_main_worktree_because(
+        "fetch",
+        "the shared FETCH_HEAD is not yet worktree-scoped",
+    )?;
     let porcelain = args.porcelain;
     let dry_run = args.dry_run;
     let append = args.append;

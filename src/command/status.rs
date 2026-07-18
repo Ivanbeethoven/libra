@@ -23,7 +23,7 @@ use git_internal::{
 use serde::Serialize;
 
 use super::{
-    merge, stash, status_untracked,
+    merge, rename_detect, stash, status_untracked,
     unmerged::{self, UnmergedEntry},
 };
 use crate::{
@@ -206,6 +206,14 @@ pub struct StatusArgs {
     /// [`apply_status_config_defaults`], never by the CLI.
     #[clap(skip = true)]
     pub relative_paths: bool,
+
+    /// Resolved rename-detection default from `status.renames` (falling back
+    /// to `diff.renames`), config-only. `None` = unset (feature default 50%
+    /// applies); `Some(false)` = disabled; `Some(true)` = enabled at 50%.
+    /// CLI flags (`--no-renames`/`--find-renames`/`--renames`) always win.
+    /// Populated by [`apply_status_config_defaults`], never by the CLI.
+    #[clap(skip)]
+    pub renames_config: Option<bool>,
 }
 
 impl StatusArgs {
@@ -279,6 +287,34 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
     let show_stash = read_bool("status.showStash").await?;
     let relative_paths = read_bool("status.relativePaths").await?;
 
+    // Rename detection default (§B.5): `status.renames`, falling back to
+    // `diff.renames`. Accepts a Git boolean or `copy`/`copies`; `copy` is
+    // fail-closed in R0 (copy detection is not supported yet) rather than
+    // silently degrading to rename detection.
+    async fn read_renames(key: &str) -> CliResult<Option<bool>> {
+        match read_value(key).await? {
+            None => Ok(None),
+            Some(value) => {
+                let lower = value.trim().to_ascii_lowercase();
+                if lower == "copy" || lower == "copies" {
+                    return Err(CliError::command_usage(format!(
+                        "copy detection is not supported for '{key}'; use true or false"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint("set the value to true or false"));
+                }
+                match parse_git_config_bool(&value) {
+                    Some(enabled) => Ok(Some(enabled)),
+                    None => Err(invalid(key, &value, "a Git boolean or copy/copies")),
+                }
+            }
+        }
+    }
+    let renames_config = match read_renames("status.renames").await? {
+        Some(value) => Some(value),
+        None => read_renames("diff.renames").await?,
+    };
+
     if args.untracked_files.is_none() {
         args.untracked_files = untracked;
     }
@@ -294,6 +330,7 @@ async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
         args.show_stash = true;
     }
     args.relative_paths = relative_paths.unwrap_or(true);
+    args.renames_config = renames_config;
     Ok(())
 }
 
@@ -394,6 +431,8 @@ pub enum StatusError {
     InvalidPathEncoding { path: PathBuf },
     #[error("failed to hash '{path}': {source}")]
     FileHash { path: PathBuf, source: io::Error },
+    #[error("cannot read tracked path '{path}': {source}")]
+    WorktreeRead { path: PathBuf, source: io::Error },
     #[error("failed to list files in '{path}': {source}")]
     ListWorkdirFiles { path: PathBuf, source: io::Error },
     #[error("failed to determine working directory: {source}")]
@@ -415,6 +454,12 @@ impl From<StatusError> for CliError {
             StatusError::FileHash { .. } => {
                 CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed)
             }
+            StatusError::WorktreeRead { .. } => CliError::fatal(msg)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint(
+                    "a tracked file could not be read (e.g. permission denied); \
+                     status fails closed rather than reporting it as deleted",
+                ),
             StatusError::ListWorkdirFiles { .. } => {
                 CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -481,6 +526,11 @@ struct StatusData {
     /// enabled-but-empty view is a no-op, so no advisory.
     sparse_view_active: bool,
     porcelain_v2: Option<std::sync::Arc<PorcelainV2Data>>,
+    /// Score/exactness per staged rename pair (display-base keys, §B.6.4/5).
+    staged_rename_details: RenameDetails,
+    /// Score/exactness per unstaged rename pair (only populated under
+    /// `status.renameUntracked=true`).
+    unstaged_rename_details: RenameDetails,
 }
 
 /// Human advisory for a non-merge sequence in progress (read-only detection).
@@ -574,22 +624,63 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         .collect();
     let mut maybe_index = Some(worktree.index);
 
-    // Resolve rename detection: `--no-renames` wins (off); otherwise `--renames`
-    // (or `--find-renames`) enables it at the given threshold (default 50).
-    let rename_threshold = if args.no_renames {
+    // Resolve rename detection (§B.5). Precedence: CLI flags always win —
+    // `--no-renames` disables, `--find-renames[=N]`/`--renames` enable at the
+    // given (or default 50%) threshold. Otherwise the resolved
+    // `status.renames`/`diff.renames` config applies (`false` disables). When
+    // nothing is set, rename detection is ON at 50%, matching Git.
+    // `--cached`/`--check-dirty` (Libra dirty-cache extensions) never run it.
+    let rename_percent: Option<u8> = if args.no_renames || args.cached || args.check_dirty {
         None
-    } else if args.renames || args.find_renames.is_some() {
-        Some(args.find_renames.unwrap_or(50))
+    } else if let Some(explicit) = args.find_renames {
+        Some(explicit)
+    } else if args.renames {
+        Some(50)
     } else {
-        None
+        match args.renames_config {
+            Some(false) => None,
+            Some(true) | None => Some(50),
+        }
     };
 
-    // Apply rename detection before collapsing untracked dirs / porcelain metadata.
-    if let Some(threshold) = rename_threshold
-        && threshold > 0
+    // Apply rename detection before collapsing untracked dirs / porcelain
+    // metadata. Staged snapshot: old = HEAD tree, new = index stage-0.
+    // Unstaged snapshot: old = index stage-0, new = worktree — but untracked
+    // paths only become destinations under the `status.renameUntracked`
+    // extension (§B.3.1; Git default: a tracked→untracked move is `D` + `??`).
+    let mut staged_rename_details: RenameDetails = HashMap::new();
+    let mut unstaged_rename_details: RenameDetails = HashMap::new();
+    if let Some(percent) = rename_percent
+        && percent > 0
     {
-        detect_renames_in_changes(&mut staged, threshold, head_oid.as_ref()).await?;
-        detect_renames_in_changes(&mut unstaged, threshold, head_oid.as_ref()).await?;
+        let head_blobs = head_oid
+            .as_ref()
+            .map(load_head_tree_blobs)
+            .unwrap_or_default();
+        let index_blobs = maybe_index
+            .as_ref()
+            .map(load_index_stage0_blobs)
+            .unwrap_or_default();
+        // Git 0..=60000 similarity scale; percent × 600 (100% → exact-only).
+        let config = rename_detect::RenameDetectConfig {
+            threshold: (percent as u32).min(100) * 600,
+            rename_limit: 1000,
+            comparison_budget: Some(rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS),
+        };
+        detect_renames_in_changes(
+            &mut staged,
+            &config,
+            RenameBlobSide::Known(&head_blobs),
+            RenameBlobSide::Known(&index_blobs),
+            &mut staged_rename_details,
+        );
+        detect_renames_in_changes(
+            &mut unstaged,
+            &config,
+            RenameBlobSide::Known(&index_blobs),
+            RenameBlobSide::Worktree,
+            &mut unstaged_rename_details,
+        );
     }
 
     let stash_count = if args.show_stash {
@@ -653,6 +744,8 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             .await
             .is_active(),
         porcelain_v2,
+        staged_rename_details,
+        unstaged_rename_details,
     };
     filter_status_data_by_pathspec(&mut data, args)?;
     Ok(data)
@@ -713,123 +806,208 @@ fn pathspec_error_to_cli(error: PathspecError) -> CliError {
     }
 }
 
-/// Detect renames between deleted and new files in `changes`.
-///
-/// Matches are selected greedily by best similarity score. A file may only
-/// participate in one rename pair. The threshold is a percentage (0-100).
-async fn detect_renames_in_changes(
-    changes: &mut Changes,
-    threshold: u8,
-    head_oid: Option<&ObjectHash>,
-) -> CliResult<()> {
-    if changes.deleted.is_empty() || changes.new.is_empty() {
-        return Ok(());
-    }
-
-    let head_blobs = head_oid.map(load_head_tree_blobs).unwrap_or_default();
-
-    // Pre-compute blob hashes for new files.
-    let mut new_hashes: HashMap<usize, ObjectHash> = HashMap::new();
-    for (idx, path) in changes.new.iter().enumerate() {
-        let abs = util::workdir_to_absolute(path);
-        if let Ok(hash) = calc_file_blob_hash(&abs) {
-            new_hashes.insert(idx, hash);
-        }
-    }
-
-    let mut used_new: HashSet<usize> = HashSet::new();
-    let mut remaining_deleted: Vec<PathBuf> = Vec::new();
-    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
-
-    for deleted in &changes.deleted {
-        let deleted_name = file_name_lossy(deleted);
-        let deleted_head_blob = head_blobs.get(deleted).cloned();
-
-        let mut best: Option<(usize, u8)> = None;
-        for (idx, new_path) in changes.new.iter().enumerate() {
-            if used_new.contains(&idx) {
-                continue;
-            }
-            let score = if deleted_head_blob
-                .as_ref()
-                .zip(new_hashes.get(&idx))
-                .is_some_and(|(a, b)| a == b)
-            {
-                100
-            } else {
-                let new_name = file_name_lossy(new_path);
-                filename_similarity(&deleted_name, &new_name)
-            };
-            if score >= threshold {
-                match best {
-                    None => best = Some((idx, score)),
-                    Some((_, current)) if score > current => best = Some((idx, score)),
-                    _ => {}
-                }
-            }
-        }
-
-        if let Some((idx, _)) = best {
-            used_new.insert(idx);
-            renamed.push((deleted.clone(), changes.new[idx].clone()));
-        } else {
-            remaining_deleted.push(deleted.clone());
-        }
-    }
-
-    let mut remaining_new: Vec<PathBuf> = changes
-        .new
-        .iter()
-        .enumerate()
-        .filter(|(idx, _)| !used_new.contains(idx))
-        .map(|(_, p)| p.clone())
-        .collect();
-
-    // Sort both remaining lists to preserve deterministic output.
-    remaining_deleted.sort();
-    remaining_new.sort();
-    renamed.sort_by(|a, b| a.1.cmp(&b.1));
-
-    changes.deleted = remaining_deleted;
-    changes.new = remaining_new;
-    changes.renamed.extend(renamed);
-    Ok(())
+/// Where one side of a rename snapshot draws its blob identities from.
+enum RenameBlobSide<'a> {
+    /// HEAD tree or index stage-0: repo-relative path → (oid, mode), a
+    /// content-addressed fact (`KnownObjectId`, §B.4.1).
+    Known(&'a HashMap<PathBuf, (ObjectHash, u32)>),
+    /// The worktree: OID is streamed from the file during this call
+    /// (`ComputedWorktreeThisCall`).
+    Worktree,
 }
 
-fn load_head_tree_blobs(head_oid: &ObjectHash) -> HashMap<PathBuf, ObjectHash> {
+/// Content provider for inexact scoring: HEAD/index blobs are read from the
+/// object store by OID (de-duplicated, budgeted), worktree files are read
+/// under the separate worktree budget (§B.7). The engine caches spanhashes
+/// per path, so each path is requested at most once per side.
+struct StatusContentSource {
+    old_is_worktree: bool,
+    new_is_worktree: bool,
+    objects: rename_detect::ObjectReadBudget,
+    worktree: rename_detect::WorktreeReadBudget,
+}
+
+impl StatusContentSource {
+    fn read(
+        &mut self,
+        path: &Path,
+        blob: &rename_detect::BlobRef,
+        from_worktree: bool,
+    ) -> rename_detect::ContentOutcome {
+        use rename_detect::{BlobEvidence, ContentOutcome, SkipReason};
+        match blob.evidence {
+            BlobEvidence::KnownObjectId { oid } if !from_worktree => self.objects.read_blob(&oid),
+            _ if from_worktree => {
+                let abs = util::workdir_to_absolute(path);
+                self.worktree.read_worktree_blob(&abs)
+            }
+            // A worktree-computed OID on the object side, or an Unknown blob:
+            // no trustworthy object to read.
+            _ => ContentOutcome::Skipped(SkipReason::ObjectUnavailable),
+        }
+    }
+}
+
+impl rename_detect::RenameContentSource for StatusContentSource {
+    fn old_content(
+        &mut self,
+        path: &Path,
+        blob: &rename_detect::BlobRef,
+    ) -> rename_detect::ContentOutcome {
+        let from_worktree = self.old_is_worktree;
+        self.read(path, blob, from_worktree)
+    }
+
+    fn new_content(
+        &mut self,
+        path: &Path,
+        blob: &rename_detect::BlobRef,
+    ) -> rename_detect::ContentOutcome {
+        let from_worktree = self.new_is_worktree;
+        self.read(path, blob, from_worktree)
+    }
+}
+
+/// Build one side of a [`rename_detect::RenameSnapshot`] from a change list.
+///
+/// `paths` are in the change list's own base (repo- or cwd-relative); each is
+/// mapped to a repo-relative key via [`util::to_workdir_path`] so the HEAD/
+/// index lookups and worktree reads are correct from any working directory
+/// (fixing the historical subdirectory bug). The returned map is keyed by the
+/// repo-relative path.
+fn build_rename_side(
+    paths: &[PathBuf],
+    side: &RenameBlobSide<'_>,
+) -> HashMap<PathBuf, rename_detect::BlobRef> {
+    use rename_detect::{BlobEvidence, BlobKind, BlobRef};
+    let mut map = HashMap::new();
+    for path in paths {
+        let repo_key = util::to_workdir_path(path);
+        let blob = match side {
+            RenameBlobSide::Known(known) => {
+                let Some((oid, mode)) = known.get(&repo_key).copied() else {
+                    continue;
+                };
+                BlobRef {
+                    kind: BlobKind::from_mode(mode),
+                    mode,
+                    size: None,
+                    evidence: BlobEvidence::KnownObjectId { oid },
+                }
+            }
+            RenameBlobSide::Worktree => {
+                let abs = util::workdir_to_absolute(&repo_key);
+                let (kind, mode) = match std::fs::symlink_metadata(&abs) {
+                    Ok(meta) if meta.file_type().is_symlink() => (BlobKind::Symlink, 0o120000),
+                    Ok(_) => (BlobKind::Regular, 0o100644),
+                    Err(_) => continue,
+                };
+                let Ok(oid) = calc_file_blob_hash(&abs) else {
+                    continue;
+                };
+                BlobRef {
+                    kind,
+                    mode,
+                    size: None,
+                    evidence: BlobEvidence::ComputedWorktreeThisCall { oid },
+                }
+            }
+        };
+        map.insert(repo_key, blob);
+    }
+    map
+}
+
+/// Per-pair rename detail: percentage score and exactness (§B.6.4/§B.6.5),
+/// keyed by the display-base `(old, new)` pair recorded in `Changes.renamed`.
+type RenameDetails = HashMap<(PathBuf, PathBuf), (u32, bool)>;
+
+/// Detect renames between the `deleted` (old) and `new` sides of `changes`
+/// using the diffcore engine (exact by OID → unique basename → bounded
+/// exhaustive inexact, §B.4.2). Matched pairs are recorded in
+/// `changes.renamed` and pruned from `deleted`/`new`; each pair's score and
+/// exactness are added to `details`. Paths keep the change list's original
+/// base for display; detection runs on repo-relative keys.
+fn detect_renames_in_changes(
+    changes: &mut Changes,
+    config: &rename_detect::RenameDetectConfig,
+    old_side: RenameBlobSide<'_>,
+    new_side: RenameBlobSide<'_>,
+    details: &mut RenameDetails,
+) {
+    if changes.deleted.is_empty() || changes.new.is_empty() {
+        return;
+    }
+    let snapshot = rename_detect::RenameSnapshot {
+        old_map: build_rename_side(&changes.deleted, &old_side),
+        new_map: build_rename_side(&changes.new, &new_side),
+    };
+    let mut source = StatusContentSource {
+        old_is_worktree: matches!(old_side, RenameBlobSide::Worktree),
+        new_is_worktree: matches!(new_side, RenameBlobSide::Worktree),
+        objects: rename_detect::ObjectReadBudget::with_defaults(),
+        worktree: rename_detect::WorktreeReadBudget::with_defaults(),
+    };
+    let outcome = rename_detect::match_pairs(&snapshot, config, &mut source);
+    if outcome.matches.is_empty() {
+        return;
+    }
+
+    // Map repo-relative matches back to the change list's display base and
+    // prune consumed endpoints.
+    let mut consumed_old: HashSet<PathBuf> = HashSet::new();
+    let mut consumed_new: HashSet<PathBuf> = HashSet::new();
+    let mut renamed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for m in &outcome.matches {
+        let old_display = util::workdir_to_current(&m.old);
+        let new_display = util::workdir_to_current(&m.new);
+        consumed_old.insert(old_display.clone());
+        consumed_new.insert(new_display.clone());
+        details.insert(
+            (old_display.clone(), new_display.clone()),
+            (m.score_percent(), m.exact),
+        );
+        renamed.push((old_display, new_display));
+    }
+    changes.deleted.retain(|p| !consumed_old.contains(p));
+    changes.new.retain(|p| !consumed_new.contains(p));
+    changes.deleted.sort();
+    changes.new.sort();
+    renamed.sort_by(|a, b| a.1.cmp(&b.1));
+    changes.renamed.extend(renamed);
+}
+
+/// Numeric Unix mode for a `TreeItemMode` (`100644`/`100755`/`120000`/
+/// `160000`), matching Git's stored blob modes.
+fn tree_item_mode_to_unix(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::Blob => 0o100644,
+        TreeItemMode::BlobExecutable => 0o100755,
+        TreeItemMode::Link => 0o120000,
+        TreeItemMode::Commit => 0o160000,
+        TreeItemMode::Tree => 0o040000,
+    }
+}
+
+/// HEAD tree blobs keyed by repo-relative path → (oid, mode) (§B.4.1 old side
+/// of the staged snapshot).
+fn load_head_tree_blobs(head_oid: &ObjectHash) -> HashMap<PathBuf, (ObjectHash, u32)> {
     let commit = Commit::load(head_oid);
     let tree = Tree::load(&commit.tree_id);
     tree.get_plain_items_with_mode()
         .into_iter()
-        .map(|(path, hash, _mode)| (path, hash))
+        .map(|(path, hash, mode)| (path, (hash, tree_item_mode_to_unix(mode))))
         .collect()
 }
 
-fn file_name_lossy(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-/// Simple filename similarity based on longest common subsequence length.
-fn filename_similarity(a: &str, b: &str) -> u8 {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    let mut prev = vec![0u16; b.len() + 1];
-    let mut curr = vec![0u16; b.len() + 1];
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            if a[i - 1] == b[j - 1] {
-                curr[j] = prev[j - 1] + 1;
-            } else {
-                curr[j] = curr[j - 1].max(prev[j]);
-            }
-        }
-        std::mem::swap(&mut prev, &mut curr);
-    }
-    let lcs = prev[b.len()] as usize;
-    let max_len = a.len().max(b.len());
-    (lcs.saturating_mul(100) / max_len.max(1)).min(100) as u8
+/// Index stage-0 blobs keyed by repo-relative path → (oid, mode) (index side
+/// of both snapshots).
+fn load_index_stage0_blobs(index: &Index) -> HashMap<PathBuf, (ObjectHash, u32)> {
+    index
+        .tracked_entries(0)
+        .into_iter()
+        .map(|entry| (PathBuf::from(&entry.name), (entry.hash, entry.mode)))
+        .collect()
 }
 
 pub(crate) fn load_status_index() -> CliResult<Index> {
@@ -915,6 +1093,19 @@ pub async fn execute_safe(mut args: StatusArgs, output: &OutputConfig) -> CliRes
     // Dirty-set cache modes (lore.md 1.1). NOTE: only this CLI entry routes
     // them — the legacy `execute_to` writer entry ignores the flags (its
     // callers never set them).
+    //
+    // Part C W0 (§C.11 line 1507a): `working_dirty`/`working_dirty_meta` are
+    // repository-global (id=1 meta), so these cache-SEMANTIC modes fail closed
+    // in a linked worktree until W1 scopes the DirtyCache call chain — they
+    // would otherwise read or prune the main worktree's dirty state. Plain
+    // `status` (below) is unaffected: it never consults the dirty cache, so it
+    // already computes a fresh, correct result in any worktree.
+    if args.scan || args.cached || args.check_dirty {
+        crate::command::ensure_main_worktree_because(
+            "status --scan/--cached/--check-dirty",
+            "the dirty cache is not yet worktree-scoped",
+        )?;
+    }
     if args.scan {
         return run_status_scan(&args, output).await;
     }
@@ -1378,6 +1569,8 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
             .await
             .is_active(),
         porcelain_v2: None,
+        staged_rename_details: RenameDetails::new(),
+        unstaged_rename_details: RenameDetails::new(),
     };
     filter_status_data_by_pathspec(&mut data, args)?;
 
@@ -1470,6 +1663,8 @@ async fn render_status_to_writer(
                 &data.unmerged,
                 &data.ignored_files,
                 data.porcelain_v2.as_deref(),
+                &data.staged_rename_details,
+                &data.unstaged_rename_details,
                 args.null_terminated,
                 &mut buffer,
             )?;
@@ -2052,6 +2247,29 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
             .collect()
     };
 
+    // Top-level `renames[]` with score/exactness/side (§B.6.5), sorted by the
+    // destination path for determinism.
+    let mut renames: Vec<serde_json::Value> = Vec::new();
+    let mut push_renames = |pairs: &[(PathBuf, PathBuf)], details: &RenameDetails, staged: bool| {
+        for (old, new) in pairs {
+            let (score, exact) = details
+                .get(&(old.clone(), new.clone()))
+                .copied()
+                .unwrap_or((100, true));
+            renames.push(serde_json::json!({
+                "from": old.display().to_string(),
+                "to": new.display().to_string(),
+                "score": score,
+                "exact": exact,
+                "staged": staged,
+                "unstaged": !staged,
+            }));
+        }
+    };
+    push_renames(&data.staged.renamed, &data.staged_rename_details, true);
+    push_renames(&data.unstaged.renamed, &data.unstaged_rename_details, false);
+    renames.sort_by(|a, b| a["to"].as_str().cmp(&b["to"].as_str()));
+
     let head = match &data.head {
         Head::Branch(name) => serde_json::json!({"type": "branch", "name": name}),
         Head::Detached(hash) => {
@@ -2093,6 +2311,7 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
         ),
         "untracked": paths_to_json(&data.unstaged.new),
         "ignored": paths_to_json(&data.ignored_files),
+        "renames": renames,
         "is_clean": !data.is_dirty(),
     });
 
@@ -2137,21 +2356,52 @@ fn output_porcelain_with_unmerged(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+
+    // Renames render as a single `R  <old> -> <new>` record (Git porcelain v1
+    // §B.6.3), never as two `R` endpoint rows. Under `-z` the record is
+    // `XY SP <new> NUL <old> NUL` (new before old, matching Git).
+    let mut endpoints: HashSet<PathBuf> = HashSet::new();
+    let mut rename_lines: Vec<(char, char, PathBuf, PathBuf)> = Vec::new();
+    for (old, new) in &staged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        let y = if unstaged.modified.contains(new) {
+            'M'
+        } else {
+            ' '
+        };
+        rename_lines.push(('R', y, old.clone(), new.clone()));
+    }
+    for (old, new) in &unstaged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        rename_lines.push((' ', 'R', old.clone(), new.clone()));
+    }
+
+    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
     for (file, staged_status, unstaged_status) in status_list {
+        if endpoints.contains(&file) {
+            continue;
+        }
         write!(
             writer,
-            "{}{} {}",
-            staged_status,
-            unstaged_status,
+            "{staged_status}{unstaged_status} {}",
             file.display()
         )
         .map_err(write_err)?;
+        writer
+            .write_all(if null_terminated { b"\0" } else { b"\n" })
+            .map_err(write_err)?;
+    }
+    for (x, y, old, new) in rename_lines {
         if null_terminated {
+            write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
+            writer.write_all(b"\0").map_err(write_err)?;
+            write!(writer, "{}", old.display()).map_err(write_err)?;
             writer.write_all(b"\0").map_err(write_err)?;
         } else {
-            writer.write_all(b"\n").map_err(write_err)?;
+            writeln!(writer, "{x}{y} {} -> {}", old.display(), new.display()).map_err(write_err)?;
         }
     }
     Ok(())
@@ -2261,13 +2511,96 @@ fn build_porcelain_v2_data(index: Index, head_oid: Option<&ObjectHash>) -> Porce
     }
 }
 
+/// Emit a porcelain v2 `2 <xy> …` rename record (§B.6.4):
+/// `2 <xy> <sub> <mH> <mI> <mW> <hH> <hI> R<pct> <new>\t<old>`. Under `-z` the
+/// path field becomes `<new> NUL <old> NUL`.
+#[allow(clippy::too_many_arguments)]
+fn write_rename_porcelain_v2(
+    old: &Path,
+    new: &Path,
+    x: char,
+    y: char,
+    score: u32,
+    metadata: &PorcelainV2Data,
+    zero_hash: &str,
+    null_terminated: bool,
+    writer: &mut impl Write,
+) -> CliResult<()> {
+    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let old_workdir = current_to_workdir(old);
+    let new_workdir = current_to_workdir(new);
+
+    // Staged rename: HEAD side is the OLD path, index side is the NEW path.
+    // Unstaged-only rename (`.R`): there is no staged component, so Git copies
+    // the index fields into the HEAD fields.
+    let staged_rename = x == 'R';
+    let (mode_head, hash_head) = if staged_rename {
+        metadata
+            .head_tree_items
+            .get(&old_workdir)
+            .map(|info| (info.mode, info.hash.clone()))
+            .unwrap_or((0, zero_hash.to_string()))
+    } else {
+        // `.R`: filled from the index below (fixup).
+        (0, zero_hash.to_string())
+    };
+    let index_key = if staged_rename {
+        &new_workdir
+    } else {
+        &old_workdir
+    };
+    let index_str = index_key.to_str().unwrap_or_default();
+    let (mode_index, hash_index) = metadata
+        .index
+        .get(index_str, 0)
+        .map(|entry| (entry.mode, entry.hash.to_string()))
+        .unwrap_or((0o100644, zero_hash.to_string()));
+    let (mode_head, hash_head) = if staged_rename {
+        (mode_head, hash_head)
+    } else {
+        (mode_index, hash_index.clone())
+    };
+    let mode_worktree = get_worktree_mode(new);
+    let sub = if is_submodule_mode(mode_index) || is_submodule_mode(mode_head) {
+        get_submodule_status(new)
+    } else {
+        "N...".to_string()
+    };
+
+    write!(
+        writer,
+        "2 {x}{y} {} {} {} {} {} {} R{} ",
+        sub,
+        format_mode(mode_head),
+        format_mode(mode_index),
+        format_mode(mode_worktree),
+        hash_head,
+        hash_index,
+        score,
+    )
+    .map_err(write_err)?;
+    if null_terminated {
+        write!(writer, "{}", new.display()).map_err(write_err)?;
+        writer.write_all(b"\0").map_err(write_err)?;
+        write!(writer, "{}", old.display()).map_err(write_err)?;
+        writer.write_all(b"\0").map_err(write_err)?;
+    } else {
+        write!(writer, "{}\t{}", new.display(), old.display()).map_err(write_err)?;
+        writer.write_all(b"\n").map_err(write_err)?;
+    }
+    Ok(())
+}
+
 /// Output porcelain v2 format using metadata collected during status computation.
+#[allow(clippy::too_many_arguments)]
 fn output_porcelain_v2(
     staged: &Changes,
     unstaged: &Changes,
     unmerged: &[UnmergedEntry],
     ignored: &[PathBuf],
     metadata: Option<&PorcelainV2Data>,
+    staged_rename_details: &RenameDetails,
+    unstaged_rename_details: &RenameDetails,
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
@@ -2280,8 +2613,58 @@ fn output_porcelain_v2(
         write_unmerged_porcelain_v2(entry, &zero_hash, null_terminated, writer)?;
     }
 
+    // Rename records (`2 …`) render separately from the flattened `1 …` list;
+    // their endpoints are excluded below so they never double as change rows.
+    let mut endpoints: HashSet<PathBuf> = HashSet::new();
+    for (old, new) in &staged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        let unstaged_char = if unstaged.modified.contains(new) {
+            'M'
+        } else {
+            '.'
+        };
+        let score = staged_rename_details
+            .get(&(old.clone(), new.clone()))
+            .map(|(pct, _)| *pct)
+            .unwrap_or(100);
+        write_rename_porcelain_v2(
+            old,
+            new,
+            'R',
+            unstaged_char,
+            score,
+            metadata,
+            &zero_hash,
+            null_terminated,
+            writer,
+        )?;
+    }
+    for (old, new) in &unstaged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        let score = unstaged_rename_details
+            .get(&(old.clone(), new.clone()))
+            .map(|(pct, _)| *pct)
+            .unwrap_or(100);
+        write_rename_porcelain_v2(
+            old,
+            new,
+            '.',
+            'R',
+            score,
+            metadata,
+            &zero_hash,
+            null_terminated,
+            writer,
+        )?;
+    }
+
     let status_list = generate_short_format_status(staged, unstaged);
     for (file, staged_status, unstaged_status) in status_list {
+        if endpoints.contains(&file) {
+            continue;
+        }
         if staged_status == '?' && unstaged_status == '?' {
             write!(writer, "? {}", file.display()).map_err(write_err)?;
             if null_terminated {
@@ -2500,7 +2883,37 @@ pub async fn output_short_format(
     .await
 }
 
+/// A short-format render item: either a plain per-path change or a rename
+/// pair (rendered with Git's `old -> new` arrow instead of two `R` rows).
+enum ShortItem {
+    Path {
+        file: PathBuf,
+        x: char,
+        y: char,
+    },
+    Rename {
+        old: PathBuf,
+        new: PathBuf,
+        x: char,
+        y: char,
+    },
+}
+
+impl ShortItem {
+    /// Sort key — Git orders renames by their new (destination) path.
+    fn sort_key(&self) -> &Path {
+        match self {
+            ShortItem::Path { file, .. } => file,
+            ShortItem::Rename { new, .. } => new,
+        }
+    }
+}
+
 /// Short format output with color controlled by OutputConfig.
+///
+/// Renames are rendered as a single `R  <old> -> <new>` line (Git's short
+/// rename form), not as two separate `R` rows (§B.6.1). Under `-z` the record
+/// is `XY SP <new> NUL <old> NUL` (new before old, matching Git).
 async fn output_short_format_with_config(
     staged: &Changes,
     unstaged: &Changes,
@@ -2512,26 +2925,67 @@ async fn output_short_format_with_config(
     let use_colors = should_use_colors(output).await;
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
 
-    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
+    // Collect rename pairs and their endpoints so the flattened tuple list can
+    // exclude them (they render as arrow lines instead).
+    let mut items: Vec<ShortItem> = Vec::new();
+    let mut endpoints: HashSet<PathBuf> = HashSet::new();
+    for (old, new) in &staged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        items.push(ShortItem::Rename {
+            old: old.clone(),
+            new: new.clone(),
+            x: 'R',
+            y: ' ',
+        });
+    }
+    for (old, new) in &unstaged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        items.push(ShortItem::Rename {
+            old: old.clone(),
+            new: new.clone(),
+            x: ' ',
+            y: 'R',
+        });
+    }
 
-    for (file, staged_status, unstaged_status) in status_list {
-        if use_colors {
-            let colored_output = format_colored_status(staged_status, unstaged_status, &file);
-            write!(writer, "{}", colored_output).map_err(write_err)?;
-        } else {
-            write!(
-                writer,
-                "{}{} {}",
-                staged_status,
-                unstaged_status,
-                file.display()
-            )
-            .map_err(write_err)?;
+    for (file, x, y) in generate_short_format_status_with_unmerged(staged, unstaged, unmerged) {
+        if endpoints.contains(&file) {
+            continue;
         }
-        if null_terminated {
-            writer.write_all(b"\0").map_err(write_err)?;
-        } else {
-            writer.write_all(b"\n").map_err(write_err)?;
+        items.push(ShortItem::Path { file, x, y });
+    }
+    items.sort_by(|a, b| a.sort_key().cmp(b.sort_key()));
+
+    for item in items {
+        match item {
+            ShortItem::Path { file, x, y } => {
+                if use_colors {
+                    write!(writer, "{}", format_colored_status(x, y, &file)).map_err(write_err)?;
+                } else {
+                    write!(writer, "{x}{y} {}", file.display()).map_err(write_err)?;
+                }
+                writer
+                    .write_all(if null_terminated { b"\0" } else { b"\n" })
+                    .map_err(write_err)?;
+            }
+            ShortItem::Rename { old, new, x, y } => {
+                if null_terminated {
+                    // `XY SP <new> NUL <old> NUL` (§B.6.1).
+                    write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
+                    writer.write_all(b"\0").map_err(write_err)?;
+                    write!(writer, "{}", old.display()).map_err(write_err)?;
+                    writer.write_all(b"\0").map_err(write_err)?;
+                } else if use_colors {
+                    let head = format_colored_status(x, y, &old);
+                    // `format_colored_status` renders `XY <old>`; append the arrow.
+                    writeln!(writer, "{head} -> {}", new.display()).map_err(write_err)?;
+                } else {
+                    writeln!(writer, "{x}{y} {} -> {}", old.display(), new.display())
+                        .map_err(write_err)?;
+                }
+            }
         }
     }
     Ok(())

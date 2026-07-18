@@ -288,23 +288,54 @@ pub fn find_git_repository(path: Option<&Path>) -> Option<GitRepositoryLocation>
 /// `commondir` pointer if present (a linked worktree borrows the main repo's
 /// db/objects/hooks), else the gitdir itself (the main worktree). The
 /// per-worktree `index` and `worktree_id` always live in the local gitdir.
-fn worktree_common_storage(gitdir: &Path) -> PathBuf {
-    if let Ok(contents) = fs::read_to_string(gitdir.join("commondir"))
-        && let Some(raw) = contents
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    {
-        let common = Path::new(raw);
-        let resolved = if common.is_absolute() {
-            common.to_path_buf()
-        } else {
-            gitdir.join(common)
-        };
-        return fs::canonicalize(&resolved).unwrap_or(resolved);
+///
+/// FAIL-CLOSED (Part C §C.4.1): a linked worktree is identified by the presence
+/// of a `commondir` file. When that file exists but is unreadable or has an
+/// empty first line, the pointer is CORRUPT — we must NOT silently fall back to
+/// treating the library-less local gitdir as common storage, which would route
+/// every db/objects lookup at a phantom repository. Return an error so mutation
+/// paths refuse and point the user at `libra worktree repair`. Only a genuinely
+/// absent `commondir` (a main worktree) resolves to the gitdir itself.
+fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
+    let commondir_file = gitdir.join("commondir");
+    match fs::read_to_string(&commondir_file) {
+        Ok(contents) => {
+            let raw = contents
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(raw) = raw else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "worktree commondir pointer at '{}' is empty; the linked worktree is \
+                         corrupt — run `libra worktree repair`",
+                        commondir_file.display()
+                    ),
+                ));
+            };
+            let common = Path::new(raw);
+            let resolved = if common.is_absolute() {
+                common.to_path_buf()
+            } else {
+                gitdir.join(common)
+            };
+            Ok(fs::canonicalize(&resolved).unwrap_or(resolved))
+        }
+        // No `commondir` marker at all → this IS the main worktree; its own
+        // gitdir holds the shared db/objects.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(gitdir.to_path_buf()),
+        // The marker exists but cannot be read → linked-worktree corruption.
+        Err(err) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "cannot read worktree commondir pointer at '{}': {err}; the linked worktree is \
+                 corrupt — run `libra worktree repair`",
+                commondir_file.display()
+            ),
+        )),
     }
-    gitdir.to_path_buf()
 }
 
 /// Resolve `(common_storage, workdir, worktree_gitdir)` for a path.
@@ -321,7 +352,7 @@ fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBu
         if standard_repo.is_dir() && is_valid_storage_dir(&standard_repo) {
             // unwrap_or is safe here: if canonicalize fails, we use the original path
             let gitdir = fs::canonicalize(&standard_repo).unwrap_or(standard_repo);
-            let common = worktree_common_storage(&gitdir);
+            let common = worktree_common_storage(&gitdir)?;
             return Ok((common, path.clone(), gitdir));
         }
 

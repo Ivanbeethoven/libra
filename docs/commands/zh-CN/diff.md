@@ -235,6 +235,16 @@ diff 驱动的 verbatim 输出。与 Git 一样，`commit -v` 始终使用内建
 忽略 `diff.external`。`--src-prefix` 与 `--dst-prefix` 分别覆盖对应配置值；两者
 同时给出时，不读取无关的前缀默认配置。`-R` 交换最终前缀对。
 
+### 重命名检测预算
+
+`diff.renameLimit`（与 Git 一致）限制二次 inexact 重命名扫描：当 rename 源
+**或**目标数量超过该限制时，仍报告 exact 重命名，但跳过 inexact 扫描并发出
+警告。取值为非负整数，经严格 local → global → system 级联；`0` 表示“无 per-side
+限制”；默认 1000。`diff.renameComparisonBudget` 限制 inexact 扫描的相似度比较
+总数：非负整数，`0` 表示“无上限”（默认）。预算耗尽时丢弃穷举扫描结果，仅保留
+exact 与唯一 basename 的重命名，并发出警告。两者在非法（非整数/负数）设置时于
+任何 diff 输出前以 `LBR-CLI-002` fail-closed。
+
 ## 人类可读输出
 
 支持的输出模式：

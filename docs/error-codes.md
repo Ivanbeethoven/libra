@@ -89,6 +89,7 @@ structured report is always present.
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata |
 | `128` | `LBR-REPO-003` | `repo` | Repository state blocks the operation | no commits yet, detached state mismatch, missing configured remote |
 | `128` | `LBR-CONFIG-001` | `config` | Global config DB schema is newer than this Libra binary supports | `pull`, `push`, `fetch`, `clone`, or `cloud` would otherwise silently ignore global storage config |
+| `128` | `LBR-UPGRADE-001` | `config` | Reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt (unsupported `upgrade.*` config spellings are usage errors, `LBR-CLI-002`) | `libra config get --global upgrade.mode` on a hand-edited, non-JSON settings file |
 | `128` | `LBR-CONFLICT-001` | `conflict` | Unresolved conflict is present | merge/rebase conflict still unresolved |
 | `128` | `LBR-CONFLICT-002` | `conflict` | Operation blocked to avoid overwriting state | non-fast-forward, destination exists, dirty worktree |
 | `128` | `LBR-POLICY-001` | `conflict` | Branch policy (protect/archive metadata) blocked the ref update | `branch reset` / `update-ref` on a protected or archived branch |
@@ -155,6 +156,7 @@ structured report is always present.
 | Stable code | Meaning |
 | --- | --- |
 | `LBR-CONFIG-001` | Global config database schema is newer than this Libra binary supports; update Libra or explicitly use `--offline` / `LIBRA_READ_POLICY=offline|local` when local-only object access is intended. |
+| `LBR-UPGRADE-001` | The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`) is unreadable or corrupt; rewrite it with `libra config set --global upgrade.mode <auto\|manual\|off>`. Unsupported `upgrade.*` config spellings are usage errors (`LBR-CLI-002`). |
 
 ### Conflict
 

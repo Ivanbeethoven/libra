@@ -22,7 +22,7 @@ libra worktree repair
 
 `libra worktree` 管理共享同一个仓库数据库和对象存储的多个工作树。这允许你同时拥有同一仓库的多个 checkout，适用于同时处理多个分支、编辑代码时运行构建，或隔离测试更改。
 
-每个 linked worktree 都是一个目录，其中包含指回共享存储目录的 `.libra` 符号链接。主工作树是原始仓库目录。所有工作树共享同一个 SQLite 数据库、对象存储和配置。
+每个 linked worktree 都是一个目录，其中包含它自己的真实 `.libra` gitdir——一个本地目录（不是符号链接），保存该 worktree 私有的 `HEAD`、index 和 `HEAD` reflog，以及指向共享存储的 `commondir` 指针和稳定的 `worktree_id`。主工作树是原始仓库目录。所有工作树共享同一个 SQLite 数据库、对象存储、branch/tag/remote refs 和配置，但各自拥有独立的 checked-out 分支和暂存状态。（由更早版本 Libra 创建的 worktree 可能仍是旧的共享 `.libra` 符号链接布局；运行 `libra worktree repair` 检查。）
 
 Worktree 元数据持久化在 `.libra` 存储目录内的 `worktrees.json` 文件中。每个条目记录文件系统路径、它是否是主工作树、锁定状态，以及可选锁定原因。状态文件通过临时文件重命名原子写入，以防损坏。
 
@@ -49,7 +49,7 @@ libra worktree add /tmp/libra-test
 
 ### 子命令：`list`
 
-列出所有已注册 worktrees 及其状态。`--porcelain` 输出稳定的机器可读格式：每个 worktree 输出 `worktree <path>`、共享 `HEAD <sha>`（仓库有提交时）行，被锁定时再加 `locked [<reason>]` 行，条目间空行分隔。由于 Libra worktree 共享同一 HEAD/index/refs，**有意省略** Git 的 per-worktree `branch`/`detached` 行（Libra 无 per-worktree HEAD）。
+列出所有已注册 worktrees 及其状态。`--porcelain` 输出稳定的机器可读格式：每个 worktree 输出 `worktree <path>`、它自己的 `HEAD <sha>` 行，以及 `branch <ref>` 或 `detached` 行（每个 worktree 各自拥有 HEAD），被锁定时再加 `locked [<reason>]` 行，条目间空行分隔。若某 worktree 的 HEAD 无法解析（旧的共享 `.libra` 布局，或缺失/损坏的 scope），则省略 HEAD 相关行，而不是错误地标上其它 worktree 的提交。
 
 ```bash
 libra worktree list

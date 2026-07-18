@@ -991,7 +991,14 @@ mod tests {
     #[test]
     fn exact_writable_file_has_no_impossible_protected_children() {
         let temp = tempfile::tempdir().expect("create exact-file policy fixture");
-        let file = temp.path().join("COMMIT_EDITMSG");
+        // Canonicalize the fixture base: the resolver canonicalizes roots, and
+        // on macOS the tempdir lives behind the `/var` → `/private/var`
+        // symlink, so an un-canonicalized expectation would never match.
+        let base = temp
+            .path()
+            .canonicalize()
+            .expect("canonicalize policy fixture");
+        let file = base.join("COMMIT_EDITMSG");
         std::fs::write(&file, b"message").expect("create exact writable file");
         let policy = SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![file.clone()],

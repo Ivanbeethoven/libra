@@ -81,6 +81,14 @@ struct LayerRow {
 }
 
 pub async fn execute_safe(args: LayerArgs, output: &OutputConfig) -> CliResult<()> {
+    // Part C W0 (§C.11 transition guard): the `layer`/`layer_path` tables are
+    // repository-global with no worktree scope yet, so a linked worktree could
+    // read or delete another worktree's layer ownership. All subcommands fail
+    // closed in a linked worktree until W1 scopes the LayerStore call chain.
+    crate::command::ensure_main_worktree_because(
+        "layer",
+        "the layer registry is not yet worktree-scoped",
+    )?;
     match args.command {
         LayerCommand::Add {
             name,

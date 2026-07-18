@@ -103,6 +103,124 @@ fn linked_worktree_has_isolated_head_and_index() {
     );
 }
 
+/// `worktree list --porcelain` reports each worktree's OWN HEAD (Part C
+/// §C.3.3): the main worktree on a branch, the linked worktree detached at its
+/// own commit — never one shared HEAD stamped onto both entries.
+#[test]
+fn porcelain_reports_per_worktree_head() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    let out = run_libra_command(&["worktree", "list", "--porcelain"], main);
+    assert_cli_success(&out, "worktree list --porcelain");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // The main worktree entry carries a branch line...
+    assert!(
+        text.lines().any(|l| l == "branch refs/heads/main"),
+        "main entry reports its branch: {text:?}"
+    );
+    // ...and the linked worktree entry is detached (its own HEAD), so a
+    // `detached` line must appear too.
+    assert!(
+        text.lines().any(|l| l == "detached"),
+        "linked worktree entry reports detached HEAD: {text:?}"
+    );
+    // Two distinct `worktree <path>` entries, each with its own HEAD line.
+    let head_lines = text.lines().filter(|l| l.starts_with("HEAD ")).count();
+    assert_eq!(
+        head_lines, 2,
+        "each worktree has its own HEAD line: {text:?}"
+    );
+}
+
+/// Part C §C.4.1: a linked worktree whose `commondir` pointer is corrupt
+/// (emptied) must FAIL CLOSED rather than silently treating its library-less
+/// local gitdir as the shared storage (a "phantom repository" that routes
+/// db/objects lookups at an empty dir).
+#[test]
+fn corrupt_commondir_fails_closed_not_phantom_repo() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Corrupt the commondir pointer (empty it) — the shared-storage link is now
+    // unresolvable.
+    fs::write(wt.join(".libra/commondir"), "").unwrap();
+
+    let out = run_libra_command(&["status"], &wt);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a corrupt commondir must fail closed, not operate on a phantom repo"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The failure happens at path resolution (repo-not-found), NOT by routing
+    // the DB lookup at a phantom `<wt>/.libra/libra.db` — the pre-fix symptom.
+    assert!(
+        !stderr.contains(".libra/libra.db"),
+        "must not route db lookups at the phantom local gitdir: {stderr}"
+    );
+    assert!(
+        stderr.contains("LBR-REPO-001") || stderr.contains("not a libra repository"),
+        "fails closed at repo resolution: {stderr}"
+    );
+}
+
+/// Part C §C.5: `rev-parse --git-dir`/`--absolute-git-dir` return the LINKED
+/// worktree's own local gitdir, and `--is-inside-git-dir` tests it — not the
+/// shared common storage. Scripts locating the index/EDITMSG via `--git-dir`
+/// must hit the per-worktree gitdir.
+#[test]
+fn rev_parse_git_dir_is_worktree_local() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    let git_dir =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "--git-dir"], &wt).stdout)
+            .trim()
+            .to_string();
+    let wt_libra = wt.join(".libra");
+    // The linked worktree's --git-dir must be ITS OWN .libra, not the main's.
+    assert!(
+        std::fs::canonicalize(&git_dir).ok() == std::fs::canonicalize(&wt_libra).ok(),
+        "linked --git-dir should be the worktree-local gitdir: got {git_dir}, want {}",
+        wt_libra.display()
+    );
+    assert!(
+        !git_dir.contains(main.file_name().unwrap().to_str().unwrap()),
+        "linked --git-dir must not point at the main worktree's storage: {git_dir}"
+    );
+
+    // --is-inside-git-dir from inside the linked .libra is true.
+    let inside = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--is-inside-git-dir"], &wt_libra).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        inside, "true",
+        "cwd inside the linked .libra is inside GIT_DIR"
+    );
+}
+
 #[test]
 fn same_branch_is_refused_across_worktrees() {
     let repo = repo_with_feature();
@@ -131,6 +249,99 @@ fn same_branch_is_refused_across_worktrees() {
         &run_libra_command(&["switch", "main"], &wt),
         "free branch ok",
     );
+}
+
+/// Part C W0 (§C.11 transition guards): the states whose stores are still
+/// repository-global — the stash stack, the dirty cache, the layer/sparse
+/// tables, and the composite `fetch`/`pull` (shared `FETCH_HEAD`) — must fail
+/// closed in a linked worktree until W1/W2 make them worktree-scoped. The
+/// guard fires before any side effect, so no remote/network is needed.
+#[test]
+fn repository_global_state_commands_refused_in_linked_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    let cases: &[&[&str]] = &[
+        &["stash", "list"],
+        &["layer", "list"],
+        &["sparse-view", "status"],
+        &["dirty", "--list"],
+        &["fetch"],
+        &["pull"],
+    ];
+    for argv in cases {
+        let out = run_libra_command(argv, &wt);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{argv:?} must fail closed in a linked worktree"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("linked worktree"),
+            "{argv:?} should fail with the linked-worktree guard, got: {stderr}"
+        );
+    }
+
+    // The SAME commands succeed in the main worktree (guard is main-only).
+    assert_cli_success(
+        &run_libra_command(&["stash", "list"], main),
+        "stash list works in main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["layer", "list"], main),
+        "layer list works in main",
+    );
+}
+
+/// Part C W0 (§C.11 line 1507a): plain `status` works in a linked worktree
+/// (it never consults the shared dirty cache), but the cache-semantic modes
+/// `--scan`/`--cached`/`--check-dirty` fail closed until W1 scopes the cache.
+#[test]
+fn status_cache_modes_refused_in_linked_but_plain_status_works() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Plain status must succeed in the linked worktree.
+    assert_cli_success(
+        &run_libra_command(&["status"], &wt),
+        "plain status works in a linked worktree",
+    );
+    assert_cli_success(
+        &run_libra_command(&["status", "--porcelain"], &wt),
+        "porcelain status works in a linked worktree",
+    );
+
+    // The dirty-cache modes fail closed.
+    for mode in [
+        vec!["status", "--scan"],
+        vec!["status", "--cached"],
+        vec!["status", "--check-dirty"],
+    ] {
+        let out = run_libra_command(&mode, &wt);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{mode:?} must fail closed in a linked worktree"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("linked worktree"),
+            "{mode:?} should hit the linked-worktree guard: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]

@@ -85,6 +85,75 @@ fn ensure_stub_web_out(web_dir: &Path) {
             );
         }
     }
+
+    // Static assets under `web/public/` (e.g. the remote-access notice pages)
+    // are served straight out of `WebAssets` at runtime, so the skip-build
+    // stub must still ship them or the embedded server 500s on paths the
+    // full Next.js export would have covered. Fail closed: a stub binary
+    // that compiles without these assets is a silent runtime regression.
+    copy_public_assets(&web_dir.join("public"), &out_dir);
+    for required in ["remote-notice/index.html", "remote-notice/zh-CN/index.html"] {
+        let asset = out_dir.join(required);
+        if !asset.is_file() {
+            panic!(
+                "skip-build web stub is missing required asset `{}`; \
+                 expected it under `web/public/` (tracked in the repository)",
+                asset.display()
+            );
+        }
+    }
+}
+
+/// Recursively copies `web/public/` into `web/out/` without overwriting
+/// files the (possibly stale) export already provides. Any enumeration or
+/// copy failure aborts the build: silently shipping a stub without public
+/// assets would 500 at runtime.
+fn copy_public_assets(public_dir: &Path, out_dir: &Path) {
+    let entries = match fs::read_dir(public_dir) {
+        Ok(entries) => entries,
+        Err(err) => panic!(
+            "failed to enumerate web public assets `{}`: {err}",
+            public_dir.display()
+        ),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => panic!(
+                "failed to read web public asset entry under `{}`: {err}",
+                public_dir.display()
+            ),
+        };
+        let source = entry.path();
+        let target = out_dir.join(entry.file_name());
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => panic!(
+                "failed to inspect web public asset `{}`: {err}",
+                source.display()
+            ),
+        };
+
+        if file_type.is_dir() {
+            if let Err(err) = fs::create_dir_all(&target) {
+                panic!(
+                    "failed to create stub asset directory `{}`: {err}",
+                    target.display()
+                );
+            }
+            copy_public_assets(&source, &target);
+        } else if file_type.is_file()
+            && !target.exists()
+            && let Err(err) = fs::copy(&source, &target)
+        {
+            panic!(
+                "failed to copy public asset `{}` to `{}`: {err}",
+                source.display(),
+                target.display()
+            );
+        }
+    }
 }
 
 /// Runs `pnpm install` (if needed) then `pnpm run build` inside `web_dir`.

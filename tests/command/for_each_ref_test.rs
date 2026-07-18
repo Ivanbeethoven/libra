@@ -2820,3 +2820,44 @@ async fn test_for_each_ref_worktreepath_atom() {
         "a tag has an empty %(worktreepath): {s:?}"
     );
 }
+
+/// Part C §C.3.3: `%(worktreepath)` resolves a branch to the LINKED worktree
+/// that has it checked out, even when `for-each-ref` runs in the main worktree.
+#[tokio::test]
+#[serial]
+async fn test_for_each_ref_worktreepath_across_worktrees() {
+    let temp = tempdir().unwrap();
+    setup_repo_with_commit(&temp).await;
+    let p = temp.path();
+    run_libra_command(&["branch", "feature"], p);
+
+    // Add a linked worktree and check out `feature` inside it.
+    let parent = tempdir().unwrap();
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], p),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // Run for-each-ref from the MAIN worktree: `feature` must report the
+    // linked worktree's canonical path, `main` reports the main path.
+    let out = run_libra_command(&["for-each-ref", "--format=%(refname)|%(worktreepath)"], p);
+    assert_cli_success(&out, "for-each-ref across worktrees");
+    let s = String::from_utf8_lossy(&out.stdout);
+    let wt_path = wt.canonicalize().unwrap().to_string_lossy().into_owned();
+    let main_path = p.canonicalize().unwrap().to_string_lossy().into_owned();
+    assert!(
+        s.lines()
+            .any(|l| l == format!("refs/heads/feature|{wt_path}")),
+        "feature reports the linked worktree path: {s:?}"
+    );
+    assert!(
+        s.lines()
+            .any(|l| l == format!("refs/heads/main|{main_path}")),
+        "main reports the main worktree path: {s:?}"
+    );
+}

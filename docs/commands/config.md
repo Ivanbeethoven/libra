@@ -375,6 +375,33 @@ Supported `--usage` values are `signing` and `encrypt`.
 - `--global` uses `~/.libra/config.db`
 - `--system` uses `/etc/libra/config.db` (override with `LIBRA_CONFIG_SYSTEM_DB`); lowest cascade precedence, writes usually need elevated privileges, and vault-encrypted secrets are rejected in this scope (see Design Rationale)
 
+## Reserved `upgrade.*` Namespace
+
+The auto-upgrade configuration is a reserved namespace stored in
+`{LIBRA_HOME}/upgrade/settings.json` (default `~/.libra/upgrade/settings.json`;
+override the base directory with the `LIBRA_HOME` environment variable — and
+when `LIBRA_CONFIG_GLOBAL_DB` isolates the global config database, the
+settings follow it to that database's directory), never in the SQLite stores.
+Only these single-value, `--global` operations are supported:
+
+| Operation | Behavior |
+| --- | --- |
+| `set --global upgrade.mode <v>` | Accepts `auto`/`manual`/`off` (case-insensitive); anything else is a usage error. Written atomically. |
+| `get --global upgrade.mode` | Reads the stored mode; a missing file reads as `off`; a corrupt file is a hard error (`LBR-UPGRADE-001`). |
+| `unset --global upgrade.mode` | Resets `mode` to `off` and **keeps** the file. |
+| `list --global [--show-origin]` | Renders the file-backed entry with origin `file:{path}`. |
+
+Every other spelling that could reach the namespace fails closed as a usage
+error (`LBR-CLI-002`, exit 129): local/system scopes, `--add`, `--get-all`,
+`--unset-all`, `--type` conversion, `--encrypt`/`--plaintext`/`--stdin`,
+`--remove-section`/`--rename-section`, `--default`, combinations of multiple
+action spellings, padded key/value spellings (no whitespace normalization),
+and `--get-regexp` patterns that can match `upgrade.mode`. `config import`
+skips `upgrade.*` entries with a warning, and `list` plus non-matching
+`--get-regexp` patterns suppress any stale `upgrade.*` rows found in SQLite so
+the settings file stays the single source of truth. A damaged settings file is
+`LBR-UPGRADE-001`.
+
 Resolution order for runtime config-backed environment variables is:
 
 1. CLI arguments

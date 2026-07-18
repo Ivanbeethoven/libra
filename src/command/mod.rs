@@ -94,6 +94,7 @@ pub mod rebase;
 pub mod reflog;
 pub mod remote;
 pub mod remove;
+pub(crate) mod rename_detect;
 pub mod repack;
 pub mod replace;
 pub mod rerere;
@@ -138,6 +139,7 @@ pub mod status;
 pub(crate) mod status_untracked;
 pub(crate) mod status_untracked_paths;
 pub mod switch;
+pub mod upgrade;
 pub mod web_assets;
 pub mod write_tree;
 
@@ -168,10 +170,20 @@ use crate::{
 /// running one in a linked worktree could collide with the main worktree's
 /// operation. Allowed in the main worktree.
 pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
+    ensure_main_worktree_because(op, "in-progress operation state is shared across worktrees")
+}
+
+/// plan-20260714 Part C W0 transition guard: refuse `op` inside a LINKED
+/// worktree with a caller-supplied reason. Used for the states whose stores are
+/// still repository-global (stash stack, dirty cache, layer/sparse tables,
+/// composite fetch/pull) until the W1/W2 slices make them worktree-scoped — a
+/// linked invocation could read or clobber the wrong (or the main worktree's)
+/// state, so it fails closed. Always allowed in the main worktree.
+pub fn ensure_main_worktree_because(op: &str, reason: &str) -> crate::utils::error::CliResult<()> {
     if crate::utils::util::is_linked_worktree() {
         return Err(crate::utils::error::CliError::fatal(format!(
-            "'{op}' is not yet supported inside a linked worktree (lore.md 2.1: in-progress \
-             operation state is shared across worktrees) \u{2014} run it in the main worktree"
+            "'{op}' is not yet supported inside a linked worktree (lore.md 2.1: {reason}) \
+             \u{2014} run it in the main worktree"
         ))
         .with_stable_code(crate::utils::error::StableErrorCode::Unsupported));
     }

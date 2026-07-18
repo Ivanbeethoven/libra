@@ -2233,3 +2233,525 @@ async fn test_config_typed_set() {
         String::from_utf8_lossy(&unset.stderr)
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reserved `upgrade.*` namespace (plan-20260714 §A.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Settings path used by the spawned binary: `base_libra_command` pins HOME to
+/// `<cwd>/.libra-test-home`, so `resolve_libra_home()` lands on
+/// `<cwd>/.libra-test-home/.libra`.
+fn upgrade_settings_file(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.join(".libra-test-home")
+        .join(".libra")
+        .join("upgrade")
+        .join("settings.json")
+}
+
+#[test]
+fn test_config_upgrade_mode_set_get_roundtrip() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+
+    // Missing settings file reads as `off`.
+    let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
+    assert_cli_success(&get, "get before set");
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "off");
+
+    // Case-insensitive set (flag-style spelling).
+    let set = run_libra_command(&["config", "set", "--global", "upgrade.mode", "AUTO"], p);
+    assert_cli_success(&set, "set --global upgrade.mode AUTO");
+    assert!(
+        String::from_utf8_lossy(&set.stdout).contains("Set global: upgrade.mode"),
+        "ack: {}",
+        String::from_utf8_lossy(&set.stdout)
+    );
+
+    // The value lives in the settings file, canonicalized to lowercase.
+    let file = upgrade_settings_file(p);
+    let raw = std::fs::read_to_string(&file).expect("settings.json written");
+    let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(doc["schema_version"], 1);
+    assert_eq!(doc["mode"], "auto");
+
+    // Both get spellings read it back.
+    let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
+    assert_cli_success(&get, "get after set");
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "auto");
+    let get_flag = run_libra_command(&["config", "--global", "--get", "upgrade.mode"], p);
+    assert_cli_success(&get_flag, "--get after set");
+    assert_eq!(String::from_utf8_lossy(&get_flag.stdout).trim(), "auto");
+
+    // Legacy positional set form routes through the same file.
+    let set2 = run_libra_command(&["config", "--global", "upgrade.mode", "manual"], p);
+    assert_cli_success(&set2, "positional set form");
+    let raw = std::fs::read_to_string(&file).unwrap();
+    assert!(raw.contains("manual"), "positional set persisted: {raw}");
+
+    // A regexp spelling that can match the reserved key fails closed (§A.3).
+    let regexp = run_libra_command(&["config", "--global", "--get-regexp", "upgrade."], p);
+    assert_eq!(
+        regexp.status.code(),
+        Some(129),
+        "--get-regexp matching upgrade.mode must fail closed: {}",
+        String::from_utf8_lossy(&regexp.stderr)
+    );
+}
+
+#[test]
+fn test_config_upgrade_mode_rejects_invalid_value_and_scopes() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    let init = run_libra_command(&["init"], p);
+    assert_cli_success(&init, "init");
+
+    // Invalid enum value.
+    let bad = run_libra_command(
+        &["config", "set", "--global", "upgrade.mode", "sometimes"],
+        p,
+    );
+    assert_eq!(bad.status.code(), Some(129), "invalid value is usage error");
+
+    // Non-global scopes fail closed.
+    for args in [
+        vec!["config", "set", "upgrade.mode", "auto"],
+        vec!["config", "set", "--local", "upgrade.mode", "auto"],
+        vec!["config", "set", "--system", "upgrade.mode", "auto"],
+    ] {
+        let out = run_libra_command(&args, p);
+        assert_eq!(
+            out.status.code(),
+            Some(129),
+            "{args:?} must fail closed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("reserved"),
+            "{args:?} names the reserved namespace: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // Multivalue / typed / section / unset-all operations fail closed.
+    for args in [
+        vec!["config", "--global", "--add", "upgrade.mode", "auto"],
+        vec!["config", "--global", "--get-all", "upgrade.mode"],
+        vec!["config", "--global", "--bool", "--get", "upgrade.mode"],
+        vec!["config", "--global", "--remove-section", "upgrade"],
+        vec!["config", "--global", "--rename-section", "upgrade", "up2"],
+        vec!["config", "--global", "--unset-all", "upgrade.mode"],
+        vec!["config", "get", "--global", "-d", "auto", "upgrade.mode"],
+        vec!["config", "--global", "--unset", "upgrade.other"],
+        // Padded values/keys are invalid — no whitespace normalization.
+        vec!["config", "set", "--global", "upgrade.mode", " auto "],
+        vec!["config", "set", "--global", " upgrade.mode", "auto"],
+        // Conflicting action spellings fail closed instead of silently
+        // dropping one of them.
+        vec!["config", "--global", "--get", "--get-all", "upgrade.mode"],
+        vec!["config", "--global", "--get", "--unset", "upgrade.mode"],
+        vec!["config", "--global", "--add", "set", "upgrade.mode", "auto"],
+        vec!["config", "--global", "--unset-all", "unset", "upgrade.mode"],
+        // Raw-spelling preflight: resolution priority must not silently drop
+        // a reserved operand or rewrite the intent (round-2 findings).
+        vec!["config", "--global", "--list", "--get", "upgrade.mode"],
+        vec!["config", "--global", "--list", "--unset", "upgrade.mode"],
+        vec!["config", "--global", "--import", "--get", "upgrade.mode"],
+        vec!["config", "--global", "--list", "upgrade.mode"],
+        vec!["config", "--global", "--unset", "upgrade.mode", "nomatch"],
+        vec!["config", "--global", "--get", "upgrade.mode", "pattern"],
+        // Round-3: regexp patterns and rename destinations are raw operands
+        // that reach the reserved namespace too.
+        vec![
+            "config",
+            "--global",
+            "--list",
+            "--get-regexp",
+            "^upgrade[.]mode$",
+        ],
+        vec![
+            "config",
+            "--global",
+            "--import",
+            "--get-regexp",
+            "^upgrade[.]mode$",
+        ],
+        vec![
+            "config",
+            "--global",
+            "--list",
+            "--rename-section",
+            "ordinary",
+            "upgrade",
+        ],
+    ] {
+        let out = run_libra_command(&args, p);
+        assert_eq!(
+            out.status.code(),
+            Some(129),
+            "{args:?} must fail closed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // None of the rejections may create the settings file or the global store.
+    assert!(
+        !upgrade_settings_file(p).exists(),
+        "rejected operations must not write settings.json"
+    );
+    assert!(
+        !p.join(".libra-test-home")
+            .join(".libra")
+            .join("config.db")
+            .exists(),
+        "rejected operations must not create the global config store"
+    );
+}
+
+#[test]
+fn test_config_upgrade_mode_unset_resets_off_and_keeps_file() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+
+    let set = run_libra_command(&["config", "set", "--global", "upgrade.mode", "auto"], p);
+    assert_cli_success(&set, "set auto");
+
+    let unset = run_libra_command(&["config", "unset", "--global", "upgrade.mode"], p);
+    assert_cli_success(&unset, "unset");
+    assert!(
+        String::from_utf8_lossy(&unset.stdout).contains("upgrade.mode"),
+        "unset ack: {}",
+        String::from_utf8_lossy(&unset.stdout)
+    );
+
+    // §A.3: the file is kept, mode is reset to off.
+    let file = upgrade_settings_file(p);
+    assert!(file.exists(), "unset must keep the settings file");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(doc["mode"], "off");
+
+    let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
+    assert_cli_success(&get, "get after unset");
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "off");
+}
+
+#[test]
+fn test_config_upgrade_mode_corrupt_file_is_strict_error() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    let file = upgrade_settings_file(p);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"{ not json").unwrap();
+
+    let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
+    assert!(!get.status.success(), "corrupt settings must fail get");
+    let stderr = String::from_utf8_lossy(&get.stderr);
+    assert!(
+        stderr.contains("LBR-UPGRADE-001"),
+        "stable code surfaced: {stderr}"
+    );
+    assert!(
+        stderr.contains("upgrade.mode"),
+        "actionable rewrite hint present: {stderr}"
+    );
+
+    // list --global inherits the strict failure (same source of truth).
+    let list = run_libra_command(&["config", "--list", "--global"], p);
+    assert!(!list.status.success(), "corrupt settings must fail list");
+
+    // An invalid stored mode is also strict.
+    std::fs::write(&file, br#"{ "schema_version": 1, "mode": "yes" }"#).unwrap();
+    let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
+    assert!(!get.status.success(), "invalid mode enum must fail get");
+
+    // A file that exists without a valid mode (missing/null) is damaged
+    // state, not `off`.
+    for body in [
+        br#"{}"#.as_slice(),
+        br#"{ "schema_version": 1 }"#.as_slice(),
+        br#"{ "schema_version": 1, "mode": null }"#.as_slice(),
+    ] {
+        std::fs::write(&file, body).unwrap();
+        let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
+        assert!(
+            !get.status.success(),
+            "settings body {:?} must fail get",
+            String::from_utf8_lossy(body)
+        );
+        assert!(
+            String::from_utf8_lossy(&get.stderr).contains("LBR-UPGRADE-001"),
+            "damaged settings use the upgrade stable code"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_config_upgrade_mode_list_uses_file_and_suppresses_sqlite() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+
+    // Plant a stale legacy `upgrade.mode` row directly into the SQLite store
+    // the spawned binary reads (`<home>/.libra/config.db`).
+    let db = p.join(".libra-test-home").join(".libra").join("config.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let conn = libra::internal::db::create_database(db.to_str().unwrap())
+        .await
+        .unwrap();
+    libra::internal::config::ConfigKv::set_with_conn(&conn, "upgrade.mode", "manual", false)
+        .await
+        .unwrap();
+    libra::internal::config::ConfigKv::set_with_conn(&conn, "upgrade.legacy", "stale", false)
+        .await
+        .unwrap();
+    drop(conn);
+
+    // Without a settings file, list shows no upgrade.mode at all — the stale
+    // SQLite row must be suppressed, not rendered.
+    let list = run_libra_command(&["config", "--list", "--global"], p);
+    assert_cli_success(&list, "list with stale row only");
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("upgrade.mode"),
+        "stale SQLite row must be suppressed: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&list.stdout).contains("upgrade.legacy"),
+        "every stale upgrade.* row must be suppressed: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+
+    // With a settings file, exactly one file-backed entry appears.
+    let set = run_libra_command(&["config", "set", "--global", "upgrade.mode", "auto"], p);
+    assert_cli_success(&set, "set auto");
+    let list = run_libra_command(&["config", "--list", "--global"], p);
+    assert_cli_success(&list, "list with settings file");
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert_eq!(
+        stdout.matches("upgrade.mode").count(),
+        1,
+        "exactly one upgrade.mode entry: {stdout}"
+    );
+    assert!(
+        stdout.contains("upgrade.mode=auto"),
+        "value shown: {stdout}"
+    );
+
+    // --show-origin renders the `file:{path}` origin (§A.3 table).
+    let origin = run_libra_command(&["config", "--list", "--show-origin", "--global"], p);
+    assert_cli_success(&origin, "list --show-origin");
+    let stdout = String::from_utf8_lossy(&origin.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("upgrade.mode"))
+        .unwrap_or_else(|| panic!("upgrade.mode line present: {stdout}"));
+    assert!(
+        line.contains("file:") && line.contains("settings.json"),
+        "origin is file:{{path}}: {line}"
+    );
+
+    // A regexp pattern that can match the reserved key fails closed …
+    let regexp = run_libra_command(&["config", "--global", "--get-regexp", "upgrade."], p);
+    assert_eq!(
+        regexp.status.code(),
+        Some(129),
+        "matching --get-regexp must fail closed: {}",
+        String::from_utf8_lossy(&regexp.stderr)
+    );
+    // … while a non-matching pattern proceeds and still suppresses stale
+    // SQLite `upgrade.*` rows (defense in depth).
+    let regexp = run_libra_command(
+        &["config", "--global", "--get-regexp", r"upgrade\.legacy"],
+        p,
+    );
+    assert_cli_success(&regexp, "non-matching --get-regexp");
+    assert_eq!(
+        String::from_utf8_lossy(&regexp.stdout).trim(),
+        "",
+        "stale upgrade.legacy row must be suppressed"
+    );
+}
+
+#[test]
+fn test_config_upgrade_mode_import_skips_reserved() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipped (git binary not available)");
+        return;
+    }
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    let home = p.join(".libra-test-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Write a Git global config containing a reserved key, using the same
+    // isolated HOME the spawned libra binary sees.
+    for kv in [
+        ["user.name", "Import Reserved User"],
+        ["upgrade.mode", "auto"],
+    ] {
+        let out = Command::new("git")
+            .args(["config", "--global", kv[0], kv[1]])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git config {kv:?}");
+    }
+
+    let import = run_libra_command(&["config", "--global", "import"], p);
+    assert_cli_success(&import, "import");
+    let stderr = String::from_utf8_lossy(&import.stderr);
+    assert!(
+        stderr.contains("reserved upgrade.*"),
+        "import warns about skipped reserved keys: {stderr}"
+    );
+
+    // The normal key imported; the reserved key did not touch file or SQLite.
+    let get = run_libra_command(&["config", "get", "--global", "user.name"], p);
+    assert_cli_success(&get, "imported user.name");
+    assert_eq!(
+        String::from_utf8_lossy(&get.stdout).trim(),
+        "Import Reserved User"
+    );
+    assert!(
+        !upgrade_settings_file(p).exists(),
+        "import must not create settings.json"
+    );
+    let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
+    assert_cli_success(&get, "upgrade.mode after import");
+    assert_eq!(String::from_utf8_lossy(&get.stdout).trim(), "off");
+}
+
+#[test]
+fn test_config_upgrade_mode_json_spellings() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+
+    // JSON set ack.
+    let set = run_libra_command(
+        &[
+            "config",
+            "--json",
+            "set",
+            "--global",
+            "upgrade.mode",
+            "auto",
+        ],
+        p,
+    );
+    assert_cli_success(&set, "json set");
+    let ack: serde_json::Value =
+        serde_json::from_slice(&set.stdout).expect("json set emits a JSON ack");
+    assert_eq!(ack["ok"], true, "{ack}");
+    assert_eq!(ack["data"]["key"], "upgrade.mode", "{ack}");
+
+    // JSON get reads the file, with a file origin.
+    let get = run_libra_command(&["config", "--json", "get", "--global", "upgrade.mode"], p);
+    assert_cli_success(&get, "json get");
+    let doc: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(doc["data"]["value"], "auto", "{doc}");
+    let origin = doc["data"]["origin"].as_str().unwrap_or_default();
+    assert!(
+        origin.starts_with("file:") && origin.ends_with("settings.json"),
+        "json get origin is file:{{path}}: {doc}"
+    );
+
+    // JSON unset resets to off, keeping the file.
+    let unset = run_libra_command(
+        &["config", "--json", "unset", "--global", "upgrade.mode"],
+        p,
+    );
+    assert_cli_success(&unset, "json unset");
+    let doc: serde_json::Value = serde_json::from_slice(&unset.stdout).unwrap();
+    assert_eq!(doc["data"]["reset_to"], "off", "{doc}");
+    assert!(upgrade_settings_file(p).exists());
+
+    // The JSON spelling still cannot write into SQLite: the store has no
+    // upgrade.* rows afterwards (a matching regexp is fail-closed, a
+    // non-matching one returns nothing).
+    let regexp = run_libra_command(
+        &[
+            "config",
+            "--json",
+            "--global",
+            "--get-regexp",
+            r"upgrade\.legacy",
+        ],
+        p,
+    );
+    assert_cli_success(&regexp, "json get-regexp non-matching");
+    let doc: serde_json::Value = serde_json::from_slice(&regexp.stdout).unwrap();
+    assert_eq!(
+        doc["data"]["entries"].as_array().map(Vec::len),
+        Some(0),
+        "{doc}"
+    );
+
+    // JSON rejection envelope carries the usage stable code.
+    let add = run_libra_command(
+        &["config", "--json", "--global", "--add", "upgrade.mode", "x"],
+        p,
+    );
+    assert_eq!(add.status.code(), Some(129));
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&add.stderr).expect("usage rejection emits a JSON envelope");
+    assert_eq!(envelope["error_code"], "LBR-CLI-002", "{envelope}");
+    assert_eq!(envelope["ok"], false, "{envelope}");
+
+    // JSON corrupt-file envelope carries LBR-UPGRADE-001.
+    std::fs::write(upgrade_settings_file(p), b"{ corrupt").unwrap();
+    let get = run_libra_command(&["config", "--json", "get", "--global", "upgrade.mode"], p);
+    assert!(!get.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&get.stderr).expect("corrupt settings emits a JSON envelope");
+    assert_eq!(envelope["error_code"], "LBR-UPGRADE-001", "{envelope}");
+    assert_eq!(envelope["category"], "config", "{envelope}");
+}
+
+#[test]
+#[cfg(unix)]
+fn test_config_upgrade_mode_unreadable_file_uses_upgrade_code() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    let file = upgrade_settings_file(p);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, br#"{ "schema_version": 1, "mode": "auto" }"#).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let get = run_libra_command(&["config", "get", "--global", "upgrade.mode"], p);
+    // Restore permissions before asserting so the tempdir can be cleaned up.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!get.status.success(), "unreadable settings must fail get");
+    let stderr = String::from_utf8_lossy(&get.stderr);
+    assert!(
+        stderr.contains("LBR-UPGRADE-001"),
+        "unreadable settings use the upgrade stable code: {stderr}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_config_upgrade_mode_isolated_by_global_db_override() {
+    // A test environment that isolates the global config DB via
+    // LIBRA_CONFIG_GLOBAL_DB (without setting LIBRA_HOME) must also isolate
+    // the upgrade settings instead of touching the real user's home.
+    let temp_dir = tempdir().unwrap();
+    let _guard = test::ChangeDirGuard::new(temp_dir.path());
+    let store = tempdir().unwrap();
+    let _libra_home = EnvVarGuard::unset("LIBRA_HOME");
+    let _scoped = ScopedConfigPathGuard::new(&store.path().join("config.db"));
+
+    let result = exec_config(vec!["config", "set", "--global", "upgrade.mode", "manual"]).await;
+    assert!(result.is_ok(), "{result:?}");
+
+    let isolated = store.path().join("upgrade").join("settings.json");
+    assert!(
+        isolated.exists(),
+        "settings must be written next to the isolated global DB: {}",
+        isolated.display()
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&isolated).unwrap()).unwrap();
+    assert_eq!(doc["mode"], "manual");
+}

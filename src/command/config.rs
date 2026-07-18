@@ -15,6 +15,10 @@ use crate::{
     internal::{
         config::{ConfigKv, ConfigKvEntry, is_sensitive_key, is_vault_internal_key},
         db::{create_database, establish_connection, get_db_conn_instance},
+        upgrade::settings::{
+            UPGRADE_MODE_KEY, UpgradeMode, UpgradeSettingsError, read_mode as read_upgrade_mode,
+            settings_path as upgrade_settings_path, write_mode as write_upgrade_mode,
+        },
         vault::{
             decrypt_token, encrypt_token, generate_pgp_key, generate_ssh_key_pair,
             lazy_init_vault_for_scope, load_unseal_key_for_scope,
@@ -44,6 +48,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     libra config list                                  List all local entries
     libra config list --show-origin                    List with scope labels
     libra config set --global user.email "j@x.com"     Set global config
+    libra config set --global upgrade.mode auto        Enable auto-upgrade (reserved namespace)
     libra config set --system core.editor vim           Set system-wide config (needs privileges)
     libra config unset user.signingkey                 Remove a key
     libra config import --global                       Import from Git global config
@@ -476,6 +481,8 @@ struct ConfigImportSummary {
     imported: usize,
     skipped_duplicates: usize,
     ignored_invalid: usize,
+    /// Reserved `upgrade.*` entries skipped by the namespace router (§A.3).
+    ignored_reserved: usize,
     auto_encrypted: usize,
     collapsed_multivalue_warnings: usize,
 }
@@ -523,8 +530,22 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
     let scope = get_scope(&args);
     let use_cascade = !has_explicit_scope(&args);
 
+    // Reserved `upgrade.*` namespace (plan-20260714 §A.3), step 1: preflight
+    // the RAW spelling before `resolve_command` — legacy-flag resolution is
+    // lossy (it picks one action by priority and silently drops the rest), so
+    // a reserved operand combined with conflicting/unsupported spellings must
+    // fail closed here, not after the intent has been rewritten.
+    upgrade_namespace_raw_preflight(&args)?;
+
     // Resolve subcommand: either explicit or translated from Git-compat flags
     let cmd = resolve_command(&args)?;
+
+    // Reserved `upgrade.*` namespace, step 2: route every resolved command
+    // that targets it to `{LIBRA_HOME}/upgrade/settings.json`, never to the
+    // SQLite store.
+    if let Some(routed) = route_upgrade_namespace(&args, &cmd, output).await {
+        return routed;
+    }
 
     match cmd {
         ResolvedCommand::Set {
@@ -619,6 +640,412 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             .await
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reserved `upgrade.*` namespace router (plan-20260714 §A.3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether `key` (a config key or a `--remove-section`/`--rename-section`
+/// section name) falls inside the reserved `upgrade.*` namespace.
+fn is_upgrade_namespace_key(key: &str) -> bool {
+    let key = key.trim();
+    key.eq_ignore_ascii_case("upgrade")
+        || key
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("upgrade."))
+}
+
+/// Usage error for config spellings outside the supported single-value
+/// `--global` contract of the reserved namespace (exit 129, `LBR-CLI-002`;
+/// `LBR-UPGRADE-001` is reserved for a damaged settings file).
+fn upgrade_namespace_usage_error(operation: &str) -> CliError {
+    CliError::command_usage(format!(
+        "{operation} is not supported for the reserved upgrade.* namespace"
+    ))
+    .with_stable_code(StableErrorCode::CliInvalidArguments)
+    .with_hint(
+        "supported operations: libra config set/get/unset --global upgrade.mode <auto|manual|off>",
+    )
+}
+
+/// Map a settings-store failure onto the CLI error surface. Every read-side
+/// failure (unreadable, corrupt, unresolvable home) is `LBR-UPGRADE-001` per
+/// docs/error-codes.md; only write failures use the generic IO write code.
+fn upgrade_settings_cli_error(err: UpgradeSettingsError) -> CliError {
+    let code = match &err {
+        UpgradeSettingsError::WriteFailed { .. } => StableErrorCode::IoWriteFailed,
+        UpgradeSettingsError::Home(_)
+        | UpgradeSettingsError::Unreadable { .. }
+        | UpgradeSettingsError::Invalid { .. } => StableErrorCode::UpgradeSettingsInvalid,
+    };
+    CliError::fatal(err.to_string()).with_stable_code(code)
+}
+
+/// Whether a `--get-regexp` pattern can reach the reserved key: the same
+/// `regex::Regex::is_match` semantics as [`ConfigKv::get_regexp_with_conn`].
+/// Such patterns fail closed (§A.3); non-matching patterns proceed, with any
+/// stale SQLite `upgrade.*` rows suppressed from the result as defense in
+/// depth. Invalid patterns fall through to the normal invalid-regex error.
+fn regexp_reaches_upgrade_mode(pattern: &str) -> bool {
+    regex::Regex::new(pattern).is_ok_and(|re| re.is_match(UPGRADE_MODE_KEY))
+}
+
+/// Raw-spelling preflight, run BEFORE `resolve_command` (which is lossy: it
+/// picks one action by priority and silently drops the rest). When any raw
+/// operand names the reserved namespace, fail closed on:
+/// - conflicting action spellings (`--list --get upgrade.mode`,
+///   `--import --get upgrade.mode`, legacy flag + explicit subcommand, …);
+/// - actions that take no key operand (`--list`/`--import` with a reserved
+///   positional key would silently drop it);
+/// - value-pattern forms of key-only legacy actions
+///   (`--unset upgrade.mode <pattern>` must not become an unconditional
+///   reset, `--get upgrade.mode <pattern>` must not ignore the pattern).
+fn upgrade_namespace_raw_preflight(args: &ConfigArgs) -> CliResult<()> {
+    let positional_reserved = args.key.as_deref().is_some_and(is_upgrade_namespace_key);
+    let subcommand_reserved = matches!(
+        &args.command,
+        Some(
+            ConfigCommand::Set { key, .. }
+                | ConfigCommand::Get { key, .. }
+                | ConfigCommand::Unset { key, .. }
+        ) if is_upgrade_namespace_key(key)
+    );
+    // With `--get-regexp`, the positional operand is a PATTERN: it reaches the
+    // reserved key when it can match it, not when it spells it literally.
+    let regexp_reserved =
+        args.get_regexp && args.key.as_deref().is_some_and(regexp_reaches_upgrade_mode);
+    // `--rename-section <old> <new>` carries its operands in the two
+    // positionals; the DESTINATION (valuepattern) must be checked too, or a
+    // rename INTO the reserved namespace escapes the router when combined
+    // with another action flag.
+    let rename_reserved = args.rename_section
+        && (args.key.as_deref().is_some_and(is_upgrade_namespace_key)
+            || args
+                .valuepattern
+                .as_deref()
+                .is_some_and(is_upgrade_namespace_key));
+    if !positional_reserved && !subcommand_reserved && !regexp_reserved && !rename_reserved {
+        return Ok(());
+    }
+    if upgrade_conflicting_action_spelling(args) {
+        return Err(upgrade_namespace_usage_error(
+            "combining multiple action spellings",
+        ));
+    }
+    if positional_reserved && (args.list || args.import) {
+        return Err(upgrade_namespace_usage_error(
+            "--list/--import with a reserved key operand",
+        ));
+    }
+    if positional_reserved
+        && args.valuepattern.is_some()
+        && (args.get || args.get_all || args.unset || args.unset_all)
+    {
+        return Err(upgrade_namespace_usage_error(
+            "a value-pattern operand on get/unset",
+        ));
+    }
+    Ok(())
+}
+
+/// A reserved-key operation must be a single, unambiguous spelling. Git-compat
+/// legacy flags are resolved by priority order, silently ignoring the rest —
+/// acceptable for ordinary keys, but a dropped `--add`/`--unset-all` on the
+/// reserved namespace would hide a multivalue/mutation intent, so any
+/// combination of action spellings fails closed here.
+fn upgrade_conflicting_action_spelling(args: &ConfigArgs) -> bool {
+    let mut actions = usize::from(args.command.is_some());
+    for flag in [
+        args.get,
+        args.get_all,
+        args.unset,
+        args.unset_all,
+        args.add,
+        args.list,
+        args.get_regexp,
+        args.import,
+        args.remove_section,
+        args.rename_section,
+    ] {
+        if flag {
+            actions += 1;
+        }
+    }
+    actions > 1
+}
+
+/// Intercept every resolved config command that targets the reserved
+/// `upgrade.*` namespace. Returns `None` when the command does not touch the
+/// namespace; `Some(result)` when it was fully handled (or rejected).
+///
+/// Contract (§A.3): only single-value `set`/`get`/`unset` with an explicit
+/// `--global` scope are supported; `unset` resets `mode` to `off` and keeps
+/// the file; every other spelling (local/system scope, `--add`, `--get-all`,
+/// type conversion, encryption, sections, conflicting action-flag combos,
+/// `--get-regexp` patterns matching the reserved key) fails closed. `list`
+/// and non-matching `--get-regexp` patterns are not intercepted here — they
+/// suppress reserved keys read from SQLite and (for `list`) render the
+/// file-backed entry instead.
+async fn route_upgrade_namespace(
+    args: &ConfigArgs,
+    cmd: &ResolvedCommand,
+    output: &OutputConfig,
+) -> Option<CliResult<()>> {
+    // Reject ambiguous action spellings before dispatching any reserved-key
+    // operation (a silently-dropped legacy flag must not slip through).
+    let guard_conflicts = || -> CliResult<()> {
+        if upgrade_conflicting_action_spelling(args) {
+            return Err(upgrade_namespace_usage_error(
+                "combining multiple action spellings",
+            ));
+        }
+        Ok(())
+    };
+    match cmd {
+        ResolvedCommand::Set {
+            key,
+            value,
+            add,
+            encrypt,
+            plaintext,
+            stdin,
+            value_type,
+        } if is_upgrade_namespace_key(key) => Some(match guard_conflicts() {
+            Err(err) => Err(err),
+            Ok(()) => {
+                handle_upgrade_set(
+                    args,
+                    key,
+                    value.as_deref(),
+                    *add,
+                    *encrypt || *plaintext || *stdin,
+                    value_type.is_some(),
+                    output,
+                )
+                .await
+            }
+        }),
+        ResolvedCommand::Get {
+            key,
+            all,
+            regexp,
+            default,
+            null,
+            value_type,
+            ..
+        } if !*regexp && is_upgrade_namespace_key(key) => Some(match guard_conflicts() {
+            Err(err) => Err(err),
+            Ok(()) => {
+                handle_upgrade_get(
+                    args,
+                    key,
+                    *all,
+                    default.is_some(),
+                    *null,
+                    value_type.is_some(),
+                    output,
+                )
+                .await
+            }
+        }),
+        // A regexp that can match the reserved key is a spelling that reaches
+        // it — fail closed instead of pretending an empty result (§A.3).
+        ResolvedCommand::Get { key, regexp, .. } if *regexp && regexp_reaches_upgrade_mode(key) => {
+            Some(Err(upgrade_namespace_usage_error(
+                "--get-regexp with a pattern matching the reserved upgrade.mode",
+            )))
+        }
+        ResolvedCommand::Unset { key, all } if is_upgrade_namespace_key(key) => {
+            Some(match guard_conflicts() {
+                Err(err) => Err(err),
+                Ok(()) => handle_upgrade_unset(args, key, *all, output).await,
+            })
+        }
+        ResolvedCommand::RemoveSection { name } if is_upgrade_namespace_key(name) => {
+            Some(Err(upgrade_namespace_usage_error("--remove-section")))
+        }
+        ResolvedCommand::RenameSection { old, new }
+            if is_upgrade_namespace_key(old) || is_upgrade_namespace_key(new) =>
+        {
+            Some(Err(upgrade_namespace_usage_error("--rename-section")))
+        }
+        _ => None,
+    }
+}
+
+/// Reject any scope other than an explicit `--global` for reserved keys.
+fn require_upgrade_global_scope(args: &ConfigArgs, operation: &str) -> CliResult<()> {
+    if args.global {
+        return Ok(());
+    }
+    Err(CliError::command_usage(format!(
+        "the reserved upgrade.* namespace is per-user only; use: libra config {operation} --global upgrade.mode"
+    ))
+    .with_stable_code(StableErrorCode::CliInvalidArguments)
+    .with_hint("upgrade settings live in {LIBRA_HOME}/upgrade/settings.json, not in a repository or system config database"))
+}
+
+/// Reject reserved keys other than `upgrade.mode`. Case-insensitive but with
+/// no whitespace normalization — a padded spelling like `" upgrade.mode"` is
+/// still ROUTED here (detection trims, fail-closed) but rejected as unknown.
+fn require_upgrade_mode_key(key: &str) -> CliResult<()> {
+    if key.eq_ignore_ascii_case(UPGRADE_MODE_KEY) {
+        return Ok(());
+    }
+    Err(CliError::command_usage(format!(
+        "unsupported reserved key '{key}': only {UPGRADE_MODE_KEY} is available"
+    ))
+    .with_stable_code(StableErrorCode::CliInvalidArguments))
+}
+
+async fn handle_upgrade_set(
+    args: &ConfigArgs,
+    key: &str,
+    value: Option<&str>,
+    add: bool,
+    encrypt_or_stdin: bool,
+    typed: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if add {
+        return Err(upgrade_namespace_usage_error(
+            "--add (multi-value operations)",
+        ));
+    }
+    if encrypt_or_stdin {
+        return Err(upgrade_namespace_usage_error(
+            "--encrypt/--plaintext/--stdin",
+        ));
+    }
+    if typed {
+        return Err(upgrade_namespace_usage_error("--type conversion"));
+    }
+    require_upgrade_global_scope(args, "set")?;
+    require_upgrade_mode_key(key)?;
+    let Some(raw) = value else {
+        return Err(CliError::command_usage(
+            "a value is required: libra config set --global upgrade.mode <auto|manual|off>",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint("to read the current mode, use: libra config get --global upgrade.mode"));
+    };
+    let Some(mode) = UpgradeMode::parse(raw) else {
+        return Err(CliError::command_usage(format!(
+            "invalid value '{raw}' for upgrade.mode (allowed: auto, manual, off)"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    };
+    write_upgrade_mode(mode).map_err(upgrade_settings_cli_error)?;
+    emit_set_ack("set", ConfigScope::Global, UPGRADE_MODE_KEY, false, output)
+}
+
+async fn handle_upgrade_get(
+    args: &ConfigArgs,
+    key: &str,
+    all: bool,
+    has_default: bool,
+    null: bool,
+    typed: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if all {
+        return Err(upgrade_namespace_usage_error("--get-all"));
+    }
+    if typed {
+        return Err(upgrade_namespace_usage_error("--type conversion"));
+    }
+    if has_default {
+        return Err(upgrade_namespace_usage_error(
+            "--default (a missing upgrade.mode always reads as 'off')",
+        ));
+    }
+    require_upgrade_global_scope(args, "get")?;
+    require_upgrade_mode_key(key)?;
+    let mode = read_upgrade_mode()
+        .map_err(upgrade_settings_cli_error)?
+        .unwrap_or(UpgradeMode::Off);
+    if output.is_json() {
+        let origin = upgrade_settings_path()
+            .map(|p| format!("file:{}", p.display()))
+            .ok();
+        emit_json_data(
+            "config",
+            &serde_json::json!({
+                "action": "get",
+                "key": UPGRADE_MODE_KEY,
+                "value": mode.as_str(),
+                "origin": origin,
+                "default_applied": false,
+            }),
+            output,
+        )?;
+    } else if !output.quiet {
+        if null {
+            print!("{mode}\0");
+        } else {
+            println!("{mode}");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_upgrade_unset(
+    args: &ConfigArgs,
+    key: &str,
+    all: bool,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if all {
+        return Err(upgrade_namespace_usage_error("--unset-all"));
+    }
+    require_upgrade_global_scope(args, "unset")?;
+    require_upgrade_mode_key(key)?;
+    // §A.3: unset writes `mode=off` and keeps the file.
+    write_upgrade_mode(UpgradeMode::Off).map_err(upgrade_settings_cli_error)?;
+    if output.is_json() {
+        emit_json_data(
+            "config",
+            &serde_json::json!({
+                "action": "unset",
+                "scope": "global",
+                "key": UPGRADE_MODE_KEY,
+                "reset_to": UpgradeMode::Off.as_str(),
+            }),
+            output,
+        )?;
+    } else if !output.quiet {
+        println!("Unset global: {UPGRADE_MODE_KEY} (mode reset to off)");
+    }
+    Ok(())
+}
+
+/// File-backed `upgrade.mode` entry for `list` output, or `None` when the
+/// settings file does not exist. Corrupt files are a hard error, matching
+/// `get` (§A.3).
+fn upgrade_list_entry(name_only: bool, with_origin: bool) -> CliResult<Option<ConfigListEntry>> {
+    let Some(mode) = read_upgrade_mode().map_err(upgrade_settings_cli_error)? else {
+        return Ok(None);
+    };
+    let origin = if with_origin {
+        Some(
+            upgrade_settings_path()
+                .map(|p| format!("file:{}", p.display()))
+                .map_err(upgrade_settings_cli_error)?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(ConfigListEntry {
+        key: UPGRADE_MODE_KEY.to_string(),
+        value: if name_only {
+            None
+        } else {
+            Some(mode.as_str().to_string())
+        },
+        origin,
+        encrypted: Some(false),
+    }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1342,7 +1769,7 @@ async fn handle_get(
 
     if regexp {
         // Regex search across all keys
-        let entries: Vec<(ConfigKvEntry, ConfigScope)> = if use_cascade {
+        let mut entries: Vec<(ConfigKvEntry, ConfigScope)> = if use_cascade {
             let mut all_entries = Vec::new();
             for s in ConfigScope::CASCADE_ORDER {
                 if s != ConfigScope::Local {
@@ -1376,6 +1803,10 @@ async fn handle_get(
                 .map(|e| (e, scope))
                 .collect()
         };
+        // Reserved namespace: `upgrade.*` never legitimately lives in SQLite,
+        // so a pattern match can only hit stale legacy rows — suppress them
+        // (§A.3; exact-key reads are routed to the settings file instead).
+        entries.retain(|(e, _)| !is_upgrade_namespace_key(&e.key));
 
         // Build display values with decryption support
         let mut display_entries = Vec::new();
@@ -1749,6 +2180,12 @@ async fn handle_list(
             }
             if let Ok(scope_entries) = ScopedConfig::list_all(s).await {
                 for e in scope_entries {
+                    // Reserved namespace: never render `upgrade.*` rows from
+                    // SQLite — the file-backed entry below is the only source
+                    // of truth (§A.3 "不得再从 SQLite 输出第二份").
+                    if is_upgrade_namespace_key(&e.key) {
+                        continue;
+                    }
                     let plaintext_warning = if !e.encrypted && is_sensitive_key(&e.key) {
                         " [PLAINTEXT]"
                     } else {
@@ -1772,6 +2209,15 @@ async fn handle_list(
                     });
                 }
             }
+        }
+
+        // File-backed reserved entry (origin `file:{path}`, §A.3). It belongs
+        // to the global (per-user) scope, so an explicit `--local`/`--system`
+        // list must not render it.
+        if (use_cascade || scope == ConfigScope::Global)
+            && let Some(entry) = upgrade_list_entry(name_only, show_origin)?
+        {
+            entries.push(entry);
         }
 
         if output.is_json() {
@@ -1808,8 +2254,10 @@ async fn handle_list(
             .await
             .map_err(CliError::from_legacy_string)?;
 
-        let entries: Vec<ConfigListEntry> = scope_entries
+        let mut entries: Vec<ConfigListEntry> = scope_entries
             .into_iter()
+            // Reserved namespace: suppress any legacy SQLite `upgrade.*` rows.
+            .filter(|e| !is_upgrade_namespace_key(&e.key))
             .map(|e| {
                 let plaintext_warning = if !e.encrypted && is_sensitive_key(&e.key) {
                     " [PLAINTEXT]"
@@ -1830,6 +2278,13 @@ async fn handle_list(
                 }
             })
             .collect();
+
+        // The reserved `upgrade.mode` belongs to the global (per-user) scope.
+        if scope == ConfigScope::Global
+            && let Some(entry) = upgrade_list_entry(name_only, false)?
+        {
+            entries.push(entry);
+        }
 
         if output.is_json() {
             emit_json_data(
@@ -2218,6 +2673,7 @@ async fn handle_import(scope: ConfigScope, output: &OutputConfig) -> CliResult<(
                 "auto_encrypted": summary.auto_encrypted,
                 "collapsed_multivalue_warnings": summary.collapsed_multivalue_warnings,
                 "ignored_invalid": summary.ignored_invalid,
+                "ignored_reserved": summary.ignored_reserved,
             }),
             output,
         )?;
@@ -2561,6 +3017,7 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
     let mut imported = 0usize;
     let mut skipped = 0usize;
     let mut ignored_invalid = 0usize;
+    let mut ignored_reserved = 0usize;
     let mut auto_encrypted = 0usize;
     let mut collapsed_warnings = 0usize;
 
@@ -2593,6 +3050,12 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
         // Validate key format
         if !key_raw.contains('.') {
             ignored_invalid += 1;
+            continue;
+        }
+        // Reserved namespace (§A.3): never import `upgrade.*` into SQLite —
+        // upgrade settings are managed only via `{LIBRA_HOME}/upgrade/settings.json`.
+        if is_upgrade_namespace_key(&key_raw) {
+            ignored_reserved += 1;
             continue;
         }
         all_entries.push((key_raw, value));
@@ -2676,12 +3139,18 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
             "ignored {ignored_invalid} unsupported Git config entries"
         ));
     }
+    if ignored_reserved > 0 {
+        emit_warning(format!(
+            "ignored {ignored_reserved} reserved upgrade.* entries (manage the upgrade mode with: libra config set --global upgrade.mode <auto|manual|off>)"
+        ));
+    }
 
     Ok(ConfigImportSummary {
         scope: scope_name(scope),
         imported,
         skipped_duplicates: skipped,
         ignored_invalid,
+        ignored_reserved,
         auto_encrypted,
         collapsed_multivalue_warnings: collapsed_warnings,
     })

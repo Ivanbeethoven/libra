@@ -2,7 +2,294 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`status --scan`/`--cached`/`--check-dirty` fail closed in a linked worktree
+  (v0.19.15, plan-20260714 Part C W0)**: these dirty-cache modes read/prune the
+  repository-global `working_dirty`/`working_dirty_meta`, so they now refuse to
+  run in a linked worktree until W1 scopes the cache. Plain `status` (and
+  `status --porcelain`/`--short`) is unaffected — it never consults the dirty
+  cache, so it already computes a fresh, correct result in any worktree.
+
+- **Repository-global-state commands fail closed in a linked worktree
+  (v0.19.14, plan-20260714 Part C W0 transition guards)**: `stash` (all
+  subcommands, incl. `stash branch`), `layer`, `sparse-view`, `dirty`, and the
+  composite `fetch`/`pull` now refuse to run inside a linked worktree with an
+  actionable "run it in the main worktree" error, joining the existing
+  merge/rebase/cherry-pick/revert/bisect/am refusal. Their stores (the stash
+  stack, dirty cache, layer/sparse tables, shared `FETCH_HEAD`) are still
+  repository-global, so a linked invocation could read or clobber the wrong
+  worktree's state; the guard fires before any side effect. The main worktree
+  is unaffected. Each guard is lifted per-command as W1/W2 make that store
+  worktree-scoped.
+
+- **`rev-parse --git-dir`/`--absolute-git-dir`/`--is-inside-git-dir` return the
+  current worktree's local gitdir (v0.19.13, plan-20260714 Part C W0 §C.5)**:
+  these queries now resolve (and test) THIS worktree's own `.libra` rather than
+  the shared common storage. For the main worktree the result is unchanged
+  (local == common); for a linked worktree `--git-dir` now points at its
+  private `.libra` (holding its own HEAD/index), so scripts that locate the
+  index/EDITMSG via `--git-dir` hit the correct per-worktree gitdir and
+  `--is-inside-git-dir` no longer misreports a cwd inside the linked `.libra`.
+
+- **`for-each-ref %(worktreepath)` resolves across worktrees (v0.19.10,
+  plan-20260714 Part C W0 §C.3.3)**: the atom now reports the path of the
+  worktree that actually has each branch checked out — resolved across ALL
+  registered worktrees from each worktree's own scoped HEAD row — instead of
+  assuming a single shared HEAD and always returning the current worktree. A
+  branch checked out in a linked worktree reports that worktree's path even
+  when `for-each-ref` runs elsewhere; a branch checked out nowhere (or a
+  detached worktree) is empty. Single-worktree output is unchanged.
+
+- **`worktree list --porcelain` reports each worktree's own HEAD (v0.19.9,
+  plan-20260714 Part C W0 §C.3.3)**: in the isolated worktree layout each
+  entry now emits its OWN `HEAD <sha>` plus a `branch <ref>` or `detached`
+  line (resolved from that worktree's scoped HEAD row via
+  `Head::head_for_worktree_scope`), instead of stamping the running command's
+  HEAD onto every entry. An entry whose HEAD cannot be resolved (a legacy
+  shared-`.libra` symlink layout, or a missing/corrupt scope) omits the HEAD
+  lines rather than being mislabeled with another worktree's commit. The
+  `worktree list` JSON/entry now carries a stable `worktree_id`. Corrects the
+  worktree/architecture docs and `COMPATIBILITY.md` (which had described a
+  shared HEAD and `--delete-dir`-gated scoped-row GC) to the isolated reality.
+
+### Fixed
+
+- **AI session/MCP storage roots no longer silently mint a phantom `.libra`
+  (v0.19.12, plan-20260714 Part C W0 §C.4.1)**: the AI session-transcript store
+  now fails closed (returns "no store", with a warning) when storage-root
+  resolution fails, instead of rooting itself at a library-less
+  `<working_dir>/.libra`. The `code` runtime's `resolve_storage_root` and the
+  MCP server's `init_mcp_server` still degrade (they are designed to keep a
+  read-only session alive) but now log a loud, diagnosable warning naming the
+  fallback and pointing linked-worktree corruption at `libra worktree repair`,
+  rather than falling back silently.
+
+- **Linked worktree with a corrupt `commondir` fails closed instead of routing
+  a phantom repository (v0.19.11, plan-20260714 Part C W0 §C.4.1)**:
+  `worktree_common_storage` previously fell through to treating a linked
+  worktree's library-less local `.libra` as the shared storage whenever its
+  `commondir` pointer was unreadable or had an empty first line, so every
+  db/objects lookup silently targeted a non-existent database inside the
+  worktree (a "phantom repo", surfacing as a confusing `LBR-REPO-002` at
+  `<wt>/.libra/libra.db`). It now fails closed at path resolution: a missing
+  `commondir` still resolves to the gitdir (the main worktree), but a present
+  yet corrupt pointer is an error pointing at `libra worktree repair`.
+
+- **`status` no longer reports an unreadable tracked file as deleted (v0.19.7,
+  plan-20260714 Part B §B.6.0.1)**: `collect_tracked_worktree_changes`
+  previously treated ANY `symlink_metadata` error on a tracked path as a
+  deletion, so a permission-denied or I/O error would surface as `deleted:`
+  and could make `commit -a` record a spurious removal. Now only a genuine
+  `NotFound` counts as a deletion; a real I/O error fails closed with
+  `LBR-IO-001` and a hint, rather than inventing a deletion.
+
+### Changed
+
+- **`status --porcelain` (v1) renders renames with Git's arrow form (v0.19.8,
+  plan-20260714 Part B R0-6 v1 slice)**: a detected rename in porcelain v1 now
+  renders as a single `R  <old> -> <new>` record (`XY SP <new> NUL <old> NUL`
+  under `-z`) rather than two `R` endpoint rows, matching Git. This completes
+  Git-compatible rename rendering across every `status` output format (human,
+  short, porcelain v1/v2, JSON).
+
+- **`status` porcelain v2 and JSON emit proper rename records (v0.19.6,
+  plan-20260714 Part B R0-5 + R0-7 JSON)**: `--porcelain=v2` now renders a
+  detected rename as Git's single `2 R<score> N... <mH> <mI> <mW> <hH> <hI>
+  R<pct> <new>\t<old>` record — with the real HEAD tree modes/hashes, index
+  modes/hashes, and worktree mode (`<new> NUL <old> NUL` path field under
+  `-z`) — instead of two `1 R` change rows for the endpoints. `--json` gains
+  a top-level `data.renames[]` array of `{from, to, score, exact, staged,
+  unstaged}` (destination-sorted) alongside the existing nested
+  `staged.renamed`/`unstaged.renamed` `{from,to}` entries. The similarity
+  score is threaded from the diffcore engine through the render pipeline.
+
+- **`status --short` renders renames with Git's arrow form (v0.19.5,
+  plan-20260714 Part B R0-6 first slice)**: a detected rename now renders as
+  one `R  <old> -> <new>` line (colored `R` in color mode) instead of two
+  separate `R` rows for the endpoints; under `-z` the record is Git's
+  `XY SP <new> NUL <old> NUL`. Non-rename rows are unchanged, and the legacy
+  `generate_short_format_status` public API keeps its pre-existing tuple
+  shape. Porcelain v1/v2 rename records land in a follow-up slice.
+
+- **`status.renames` config cascade (v0.19.4, plan-20260714 Part B R0-7)**:
+  `libra status` now honors `status.renames` (falling back to `diff.renames`)
+  through the strict local → global → system cascade to set the rename-
+  detection default — `false` disables it, a truthy or unset value enables it
+  at 50%. `copy`/`copies` are rejected (copy detection is unsupported) instead
+  of silently degrading, and invalid values fail closed with `LBR-CLI-002`
+  before output. CLI flags (`--no-renames`/`--find-renames`/`--renames`)
+  always win over config. Documented in `docs/commands/status.md` (+ zh-CN).
+
+- **`libra status` rename detection is now on by default (v0.19.3,
+  plan-20260714 Part B R0-2/R0-4)**: a staged or unstaged delete+add pair with
+  similar content is reported as a rename without any flag, matching Git's
+  default. Matching moves to the shared diffcore engine
+  (`command::rename_detect`) — exact by blob id, then unique basename, then a
+  bounded inexact spanhash pass with per-side rename limit (1000) and a
+  similarity-comparison budget — replacing the previous greedy basename-LCS
+  matcher. Detection now runs on repo-relative keys, so renames are found
+  correctly when `status` is invoked from a subdirectory. `--no-renames`
+  disables it (and wins over `--find-renames`/`--renames`); the dirty-cache
+  `--cached`/`--check-dirty` extensions run without rename detection. Staged
+  snapshots pair HEAD tree ↔ index stage-0; unstaged pair index stage-0 ↔
+  worktree, per Git's content-addressing.
+
 ### Added
+
+- **`diff.renameLimit` / `diff.renameComparisonBudget` documentation
+  (plan-20260714 R0-1)**: documents the per-side inexact-pass limit and the
+  similarity-comparison budget (both non-negative, `0` = unlimited, invalid
+  fails closed with `LBR-CLI-002`) in `docs/commands/diff.md` and the zh-CN
+  translation.
+
+- **Auto-upgrade integration tests and docs (v0.19.2, plan-20260714 §A.9/
+  §A.11)**: two new `test-upgrade`-gated integration targets —
+  `upgrade_auto_test` (end-to-end signature+decision chain, revocation-replay
+  and same-version-identity anti-rollback, the real-binary `__upgrade-probe`
+  self-check across a process boundary, and install/rollback transactions) and
+  `upgrade_publish_contract_test` (matrix coverage, URL binding, size bounds,
+  channel, and renew-preserves-pause/revocations). Registered with
+  `required-features = ["test-upgrade"]`, indexed in `tests/INDEX.md`, and run
+  in a dedicated CI step; `release.yml` gains a guard that fails the release if
+  the `test-upgrade` feature is ever spliced into a release build. New
+  `docs/auto-upgrade.md` plus README and config-doc coverage of supported
+  platforms, the official-install requirement, network/throttle behavior, and
+  recovery/rollback. The subsystem remains inert until the release-key
+  ceremony (see the note below).
+
+- **Auto-upgrade orchestration and startup hooks (v0.19.1, plan-20260714
+  §A.7/§A.8/§A.10)**: new `internal::upgrade::orchestrator` wires the whole
+  flow. `startup_recovery_gate` runs before repo preflight and drives any
+  crashed install transaction to a terminal state (a fatal, unrecoverable
+  transaction stops the process before the user's command; a rollback emits
+  an advisory). `run_auto_upgrade_check` implements the `upgrade.mode=auto`
+  check — throttle gate, signed-manifest fetch, decision, candidate download
+  + self-check, and install under the §A.5 lock with the post-install probe —
+  and is fully failure-isolated so it can never break or fail the user's
+  command (a new `emit_advisory_warning` reports without tripping
+  `--exit-code-on-warning`). Both hooks short-circuit with no I/O until the
+  compiled trust table is populated, so auto-upgrade is inert by construction
+  until the release-key ceremony. A synchronous bounded `run_sync_probe`
+  backs the recovery-path self-check. Wired into `cli.rs` startup.
+
+### Note
+
+- The auto-upgrade subsystem (plan-20260714 Part A) is code-complete through
+  orchestration but remains **inert**: `PRODUCTION_TRUSTED_KEYS` is empty
+  pending the official release-key ceremony, and the signing/publish jobs and
+  `install.sh` official-marker path are not yet wired. Until then Libra never
+  checks for or installs upgrades regardless of `upgrade.mode`.
+
+- **Auto-upgrade decision pipeline and candidate self-check entry (v0.19.0,
+  plan-20260714 §A.7/§A.10)**: new `internal::upgrade::flow` composes the
+  pure decision — verify → anti-rollback/time → platform support (Windows
+  published-but-unsupported in R0) → `paused`/`revoked`/`newer` gates →
+  artifact selection — into a single `Install`/`Skip` verdict carrying the
+  marker and anti-rollback state to persist on commit. A new hidden
+  front-of-argv `__upgrade-probe --kind <version|pre-install|post-install>
+  --expected-version <X.Y.Z>` entry (recognized in `cli.rs` before clap, repo
+  preflight, schema migration, config writes and background tasks) runs only
+  a side-effect-free identity self-check of the running binary and exits,
+  never forwarding to a real command; a malformed or mismatched probe exits
+  non-zero silently so the orchestrator fails closed. Because it is
+  front-scanned like `help error-codes`, it stays invisible to help, the
+  Command-Groups banner and every compat guard. Internal machinery only.
+
+- **Crash-safe install transaction and candidate probes (v0.18.99,
+  plan-20260714 §A.7)**: new `internal::upgrade::{txn,probe}`. `txn`
+  journals the install to `.libra-upgrade-txn.json` through the seven-state
+  machine (Prepared → BackupDurable → CandidateInstalled → PostProbePassed →
+  Committed, with RollbackIntent/AbortAbsentIntent branches), always writing
+  intent before each filesystem mutation and implementing the full §A.7
+  recovery decision table so any crash point resolves idempotently to
+  committed, rolled-back-to-previous, or aborted-fresh — the post-probe is
+  injected so every intermediate on-disk layout is covered by a direct
+  reconstruction test. `probe` spawns the candidate/target self-check in its
+  own process group with `kill_on_drop` and a hard per-probe timeout,
+  killing and reaping the whole group on timeout so no descendant survives;
+  any nonzero exit, signal, timeout or spawn failure is a fail-closed probe
+  failure. Internal machinery only.
+
+- **Install-directory lock and official-install marker (v0.18.98,
+  plan-20260714 §A.2/§A.4/§A.5)**: new `internal::upgrade::{lock,marker}` —
+  `InstallDir` opens the install directory once with
+  `O_DIRECTORY|O_NOFOLLOW` after §A.5 validation (absolute path, effective-
+  uid ownership, no group/world write; no sticky exception granted) and
+  performs every target/lock/marker/state operation fd-relative with
+  `O_NOFOLLOW` (exclusive-temp + `renameat` + directory fsync atomic writes,
+  refusing path separators and dot entries). The advisory `flock` upgrade
+  lock uses try-lock (busy ⇒ Skip) for checks and blocking acquire for
+  recovery. `.libra-official-install.json` establishes official provenance
+  only when the marker parses with `install_source=official_signed_manifest`
+  AND its platform/sha256/size match the actual target binary — a marker
+  copied next to a foreign binary, or a binary hashing itself, never
+  qualifies (§A.2). Non-Unix platforms fail closed (`UnsupportedPlatform`).
+  Internal machinery only.
+
+- **Auto-upgrade anti-rollback state and time policy (v0.18.97, plan-20260714
+  §A.6/§A.7)**: new `internal::upgrade::state` — durable
+  `.libra-upgrade-state.json` (atomic writes, `0600`) recording the highest
+  accepted version with per-platform artifact identities, the highest control
+  revision with its envelope digest, the monotone `trusted_time_floor`, the
+  15-min + deterministic-jitter success cooldown and the ≤1 h failure
+  backoff. Pure decision functions enforce: control-revision rollback/fork
+  rejection (a pre-revocation envelope cannot replay after a revocation was
+  seen), version rollback rejection with same-version artifact-identity
+  immutability, required HTTPS `Date` inside the manifest lifetime, expiry
+  via `effective_now = max(local, floor, Date)` (clock rollback cannot
+  resurrect a manifest; a future local clock only rejects the current round
+  and never poisons the floor), floor-anchored cooldown trust windows and
+  cache-install refusal when the local clock sits below the floor. Corrupt
+  state fails closed (skip upgrading with a warning) instead of silently
+  resetting anti-rollback history. Internal machinery only.
+
+- **Dedicated auto-upgrade HTTPS transport (v0.18.96, plan-20260714 §A.6)**:
+  new `internal::upgrade::http` — a pinned reqwest client (`https_only`,
+  `redirect::Policy::none()` so any 3xx is a hard failure, connect/read
+  deadlines), manifest fetch bounded to 1 MiB with the HTTPS `Date` header
+  captured for later time policy, effective-URL recheck before any body read,
+  and artifact download streaming through a pure `SizeGate` (oversized
+  `Content-Length` aborts before the body, per-chunk counting aborts past the
+  manifest size, the stream must end at exactly the expected size and match
+  the manifest sha256). Internal machinery only; live-server behavioral tests
+  land with the `test-upgrade` integration target (§A.11).
+
+- **Signed release-manifest verification core (v0.18.95, plan-20260714 §A.6)**:
+  new `internal::upgrade::{manifest,trusted_keys,platform}` — a pure
+  `verify_envelope_bytes` implementing the full §A.6 order (envelope parse
+  with duplicate-key-id rejection, domain-separated Ed25519 verification via
+  `ring`, strict payload semantics: `stable` channel, release-SemVer-only
+  versions, exact four-platform artifact matrix with unique platforms,
+  structural artifact-URL grammar pinned to
+  `https://download.libra.tools/libra/releases/v{tag}/libra-{platform}` with
+  `tag == version` and URL-platform == artifact-platform binding, 128 MiB
+  size bound, then key-generation floor and key-validity windows). The
+  compiled production trust table ships EMPTY until the release-key ceremony,
+  so verification fails closed and auto-upgrade stays inert. The new
+  `test-upgrade` cargo feature (plus `LIBRA_TEST=1` at runtime) is the only
+  trust-root injection path; release builds contain no override code.
+  Windows stays published-but-unsupported for auto-upgrade (§A.1). Internal
+  machinery only — no CLI surface changes.
+
+- **Reserved `upgrade.mode` config namespace (v0.18.94, plan-20260714 §A.3)**:
+  the auto-upgrade switch now lives in `{LIBRA_HOME}/upgrade/settings.json`
+  (atomic writes, `0700`/`0600` permissions on Unix), backed by a single
+  Rust-side `resolve_libra_home()` that mirrors `install.sh`'s
+  `LIBRA_HOME`/`HOME` rules. `libra config` routes every spelling that can
+  reach `upgrade.*` through a reserved-namespace router: only single-value
+  `set`/`get`/`unset` with `--global` are supported (`unset` resets to `off`
+  and keeps the file; missing file reads as `off`; corrupt or unreadable files
+  fail with the new `LBR-UPGRADE-001` stable code), `list --show-origin`
+  renders the `file:{path}` origin, and local/system scopes, `--add`,
+  `--get-all`, `--unset-all`, type conversion, section operations, conflicting
+  action-flag combinations, padded spellings, and `--get-regexp` patterns
+  matching `upgrade.mode` fail closed as usage errors (`LBR-CLI-002`).
+  `config import` skips reserved keys with a warning, and `list` plus
+  non-matching `--get-regexp` suppress stale SQLite `upgrade.*` rows. When
+  `LIBRA_CONFIG_GLOBAL_DB` isolates the global config database, the upgrade
+  settings follow it. The mode itself only selects the upgrade policy
+  (`auto`/`manual`/`off`); the upgrade engine lands in follow-up slices.
 
 - **Optional `lba` installer shorthand (v0.18.88)**: `install.sh` now creates
   a movable relative `lba -> libra` symlink by default. Same-version reruns
