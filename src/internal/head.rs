@@ -179,6 +179,57 @@ impl Head {
         Self::current_result_with_conn(&db_conn).await
     }
 
+    /// Resolve the HEAD of a SPECIFIC worktree scope (not the ambient cwd
+    /// scope): `None` = the main worktree (`worktree_id IS NULL`), `Some(id)` =
+    /// a linked worktree. Returns the resolved [`Head`] and its commit hash
+    /// (the branch tip, or the detached commit). `Ok(None)` when that scope has
+    /// no HEAD row (e.g. a legacy-symlink worktree) so callers can render
+    /// deterministically without mislabeling another worktree's HEAD (Part C
+    /// §C.3.3 `worktree list --porcelain` per-worktree HEAD).
+    pub async fn head_for_worktree_scope(
+        worktree_id: Option<&str>,
+    ) -> Result<Option<(Head, Option<ObjectHash>)>, BranchStoreError> {
+        let db = get_db_conn_instance().await;
+        let mut query = reference::Entity::find()
+            .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+            .filter(reference::Column::Remote.is_null());
+        query = match worktree_id {
+            Some(id) => query.filter(reference::Column::WorktreeId.eq(id.to_string())),
+            None => query.filter(reference::Column::WorktreeId.is_null()),
+        };
+        let Some(model) = query
+            .one(&db)
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        match model.name {
+            Some(name) => {
+                // Branch HEAD: resolve the branch tip commit (shared refs).
+                let commit = Branch::find_branch_result(&name, None)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|b| b.commit);
+                Ok(Some((Head::Branch(name), commit)))
+            }
+            None => {
+                let commit_hash = model.commit.ok_or_else(|| BranchStoreError::Corrupt {
+                    name: "HEAD".to_string(),
+                    detail: "detached HEAD is missing commit hash".to_string(),
+                })?;
+                let commit = ObjectHash::from_str(commit_hash.as_str()).map_err(|error| {
+                    BranchStoreError::Corrupt {
+                        name: "HEAD".to_string(),
+                        detail: format!("invalid detached HEAD commit hash: {error}"),
+                    }
+                })?;
+                Ok(Some((Head::Detached(commit), Some(commit))))
+            }
+        }
+    }
+
     pub async fn remote_current_with_conn<C>(db: &C, remote: &str) -> Option<Head>
     where
         C: ConnectionTrait,

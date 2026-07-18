@@ -2045,9 +2045,10 @@ fn worktree_list_porcelain_emits_attribute_lines() {
     assert_cli_success(&out, "worktree list --porcelain");
     let text = String::from_utf8_lossy(&out.stdout);
 
-    // Git-style porcelain: a `worktree <path>` line and the shared `HEAD <sha>`
-    // line, with a trailing blank line. Libra intentionally omits Git's
-    // per-worktree `branch`/`detached` lines (worktrees share one HEAD).
+    // Git-style porcelain: a `worktree <path>` line, this worktree's own
+    // `HEAD <sha>` line, and — since the main worktree is on a branch — a
+    // `branch refs/heads/<name>` line, terminated by a blank line (Part C
+    // §C.3.3: each worktree reports its own HEAD, not a shared one).
     let mut lines = text.lines();
     let first = lines.next().unwrap_or("");
     assert!(
@@ -2056,13 +2057,11 @@ fn worktree_list_porcelain_emits_attribute_lines() {
     );
     assert!(
         text.lines().any(|l| l.starts_with("HEAD ")),
-        "the shared HEAD line is present: {text:?}"
+        "the worktree's HEAD line is present: {text:?}"
     );
     assert!(
-        !text
-            .lines()
-            .any(|l| l.starts_with("branch ") || l == "detached"),
-        "Libra omits per-worktree branch/detached lines: {text:?}"
+        text.lines().any(|l| l.starts_with("branch refs/heads/")),
+        "the main worktree's branch line is present: {text:?}"
     );
     assert!(
         text.ends_with("\n\n"),

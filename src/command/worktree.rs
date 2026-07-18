@@ -152,6 +152,10 @@ pub(crate) struct WorktreeListEntry {
     pub(crate) locked: bool,
     pub(crate) lock_reason: Option<String>,
     pub(crate) exists: bool,
+    /// Stable worktree identity (Part C §C.3.3): `None` = the main worktree
+    /// (`worktree_id IS NULL`), `Some(id)` = a linked worktree. Consumers must
+    /// use this as the primary key, never the path.
+    pub(crate) worktree_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -674,7 +678,9 @@ fn find_entry<'a>(state: &'a WorktreeState, path: &Path) -> Option<&'a WorktreeE
 /// - creates the target directory if it does not exist,
 /// - rejects paths that canonicalize inside `.libra` (with cleanup),
 /// - ensures the worktree is not already registered,
-/// - creates a `.libra` directory symlink pointing at the shared storage, and
+/// - creates a real per-worktree `.libra` gitdir (its own local HEAD, index,
+///   and HEAD reflog) that records a `commondir` pointer to the shared object
+///   store and a stable `worktree_id` — it is NOT a symlink to shared storage,
 /// - when `HEAD` exists, populates the new worktree from committed `HEAD`
 ///   content (not staged-only index changes).
 async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
@@ -964,32 +970,77 @@ pub(crate) fn run_list_worktrees() -> WorktreeResult<WorktreeListOutput> {
     let worktrees = state
         .worktrees
         .into_iter()
-        .map(|w| WorktreeListEntry {
-            kind: if w.is_main { "main" } else { "worktree" },
-            exists: Path::new(&w.path).exists(),
-            path: w.path,
-            is_main: w.is_main,
-            locked: w.locked,
-            lock_reason: w.lock_reason,
+        .map(|w| {
+            let worktree_id = resolve_entry_worktree_id(&w.path, w.is_main);
+            WorktreeListEntry {
+                kind: if w.is_main { "main" } else { "worktree" },
+                exists: Path::new(&w.path).exists(),
+                worktree_id,
+                path: w.path,
+                is_main: w.is_main,
+                locked: w.locked,
+                lock_reason: w.lock_reason,
+            }
         })
         .collect();
     Ok(WorktreeListOutput { worktrees })
 }
 
+/// Resolve a registered worktree's stable id from its path (Part C §C.3.3).
+/// The main worktree's HEAD row is keyed `worktree_id IS NULL`, so it returns
+/// `None`. A linked worktree returns its stored `.libra/worktree_id`, falling
+/// back to the canonical-path derivation used at creation (so a recovered or
+/// moved worktree still maps to its own scoped rows rather than aliasing main).
+pub(crate) fn resolve_entry_worktree_id(path: &str, is_main: bool) -> Option<String> {
+    if is_main {
+        return None;
+    }
+    let gitdir = Path::new(path).join(util::ROOT_DIR);
+    if let Ok(id) = fs::read_to_string(gitdir.join("worktree_id")) {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    Some(util::worktree_instance_id(&canonical))
+}
+
 /// Render the worktree list as Git-style `--porcelain` output: one attribute
-/// per line, with a blank line between worktrees. Libra worktrees share the
-/// repository HEAD/index/refs, so the shared `HEAD` commit is reported once per
-/// entry (when the repository has any commit). Git's per-worktree `branch` /
-/// `detached` lines are intentionally omitted — Libra has no per-worktree HEAD.
+/// per line, with a blank line between worktrees. In the isolated layout each
+/// worktree owns its own HEAD (index and HEAD reflog too), so each entry
+/// reports ITS OWN `HEAD <sha>` and either `branch <ref>` or `detached`
+/// (Git semantics, Part C §C.3.3) — never the running command's HEAD stamped
+/// onto every entry. A worktree with no resolvable HEAD row (a legacy-symlink
+/// layout, or a missing/corrupt scope) emits neither line rather than
+/// mislabeling it with another worktree's commit.
 pub(crate) async fn format_worktree_porcelain(worktrees: &[WorktreeListEntry]) -> String {
-    let head_sha = Head::current_commit_result().await.ok().flatten();
     let mut out = String::new();
     for w in worktrees {
         out.push_str("worktree ");
         out.push_str(&w.path);
         out.push('\n');
-        if let Some(sha) = &head_sha {
-            out.push_str(&format!("HEAD {sha}\n"));
+        match Head::head_for_worktree_scope(w.worktree_id.as_deref()).await {
+            Ok(Some((head, commit))) => {
+                if let Some(sha) = commit {
+                    out.push_str(&format!("HEAD {sha}\n"));
+                }
+                match head {
+                    Head::Branch(name) => {
+                        let full = if name.starts_with("refs/") {
+                            name
+                        } else {
+                            format!("refs/heads/{name}")
+                        };
+                        out.push_str(&format!("branch {full}\n"));
+                    }
+                    Head::Detached(_) => out.push_str("detached\n"),
+                }
+            }
+            // No HEAD row for this scope (legacy layout / missing): omit HEAD
+            // lines deterministically rather than stamping a wrong commit.
+            Ok(None) => {}
+            Err(_) => {}
         }
         if w.locked {
             match w.lock_reason.as_deref() {

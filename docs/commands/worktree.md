@@ -22,7 +22,7 @@ libra worktree repair
 
 `libra worktree` manages multiple working trees that share a single repository database and object store. This allows you to have several checkouts of the same repository simultaneously, which is useful for working on multiple branches at once, running builds while editing code, or testing changes in isolation.
 
-Each linked worktree is a directory containing a `.libra` symlink pointing back to the shared storage directory. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, and configuration.
+Each linked worktree is a directory containing its own real `.libra` gitdir — a local directory (not a symlink) that holds the worktree's private `HEAD`, index, and `HEAD` reflog, plus a `commondir` pointer to the shared storage and a stable `worktree_id`. The main worktree is the original repository directory. All worktrees share the same SQLite database, object store, branch/tag/remote refs, and configuration, but each keeps its own checked-out branch and staging state. (A worktree created by an older Libra version may still use the legacy shared-`.libra` symlink layout; run `libra worktree repair` to check.)
 
 Worktree metadata is persisted in a `worktrees.json` file inside the `.libra` storage directory. Each entry tracks the filesystem path, whether it is the main worktree, its lock status, and an optional lock reason. The state file is written atomically via a temporary file rename to prevent corruption.
 
@@ -50,11 +50,12 @@ libra worktree add /tmp/libra-test
 ### Subcommand: `list`
 
 List all registered worktrees and their state. `--porcelain` emits a stable,
-machine-readable format: for each worktree a `worktree <path>` line, the shared
-`HEAD <sha>` line (when the repository has any commit), and a `locked [<reason>]`
-line when locked, with a blank line between worktrees. Because Libra worktrees
-share one HEAD/index/refs, Git's per-worktree `branch`/`detached` lines are
-intentionally omitted (Libra has no per-worktree HEAD).
+machine-readable format: for each worktree a `worktree <path>` line, that
+worktree's own `HEAD <sha>` line and either a `branch <ref>` or a `detached`
+line (each worktree owns its HEAD), and a `locked [<reason>]` line when locked,
+with a blank line between worktrees. A worktree whose HEAD cannot be resolved
+(a legacy shared-`.libra` layout, or a missing/corrupt scope) omits the HEAD
+lines rather than being mislabeled with another worktree's commit.
 
 ```bash
 libra worktree list

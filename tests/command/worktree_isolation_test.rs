@@ -103,6 +103,43 @@ fn linked_worktree_has_isolated_head_and_index() {
     );
 }
 
+/// `worktree list --porcelain` reports each worktree's OWN HEAD (Part C
+/// §C.3.3): the main worktree on a branch, the linked worktree detached at its
+/// own commit — never one shared HEAD stamped onto both entries.
+#[test]
+fn porcelain_reports_per_worktree_head() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    let out = run_libra_command(&["worktree", "list", "--porcelain"], main);
+    assert_cli_success(&out, "worktree list --porcelain");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // The main worktree entry carries a branch line...
+    assert!(
+        text.lines().any(|l| l == "branch refs/heads/main"),
+        "main entry reports its branch: {text:?}"
+    );
+    // ...and the linked worktree entry is detached (its own HEAD), so a
+    // `detached` line must appear too.
+    assert!(
+        text.lines().any(|l| l == "detached"),
+        "linked worktree entry reports detached HEAD: {text:?}"
+    );
+    // Two distinct `worktree <path>` entries, each with its own HEAD line.
+    let head_lines = text.lines().filter(|l| l.starts_with("HEAD ")).count();
+    assert_eq!(
+        head_lines, 2,
+        "each worktree has its own HEAD line: {text:?}"
+    );
+}
+
 #[test]
 fn same_branch_is_refused_across_worktrees() {
     let repo = repo_with_feature();

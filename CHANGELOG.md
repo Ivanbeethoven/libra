@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`worktree list --porcelain` reports each worktree's own HEAD (v0.19.9,
+  plan-20260714 Part C W0 §C.3.3)**: in the isolated worktree layout each
+  entry now emits its OWN `HEAD <sha>` plus a `branch <ref>` or `detached`
+  line (resolved from that worktree's scoped HEAD row via
+  `Head::head_for_worktree_scope`), instead of stamping the running command's
+  HEAD onto every entry. An entry whose HEAD cannot be resolved (a legacy
+  shared-`.libra` symlink layout, or a missing/corrupt scope) omits the HEAD
+  lines rather than being mislabeled with another worktree's commit. The
+  `worktree list` JSON/entry now carries a stable `worktree_id`. Corrects the
+  worktree/architecture docs and `COMPATIBILITY.md` (which had described a
+  shared HEAD and `--delete-dir`-gated scoped-row GC) to the isolated reality.
+
 ### Fixed
 
 - **`status` no longer reports an unreadable tracked file as deleted (v0.19.7,

@@ -622,6 +622,7 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
         for entry in state.worktrees {
             result.worktrees.push(legacy::WorktreeListEntry {
                 kind: "worktree",
+                worktree_id: legacy::resolve_entry_worktree_id(&entry.path, false),
                 path: entry.path.clone(),
                 is_main: false,
                 locked: entry.locked,
@@ -642,6 +643,7 @@ async fn list_all_worktrees(output: &OutputConfig, porcelain: bool) -> CliResult
         for entry in &state.worktrees {
             all.push(legacy::WorktreeListEntry {
                 kind: "worktree",
+                worktree_id: legacy::resolve_entry_worktree_id(&entry.path, false),
                 path: entry.path.clone(),
                 is_main: false,
                 locked: entry.locked,
