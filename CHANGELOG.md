@@ -4,6 +4,15 @@
 
 ### Changed
 
+- **`for-each-ref %(worktreepath)` resolves across worktrees (v0.19.10,
+  plan-20260714 Part C W0 §C.3.3)**: the atom now reports the path of the
+  worktree that actually has each branch checked out — resolved across ALL
+  registered worktrees from each worktree's own scoped HEAD row — instead of
+  assuming a single shared HEAD and always returning the current worktree. A
+  branch checked out in a linked worktree reports that worktree's path even
+  when `for-each-ref` runs elsewhere; a branch checked out nowhere (or a
+  detached worktree) is empty. Single-worktree output is unchanged.
+
 - **`worktree list --porcelain` reports each worktree's own HEAD (v0.19.9,
   plan-20260714 Part C W0 §C.3.3)**: in the isolated worktree layout each
   entry now emits its OWN `HEAD <sha>` plus a `branch <ref>` or `detached`

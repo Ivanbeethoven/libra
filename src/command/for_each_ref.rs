@@ -176,6 +176,18 @@ pub async fn execute_safe(args: ForEachRefArgs, output: &OutputConfig) -> CliRes
     let upstreams = resolve_upstreams(&result).await;
     // Resolve each branch's push tracking ref for `%(push)`.
     let pushes = resolve_pushes(&result).await;
+    // Resolve which worktree has each branch checked out for `%(worktreepath)`
+    // (only when the atom is present — it touches the worktree registry + a
+    // scoped HEAD read per worktree).
+    let worktree_paths = if args
+        .format
+        .as_deref()
+        .is_some_and(|f| f.contains("%(worktreepath)"))
+    {
+        worktree_paths_by_ref().await
+    } else {
+        HashMap::new()
+    };
     render_output(
         &result,
         &args,
@@ -183,6 +195,7 @@ pub async fn execute_safe(args: ForEachRefArgs, output: &OutputConfig) -> CliRes
         head_refname.as_deref(),
         &upstreams,
         &pushes,
+        &worktree_paths,
     )?;
     Ok(())
 }
@@ -267,6 +280,36 @@ async fn resolve_pushes(entries: &[RefEntry]) -> HashMap<String, String> {
                 entry.refname.clone(),
                 format!("refs/remotes/{push_remote}/{merge_short}"),
             );
+        }
+    }
+    map
+}
+
+/// Map each branch refname to the absolute path of the worktree that has it
+/// checked out (Part C §C.3.3): iterate every registered worktree, read its
+/// OWN scoped HEAD, and record `refs/heads/<name> -> <canonical path>` for a
+/// branch HEAD. Each ref can be checked out in at most one worktree, so the
+/// first live path wins. Detached HEADs contribute nothing (no ref to key on).
+/// Covers the main worktree too, so `%(worktreepath)` stays correct for a
+/// single-worktree repo while also resolving branches checked out elsewhere.
+async fn worktree_paths_by_ref() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Ok(list) = crate::command::worktree::run_list_worktrees() else {
+        return map;
+    };
+    for w in list.worktrees {
+        if let Ok(Some((Head::Branch(name), _))) =
+            Head::head_for_worktree_scope(w.worktree_id.as_deref()).await
+        {
+            let refname = if name.starts_with("refs/") {
+                name
+            } else {
+                format!("refs/heads/{name}")
+            };
+            let path = std::fs::canonicalize(&w.path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or(w.path);
+            map.entry(refname).or_insert(path);
         }
     }
     map
@@ -1249,6 +1292,7 @@ async fn populate_describe_cache(entries: &mut [RefEntry], format: &str) -> CliR
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_output(
     entries: &[RefEntry],
     args: &ForEachRefArgs,
@@ -1256,6 +1300,7 @@ fn render_output(
     head_refname: Option<&str>,
     upstreams: &HashMap<String, String>,
     pushes: &HashMap<String, String>,
+    worktree_paths: &HashMap<String, String>,
 ) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("for-each-ref", &entries.to_vec(), output);
@@ -1301,6 +1346,7 @@ fn render_output(
                 head_refname,
                 upstreams,
                 pushes,
+                worktree_paths,
                 color_enabled,
                 &need_color_reset,
                 quote,
@@ -1358,6 +1404,11 @@ pub(crate) async fn render_ref_format_lines(
     };
     let upstreams = resolve_upstreams(&entries).await;
     let pushes = resolve_pushes(&entries).await;
+    let worktree_paths = if format.contains("%(worktreepath)") {
+        worktree_paths_by_ref().await
+    } else {
+        HashMap::new()
+    };
 
     let mut lines = Vec::with_capacity(entries.len());
     for entry in &entries {
@@ -1368,6 +1419,7 @@ pub(crate) async fn render_ref_format_lines(
             head_refname.as_deref(),
             &upstreams,
             &pushes,
+            &worktree_paths,
             color_enabled,
             &need_color_reset,
             None,
@@ -1387,6 +1439,7 @@ fn render_format(
     head_refname: Option<&str>,
     upstreams: &HashMap<String, String>,
     pushes: &HashMap<String, String>,
+    worktree_paths: &HashMap<String, String>,
     color_enabled: bool,
     need_color_reset: &std::cell::Cell<bool>,
     quote: Option<QuoteStyle>,
@@ -1496,20 +1549,20 @@ fn render_format(
         CommitFields::default()
     };
     // `%(worktreepath)`: the absolute path of the worktree that has this ref
-    // checked out, else empty. Libra worktrees share a single HEAD, so the
-    // checked-out branch is the current HEAD branch and the reported path is the
-    // CURRENT worktree — the one the command runs in (`util::working_dir()`).
-    // Computed lazily, only when the atom is present. Matches Git for a
-    // single-worktree repository.
-    let worktreepath =
-        if format.contains("%(worktreepath)") && head_refname == Some(entry.refname.as_str()) {
-            util::working_dir()
-                .canonicalize()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+    // checked out, else empty (Part C §C.3.3). Each worktree owns its HEAD, so
+    // the answer comes from `worktree_paths` (refname -> that worktree's path,
+    // built across ALL worktrees from their scoped HEAD rows), not from the
+    // current worktree. A branch checked out in a linked worktree resolves to
+    // that worktree's path even when the command runs elsewhere; a branch
+    // checked out nowhere is empty. Detached HEADs never key a ref here.
+    let worktreepath = if format.contains("%(worktreepath)") {
+        worktree_paths
+            .get(entry.refname.as_str())
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // Atom name (inside `%(...)`) -> value. Single-pass substitution below
     // writes each value literally, so a value containing `%(` is never
     // re-parsed as an atom and never trips the unknown-atom check.
