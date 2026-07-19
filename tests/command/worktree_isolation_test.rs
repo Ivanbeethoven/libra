@@ -644,6 +644,17 @@ fn gc_skips_prune_in_multi_worktree_repo() {
         "the linked worktree's staged blob was pruned by gc"
     );
 
+    // Part C §C.9: every worktree's private index is a reachability root, so
+    // `fsck --unreachable` must NOT report the linked worktree's staged blob as
+    // garbage (fsck only reports, but a false "unreachable" invites a manual
+    // delete).
+    let fsck = run_libra_command(&["fsck", "--unreachable"], main);
+    let fsck_text = String::from_utf8_lossy(&fsck.stdout) + String::from_utf8_lossy(&fsck.stderr);
+    assert!(
+        !fsck_text.contains(&oid),
+        "the linked worktree's staged blob must not be reported unreachable: {fsck_text}"
+    );
+
     // The incremental-repack task has the same gap (it rebuilds one pack from
     // the reachable set and deletes the old packs), so it must skip too.
     let repack = run_libra_command(

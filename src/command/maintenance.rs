@@ -1553,17 +1553,27 @@ pub(crate) async fn collect_reachable_objects(
         walk_reachable(&oid, storage, &mut reachable)?;
     }
 
-    // Collect from index — every stage, not just stage 0, so a blob referenced
-    // only by an unmerged conflict stage (1/2/3) is not treated as garbage.
-    let index_path = path::index();
-    let index_exists = index_path.try_exists().map_err(|error| {
-        CliError::fatal(format!(
-            "failed to inspect index GC root '{}': {error}",
-            index_path.display()
-        ))
-        .with_stable_code(StableErrorCode::IoReadFailed)
-    })?;
-    if index_exists {
+    // Collect from EVERY worktree's index — every stage, not just stage 0, so a
+    // blob referenced only by an unmerged conflict stage (1/2/3) is not treated
+    // as garbage.
+    //
+    // plan-20260714 Part C §C.9: each worktree owns a PRIVATE index, so walking
+    // only `path::index()` (this worktree's) would classify a blob staged in
+    // another worktree as unreachable — reported as garbage by `fsck` and, before
+    // the multi-worktree guard, deleted by `gc`. Every registered worktree's
+    // index is a reachability root. A worktree whose index cannot be read fails
+    // closed: callers must never prune against a partial root set.
+    for index_path in worktree_index_roots() {
+        let index_exists = index_path.try_exists().map_err(|error| {
+            CliError::fatal(format!(
+                "failed to inspect index GC root '{}': {error}",
+                index_path.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        if !index_exists {
+            continue;
+        }
         let index = git_internal::internal::index::Index::load(&index_path).map_err(|error| {
             CliError::fatal(format!(
                 "failed to read index GC root '{}': {error}",
@@ -1579,6 +1589,35 @@ pub(crate) async fn collect_reachable_objects(
     }
 
     Ok(reachable)
+}
+
+/// Every worktree's private index path — this worktree's plus each registered
+/// linked worktree's `<path>/.libra/index` (plan-20260714 Part C §C.9).
+///
+/// The current worktree's index always comes first so a single-worktree
+/// repository behaves exactly as before. Registry entries whose directory is
+/// gone are skipped (a pruned worktree holds nothing); the caller's
+/// `try_exists` handles a registered-but-indexless worktree.
+pub(crate) fn worktree_index_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = vec![path::index()];
+    let Ok(list) = crate::command::worktree::run_list_worktrees() else {
+        // The registry is unreadable: fall back to this worktree's index only.
+        // Deletion paths independently refuse on multi-worktree repositories, so
+        // this cannot silently narrow the root set for a prune.
+        return roots;
+    };
+    for entry in list.worktrees {
+        if entry.is_main || !entry.exists {
+            continue;
+        }
+        let candidate = std::path::Path::new(&entry.path)
+            .join(crate::utils::util::ROOT_DIR)
+            .join("index");
+        if !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    }
+    roots
 }
 
 /// Walk object references recursively, adding all transitive dependencies.

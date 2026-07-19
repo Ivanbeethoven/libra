@@ -123,6 +123,17 @@
 
 ### Fixed
 
+- **Every worktree's index is now a reachability root (v0.19.25,
+  plan-20260714 Part C §C.9)**: the reachability walks used by `gc`/`repack`
+  and by `fsck` each read only the CURRENT worktree's index, so a blob staged
+  in ANOTHER worktree was treated as unreferenced — `fsck --unreachable`
+  reported it as garbage, which invites a manual delete. Both walks now collect
+  every registered worktree's private index, across all stages (0–3, so a blob
+  held only by an unmerged conflict stage counts too). This is the first
+  reachability-root source of the per-worktree inventory; `gc`'s multi-worktree
+  prune guard stays until the remaining root types (held sidecars, operation-view
+  pointers, sequencer rows) are also collected.
+
 - **`gc` no longer prunes objects reachable only from a linked worktree
   (v0.19.23, plan-20260714 Part C W0 release gate §C.11)**: the
   garbage-collection reachability walk reads only the CURRENT worktree's index,
