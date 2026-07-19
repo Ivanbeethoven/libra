@@ -750,6 +750,26 @@ async fn run_incremental_repack(
             message: "no pack directory".to_string(),
         });
     }
+    // plan-20260714 Part C W0 release gate (§C.11): this task rebuilds one
+    // consolidated pack from `collect_reachable_objects` and then DELETES the
+    // old packs — so an object that lives only in an old pack and is reachable
+    // only from a LINKED worktree's private index would be dropped. Same gap as
+    // the gc prune: refuse in a multi-worktree repository until every
+    // worktree's reachability roots are collected.
+    if !dry_run && repository_has_linked_worktrees() {
+        return Ok(TaskResult {
+            task: "incremental-repack".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: 0,
+            refs_packed: 0,
+            packs_repacked: 0,
+            message: "skipped repack: this repository has linked worktrees, whose private index \
+                      objects are not yet reachability roots; consolidating would drop them with \
+                      the old packs"
+                .to_string(),
+        });
+    }
 
     let packs: Vec<_> = match fs::read_dir(&pack_dir) {
         Ok(entries) => entries

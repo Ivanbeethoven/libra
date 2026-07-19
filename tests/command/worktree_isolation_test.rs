@@ -643,6 +643,20 @@ fn gc_skips_prune_in_multi_worktree_repo() {
         String::from_utf8_lossy(&cat.stdout).contains("precious"),
         "the linked worktree's staged blob was pruned by gc"
     );
+
+    // The incremental-repack task has the same gap (it rebuilds one pack from
+    // the reachable set and deletes the old packs), so it must skip too.
+    let repack = run_libra_command(
+        &["maintenance", "run", "--task", "incremental-repack"],
+        main,
+    );
+    assert_cli_success(&repack, "maintenance incremental-repack");
+    let repack_text =
+        String::from_utf8_lossy(&repack.stdout) + String::from_utf8_lossy(&repack.stderr);
+    assert!(
+        repack_text.contains("linked worktree"),
+        "incremental-repack should skip in a multi-worktree repo: {repack_text}"
+    );
 }
 
 #[test]

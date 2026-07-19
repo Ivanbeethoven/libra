@@ -121,8 +121,12 @@
   entirely and says so in its task message, instead of deleting objects it
   cannot see. `--dry-run` still previews, and single-worktree repositories are
   unaffected. Pruning is re-enabled there once every worktree's reachability
-  roots are collected. (`repack -d` was never affected — it only removes loose
-  objects that are now inside the new pack.)
+  roots are collected. The `incremental-repack` maintenance task has the same
+  gap — it rebuilds one consolidated pack from the reachable set and then
+  deletes the old packs, dropping any object that lived only in an old pack and
+  is reachable only from a linked worktree — so it skips in a multi-worktree
+  repository too. (Standalone `repack -d` was never affected: it only removes
+  loose objects that are now inside the new pack, and never deletes packs.)
 
 - **AI session/MCP storage roots no longer silently mint a phantom `.libra`
   (v0.19.12, plan-20260714 Part C W0 §C.4.1)**: the AI session-transcript store
