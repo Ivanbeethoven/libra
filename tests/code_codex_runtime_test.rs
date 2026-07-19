@@ -247,6 +247,7 @@ fn init_libra_repo() -> Result<tempfile::TempDir> {
         .context("failed to create codex test tempdir")?;
     let repo_dir = temp.path().to_path_buf();
     let output = Command::new(libra_bin_path())
+        .current_dir(&repo_dir)
         .args(["init", "--vault=false", "--quiet"])
         .arg(&repo_dir)
         .output()

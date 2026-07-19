@@ -260,6 +260,7 @@ mod tests {
             false,
         ))
         .unwrap();
+        let _cwd_guard = crate::utils::test::ChangeDirGuard::new(global_dir.path());
 
         // env wins.
         let client = Client::from_env().expect("from_env should pick up env DEEPSEEK_API_KEY");

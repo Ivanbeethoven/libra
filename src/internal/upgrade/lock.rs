@@ -234,7 +234,7 @@ mod unix_impl {
             Ok(Some(match stat.st_mode & libc::S_IFMT {
                 libc::S_IFREG => EntryKind::Regular {
                     size: stat.st_size as u64,
-                    mode: (stat.st_mode & 0o7777) as u32,
+                    mode: stat.st_mode & 0o7777,
                 },
                 libc::S_IFDIR => EntryKind::Directory,
                 libc::S_IFLNK => EntryKind::Symlink,

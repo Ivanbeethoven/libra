@@ -27,6 +27,7 @@ mod legacy;
 // `worktree-fuse` feature routed compilation through this file or directly
 // through `worktree.rs`.
 pub use legacy::WORKTREE_EXAMPLES;
+pub(crate) use legacy::run_list_worktrees;
 
 const FUSE_MOUNT_TIMEOUT: Duration = Duration::from_secs(15);
 const FUSE_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(15);

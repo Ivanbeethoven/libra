@@ -227,6 +227,7 @@ mod tests {
                 false,
             ))
             .unwrap();
+        let _cwd_guard = crate::utils::test::ChangeDirGuard::new(global_dir.path());
 
         let client = Client::from_env().expect("from_env should prefer process ZHIPU_API_KEY");
         assert_eq!(client.provider.api_key(), "zh-env-key");

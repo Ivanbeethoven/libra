@@ -5392,6 +5392,8 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let working_dir = temp_dir.path().to_path_buf();
         let storage_root = working_dir.join(".libra");
+        fs::create_dir_all(storage_root.join("objects")).unwrap();
+        fs::create_dir_all(storage_root.join("hooks")).unwrap();
         let session_store = SessionStore::from_storage_path(&storage_root);
         let thread_id = Uuid::new_v4();
         let mut session = SessionState::new(&working_dir.to_string_lossy());
