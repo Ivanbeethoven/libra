@@ -11,7 +11,7 @@
 
 use std::fs;
 
-use super::{assert_cli_success, run_libra_command};
+use super::{assert_cli_success, run_libra_command, run_libra_command_with_stdin};
 
 /// A committed repo (a.txt @ c1) with a `feature` branch. Returns its dir.
 fn repo_with_feature() -> tempfile::TempDir {
@@ -558,6 +558,42 @@ fn reflog_expire_updateref_refuses_branch_checked_out_elsewhere() {
     assert_cli_success(
         &run_libra_command(&["reflog", "expire", "--updateref", "main"], main),
         "reflog expire --updateref on own branch works",
+    );
+}
+
+/// Part C W0 (§C.11): `fast-import`'s batch flush rewrites shared branch refs;
+/// it refuses (before the transaction) to import into a branch checked out in
+/// another worktree.
+#[test]
+fn fast_import_refuses_branch_checked_out_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // From main, import a commit onto `feature` (checked out in wt) — refused.
+    let stream = "blob\nmark :1\ndata 6\nhello\n\n\
+        commit refs/heads/feature\nmark :2\n\
+        committer Tester <t@example.com> 1700000000 +0000\ndata 8\nimported\n\n\
+        M 100644 :1 g.txt\n\ndone\n";
+    let out = run_libra_command_with_stdin(&["fast-import", "--quiet"], main, stream);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "fast-import into a wt branch must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("checked out"),
+        "names the collision: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

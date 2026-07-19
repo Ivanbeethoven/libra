@@ -4,6 +4,15 @@
 
 ### Changed
 
+- **`fast-import` refuses a branch checked out in another worktree (v0.19.22,
+  plan-20260714 Part C W0 §C.11)**: the batch ref flush rewrites and deletes
+  shared branch refs; it now fails closed, before the transaction, if any
+  target branch is checked out in a different worktree. Importing into this
+  worktree's own branch is unaffected. This completes the cross-worktree
+  ref-writer guard set (`branch`/`update-ref`/`symbolic-ref`/`op restore`/
+  `reflog expire --updateref`/`checkout`/`switch`/`fast-import`); `fetch`
+  already refused checked-out destinations across all worktrees.
+
 - **`reflog expire --updateref` refuses a branch checked out in another
   worktree (v0.19.21, plan-20260714 Part C W0 §C.11)**: `--updateref` moves a
   pruned branch's tip to its newest surviving reflog entry; it now fails closed,
