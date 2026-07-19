@@ -357,6 +357,21 @@ async fn run_cache_evict(dry_run: bool) -> CliResult<TaskResult> {
     })
 }
 
+/// plan-20260714 Part C W0 (§C.11 release gate): does this repository have any
+/// LINKED worktree besides the main one?
+///
+/// Object deletion is only safe when every worktree's reachability roots are
+/// collected. Until the typed `GcObjectSource` inventory covers linked private
+/// indexes / held sidecars / operation-view pointers, deletion paths fail
+/// closed whenever this returns true. A registry read failure is treated as
+/// "yes" (fail closed) rather than silently enabling a prune.
+fn repository_has_linked_worktrees() -> bool {
+    match crate::command::worktree::run_list_worktrees() {
+        Ok(list) => list.worktrees.iter().any(|entry| !entry.is_main),
+        Err(_) => true,
+    }
+}
+
 async fn run_gc(
     repo_path: &Path,
     dry_run: bool,
@@ -379,6 +394,28 @@ async fn run_gc(
             refs_packed: 0,
             packs_repacked: 0,
             message: "skipped loose-object prune: this store is shared (other repos borrow from                       it via alternates); have borrowers run 'libra alternates remove' first"
+                .to_string(),
+        });
+    }
+    // plan-20260714 Part C W0 release gate (§C.11): the reachability walk below
+    // reads only THIS worktree's index (`path::index()`) plus shared refs and
+    // sidecars. A linked worktree's private index — blobs staged or unmerged
+    // there but not yet committed — is NOT yet a GC root, so pruning here would
+    // delete objects that only that worktree can still reach. Until the typed
+    // `GcObjectSource` inventory lands, refuse to prune in a multi-worktree
+    // repository (the plan's prescribed fallback: fail closed rather than ship
+    // an incomplete root set).
+    if !dry_run && repository_has_linked_worktrees() {
+        return Ok(TaskResult {
+            task: "gc".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: 0,
+            refs_packed: 0,
+            packs_repacked: 0,
+            message: "skipped loose-object prune: this repository has linked worktrees, whose \
+                      private index objects are not yet reachability roots; remove them with \
+                      'libra worktree remove' first, or run with --dry-run to preview"
                 .to_string(),
         });
     }
@@ -711,6 +748,26 @@ async fn run_incremental_repack(
             refs_packed: 0,
             packs_repacked: 0,
             message: "no pack directory".to_string(),
+        });
+    }
+    // plan-20260714 Part C W0 release gate (§C.11): this task rebuilds one
+    // consolidated pack from `collect_reachable_objects` and then DELETES the
+    // old packs — so an object that lives only in an old pack and is reachable
+    // only from a LINKED worktree's private index would be dropped. Same gap as
+    // the gc prune: refuse in a multi-worktree repository until every
+    // worktree's reachability roots are collected.
+    if !dry_run && repository_has_linked_worktrees() {
+        return Ok(TaskResult {
+            task: "incremental-repack".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: 0,
+            refs_packed: 0,
+            packs_repacked: 0,
+            message: "skipped repack: this repository has linked worktrees, whose private index \
+                      objects are not yet reachability roots; consolidating would drop them with \
+                      the old packs"
+                .to_string(),
         });
     }
 
@@ -1496,17 +1553,27 @@ pub(crate) async fn collect_reachable_objects(
         walk_reachable(&oid, storage, &mut reachable)?;
     }
 
-    // Collect from index — every stage, not just stage 0, so a blob referenced
-    // only by an unmerged conflict stage (1/2/3) is not treated as garbage.
-    let index_path = path::index();
-    let index_exists = index_path.try_exists().map_err(|error| {
-        CliError::fatal(format!(
-            "failed to inspect index GC root '{}': {error}",
-            index_path.display()
-        ))
-        .with_stable_code(StableErrorCode::IoReadFailed)
-    })?;
-    if index_exists {
+    // Collect from EVERY worktree's index — every stage, not just stage 0, so a
+    // blob referenced only by an unmerged conflict stage (1/2/3) is not treated
+    // as garbage.
+    //
+    // plan-20260714 Part C §C.9: each worktree owns a PRIVATE index, so walking
+    // only `path::index()` (this worktree's) would classify a blob staged in
+    // another worktree as unreachable — reported as garbage by `fsck` and, before
+    // the multi-worktree guard, deleted by `gc`. Every registered worktree's
+    // index is a reachability root. A worktree whose index cannot be read fails
+    // closed: callers must never prune against a partial root set.
+    for index_path in worktree_index_roots() {
+        let index_exists = index_path.try_exists().map_err(|error| {
+            CliError::fatal(format!(
+                "failed to inspect index GC root '{}': {error}",
+                index_path.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        if !index_exists {
+            continue;
+        }
         let index = git_internal::internal::index::Index::load(&index_path).map_err(|error| {
             CliError::fatal(format!(
                 "failed to read index GC root '{}': {error}",
@@ -1522,6 +1589,35 @@ pub(crate) async fn collect_reachable_objects(
     }
 
     Ok(reachable)
+}
+
+/// Every worktree's private index path — this worktree's plus each registered
+/// linked worktree's `<path>/.libra/index` (plan-20260714 Part C §C.9).
+///
+/// The current worktree's index always comes first so a single-worktree
+/// repository behaves exactly as before. Registry entries whose directory is
+/// gone are skipped (a pruned worktree holds nothing); the caller's
+/// `try_exists` handles a registered-but-indexless worktree.
+pub(crate) fn worktree_index_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = vec![path::index()];
+    let Ok(list) = crate::command::worktree::run_list_worktrees() else {
+        // The registry is unreadable: fall back to this worktree's index only.
+        // Deletion paths independently refuse on multi-worktree repositories, so
+        // this cannot silently narrow the root set for a prune.
+        return roots;
+    };
+    for entry in list.worktrees {
+        if entry.is_main || !entry.exists {
+            continue;
+        }
+        let candidate = std::path::Path::new(&entry.path)
+            .join(crate::utils::util::ROOT_DIR)
+            .join("index");
+        if !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    }
+    roots
 }
 
 /// Walk object references recursively, adding all transitive dependencies.

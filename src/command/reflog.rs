@@ -662,6 +662,28 @@ async fn handle_expire(options: ExpireCliOptions, output: &OutputConfig) -> CliR
     // Phase A: resolve + validate (no writes).
     let refs = resolve_expire_refs(&db, &options).await?;
 
+    // Part C W0 (§C.11): `--updateref` moves a local branch tip to its newest
+    // surviving reflog entry. Refuse before any write if a target branch is
+    // checked out in ANOTHER worktree — moving its tip would diverge that
+    // worktree's working tree from its branch. Non-`--updateref` expiry only
+    // trims reflog entries and is unaffected.
+    if options.updateref && !options.dry_run {
+        for ref_name in &refs {
+            if let Some(branch) = ref_name.strip_prefix("refs/heads/")
+                && let Some(other) =
+                    crate::internal::head::Head::branch_checked_out_elsewhere(branch).await
+            {
+                return Err(CliError::fatal(format!(
+                    "cannot expire --updateref: branch '{branch}' is checked out at worktree '{other}'"
+                ))
+                .with_stable_code(StableErrorCode::Unsupported)
+                .with_hint(
+                    "switch that worktree to another branch first, or run the command there",
+                ));
+            }
+        }
+    }
+
     // Phase B: expire each ref in its own transaction.
     let mut results = Vec::new();
     for ref_name in &refs {

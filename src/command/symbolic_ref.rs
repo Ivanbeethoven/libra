@@ -141,6 +141,17 @@ fn validate_name(name: &str) -> CliResult<()> {
 
 async fn set_head_target(target: &str) -> CliResult<()> {
     let branch_name = branch_name_from_full_ref(target)?;
+    // Part C W0 (§C.11): pointing this worktree's HEAD at a branch already
+    // checked out in ANOTHER worktree would create a forbidden duplicate
+    // checkout. `branch_checked_out_elsewhere` excludes the current worktree, so
+    // re-pointing at this worktree's own current branch is still allowed.
+    if let Some(other) = Head::branch_checked_out_elsewhere(branch_name).await {
+        return Err(CliError::fatal(format!(
+            "cannot point HEAD at '{branch_name}': it is already checked out at worktree '{other}'"
+        ))
+        .with_stable_code(StableErrorCode::Unsupported)
+        .with_hint("check out a different branch, or run the command in that worktree"));
+    }
     Head::update_result(Head::Branch(branch_name.to_string()), None)
         .await
         .map_err(map_head_write_error)?;

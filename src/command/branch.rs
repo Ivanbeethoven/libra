@@ -452,6 +452,14 @@ async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> Cli
     {
         return Err(CliError::from(BranchError::ResetCurrentBranch(branch)));
     }
+    // Part C W0 (§C.11): refuse to reset a branch checked out in ANOTHER
+    // worktree — moving its tip would silently diverge that worktree's working
+    // tree from its branch. The current worktree's branch is caught above.
+    if let Some(other) = Head::branch_checked_out_elsewhere(&branch).await {
+        return Err(CliError::from(BranchError::CheckedOutElsewhere(
+            "reset", branch, other,
+        )));
+    }
     // Target must resolve AND load as a commit — a ref is never pointed at a
     // missing or non-commit object.
     let target_commit = get_target_commit(&args.target).await.map_err(|_| {
@@ -792,6 +800,12 @@ enum BranchError {
     #[error("Cannot delete the branch '{0}' which you are currently on")]
     DeleteCurrent(String),
 
+    /// The branch is checked out in ANOTHER worktree (Part C W0 §C.11): a
+    /// destructive change would leave that worktree's HEAD dangling. `.0` is the
+    /// operation verb, `.1` the branch, `.2` the other worktree's id/path.
+    #[error("Cannot {0} branch '{1}': it is checked out at worktree '{2}'")]
+    CheckedOutElsewhere(&'static str, String, String),
+
     #[error("The branch '{0}' is not fully merged.")]
     NotFullyMerged(String),
 
@@ -914,6 +928,13 @@ impl From<BranchError> for CliError {
             ))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("switch to another branch first."),
+            BranchError::CheckedOutElsewhere(verb, name, other) => CliError::fatal(format!(
+                "Cannot {verb} branch '{name}': it is checked out at worktree '{other}'"
+            ))
+            .with_stable_code(StableErrorCode::Unsupported)
+            .with_hint(
+                "switch that worktree to another branch first, or run the command there",
+            ),
             BranchError::NotFullyMerged(name) => {
                 CliError::failure(format!("The branch '{name}' is not fully merged."))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
@@ -1505,6 +1526,16 @@ async fn delete_branch_impl(branch_name: String, force: bool) -> Result<BranchOu
     {
         return Err(BranchError::DeleteCurrent(branch_name));
     }
+    // Part C W0 (§C.11): refuse to delete a branch checked out in ANOTHER
+    // worktree — that worktree's HEAD would be left dangling (Git parity). The
+    // current worktree's own branch is caught by DeleteCurrent above.
+    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+        return Err(BranchError::CheckedOutElsewhere(
+            "delete",
+            branch_name,
+            other,
+        ));
+    }
 
     if !force {
         let head_commit = match head {
@@ -1574,6 +1605,12 @@ async fn rename_branch_impl(args: &[String]) -> Result<BranchOutput, BranchError
     }
 
     let old_branch = require_existing_local_branch(&old_name).await?;
+    // Part C W0 (§C.11): refuse to rename a branch checked out in ANOTHER
+    // worktree — that worktree's HEAD would be left pointing at the deleted old
+    // name. The current worktree's own HEAD is re-pointed to the new name below.
+    if let Some(other) = Head::branch_checked_out_elsewhere(&old_name).await {
+        return Err(BranchError::CheckedOutElsewhere("rename", old_name, other));
+    }
     if Branch::find_branch_result(&new_name, None)
         .await
         .map_err(map_branch_store_error)?

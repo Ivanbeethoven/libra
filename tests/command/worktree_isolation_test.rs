@@ -11,7 +11,7 @@
 
 use std::fs;
 
-use super::{assert_cli_success, run_libra_command};
+use super::{assert_cli_success, run_libra_command, run_libra_command_with_stdin};
 
 /// A committed repo (a.txt @ c1) with a `feature` branch. Returns its dir.
 fn repo_with_feature() -> tempfile::TempDir {
@@ -342,6 +342,332 @@ fn status_cache_modes_refused_in_linked_but_plain_status_works() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// Part C W0 (§C.11): destructive branch writers (`branch -d`, `branch -m`,
+/// `branch reset`) refuse to touch a branch that is checked out in ANOTHER
+/// worktree — otherwise that worktree's HEAD would dangle or its working tree
+/// would silently diverge (Git parity).
+#[test]
+fn branch_writers_refuse_branch_checked_out_in_another_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    // The linked worktree checks out `feature`.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // From the main worktree, deleting/renaming/resetting `feature` is refused.
+    for argv in [
+        vec!["branch", "-D", "feature"],
+        vec!["branch", "-m", "feature", "feature2"],
+        vec!["branch", "reset", "feature", "main"],
+    ] {
+        let out = run_libra_command(&argv, main);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{argv:?} must be refused while feature is checked out elsewhere"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("checked out"),
+            "{argv:?} should name the other worktree: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A branch checked out NOWHERE else is still freely mutable.
+    assert_cli_success(
+        &run_libra_command(&["branch", "spare"], main),
+        "create spare branch",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "-D", "spare"], main),
+        "delete a free branch works",
+    );
+}
+
+/// Part C W0 (§C.11): `update-ref` refuses to move or delete a branch that is
+/// checked out in another worktree, but may still update this worktree's own
+/// current branch.
+#[test]
+fn update_ref_refuses_branch_checked_out_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+    // main HEAD commit, to use as an update target.
+    let main_oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+        .trim()
+        .to_string();
+
+    // From main, update-ref on `feature` (checked out in wt) is refused.
+    let refused = run_libra_command(&["update-ref", "refs/heads/feature", &main_oid], main);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "update-ref on wt branch refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("checked out"),
+        "names the other worktree: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // update-ref on main's OWN current branch is still allowed.
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/main", &main_oid], main),
+        "update-ref on own branch works",
+    );
+}
+
+/// Part C W0 (§C.11): `symbolic-ref HEAD refs/heads/<b>` refuses to point HEAD
+/// at a branch already checked out in another worktree (would create a
+/// duplicate checkout).
+#[test]
+fn symbolic_ref_refuses_branch_checked_out_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // From main (on `main`), pointing HEAD at `feature` is refused.
+    let refused = run_libra_command(&["symbolic-ref", "HEAD", "refs/heads/feature"], main);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "symbolic-ref to wt branch refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("checked out"),
+        "names the collision: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // Re-pointing at main's own current branch is allowed.
+    assert_cli_success(
+        &run_libra_command(&["symbolic-ref", "HEAD", "refs/heads/main"], main),
+        "symbolic-ref to own branch works",
+    );
+}
+
+/// Part C W0 (§C.11, intentionally-different from Git): `--ignore-other-worktrees`
+/// does NOT bypass the same-branch guard in a multi-worktree repo. Libra never
+/// allows the same branch checked out in two worktrees.
+#[test]
+fn ignore_other_worktrees_flag_cannot_bypass_in_multi_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    // main is on `main`; the linked worktree takes `feature`.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // From main, `checkout --ignore-other-worktrees feature` is STILL refused.
+    let co = run_libra_command(&["checkout", "--ignore-other-worktrees", "feature"], main);
+    assert_ne!(co.status.code(), Some(0), "checkout flag cannot bypass");
+    let co_err = String::from_utf8_lossy(&co.stderr);
+    assert!(
+        co_err.contains("already checked out") && co_err.contains("ignore-other-worktrees"),
+        "error explains the flag is not honored: {co_err}"
+    );
+
+    // Plain `switch feature` is also refused (the same-branch guard).
+    let sw = run_libra_command(&["switch", "feature"], main);
+    assert_ne!(sw.status.code(), Some(0), "switch to wt branch refused");
+    assert!(
+        String::from_utf8_lossy(&sw.stderr).contains("already checked out"),
+        "switch refused: {}",
+        String::from_utf8_lossy(&sw.stderr)
+    );
+}
+
+/// Part C W0 (§C.11): `reflog expire --updateref` moves a branch tip; it
+/// refuses a branch checked out in another worktree (before any write).
+#[test]
+fn reflog_expire_updateref_refuses_branch_checked_out_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+    // Commit on `feature` in the linked worktree so it has a (shared) branch
+    // reflog for `reflog expire` to resolve — otherwise expire errors with
+    // "reflog not found" before the cross-worktree guard runs.
+    fs::write(wt.join("f.txt"), "f\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "on-feature", "--no-verify"], &wt),
+        "wt commit on feature",
+    );
+
+    // From main, `reflog expire --updateref feature` is refused.
+    let out = run_libra_command(
+        &["reflog", "expire", "--updateref", "--expire=all", "feature"],
+        main,
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "reflog expire --updateref on a wt branch refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("checked out"),
+        "names the collision: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--updateref` on main's own branch is allowed (no other-worktree conflict).
+    assert_cli_success(
+        &run_libra_command(&["reflog", "expire", "--updateref", "main"], main),
+        "reflog expire --updateref on own branch works",
+    );
+}
+
+/// Part C W0 (§C.11): `fast-import`'s batch flush rewrites shared branch refs;
+/// it refuses (before the transaction) to import into a branch checked out in
+/// another worktree.
+#[test]
+fn fast_import_refuses_branch_checked_out_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // From main, import a commit onto `feature` (checked out in wt) — refused.
+    let stream = "blob\nmark :1\ndata 6\nhello\n\n\
+        commit refs/heads/feature\nmark :2\n\
+        committer Tester <t@example.com> 1700000000 +0000\ndata 8\nimported\n\n\
+        M 100644 :1 g.txt\n\ndone\n";
+    let out = run_libra_command_with_stdin(&["fast-import", "--quiet"], main, stream);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "fast-import into a wt branch must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("checked out"),
+        "names the collision: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Part C W0 release gate (§C.11): GC's reachability walk reads only the
+/// CURRENT worktree's index, so a blob staged (but not committed) in a LINKED
+/// worktree is not yet a root. Until the typed `GcObjectSource` inventory
+/// lands, `maintenance run --task gc` must skip the loose-object prune in a
+/// multi-worktree repository rather than delete objects it cannot see.
+#[test]
+fn gc_skips_prune_in_multi_worktree_repo() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Stage a blob ONLY in the linked worktree (never committed). Its object is
+    // reachable only from that worktree's private index.
+    fs::write(wt.join("staged-only.txt"), "precious\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "staged-only.txt"], &wt),
+        "stage blob in wt",
+    );
+    let oid = String::from_utf8_lossy(
+        &run_libra_command(&["hash-object", "staged-only.txt"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(!oid.is_empty(), "hashed the staged blob");
+
+    // GC from the MAIN worktree must skip the prune (not delete the blob).
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
+    assert_cli_success(&gc, "maintenance gc");
+    let text = String::from_utf8_lossy(&gc.stdout) + String::from_utf8_lossy(&gc.stderr);
+    assert!(
+        text.contains("linked worktree"),
+        "gc should report skipping the prune for linked worktrees: {text}"
+    );
+
+    // The staged-only blob must still be readable (no data loss).
+    let cat = run_libra_command(&["cat-file", "-p", &oid], main);
+    assert_cli_success(&cat, "staged-only blob survives gc");
+    assert!(
+        String::from_utf8_lossy(&cat.stdout).contains("precious"),
+        "the linked worktree's staged blob was pruned by gc"
+    );
+
+    // Part C §C.9: every worktree's private index is a reachability root, so
+    // `fsck --unreachable` must NOT report the linked worktree's staged blob as
+    // garbage (fsck only reports, but a false "unreachable" invites a manual
+    // delete).
+    let fsck = run_libra_command(&["fsck", "--unreachable"], main);
+    let fsck_text = String::from_utf8_lossy(&fsck.stdout) + String::from_utf8_lossy(&fsck.stderr);
+    assert!(
+        !fsck_text.contains(&oid),
+        "the linked worktree's staged blob must not be reported unreachable: {fsck_text}"
+    );
+
+    // The incremental-repack task has the same gap (it rebuilds one pack from
+    // the reachable set and deletes the old packs), so it must skip too.
+    let repack = run_libra_command(
+        &["maintenance", "run", "--task", "incremental-repack"],
+        main,
+    );
+    assert_cli_success(&repack, "maintenance incremental-repack");
+    let repack_text =
+        String::from_utf8_lossy(&repack.stdout) + String::from_utf8_lossy(&repack.stderr);
+    assert!(
+        repack_text.contains("linked worktree"),
+        "incremental-repack should skip in a multi-worktree repo: {repack_text}"
+    );
 }
 
 #[test]

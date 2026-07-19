@@ -747,6 +747,22 @@ impl<R: BufRead> Importer<R> {
                 ))
             })?;
         }
+        // Part C W0 (§C.11): the batch flush rewrites/deletes shared branch
+        // refs. Refuse before the transaction if any target branch is checked
+        // out in ANOTHER worktree — its HEAD would dangle or its working tree
+        // would silently diverge. `branch_checked_out_elsewhere` excludes the
+        // current worktree, so importing into this worktree's own branch stays
+        // allowed.
+        for refname in pending_refs.keys() {
+            if let Some(branch) = refname.strip_prefix("refs/heads/")
+                && let Some(other) =
+                    crate::internal::head::Head::branch_checked_out_elsewhere(branch).await
+            {
+                return Err(self.fatal(&format!(
+                    "cannot import into branch '{branch}': it is checked out at worktree '{other}'"
+                )));
+            }
+        }
         let db = get_db_conn_instance().await;
         let written = db
             .transaction(|txn| {

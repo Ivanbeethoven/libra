@@ -1540,13 +1540,21 @@ async fn collect_reachability_context(storage: &ClientStorage) -> CliResult<Reac
         }
     }
 
-    // Collect objects from index
-    let index_path = path::index();
-    if index_path.exists()
-        && let Ok(index) = Index::load(&index_path)
-    {
-        for entry in index.tracked_entries(0) {
-            ctx.index_objects.insert(entry.hash);
+    // Collect objects from EVERY worktree's index (plan-20260714 Part C §C.9).
+    // Each worktree owns a PRIVATE index, so walking only `path::index()` would
+    // report a blob staged in ANOTHER worktree as unreachable/dangling — fsck
+    // does not delete, but a false "unreachable" invites a manual delete. All
+    // stages (0..=3) count: a blob referenced only by an unmerged conflict
+    // stage is not garbage either.
+    for index_path in crate::command::maintenance::worktree_index_roots() {
+        if index_path.exists()
+            && let Ok(index) = Index::load(&index_path)
+        {
+            for stage in 0..=3 {
+                for entry in index.tracked_entries(stage) {
+                    ctx.index_objects.insert(entry.hash);
+                }
+            }
         }
     }
 

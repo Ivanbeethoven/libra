@@ -4,6 +4,74 @@
 
 ### Changed
 
+- **Internal: `WorktreeScope` is now the single worktree-scope value object
+  (v0.19.24, plan-20260714 Part C §C.4.1)**: scope resolution no longer passes a
+  bare `Option<String>` around for each layer to reinterpret. The type encodes
+  both storage conventions explicitly — `worktree_id()` for the `reference`
+  (HEAD) table, where the main worktree is spelled `NULL`, and `storage_key()`
+  for `worktree_id TEXT NOT NULL` columns, where main is the empty string (a
+  nullable unique key cannot express "at most one row per scope" in SQLite).
+  A linked worktree can never alias onto main in either form. The HEAD scope
+  query and the linked-worktree guards now resolve through it; behavior is
+  unchanged.
+
+- **`fast-import` refuses a branch checked out in another worktree (v0.19.22,
+  plan-20260714 Part C W0 §C.11)**: the batch ref flush rewrites and deletes
+  shared branch refs; it now fails closed, before the transaction, if any
+  target branch is checked out in a different worktree. Importing into this
+  worktree's own branch is unaffected. This completes the cross-worktree
+  ref-writer guard set (`branch`/`update-ref`/`symbolic-ref`/`op restore`/
+  `reflog expire --updateref`/`checkout`/`switch`/`fast-import`); `fetch`
+  already refused checked-out destinations across all worktrees.
+
+- **`reflog expire --updateref` refuses a branch checked out in another
+  worktree (v0.19.21, plan-20260714 Part C W0 §C.11)**: `--updateref` moves a
+  pruned branch's tip to its newest surviving reflog entry; it now fails closed,
+  before any write, when a target branch is checked out in a different worktree
+  (moving its tip would diverge that worktree's working tree). Plain reflog
+  expiry (no `--updateref`) only trims entries and is unaffected.
+
+- **`op restore` refuses a branch checked out in another worktree (v0.19.20,
+  plan-20260714 Part C W0 §C.11)**: `op restore` rewrites and prunes shared
+  branch refs to reproduce a past operation's view; it now fails closed, before
+  any write, if any branch it would move or prune is checked out in a different
+  worktree (that worktree's HEAD would dangle). Restoring this worktree's own
+  branch is still allowed.
+
+- **`checkout`/`switch --ignore-other-worktrees` no longer bypasses the
+  same-branch guard (v0.19.19, plan-20260714 Part C W0 §C.11,
+  intentionally-different from Git)**: Libra never allows the same shared branch
+  checked out in two worktrees, so `--ignore-other-worktrees` is now accepted
+  only for CLI compatibility — it does NOT override the refusal in a
+  multi-worktree repo (against a real collision the checkout is still refused,
+  with a note that the flag is not honored). It remains a silent no-op in a
+  single-worktree repo (no collision to override). Docs, `COMPATIBILITY.md`, and
+  the error hint (which no longer suggests the flag) are updated accordingly.
+
+- **`symbolic-ref HEAD` refuses a branch checked out in another worktree
+  (v0.19.18, plan-20260714 Part C W0 §C.11)**: `symbolic-ref HEAD
+  refs/heads/<branch>` now fails closed when `<branch>` is already checked out
+  in a different worktree, preventing a forbidden duplicate checkout (the same
+  guard `switch`/`checkout` already apply). Re-pointing at this worktree's own
+  current branch is still allowed.
+
+- **`update-ref` refuses to move/delete a branch checked out in another
+  worktree (v0.19.17, plan-20260714 Part C W0 §C.11)**: `update-ref
+  refs/heads/<branch>` now fails closed when `<branch>` is checked out in a
+  different worktree (its HEAD would dangle or its working tree diverge),
+  joining the `branch -d`/`-m`/`reset` guards. Updating this worktree's own
+  current branch is still allowed.
+
+- **Destructive branch writers refuse a branch checked out in another worktree
+  (v0.19.16, plan-20260714 Part C W0 §C.11)**: `branch -d`/`-D` (delete),
+  `branch -m`/`-M` (rename), and `branch reset` now fail closed when the target
+  branch is checked out in a DIFFERENT worktree, instead of leaving that
+  worktree's HEAD dangling (delete/rename) or silently diverging its working
+  tree from its branch (reset) — matching Git, which refuses these across
+  worktrees. The current worktree's own branch is still caught by the existing
+  "currently on"/"reset current branch" checks, and a branch checked out
+  nowhere else remains freely mutable.
+
 - **`status --scan`/`--cached`/`--check-dirty` fail closed in a linked worktree
   (v0.19.15, plan-20260714 Part C W0)**: these dirty-cache modes read/prune the
   repository-global `working_dirty`/`working_dirty_meta`, so they now refuse to
@@ -54,6 +122,33 @@
   shared HEAD and `--delete-dir`-gated scoped-row GC) to the isolated reality.
 
 ### Fixed
+
+- **Every worktree's index is now a reachability root (v0.19.25,
+  plan-20260714 Part C §C.9)**: the reachability walks used by `gc`/`repack`
+  and by `fsck` each read only the CURRENT worktree's index, so a blob staged
+  in ANOTHER worktree was treated as unreferenced — `fsck --unreachable`
+  reported it as garbage, which invites a manual delete. Both walks now collect
+  every registered worktree's private index, across all stages (0–3, so a blob
+  held only by an unmerged conflict stage counts too). This is the first
+  reachability-root source of the per-worktree inventory; `gc`'s multi-worktree
+  prune guard stays until the remaining root types (held sidecars, operation-view
+  pointers, sequencer rows) are also collected.
+
+- **`gc` no longer prunes objects reachable only from a linked worktree
+  (v0.19.23, plan-20260714 Part C W0 release gate §C.11)**: the
+  garbage-collection reachability walk reads only the CURRENT worktree's index,
+  so a blob staged (but not yet committed) in a linked worktree was not a root —
+  running `maintenance run --task gc` from the main worktree could delete it.
+  In a repository with linked worktrees `gc` now skips the loose-object prune
+  entirely and says so in its task message, instead of deleting objects it
+  cannot see. `--dry-run` still previews, and single-worktree repositories are
+  unaffected. Pruning is re-enabled there once every worktree's reachability
+  roots are collected. The `incremental-repack` maintenance task has the same
+  gap — it rebuilds one consolidated pack from the reachable set and then
+  deletes the old packs, dropping any object that lived only in an old pack and
+  is reachable only from a linked worktree — so it skips in a multi-worktree
+  repository too. (Standalone `repack -d` was never affected: it only removes
+  loose objects that are now inside the new pack, and never deletes packs.)
 
 - **AI session/MCP storage roots no longer silently mint a phantom `.libra`
   (v0.19.12, plan-20260714 Part C W0 §C.4.1)**: the AI session-transcript store

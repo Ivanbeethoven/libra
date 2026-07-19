@@ -119,6 +119,19 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
     if !util::is_valid_refname(&args.ref_name) {
         return Err(fatal(format!("invalid ref name '{}'", args.ref_name)));
     }
+    // Part C W0 (§C.11): refuse to move or delete a branch checked out in
+    // ANOTHER worktree — its HEAD would be left dangling or its working tree
+    // would silently diverge. `branch_checked_out_elsewhere` excludes the
+    // current worktree, so updating this worktree's own branch is still allowed.
+    if let Some(other) = crate::internal::head::Head::branch_checked_out_elsewhere(branch).await {
+        return Err(CliError::fatal(format!(
+            "cannot update '{}': branch '{branch}' is checked out at worktree '{other}'",
+            args.ref_name
+        ))
+        .with_exit_code(128)
+        .with_stable_code(StableErrorCode::Unsupported)
+        .with_hint("switch that worktree to another branch first, or run the command there"));
+    }
 
     let hash_kind = get_hash_kind();
     let zero = ObjectHash::zero_str(hash_kind);
