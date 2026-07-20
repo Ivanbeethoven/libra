@@ -14,9 +14,10 @@
 //!   name (if any) so `reset` can re-attach instead of leaving the user in a
 //!   detached state.
 //! - Working-tree safety: every `bisect good/bad/skip` calls
-//!   [`restore_to_commit`], which clears the worktree (preserving `.libra/`)
-//!   before re-laying the target tree. `start` therefore refuses to run with
-//!   uncommitted or ignored changes that could be lost.
+//!   [`restore_to_commit`], which rewrites the per-worktree index AND the
+//!   working tree from the target commit via the canonical restore contract
+//!   (tracked paths only — untracked files survive a step, like `git bisect`).
+//!   `start` still refuses to run with uncommitted changes that could be lost.
 //! - Convergence semantics: [`BisectNext`] distinguishes between "more
 //!   candidates", "single culprit found", and "all candidates skipped" so
 //!   each handler can render the right user message.
@@ -27,10 +28,7 @@ use std::{
     str::FromStr,
 };
 
-use git_internal::{
-    hash::ObjectHash,
-    internal::object::{commit::Commit, tree::Tree},
-};
+use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait, Value};
 use serde::Serialize;
 
@@ -49,7 +47,6 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         ignore::IgnorePolicy,
-        object_ext::TreeExt,
         output::{OutputConfig, emit_json_data},
         util,
     },
@@ -247,15 +244,61 @@ impl BisectState {
             }
         }
 
+        // Part C W1 (§C.4.2): `worktree_id` scopes the bisect to the worktree
+        // that started it (empty string = main). Added by plain `ADD COLUMN`
+        // (not a table rebuild) so it works regardless of which of the lazily
+        // added columns above already exist. Existing rows belong to main
+        // (`''`), and each worktree keeps its own single bisect row.
+        let check_worktree_id_stmt = Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+                SELECT COUNT(*)
+                FROM pragma_table_info('bisect_state')
+                WHERE name='worktree_id';
+            "#
+            .to_string(),
+        );
+        if let Some(result) = db
+            .query_one(check_worktree_id_stmt)
+            .await
+            .map_err(|e| format!("failed to check bisect_state columns: {e}"))?
+        {
+            let count: i64 = result.try_get_by_index(0).unwrap_or(0);
+            if count == 0 {
+                let alter_stmt = Statement::from_string(
+                    DbBackend::Sqlite,
+                    "ALTER TABLE bisect_state ADD COLUMN worktree_id TEXT NOT NULL DEFAULT '';"
+                        .to_string(),
+                );
+                match db.execute(alter_stmt).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        if !e.to_string().contains("duplicate column name") {
+                            return Err(format!("failed to add worktree_id column: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    /// This worktree's scope key for `bisect_state` (`""` = main worktree).
+    fn scope_key() -> String {
+        crate::internal::worktree_scope::WorktreeScope::current()
+            .storage_key()
+            .to_string()
     }
 
     /// Counts rows where `completed = 0`. Returns false on an empty table.
     async fn has_active_state_in_db<C: ConnectionTrait>(db: &C) -> Result<bool, String> {
-        // Check if there's an in-progress (not completed) bisect session
-        let stmt = Statement::from_string(
+        // Check if there's an in-progress (not completed) bisect session in
+        // THIS worktree's scope (Part C W1 §C.4.2).
+        let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT COUNT(*) FROM bisect_state WHERE completed = 0;".to_string(),
+            "SELECT COUNT(*) FROM bisect_state WHERE completed = 0 AND worktree_id = ?;",
+            [Self::scope_key().into()],
         );
 
         if let Some(result) = db
@@ -273,10 +316,11 @@ impl BisectState {
     /// Counts rows regardless of `completed`. Used by `reset` to recover even
     /// after the search converged.
     async fn has_any_state_in_db<C: ConnectionTrait>(db: &C) -> Result<bool, String> {
-        // Check if there's any bisect state (active or completed)
-        let stmt = Statement::from_string(
+        // Check if there's any bisect state (active or completed) in scope.
+        let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT COUNT(*) FROM bisect_state;".to_string(),
+            "SELECT COUNT(*) FROM bisect_state WHERE worktree_id = ?;",
+            [Self::scope_key().into()],
         );
 
         if let Some(result) = db
@@ -302,8 +346,8 @@ impl BisectState {
         let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             r#"
-                INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                INSERT INTO bisect_state (orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent, worktree_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             "#,
             [
                 state.orig_head.to_string().into(),
@@ -329,6 +373,7 @@ impl BisectState {
                     .unwrap_or(Value::BigInt(None)),
                 (state.completed as i64).into(),
                 (state.first_parent as i64).into(),
+                Self::scope_key().into(),
             ],
         );
 
@@ -343,9 +388,10 @@ impl BisectState {
     /// `good`/`skipped` vectors and re-parsing each `ObjectHash`. Returns
     /// `Ok(None)` when no row exists.
     async fn load_from_db<C: ConnectionTrait>(db: &C) -> Result<Option<BisectState>, String> {
-        let stmt = Statement::from_string(
+        let stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "SELECT orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent FROM bisect_state LIMIT 1;".to_string(),
+            "SELECT orig_head, orig_head_name, bad, good, current, skipped, steps, completed, first_parent FROM bisect_state WHERE worktree_id = ? LIMIT 1;",
+            [Self::scope_key().into()],
         );
 
         if let Some(result) = db
@@ -397,11 +443,15 @@ impl BisectState {
         Ok(None)
     }
 
-    /// Truncate the bisect-state table. Used by both `save` (before insert)
-    /// and `cleanup` (after a session ends).
+    /// Truncate THIS worktree's bisect-state row (Part C W1 §C.4.2). Used by
+    /// both `save` (before insert) and `cleanup` (after a session ends). Never
+    /// an unconditional `DELETE`, which would wipe another worktree's bisect.
     async fn clear_state_in_db<C: ConnectionTrait>(db: &C) -> Result<(), String> {
-        let stmt =
-            Statement::from_string(DbBackend::Sqlite, "DELETE FROM bisect_state;".to_string());
+        let stmt = Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM bisect_state WHERE worktree_id = ?;",
+            [Self::scope_key().into()],
+        );
 
         db.execute(stmt)
             .await
@@ -561,7 +611,12 @@ impl From<BisectError> for CliError {
 /// - All variants forward their errors as `Err(CliError::fatal)` derived from
 ///   either DB failures, missing state, or rev-resolution failures.
 pub async fn execute_safe(bisect_cmd: Bisect, output: &OutputConfig) -> CliResult<()> {
-    crate::command::ensure_main_worktree("bisect")?;
+    // Part C W1 (§C.4.2): bisect is now safe in a LINKED worktree — its state
+    // is the `bisect_state` row keyed by `worktree_id` (every load/save/clear
+    // carries this worktree's scope key), its checkouts materialize into THIS
+    // worktree's working directory, and `reset` restores only this worktree's
+    // own HEAD. Two worktrees can bisect concurrently without interfering, so
+    // the `ensure_main_worktree` guard is lifted here.
     let result = run_bisect(bisect_cmd).await?;
     render_bisect_output(&result, output)
 }
@@ -853,9 +908,11 @@ async fn run_bisect_start(
             .with_hint("bisect requires a working tree to check out commits for testing"));
     }
 
-    // Require a clean working tree to prevent data loss
-    // Bisect checkout removes and restores files, which would delete untracked content
-    // Use IncludeIgnored policy to catch ignored files (.env, cache dirs) that would also be deleted
+    // Require a clean working tree to prevent data loss: each bisect checkout
+    // resets tracked paths in the index and working tree to the candidate
+    // commit (uncommitted tracked changes would be lost), and a candidate that
+    // TRACKS a path currently present as an untracked/ignored file would
+    // overwrite it — so IncludeIgnored still catches .env/cache-dir collisions.
     let staged = changes_to_be_committed_safe()
         .await
         .map_err(|e| CliError::fatal(format!("Failed to check staged changes: {e}")))?;
@@ -865,7 +922,7 @@ async fn run_bisect_start(
         return Err(CliError::fatal(
             "working tree contains uncommitted changes",
         )
-        .with_hint("commit or stash your changes before running bisect. Note: each 'bisect good/bad/skip' step resets the working tree and deletes untracked/ignored files (including build artifacts), so keep important generated files outside the repo or stashed"));
+        .with_hint("commit or stash your changes before running bisect. Note: each 'bisect good/bad/skip' step resets tracked files in the index and working tree to the candidate commit, so uncommitted tracked changes would be lost — and an untracked/ignored file would be overwritten if a candidate commit tracks a path with the same name"));
     }
 
     // Check if there's any existing bisect state (active or completed)
@@ -1284,6 +1341,27 @@ async fn run_bisect_reset(rev: Option<String>) -> CliResult<BisectOutput> {
         (state.orig_head, None)
     };
 
+    // Part C W1 (§C.4.2): branches are SHARED across worktrees. While this
+    // worktree bisected (detached), another worktree may have legitimately
+    // checked out the original branch — re-attaching would put one branch on
+    // two HEADs, the exact state `switch`/`checkout` categorically refuse.
+    // Warn and end the session detached at the target commit instead.
+    let target_branch = match target_branch {
+        Some(branch_name) => {
+            if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+                crate::utils::error::emit_warning(format!(
+                    "not re-attaching branch '{branch_name}': it is now checked out at \
+                     worktree '{other}'; bisect ends detached at {target_hash} \
+                     (use 'libra switch' to pick a branch)"
+                ));
+                None
+            } else {
+                Some(branch_name)
+            }
+        }
+        None => None,
+    };
+
     // Restore original HEAD - use branch if available to avoid detached state
     if let Some(branch_name) = target_branch.clone() {
         restore_to_branch(branch_name, target_hash).await?;
@@ -1645,90 +1723,42 @@ async fn checkout_to_bisect_point(
     Ok(state.steps)
 }
 
-/// Repaint the worktree from the tree of `commit_hash`.
+/// Repaint the index AND the worktree from the tree of `commit_hash`, via the
+/// canonical restore contract (the same call `switch` makes when moving HEAD).
 ///
 /// Functional scope:
-/// - Loads the commit and its root tree, identifies the working directory by
-///   stripping `.libra` from the storage path, clears the worktree (keeping
-///   the `.libra` directory itself), and restores every plain entry through
-///   [`restore::restore_to_file`] so LFS pointers are honoured.
+/// - `restore --source <commit> --staged --worktree <workdir>` rewrites the
+///   per-worktree index and working tree together: tracked paths are laid from
+///   the target tree (LFS pointers and symlinks honoured), and index-tracked
+///   paths absent from the target are removed (no-overlay).
 ///
-/// Boundary conditions:
-/// - Failures to load the commit or tree are fatal — partial restoration
-///   would leave the worktree corrupt.
-/// - Calling this function effectively *deletes* every file under the
-///   working tree that is not part of `commit_hash`'s tree, including
-///   ignored files. `start` therefore guards against dirty worktrees.
+/// Boundary conditions (Part C W1, §C.4.2):
+/// - `restore` resolves the index and working directory PER-WORKTREE, so a
+///   linked worktree's bisect checkouts materialize into its own tree. The
+///   former burn-down repaint resolved the MAIN worktree's directory via the
+///   shared storage path's parent and never rewrote the index, so every step
+///   showed phantom `status` modifications.
+/// - Untracked files created mid-session (e.g. by a `bisect run` script) now
+///   survive a step, matching `git bisect`'s checkout semantics; `start` still
+///   requires a clean tree so nothing pre-existing can be clobbered.
 async fn restore_to_commit(commit_hash: ObjectHash) -> CliResult<()> {
-    let commit = load_object::<Commit>(&commit_hash)
-        .map_err(|e| CliError::fatal(format!("Failed to load commit: {e}")))?;
-
-    let tree = load_object::<Tree>(&commit.tree_id)
-        .map_err(|e| CliError::fatal(format!("Failed to load tree: {e}")))?;
-
-    let workdir = util::try_get_storage_path(None)
-        .map_err(|e| CliError::fatal(format!("Cannot find storage path: {e}")))?;
-    let workdir = workdir
-        .parent()
-        .ok_or_else(|| CliError::fatal("Cannot find working directory"))?
-        .to_path_buf();
-
-    // Clear working directory (except .libra)
-    clear_workdir_except_libra(&workdir)?;
-
-    // Restore files from tree (handles LFS pointers via restore::restore_to_file)
-    restore_tree_to_workdir(&tree).await?;
-
-    Ok(())
-}
-
-/// Delete every top-level entry inside `workdir` except the `.libra/`
-/// directory.
-///
-/// Boundary conditions:
-/// - Used only in bisect's "burn down and lay back" worktree restore path.
-///   Any I/O error aborts the restore with a fatal `CliError`.
-fn clear_workdir_except_libra(workdir: &std::path::Path) -> CliResult<()> {
-    for entry in std::fs::read_dir(workdir)
-        .map_err(|e| CliError::fatal(format!("Failed to read workdir: {e}")))?
-    {
-        let entry = entry.map_err(|e| CliError::fatal(format!("Failed to read entry: {e}")))?;
-        let path = entry.path();
-
-        // Skip .libra directory
-        if path.file_name().map(|n| n == ".libra").unwrap_or(false) {
-            continue;
-        }
-
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path).map_err(|e| {
-                CliError::fatal(format!("Failed to remove dir {}: {}", path.display(), e))
-            })?;
-        } else {
-            std::fs::remove_file(&path).map_err(|e| {
-                CliError::fatal(format!("Failed to remove file {}: {}", path.display(), e))
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Materialise every plain (non-tree) item from `tree` onto disk via
-/// [`restore::restore_to_file`].
-///
-/// Boundary conditions:
-/// - Stops at the first failure with a fatal error tagged with the offending
-///   path. The worktree may already be partially restored.
-async fn restore_tree_to_workdir(tree: &Tree) -> CliResult<()> {
-    let items = tree.get_plain_items();
-    for (path, hash) in items {
-        // path is already a PathBuf relative to workdir
-        restore::restore_to_file(&hash, &path).await.map_err(|e| {
-            CliError::fatal(format!("Failed to restore file {}: {}", path.display(), e))
-        })?;
-    }
-
+    let restore_args = restore::RestoreArgs {
+        overlay: false,
+        no_overlay: false,
+        ours: false,
+        theirs: false,
+        ignore_unmerged: false,
+        merge: false,
+        conflict: None,
+        worktree: true,
+        staged: true,
+        source: Some(commit_hash.to_string()),
+        pathspec: vec![util::working_dir_string()],
+        pathspec_from_file: None,
+        pathspec_file_nul: false,
+        no_progress: false,
+    };
+    restore::execute_to_output(restore_args).await?;
     Ok(())
 }
 

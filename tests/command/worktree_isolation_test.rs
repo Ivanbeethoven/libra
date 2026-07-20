@@ -1032,6 +1032,204 @@ fn merge_runs_in_linked_worktree() {
     assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
 }
 
+fn head_sha(dir: &std::path::Path) -> String {
+    String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], dir).stdout)
+        .trim()
+        .to_string()
+}
+
+/// In `dir`: switch to `feature` and add commits c2 (+b2.txt) and c3 (+b3.txt)
+/// on top of c1, returning `(c1_sha, c2_sha, c3_sha)` — a bisect range.
+fn grow_feature_history(dir: &std::path::Path) -> (String, String, String) {
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], dir),
+        "switch feature",
+    );
+    let c1 = head_sha(dir);
+    let mut shas = Vec::new();
+    for n in [2, 3] {
+        fs::write(dir.join(format!("b{n}.txt")), format!("b{n}\n")).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", &format!("b{n}.txt")], dir),
+            "add",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("c{n}"), "--no-verify"], dir),
+            "commit",
+        );
+        shas.push(head_sha(dir));
+    }
+    (c1, shas[0].clone(), shas[1].clone())
+}
+
+/// Part C W1 (§C.4.2): `bisect` is allowed in a linked worktree — its
+/// `bisect_state` row is keyed by `worktree_id`, its checkouts materialize into
+/// that worktree's OWN working directory AND index (no phantom `status`
+/// modifications), and `reset` restores only that worktree's HEAD. The main
+/// worktree's HEAD and files stay untouched throughout.
+#[test]
+fn bisect_runs_in_linked_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let (c1, c2, c3) = grow_feature_history(&wt);
+    let main_head_before = abbrev_head(main);
+
+    // Start a bisect in the LINKED worktree — must not be refused.
+    let start = run_libra_command(&["bisect", "start", "HEAD", "--good", &c1], &wt);
+    assert!(
+        start.status.success(),
+        "bisect start in a linked worktree should work: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    // The bisect checkout detached the LINKED worktree's HEAD at a candidate
+    // in (c1..c3] and materialized THAT candidate's files into the linked
+    // worktree — with the index rewritten in step, so `status` is clean.
+    assert_eq!(abbrev_head(&wt), "HEAD", "wt HEAD detached at bisect point");
+    let candidate = head_sha(&wt);
+    assert!(
+        candidate == c2 || candidate == c3,
+        "wt detached at a bisect candidate (got {candidate})"
+    );
+    assert!(wt.join("b2.txt").exists(), "candidate tree materialized");
+    assert_eq!(
+        wt.join("b3.txt").exists(),
+        candidate == c3,
+        "b3.txt present exactly when the candidate is c3"
+    );
+    let wt_status = run_libra_command(&["status", "--porcelain"], &wt);
+    assert_eq!(
+        String::from_utf8_lossy(&wt_status.stdout).trim(),
+        "",
+        "bisect checkout rewrites the per-worktree index in step with the \
+         worktree — no phantom modifications"
+    );
+
+    // The MAIN worktree is untouched: HEAD, files, and status.
+    assert_eq!(
+        abbrev_head(main),
+        main_head_before,
+        "main HEAD untouched by the linked worktree's bisect"
+    );
+    assert!(
+        !main.join("b2.txt").exists() && !main.join("b3.txt").exists(),
+        "the bisect checkout materialized into the LINKED worktree, not main"
+    );
+    assert!(main.join("a.txt").exists(), "main's own files survive");
+
+    // Reset ends the session and restores the linked worktree's branch + tree.
+    assert_cli_success(
+        &run_libra_command(&["bisect", "reset"], &wt),
+        "bisect reset",
+    );
+    assert_eq!(abbrev_head(&wt), "feature", "wt restored to its branch");
+    assert!(
+        wt.join("b2.txt").exists() && wt.join("b3.txt").exists(),
+        "wt tree restored to the feature tip"
+    );
+    assert_eq!(abbrev_head(main), main_head_before, "main still untouched");
+}
+
+/// Part C W1 (§C.4.2): worktree ids are deterministic (hash of the canonical
+/// path), so `worktree remove` must GC the removed worktree's scoped
+/// `bisect_state` row — otherwise a worktree re-added at the SAME path would
+/// silently inherit (and resume) the dead bisect session.
+#[test]
+fn readded_worktree_does_not_inherit_bisect_session() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let (c1, _c2, _c3) = grow_feature_history(&wt);
+    assert_cli_success(
+        &run_libra_command(&["bisect", "start", "HEAD", "--good", &c1], &wt),
+        "bisect start",
+    );
+
+    // Remove the worktree MID-BISECT, clear its directory, and re-add at the
+    // same path (same deterministic worktree id).
+    assert_cli_success(
+        &run_libra_command(&["worktree", "remove", wt.to_str().unwrap()], main),
+        "worktree remove",
+    );
+    fs::remove_dir_all(&wt).expect("clear removed worktree dir");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree re-add",
+    );
+
+    // The fresh worktree must NOT see the dead session: a new bisect starts
+    // cleanly instead of being refused (or worse, resumed).
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "re-added wt switch feature",
+    );
+    let restart = run_libra_command(&["bisect", "start", "HEAD", "--good", &c1], &wt);
+    assert!(
+        restart.status.success(),
+        "re-added worktree starts a FRESH bisect (stale row must be GC'd): {}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+}
+
+/// Part C W1 (§C.4.2): while a worktree bisects (detached), its original
+/// branch looks free and another worktree may legitimately check it out.
+/// `bisect reset` must then NOT re-attach that branch (one branch on two
+/// HEADs is the state `switch`/`checkout` categorically refuse) — it warns
+/// and ends the session detached at the original tip instead.
+#[test]
+fn bisect_reset_does_not_steal_branch_attached_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    let (c1, _c2, c3) = grow_feature_history(&wt);
+    assert_cli_success(
+        &run_libra_command(&["bisect", "start", "HEAD", "--good", &c1], &wt),
+        "bisect start",
+    );
+
+    // The bisecting worktree is detached, so `feature` is free: MAIN takes it.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], main),
+        "main takes the branch while wt is detached",
+    );
+
+    // Reset must not create a second attachment of `feature`.
+    let reset = run_libra_command(&["bisect", "reset"], &wt);
+    assert!(
+        reset.status.success(),
+        "bisect reset still succeeds: {}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&reset.stderr).contains("not re-attaching branch 'feature'"),
+        "reset warns that the branch is taken: {}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    assert_eq!(
+        abbrev_head(&wt),
+        "HEAD",
+        "wt ends DETACHED instead of double-attaching the branch"
+    );
+    assert_eq!(head_sha(&wt), c3, "wt detached at the original tip");
+    assert_eq!(abbrev_head(main), "feature", "main keeps the branch");
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

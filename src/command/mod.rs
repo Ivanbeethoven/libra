@@ -165,10 +165,12 @@ use crate::{
 
 // impl load for all objects
 /// lore.md 2.1: refuse an in-progress sequencer operation inside a LINKED
-/// worktree. Merge/rebase/cherry-pick/revert/bisect state (rebase_state /
-/// sequence_state / MERGE_HEAD) is still shared across worktrees in v1, so
-/// running one in a linked worktree could collide with the main worktree's
-/// operation. Allowed in the main worktree.
+/// worktree. Only `rebase` still needs this (Part C W1): its `rebase_state`
+/// row and sidecar files are still repository-global, so running it in a
+/// linked worktree could collide with the main worktree's operation.
+/// Merge/cherry-pick/am/revert/bisect state is worktree-scoped (per-scope
+/// `sequence_state`/`bisect_state` rows + local-gitdir sidecars) and those
+/// commands run in any worktree. Allowed in the main worktree.
 pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
     ensure_main_worktree_because(op, "in-progress operation state is shared across worktrees")
 }

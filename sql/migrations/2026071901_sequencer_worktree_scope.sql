@@ -59,4 +59,8 @@ DROP TABLE `sequence_state__old_2026071901`;
 -- Retiring that lazy DDL is its own W1 step (§C.11 "清除 lazy DDL"); until then
 -- `rebase` remains refused in a linked worktree by `ensure_main_worktree`, so
 -- the repository-global `rebase_state` has no concurrent writer and no
--- cross-worktree hazard. Same for the lazily-created `bisect_state`.
+-- cross-worktree hazard. The lazily-created `bisect_state` is scoped IN PLACE
+-- instead (v0.19.34): `src/command/bisect.rs` lazily ADDs a
+-- `worktree_id TEXT NOT NULL DEFAULT ''` column (safe regardless of the
+-- table's current column set) and keys every query by it, so bisect runs
+-- per-worktree without a static rebuild here.

@@ -4,6 +4,32 @@
 
 ### Changed
 
+- **`bisect` now runs in linked worktrees (v0.19.34, plan-20260714 Part C
+  §C.4.2)**: the `bisect_state` row is keyed by `worktree_id` (main worktree =
+  `""`, matching the sequencer convention), so each worktree's session —
+  start/good/bad/skip/run/log/view/reset — is fully independent and two
+  worktrees can bisect concurrently without interfering. Of the
+  sequencer-family ops, only `rebase` remains refused in a linked worktree
+  (its state is still repository-global). Four correctness fixes ride along:
+  - *Checkout rewrites the index in step with the worktree*: bisect checkouts
+    now go through the canonical restore contract (the same call `switch`
+    makes), rewriting the per-worktree index AND working tree together — the
+    old burn-down repaint never touched the index, so every bisect step showed
+    phantom `status` modifications. Side effect (git parity): untracked files
+    created mid-session survive a step instead of being deleted.
+  - *Linked-worktree checkout targets the right tree*: the old repaint
+    resolved the working directory via the shared storage path's parent — the
+    MAIN worktree's directory — so a linked worktree's bisect would have
+    materialized candidate trees into the wrong worktree.
+  - *`bisect reset` honors branch exclusivity*: while a worktree bisects
+    (detached), another worktree may legitimately check out its original
+    branch; reset now warns and ends the session detached instead of silently
+    attaching one branch to two HEADs (the state `switch`/`checkout` refuse).
+  - *`worktree remove` GCs the scoped session rows*: worktree ids are
+    deterministic (hash of the canonical path), so a stale `bisect_state`/
+    `sequence_state` row would be inherited — and a dead bisect session
+    silently resumed — by a worktree re-added at the same path.
+
 - **Internal: `WorktreeScope` is now the single worktree-scope value object
   (v0.19.24, plan-20260714 Part C §C.4.1)**: scope resolution no longer passes a
   bare `Option<String>` around for each layer to reinterpret. The type encodes

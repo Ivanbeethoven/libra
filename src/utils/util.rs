@@ -393,10 +393,12 @@ pub fn worktree_gitdir() -> PathBuf {
 /// with `worktree_id IS NULL`). Resolved from the process cwd exactly like
 /// `path::index()`; a single process operates in one worktree, so this is
 /// stable for its lifetime.
-/// Whether the current process runs in a LINKED worktree (lore.md 2.1). v1
-/// refuses in-progress sequencer operations (merge/rebase/cherry-pick/revert/
-/// bisect) here because their state (rebase_state / sequence_state /
-/// MERGE_HEAD) is still shared across worktrees.
+/// Whether the current process runs in a LINKED worktree (lore.md 2.1). Used
+/// by the transition guards for stores that are still repository-global —
+/// `rebase` (its `rebase_state` + sidecars), the stash stack, layer/sparse/
+/// dirty tables, and the composite `pull`. The other sequencer ops
+/// (merge/cherry-pick/am/revert/bisect) are worktree-scoped and run here
+/// freely (Part C W1).
 pub fn is_linked_worktree() -> bool {
     current_worktree_id().is_some()
 }
@@ -1284,7 +1286,6 @@ fn peel_object_to_type_typed(
     let storage = objects_storage();
     let mut current = ensure_hash_kind(object_id, display_name, false)?;
     let mut seen = HashSet::new();
-    let mut peeled_tag = false;
 
     loop {
         if !seen.insert(current) {
@@ -1314,13 +1315,7 @@ fn peel_object_to_type_typed(
                 );
             }
             _ if current_type == ObjectType::Tag => {
-                peeled_tag = true;
                 current = peel_tag_target_typed(&storage, current, display_name)?;
-            }
-            Some(expected_type) if peeled_tag => {
-                return Err(CommitBaseError::InvalidReference(format!(
-                    "tag points to {current_type}, expected {expected_type} while resolving '{display_name}'"
-                )));
             }
             Some(expected_type) => {
                 return Err(CommitBaseError::InvalidReference(format!(

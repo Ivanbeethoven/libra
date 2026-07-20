@@ -908,16 +908,37 @@ fn resolve_worktree_id(target: &Path) -> Option<String> {
         .or_else(|| Some(util::worktree_instance_id(target)))
 }
 
-/// GC a removed worktree's PRIVATE HEAD + HEAD-reflog rows (lore.md 2.1) so a
-/// reused instance id never inherits stale state. Best-effort: a failure is
-/// logged, not fatal (the registry drop is the source of truth).
+/// GC a removed worktree's PRIVATE HEAD + HEAD-reflog rows (lore.md 2.1) — and
+/// its worktree-scoped sequencer/bisect session rows (Part C W1) — so a reused
+/// instance id never inherits stale state. Instance ids are DETERMINISTIC
+/// (FNV of the canonical path), so a worktree re-added at the same path gets
+/// the same id: a surviving `bisect_state`/`sequence_state` row would make the
+/// fresh worktree silently resume a dead session (a resumed bisect step even
+/// repaints candidate trees — data loss). Best-effort: a failure is logged,
+/// not fatal (the registry drop is the source of truth).
 async fn gc_worktree_scoped_rows(worktree_id: &str) {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let db = crate::internal::db::get_db_conn_instance().await;
-    for sql in [
+    let mut stmts = vec![
         "DELETE FROM reference WHERE worktree_id = ? AND kind = 'Head'",
         "DELETE FROM reflog WHERE worktree_id = ?",
-    ] {
+        "DELETE FROM sequence_state WHERE worktree_id = ?",
+    ];
+    // `bisect_state` is created lazily on first bisect use — only purge when
+    // the table exists (a DELETE on a missing table would log a spurious warn).
+    let has_bisect_table = db
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bisect_state'",
+        ))
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if has_bisect_table {
+        stmts.push("DELETE FROM bisect_state WHERE worktree_id = ?");
+    }
+    for sql in stmts {
         if let Err(e) = db
             .execute(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
