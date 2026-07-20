@@ -123,6 +123,17 @@
 
 ### Changed
 
+- **`cherry-pick` is now allowed in a linked worktree (v0.19.30, plan-20260714
+  Part C W1 §C.4.2)**: with its state fully worktree-scoped — the
+  `sequence_state` row keyed by `worktree_id` (v0.19.26) and the local-gitdir
+  `CHERRY_PICK_MSG` (v0.19.28) — the `ensure_main_worktree` refusal is lifted.
+  The start-time sequencer mutex is now scope-aware too: in a linked worktree it
+  only considers that worktree's own scoped sequence, not another worktree's,
+  and not the main-only merge/rebase/revert state (which can never be active for
+  a linked worktree). Two worktrees can cherry-pick onto their own branches
+  concurrently without their sequencer state or message buffer colliding.
+  merge/rebase/revert/bisect/am remain refused (their state is still global).
+
 - **`FETCH_HEAD` is worktree-local and `fetch` is allowed in a linked worktree
   (v0.19.29, plan-20260714 Part C W1 §C.4.2)**: `FETCH_HEAD` — the record of the
   refs a worktree just fetched, which `pull` reads back — was written to the

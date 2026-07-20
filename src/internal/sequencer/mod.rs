@@ -459,9 +459,19 @@ async fn legacy_table_active<C: ConnectionTrait>(db: &C, table: &str) -> Result<
 /// `revert-state.json` (or a `cherry_pick_state` row), and the mutex must see
 /// it — otherwise a new sequence could start over an old-binary sequence.
 pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKind>, String> {
-    // Unified table first (cherry-pick in v1).
+    // Unified table first (cherry-pick/am in v1) — this is already scoped to the
+    // current worktree by `load_stored`.
     if let Some(kind) = unified_active().await? {
         return Ok(Some(kind));
+    }
+    // Part C §C.4.4: the remaining probes below cover merge/revert/rebase, whose
+    // state is repository-global AND whose operations are refused in a linked
+    // worktree (main-only). So in a LINKED worktree none of them can be active
+    // "for this worktree", and main's in-progress merge/rebase must NOT block a
+    // linked worktree's own sequence (that was the pre-fix cross-worktree
+    // blocking). Only the scoped unified sequence above is relevant there.
+    if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
+        return Ok(None);
     }
     let storage = util::storage_path();
     // Legacy JSON sidecars (merge, revert).

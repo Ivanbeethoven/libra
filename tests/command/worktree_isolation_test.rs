@@ -794,6 +794,70 @@ fn fetch_uses_worktree_local_fetch_head() {
     );
 }
 
+/// Part C W1 (§C.4.2): cherry-pick is now allowed in a linked worktree, and
+/// two worktrees can each cherry-pick onto their OWN branch without their
+/// sequencer state or `CHERRY_PICK_MSG` colliding.
+#[test]
+fn cherry_pick_runs_concurrently_in_worktrees() {
+    // main repo on `main`; make a `pick` commit on a side branch to cherry-pick.
+    let repo = repo_with_feature();
+    let main = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "src"], main),
+        "branch src",
+    );
+    fs::write(main.join("p.txt"), "picked\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "p.txt"], main), "add p");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "the-pick", "--no-verify"], main),
+        "commit pick",
+    );
+    let pick = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], main),
+        "back to main",
+    );
+
+    // A linked worktree checked out on `feature`.
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // Cherry-pick the same commit in BOTH worktrees. Neither must be refused,
+    // and each lands on its own branch.
+    let co_wt = run_libra_command(&["cherry-pick", &pick], &wt);
+    assert!(
+        co_wt.status.success(),
+        "cherry-pick in the linked worktree should work: {}",
+        String::from_utf8_lossy(&co_wt.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&co_wt.stderr).contains("linked worktree"),
+        "cherry-pick must no longer be refused in a linked worktree"
+    );
+    let co_main = run_libra_command(&["cherry-pick", &pick], main);
+    assert!(
+        co_main.status.success(),
+        "cherry-pick in main should work: {}",
+        String::from_utf8_lossy(&co_main.stderr)
+    );
+
+    // Each worktree's branch now carries the picked file; HEADs are independent.
+    assert!(main.join("p.txt").exists(), "main picked p.txt onto `main`");
+    assert!(wt.join("p.txt").exists(), "wt picked p.txt onto `feature`");
+    assert_eq!(abbrev_head(main), "main", "main still on its branch");
+    assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();
@@ -804,7 +868,10 @@ fn sequencer_ops_refused_in_linked_worktree() {
         &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
         "worktree add",
     );
-    for op in ["merge", "rebase", "cherry-pick", "revert"] {
+    // merge/rebase/revert are still refused in a linked worktree (their state
+    // is repository-global). cherry-pick was lifted in W1 once its state became
+    // fully worktree-scoped — see `cherry_pick_runs_concurrently_in_worktrees`.
+    for op in ["merge", "rebase", "revert"] {
         let out = run_libra_command(&[op, "feature"], &wt);
         assert_ne!(
             out.status.code(),

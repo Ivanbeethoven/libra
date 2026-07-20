@@ -593,7 +593,14 @@ pub async fn execute(args: CherryPickArgs) {
 /// errors and exiting. Replays one or more commit changes onto the current
 /// branch, optionally creating new commits or leaving them staged.
 pub async fn execute_safe(args: CherryPickArgs, output: &OutputConfig) -> CliResult<()> {
-    crate::command::ensure_main_worktree("cherry-pick")?;
+    // Part C W1 (§C.4.2): cherry-pick is now safe in a LINKED worktree — its
+    // entire state is worktree-scoped (`sequence_state` keyed by `worktree_id`
+    // plus the local-gitdir `CHERRY_PICK_MSG`; there is no `CHERRY_PICK_HEAD`
+    // file), the start-time mutex `detect_active_operation` no longer sees
+    // another worktree's sequence, and it advances only THIS worktree's own
+    // current branch. Two worktrees can cherry-pick concurrently without
+    // interfering, so the `ensure_main_worktree` guard is lifted here.
+    //
     // Symmetric sequencer mutex (lore.md 2.6): a NEW cherry-pick is refused
     // while ANY other sequence (merge/revert/rebase) is unresolved. Control
     // verbs are exempt (they conclude the in-progress cherry-pick). Same-op
