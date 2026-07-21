@@ -1321,6 +1321,76 @@ fn bisect_reset_does_not_steal_branch_attached_elsewhere() {
     assert_eq!(abbrev_head(main), "feature", "main keeps the branch");
 }
 
+/// plan-20260714 §C.9 item 10: an in-progress sequencer/rebase/bisect row's
+/// OID columns are GC reachability roots — across EVERY worktree scope, not
+/// just the scope gc runs from. A commit anchored ONLY by a (foreign-scope)
+/// `rebase_state` row must survive `gc`; once the row is gone, the same
+/// commit is pruned (proving the positive case was not vacuous).
+#[test]
+fn sequencer_state_rows_are_gc_roots_across_scopes() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+
+    // A commit reachable from nothing but the state row we are about to
+    // plant: commit on a temp branch, delete the branch, purge the reflog.
+    assert_cli_success(&run_libra_command(&["switch", "-c", "tmp"], main), "tmp");
+    fs::write(main.join("t.txt"), "t\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "t.txt"], main), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tmp-commit", "--no-verify"], main),
+        "commit",
+    );
+    let oid = head_sha(main);
+    assert_cli_success(&run_libra_command(&["switch", "main"], main), "back");
+    assert_cli_success(
+        &run_libra_command(&["branch", "-D", "tmp"], main),
+        "drop tmp",
+    );
+    let sqlite = |sql: &str| {
+        let out = std::process::Command::new("/usr/bin/sqlite3")
+            .arg(main.join(".libra/libra.db"))
+            .arg(sql)
+            .output()
+            .expect("run sqlite3");
+        assert!(
+            out.status.success(),
+            "sqlite3 {sql}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    sqlite("DELETE FROM reflog;");
+
+    // Plant a FOREIGN-scope rebase_state row anchoring the commit.
+    sqlite(&format!(
+        "INSERT INTO rebase_state (worktree_id, head_name, onto, orig_head, current_head, \
+         todo, done, stopped_sha) VALUES ('wt-alien', 'refs/heads/x', '{oid}', '{oid}', \
+         '{oid}', '', '', '{oid}');"
+    ));
+
+    assert_cli_success(
+        &run_libra_command(&["maintenance", "run", "--task", "gc"], main),
+        "gc with state row",
+    );
+    let survives = run_libra_command(&["cat-file", "-t", &oid], main);
+    assert!(
+        survives.status.success(),
+        "a commit anchored only by a foreign-scope rebase_state row survives gc: {}",
+        String::from_utf8_lossy(&survives.stderr)
+    );
+
+    // Negative control: drop the row — the same commit is now garbage.
+    sqlite("DELETE FROM rebase_state;");
+    assert_cli_success(
+        &run_libra_command(&["maintenance", "run", "--task", "gc"], main),
+        "gc without state row",
+    );
+    let pruned = run_libra_command(&["cat-file", "-t", &oid], main);
+    assert!(
+        !pruned.status.success(),
+        "without the state row the commit is pruned (positive case was real)"
+    );
+}
+
 /// Part C W1 (§C.4.2 ambiguous-common-sidecar rule): the legacy common
 /// `.libra/rebase-merge/` crash-state directory is never auto-adopted (and
 /// destroyed) while linked worktrees are registered — its owner is ambiguous.

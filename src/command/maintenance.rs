@@ -1524,25 +1524,39 @@ pub(crate) async fn collect_reachable_objects(
     // Held autostashes deliberately do not enter refs/stash while a merge or
     // rebase is in progress. Their fsynced sidecars are therefore first-class
     // GC roots; omitting them can irreversibly delete the user's dirty state.
-    let merge_autostash = crate::command::merge::MergeAutostash::load_optional_sync()
-        .map_err(|error| {
-            CliError::fatal(format!("failed to load merge autostash GC root: {error}"))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-        })?
-        .map(|held| {
-            parse_object_hash(&held.stash_commit).ok_or_else(|| {
-                CliError::fatal(format!(
-                    "merge-autostash.json contains invalid object id '{}'",
-                    held.stash_commit
-                ))
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-            })
-        })
-        .transpose()?;
-    let rebase_autostash = crate::command::rebase::held_autostash_oid()?;
-    for held in [merge_autostash, rebase_autostash].into_iter().flatten() {
-        walk_reachable(&held, storage, &mut reachable)?;
+    // Part C §C.9: the sidecars are worktree-LOCAL, so enumerate EVERY
+    // worktree's gitdir — a linked worktree's held autostash is exactly as
+    // live as main's.
+    for gitdir in worktree_gitdir_roots() {
+        let merge_autostash =
+            crate::command::merge::MergeAutostash::load_optional_sync_in_gitdir(&gitdir)
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to load merge autostash GC root: {error}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .map(|held| {
+                    parse_object_hash(&held.stash_commit).ok_or_else(|| {
+                        CliError::fatal(format!(
+                            "merge-autostash.json contains invalid object id '{}'",
+                            held.stash_commit
+                        ))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })
+                })
+                .transpose()?;
+        let rebase_autostash = crate::command::rebase::held_autostash_oid_in_gitdir(&gitdir)?;
+        for held in [merge_autostash, rebase_autostash].into_iter().flatten() {
+            walk_reachable(&held, storage, &mut reachable)?;
+        }
     }
+
+    // plan-20260714 §C.9 item 10: an in-progress sequencer / rebase / bisect
+    // row holds the ONLY anchors for its todo/stopped objects once refs and
+    // reflogs move on — a maintenance run must not prune what `--continue`
+    // needs. Every row of every worktree scope is a root; a row that cannot
+    // be read or carries an invalid OID fails closed (callers never prune
+    // against a partial root set).
+    collect_sequencer_state_roots(&db_conn, storage, &mut reachable).await?;
 
     // Ordinary stashes are file-backed rather than SQLite reference rows, and
     // older entries live only in logs/refs/stash. Trace the full reflog, not
@@ -1620,6 +1634,217 @@ pub(crate) fn worktree_index_roots() -> Vec<std::path::PathBuf> {
         }
     }
     roots
+}
+
+/// Every worktree's private gitdir (the parent of its index) — used to
+/// enumerate worktree-local GC-root sidecars (`merge-autostash.json`,
+/// `rebase-aux.json`) across ALL worktrees (Part C §C.9).
+fn worktree_gitdir_roots() -> Vec<std::path::PathBuf> {
+    worktree_index_roots()
+        .into_iter()
+        .filter_map(|index| index.parent().map(|dir| dir.to_path_buf()))
+        .collect()
+}
+
+/// plan-20260714 §C.9 item 10: trace the OID columns of every
+/// `sequence_state` / `rebase_state` / `bisect_state` row — across ALL
+/// worktree scopes — as reachability roots. An interrupted cherry-pick's todo
+/// commits, a stopped rebase's `stopped_sha`, or a bisect session's bounds
+/// may have no other anchor once refs/reflogs move on.
+///
+/// Fail-closed contract: a row that cannot be read or a structured OID column
+/// that does not parse is a hard error (callers never prune against a partial
+/// root set). A MISSING table resolves to "no roots from that store" — only
+/// `bisect_state` is still lazily created, but bare test databases may lack
+/// any of them. The free-form `payload` column is scanned leniently: JSON
+/// string values that parse as OIDs are walked only when the object exists
+/// (payload content is op-specific, not a structured OID column).
+async fn collect_sequencer_state_roots(
+    db: &sea_orm::DatabaseConnection,
+    storage: &ClientStorage,
+    reachable: &mut HashSet<ObjectHash>,
+) -> CliResult<()> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    let is_null_oid = |oid: &str| !oid.is_empty() && oid.chars().all(|c| c == '0');
+    let stmt_of = |sql: &'static str| Statement::from_string(DbBackend::Sqlite, sql.to_string());
+    let missing_table = |err: &sea_orm::DbErr| err.to_string().contains("no such table");
+
+    // Parse one structured OID cell (fail-closed) and walk it.
+    fn walk_cell(
+        table: &str,
+        column: &str,
+        raw: &str,
+        storage: &ClientStorage,
+        reachable: &mut HashSet<ObjectHash>,
+    ) -> CliResult<()> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let hash = parse_object_hash(trimmed).ok_or_else(|| {
+            CliError::fatal(format!(
+                "{table}.{column} contains invalid object id '{trimmed}' while computing GC \
+                 roots"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+        walk_reachable(&hash, storage, reachable)
+    }
+
+    // ── sequence_state: head_orig / current_oid / todo (newline list) /
+    //    payload (lenient JSON scan) ─────────────────────────────────────────
+    match db
+        .query_all(stmt_of(
+            "SELECT worktree_id, head_orig, current_oid, todo, payload FROM sequence_state",
+        ))
+        .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                let head_orig: String = row.try_get_by_index(1).map_err(state_row_error)?;
+                let current_oid: String = row.try_get_by_index(2).map_err(state_row_error)?;
+                let todo: String = row.try_get_by_index(3).map_err(state_row_error)?;
+                let payload: String = row.try_get_by_index(4).map_err(state_row_error)?;
+                for cell in [&head_orig, &current_oid] {
+                    if !is_null_oid(cell) {
+                        walk_cell("sequence_state", "oid", cell, storage, reachable)?;
+                    }
+                }
+                for line in todo.lines() {
+                    walk_cell("sequence_state", "todo", line, storage, reachable)?;
+                }
+                walk_payload_oids(&payload, storage, reachable)?;
+            }
+        }
+        Err(err) if missing_table(&err) => {}
+        Err(err) => {
+            return Err(
+                CliError::fatal(format!("failed to load sequence_state GC roots: {err}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed),
+            );
+        }
+    }
+
+    // ── rebase_state: onto / orig_head / current_head / stopped_sha +
+    //    todo / done (newline lists) ─────────────────────────────────────────
+    match db
+        .query_all(stmt_of(
+            "SELECT worktree_id, onto, orig_head, current_head, todo, done, stopped_sha \
+             FROM rebase_state",
+        ))
+        .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                for (idx, column) in [(1, "onto"), (2, "orig_head"), (3, "current_head")] {
+                    let cell: String = row.try_get_by_index(idx).map_err(state_row_error)?;
+                    walk_cell("rebase_state", column, &cell, storage, reachable)?;
+                }
+                for (idx, column) in [(4, "todo"), (5, "done")] {
+                    let list: String = row.try_get_by_index(idx).map_err(state_row_error)?;
+                    for line in list.lines() {
+                        walk_cell("rebase_state", column, line, storage, reachable)?;
+                    }
+                }
+                let stopped: Option<String> = row.try_get_by_index(6).map_err(state_row_error)?;
+                if let Some(stopped) = stopped {
+                    walk_cell("rebase_state", "stopped_sha", &stopped, storage, reachable)?;
+                }
+            }
+        }
+        Err(err) if missing_table(&err) => {}
+        Err(err) => {
+            return Err(
+                CliError::fatal(format!("failed to load rebase_state GC roots: {err}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed),
+            );
+        }
+    }
+
+    // ── bisect_state: orig_head / bad / current + good / skipped (JSON) ─────
+    match db
+        .query_all(stmt_of(
+            "SELECT orig_head, bad, good, current, skipped FROM bisect_state",
+        ))
+        .await
+    {
+        Ok(rows) => {
+            for row in rows {
+                let orig_head: String = row.try_get_by_index(0).map_err(state_row_error)?;
+                walk_cell("bisect_state", "orig_head", &orig_head, storage, reachable)?;
+                for (idx, column) in [(1, "bad"), (3, "current")] {
+                    let cell: Option<String> =
+                        row.try_get_by_index(idx).map_err(state_row_error)?;
+                    if let Some(cell) = cell {
+                        walk_cell("bisect_state", column, &cell, storage, reachable)?;
+                    }
+                }
+                for (idx, column) in [(2, "good"), (4, "skipped")] {
+                    let json: String = row.try_get_by_index(idx).map_err(state_row_error)?;
+                    let oids: Vec<String> = serde_json::from_str(&json).map_err(|error| {
+                        CliError::fatal(format!(
+                            "bisect_state.{column} contains invalid JSON while computing GC \
+                             roots: {error}"
+                        ))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                    })?;
+                    for oid in oids {
+                        walk_cell("bisect_state", column, &oid, storage, reachable)?;
+                    }
+                }
+            }
+        }
+        Err(err) if missing_table(&err) => {}
+        Err(err) => {
+            return Err(
+                CliError::fatal(format!("failed to load bisect_state GC roots: {err}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn state_row_error(err: sea_orm::DbErr) -> CliError {
+    CliError::fatal(format!(
+        "sequencer state row cannot be read while computing GC roots: {err}"
+    ))
+    .with_stable_code(StableErrorCode::RepoCorrupt)
+}
+
+/// Lenient payload scan: walk every JSON string value that parses as an OID
+/// AND exists in the object store. Payload content is op-specific (e.g. the
+/// cherry-pick commit-modifier), so unlike the structured columns a
+/// non-OID-looking string is simply skipped rather than failing the run.
+fn walk_payload_oids(
+    payload: &str,
+    storage: &ClientStorage,
+    reachable: &mut HashSet<ObjectHash>,
+) -> CliResult<()> {
+    if payload.trim().is_empty() {
+        return Ok(());
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return Ok(());
+    };
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            serde_json::Value::String(text) => {
+                if let Some(hash) = parse_object_hash(text.trim())
+                    && storage.exist(&hash)
+                {
+                    walk_reachable(&hash, storage, reachable)?;
+                }
+            }
+            serde_json::Value::Array(items) => stack.extend(items),
+            serde_json::Value::Object(map) => stack.extend(map.into_values()),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Walk object references recursively, adding all transitive dependencies.

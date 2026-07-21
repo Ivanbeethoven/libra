@@ -442,11 +442,23 @@ impl MergeAutostash {
     }
 
     pub(crate) fn load_optional_sync() -> Result<Option<Self>, String> {
-        let path = Self::path();
+        Self::load_optional_sync_at(&Self::path())
+    }
+
+    /// Read a SPECIFIC worktree's held-autostash sidecar. GC enumerates every
+    /// worktree's gitdir (Part C §C.9) — a held autostash is a first-class
+    /// reachability root regardless of which worktree holds it.
+    pub(crate) fn load_optional_sync_in_gitdir(
+        gitdir: &std::path::Path,
+    ) -> Result<Option<Self>, String> {
+        Self::load_optional_sync_at(&gitdir.join("merge-autostash.json"))
+    }
+
+    fn load_optional_sync_at(path: &std::path::Path) -> Result<Option<Self>, String> {
         if !path.exists() {
             return Ok(None);
         }
-        let data = fs::read_to_string(&path)
+        let data = fs::read_to_string(path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
         serde_json::from_str(&data)
             .map(Some)

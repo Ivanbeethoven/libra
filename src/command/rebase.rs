@@ -124,11 +124,14 @@ impl RebaseAuxState {
     }
 
     fn load_optional() -> Result<Option<Self>, RebaseError> {
-        let path = Self::path();
+        Self::load_optional_at(&Self::path())
+    }
+
+    fn load_optional_at(path: &std::path::Path) -> Result<Option<Self>, RebaseError> {
         if !path.exists() {
             return Ok(None);
         }
-        let bytes = fs::read(&path).map_err(|error| RebaseError::AuxStateLoad {
+        let bytes = fs::read(path).map_err(|error| RebaseError::AuxStateLoad {
             path: path.display().to_string(),
             detail: error.to_string(),
         })?;
@@ -171,14 +174,13 @@ impl RebaseAuxState {
 /// intentionally absent from `refs/stash`; GC must trace this sidecar while a
 /// rebase is stopped or it can delete the user's only copy of dirty changes.
 ///
-/// Scope note (Part C W1): this reads the CURRENT worktree's aux sidecar.
-/// Linked worktrees' sidecars are not enumerated yet — safe today because
-/// object deletion fails closed whenever linked worktrees exist
-/// (`repository_has_linked_worktrees` gate) and rebase is still refused in
-/// linked worktrees; the all-worktrees enumeration lands with the
-/// sequencer-state GC-roots slice.
-pub(crate) fn held_autostash_oid() -> CliResult<Option<ObjectHash>> {
-    RebaseAuxState::load_optional()
+/// Scope (Part C §C.9): GC enumerates EVERY worktree's gitdir, so this reads
+/// the aux sidecar of the gitdir the caller names — a held autostash is a
+/// first-class reachability root regardless of which worktree holds it.
+pub(crate) fn held_autostash_oid_in_gitdir(
+    gitdir: &std::path::Path,
+) -> CliResult<Option<ObjectHash>> {
+    RebaseAuxState::load_optional_at(&gitdir.join("rebase-aux.json"))
         .map_err(|error| {
             CliError::fatal(format!("failed to load rebase autostash GC root: {error}"))
                 .with_stable_code(StableErrorCode::IoReadFailed)

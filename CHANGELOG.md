@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **GC: in-progress sequencer / rebase / bisect state rows are now
+  reachability roots (v0.19.39, plan-20260714 Part C §C.9 item 10)**: an
+  interrupted cherry-pick's todo commits, a stopped rebase's
+  `onto`/`orig_head`/`current_head`/`todo`/`done`/`stopped_sha`, and a bisect
+  session's `orig_head`/`bad`/`good`/`current`/`skipped` previously had NO
+  anchor in the reachability walk once refs and reflogs moved on — one
+  maintenance run could delete the very objects `--continue` needs.
+  `collect_reachable_objects` now traces those OID columns across EVERY
+  worktree scope (fail-closed: an unreadable row or invalid OID aborts rather
+  than pruning against a partial root set; the free-form sequencer `payload`
+  is scanned leniently). Held merge/rebase autostash sidecars are likewise
+  enumerated across ALL worktrees' gitdirs, not just the one gc runs from.
+
 - **Internal: the sequencer mutex probes rebase per-worktree (v0.19.38,
   plan-20260714 Part C §C.4.4, W1 rebase slice 3/4)**:
   `detect_active_operation` now probes THIS worktree's scoped `rebase_state`
