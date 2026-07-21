@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **Internal: rebase sidecars become worktree-local; the legacy
+  `rebase-merge/` directory is no longer auto-adopted on ambiguous ownership
+  (v0.19.37, plan-20260714 Part C §C.4.2, W1 rebase slice 2/4)**:
+  `rebase-aux.json` (exec queue, update-refs plan, rewrites, held autostash
+  oid) now lives in the worktree-LOCAL gitdir — unchanged paths for the main
+  worktree, per-worktree state once rebase is allowed in linked worktrees.
+  The legacy common `.libra/rebase-merge/` crash-state directory is never
+  consumed from a linked worktree, and the main worktree refuses to adopt it
+  while linked worktrees are registered (its owner would be ambiguous, and
+  adoption destroys the directory) — the error explains how to resolve it.
+  A linked worktree's `rebase` cleanup also no longer deletes the common
+  legacy directory. Behavior in single-worktree repositories is unchanged.
+
 - **Internal: `rebase_state` is re-keyed per-worktree and its lazy DDL is
   retired (v0.19.36, plan-20260714 Part C §C.4.2, W1 rebase slice 1/4)**:
   migration `2026072101_rebase_state_worktree_scope` rebuilds the table to

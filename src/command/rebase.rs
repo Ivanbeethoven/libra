@@ -115,8 +115,12 @@ struct RebaseRefUpdate {
 }
 
 impl RebaseAuxState {
+    /// Part C W1 (§C.4.2): the aux sidecar (exec queue, update-refs plan,
+    /// rewrites, held autostash oid) is per-rebase state, so it lives in THIS
+    /// worktree's local gitdir. For the main worktree the local gitdir IS the
+    /// common `.libra`, so main-worktree paths are unchanged.
     fn path() -> PathBuf {
-        util::storage_path().join("rebase-aux.json")
+        util::worktree_gitdir().join("rebase-aux.json")
     }
 
     fn load_optional() -> Result<Option<Self>, RebaseError> {
@@ -166,6 +170,13 @@ impl RebaseAuxState {
 /// Return the held autostash root for repository maintenance. Held objects are
 /// intentionally absent from `refs/stash`; GC must trace this sidecar while a
 /// rebase is stopped or it can delete the user's only copy of dirty changes.
+///
+/// Scope note (Part C W1): this reads the CURRENT worktree's aux sidecar.
+/// Linked worktrees' sidecars are not enumerated yet — safe today because
+/// object deletion fails closed whenever linked worktrees exist
+/// (`repository_has_linked_worktrees` gate) and rebase is still refused in
+/// linked worktrees; the all-worktrees enumeration lands with the
+/// sequencer-state GC-roots slice.
 pub(crate) fn held_autostash_oid() -> CliResult<Option<ObjectHash>> {
     RebaseAuxState::load_optional()
         .map_err(|error| {
@@ -234,9 +245,14 @@ impl RebaseState {
         Self::ensure_rebase_state_table_exists(&db).await?;
         Self::clear_state_in_db(&db).await?;
 
-        let legacy_dir = Self::legacy_rebase_dir();
-        if legacy_dir.exists() {
-            fs::remove_dir_all(&legacy_dir).map_err(|e| e.to_string())?;
+        // The COMMON legacy dir is main-owned (see `migrate_legacy_state`):
+        // a linked worktree's cleanup clears only its own DB row above and
+        // must not delete another worktree's crash-recovery directory.
+        if !crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
+            let legacy_dir = Self::legacy_rebase_dir();
+            if legacy_dir.exists() {
+                fs::remove_dir_all(&legacy_dir).map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
     }
@@ -461,6 +477,27 @@ impl RebaseState {
         let legacy_dir = Self::legacy_rebase_dir();
         if !legacy_dir.exists() {
             return Ok(None);
+        }
+
+        // Part C W1 (§C.4.2 ambiguous-common-sidecar rule): the legacy
+        // `rebase-merge/` directory lives in COMMON storage with no owner
+        // metadata. A linked worktree must never adopt it (it is not this
+        // worktree's rebase — same reasoning as the sequencer mutex's
+        // main-only legacy probes), and even the main worktree must not
+        // consume it while linked worktrees are registered: with more than
+        // one candidate owner, adopting-and-destroying here could wipe
+        // another worktree's crash-recovery state.
+        if crate::internal::worktree_scope::WorktreeScope::current().is_linked() {
+            return Ok(None);
+        }
+        if crate::command::maintenance::repository_has_linked_worktrees() {
+            return Err(format!(
+                "a legacy rebase state directory exists at '{}' but linked worktrees are \
+                 registered, so its owner is ambiguous and it will not be adopted \
+                 automatically; finish or abort that legacy rebase, or remove the directory \
+                 manually once you have confirmed it is stale",
+                legacy_dir.display()
+            ));
         }
 
         let state = Self::load_from_legacy_dir()?;

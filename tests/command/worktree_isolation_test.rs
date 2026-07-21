@@ -1321,6 +1321,54 @@ fn bisect_reset_does_not_steal_branch_attached_elsewhere() {
     assert_eq!(abbrev_head(main), "feature", "main keeps the branch");
 }
 
+/// Part C W1 (§C.4.2 ambiguous-common-sidecar rule): the legacy common
+/// `.libra/rebase-merge/` crash-state directory is never auto-adopted (and
+/// destroyed) while linked worktrees are registered — its owner is ambiguous.
+/// The main worktree fails closed with an actionable error; a linked
+/// worktree's probes simply do not see it (it is not that worktree's rebase).
+#[test]
+fn legacy_rebase_merge_dir_not_auto_adopted_with_linked_worktrees() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Plant a legacy crash-state dir in COMMON storage.
+    fs::create_dir_all(main.join(".libra/rebase-merge")).unwrap();
+
+    // Main: `rebase --continue` fails CLOSED mentioning the ambiguous legacy
+    // dir, and must NOT consume it.
+    let cont = run_libra_command(&["rebase", "--continue"], main);
+    assert_ne!(
+        cont.status.code(),
+        Some(0),
+        "adoption is refused while linked worktrees exist"
+    );
+    let stderr = String::from_utf8_lossy(&cont.stderr);
+    assert!(
+        stderr.contains("legacy rebase state"),
+        "error names the legacy dir and why: {stderr}"
+    );
+    assert!(
+        main.join(".libra/rebase-merge").exists(),
+        "the legacy dir is preserved, not consumed"
+    );
+
+    // Linked worktree: status still works and does not adopt it either.
+    assert_cli_success(
+        &run_libra_command(&["status"], &wt),
+        "status works in the linked worktree",
+    );
+    assert!(
+        main.join(".libra/rebase-merge").exists(),
+        "still preserved after linked-worktree probes"
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

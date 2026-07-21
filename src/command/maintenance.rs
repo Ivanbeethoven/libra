@@ -364,8 +364,10 @@ async fn run_cache_evict(dry_run: bool) -> CliResult<TaskResult> {
 /// collected. Until the typed `GcObjectSource` inventory covers linked private
 /// indexes / held sidecars / operation-view pointers, deletion paths fail
 /// closed whenever this returns true. A registry read failure is treated as
-/// "yes" (fail closed) rather than silently enabling a prune.
-fn repository_has_linked_worktrees() -> bool {
+/// "yes" (fail closed) rather than silently enabling a prune. Also consulted
+/// by `rebase`'s legacy-sidecar adoption gate (§C.4.2), which must fail
+/// closed on ambiguous ownership.
+pub(crate) fn repository_has_linked_worktrees() -> bool {
     match crate::command::worktree::run_list_worktrees() {
         Ok(list) => list.worktrees.iter().any(|entry| !entry.is_main),
         Err(_) => true,
