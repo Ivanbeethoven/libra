@@ -202,6 +202,11 @@ pub(crate) enum PullError {
     #[error("pull failed during rebase phase: {0}")]
     Rebase(#[source] rebase::RebaseError),
 
+    /// Part C W1: the rebase mode alone is refused in a linked worktree (its
+    /// state is still repository-global); carries the ready-made guard error.
+    #[error("'pull --rebase' is not yet supported inside a linked worktree")]
+    RebaseInLinkedWorktree(CliError),
+
     #[error("pull --autostash failed: {0}")]
     Autostash(String),
 
@@ -248,6 +253,7 @@ impl From<PullError> for CliError {
             PullError::Fetch(error) => map_fetch_error_to_cli(&error).with_detail("phase", "fetch"),
             PullError::Merge(error) => map_merge_error_to_cli(&error).with_detail("phase", "merge"),
             PullError::Rebase(error) => CliError::from(error).with_detail("phase", "rebase"),
+            PullError::RebaseInLinkedWorktree(guard) => guard.with_detail("phase", "rebase"),
             PullError::Autostash(detail) => {
                 CliError::failure(format!("pull --autostash failed: {detail}"))
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
@@ -341,16 +347,14 @@ pub async fn execute(args: PullArgs) {
 /// Returns [`CliError`] when the pull target cannot be resolved, fetch fails,
 /// histories cannot be merged safely, or refs/worktree updates fail.
 pub async fn execute_safe(args: PullArgs, output: &OutputConfig) -> CliResult<()> {
-    // Part C W0 (§C.4.4/§C.11): `pull` is a composite mutating command — its
-    // fetch writes the shared `FETCH_HEAD` and its merge/rebase uses the still
-    // repository-global sequencer/merge state. It fails closed in a linked
-    // worktree (in ANY of its modes) until W1/W2 route its fetch + merge/rebase
-    // through explicitly worktree-scoped APIs, rather than letting it bypass the
-    // public merge/rebase entry guards.
-    crate::command::ensure_main_worktree_because(
-        "pull",
-        "pull's shared FETCH_HEAD and merge/rebase state are not yet worktree-scoped",
-    )?;
+    // Part C W1 (§C.4.4): pull's fetch phase writes only repository-scoped
+    // state (`refs/remotes/*` + objects; the pull-internal fetch writes no
+    // FETCH_HEAD) and its merge phase runs on fully worktree-scoped merge
+    // state (v0.19.33), so the merge/ff modes are safe in a linked worktree.
+    // Only the REBASE mode still rides the repository-global `rebase_state`
+    // (plus the legacy stash-stack autostash) — `run_pull` refuses that mode
+    // alone, after config resolution (so `pull.rebase = true` cannot sneak
+    // past a flag-only check).
     let result = run_pull(args, output).await.map_err(CliError::from)?;
     render_pull_output(&result, output)
 }
@@ -361,6 +365,18 @@ pub(crate) async fn run_pull(
 ) -> Result<PullOutput, PullError> {
     let branch = current_branch_for_pull().await?;
     let effective = resolve_effective_pull_options(&args, &branch).await?;
+    // Part C W1 (§C.4.4): the rebase mode (whether from `--rebase` or from
+    // `pull.rebase`/`branch.<name>.rebase` config) still uses the
+    // repository-global `rebase_state` and the stash-stack autostash, so it
+    // alone stays refused in a linked worktree — before any fetch runs.
+    if effective.rebase
+        && let Err(guard) = crate::command::ensure_main_worktree_because(
+            "pull --rebase",
+            "pull's rebase state is not yet worktree-scoped; use the merge mode (--no-rebase)",
+        )
+    {
+        return Err(PullError::RebaseInLinkedWorktree(guard));
+    }
     let target = resolve_pull_target(&args, branch, effective.rebase).await?;
     // `--no-progress` forwards to the fetch: suppress its "Receiving objects"
     // meter just like `git pull --no-progress`.

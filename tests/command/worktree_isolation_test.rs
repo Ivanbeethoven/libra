@@ -252,12 +252,14 @@ fn same_branch_is_refused_across_worktrees() {
 }
 
 /// Part C W0 (§C.11 transition guards): the states whose stores are still
-/// repository-global — the stash stack, the dirty cache, the layer/sparse
-/// tables, and the composite `pull` (shared merge/rebase state) — must fail
-/// closed in a linked worktree until W1/W2 make them worktree-scoped. The
-/// guard fires before any side effect, so no remote/network is needed.
-/// (`fetch` was un-guarded in W1 once `FETCH_HEAD` became worktree-local — see
-/// `fetch_uses_worktree_local_fetch_head`.)
+/// repository-global — the stash stack, the dirty cache, and the layer/sparse
+/// tables — must fail closed in a linked worktree until W1/W2 make them
+/// worktree-scoped. The guard fires before any side effect, so no
+/// remote/network is needed. (`fetch` was un-guarded in W1 once `FETCH_HEAD`
+/// became worktree-local — see `fetch_uses_worktree_local_fetch_head`; `pull`
+/// in merge mode was un-guarded once merge state was scoped — only its
+/// `--rebase` mode still refuses, asserted below on a branch-attached
+/// worktree since the mode is resolved after HEAD.)
 #[test]
 fn repository_global_state_commands_refused_in_linked_worktree() {
     let repo = repo_with_feature();
@@ -269,12 +271,29 @@ fn repository_global_state_commands_refused_in_linked_worktree() {
         "worktree add",
     );
 
+    // `pull --rebase` alone: needs the worktree ON a branch (mode resolution
+    // runs after the not-on-a-branch check), and fires before any fetch.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+    let rebase_pull = run_libra_command(&["pull", "--rebase"], &wt);
+    assert_ne!(
+        rebase_pull.status.code(),
+        Some(0),
+        "pull --rebase must fail closed in a linked worktree"
+    );
+    assert!(
+        String::from_utf8_lossy(&rebase_pull.stderr).contains("linked worktree"),
+        "pull --rebase fails with the linked-worktree guard: {}",
+        String::from_utf8_lossy(&rebase_pull.stderr)
+    );
+
     let cases: &[&[&str]] = &[
         &["stash", "list"],
         &["layer", "list"],
         &["sparse-view", "status"],
         &["dirty", "--list"],
-        &["pull"],
     ];
     for argv in cases {
         let out = run_libra_command(argv, &wt);
@@ -791,6 +810,78 @@ fn fetch_uses_worktree_local_fetch_head() {
     assert!(
         !main.join(".libra/FETCH_HEAD").exists(),
         "the linked worktree's fetch must not write the main worktree's FETCH_HEAD"
+    );
+}
+
+/// Part C W1 (§C.4.4): `pull` in MERGE mode runs in a linked worktree — its
+/// fetch resolves worktree-local paths and its merge integrates on that
+/// worktree's own scoped HEAD/index/tree; the main worktree is untouched.
+/// (The rebase mode stays refused — see
+/// `repository_global_state_commands_refused_in_linked_worktree`. Note:
+/// libra's pull-internal fetch does not write a FETCH_HEAD at all — only the
+/// public `fetch` command does — so the assertion here is only that MAIN's
+/// gitdir gains none.)
+#[test]
+fn pull_merges_in_linked_worktree() {
+    // An upstream repo to pull FROM (a plain local path remote).
+    let upstream = repo_with_feature();
+    let up = upstream.path();
+
+    // A clone hosting the linked worktree.
+    let clone_parent = tempfile::tempdir().expect("clone parent");
+    let clone_dir = clone_parent.path().join("clone");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", up.to_str().unwrap(), clone_dir.to_str().unwrap()],
+            clone_parent.path(),
+        ),
+        "clone upstream",
+    );
+    let main = clone_dir.as_path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // Advance the UPSTREAM's `feature` so the pull has something to merge.
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], up),
+        "upstream switch feature",
+    );
+    fs::write(up.join("b2.txt"), "b2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b2.txt"], up), "upstream add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2-upstream", "--no-verify"], up),
+        "upstream commit",
+    );
+
+    let main_head_before = abbrev_head(main);
+
+    // Pull (merge mode) in the LINKED worktree — must not be refused.
+    let pull = run_libra_command(&["pull", "origin", "feature"], &wt);
+    assert!(
+        pull.status.success(),
+        "pull (merge mode) in a linked worktree should work: {}",
+        String::from_utf8_lossy(&pull.stderr)
+    );
+
+    // The merge landed in the LINKED worktree only.
+    assert!(wt.join("b2.txt").exists(), "pulled file present in the wt");
+    assert_eq!(abbrev_head(&wt), "feature", "wt still on its branch");
+    assert!(
+        !main.join("b2.txt").exists(),
+        "the pull integrated into the LINKED worktree, not main"
+    );
+    assert_eq!(abbrev_head(main), main_head_before, "main HEAD untouched");
+    assert!(
+        !main.join(".libra/FETCH_HEAD").exists(),
+        "the linked worktree's pull must not write into main's gitdir"
     );
 }
 

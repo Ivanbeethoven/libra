@@ -4,6 +4,17 @@
 
 ### Changed
 
+- **`pull` (merge/ff mode) now runs in linked worktrees (v0.19.35,
+  plan-20260714 Part C §C.4.4)**: pull's fetch phase writes only
+  repository-scoped state (`refs/remotes/*` + objects — it writes no
+  FETCH_HEAD; the public `fetch` command's FETCH_HEAD has been worktree-local
+  since v0.19.29) and its merge phase runs on the fully worktree-scoped merge
+  state (since v0.19.33), so the blanket linked-worktree refusal is lifted. Only the REBASE mode still fails closed
+  there — its `rebase_state` (and the legacy stash-stack autostash it uses)
+  is still repository-global — and the mode is resolved AFTER
+  `pull.rebase`/`branch.<name>.rebase` config, before any fetch, so an
+  implicitly configured rebase cannot slip past the guard.
+
 - **`bisect` now runs in linked worktrees (v0.19.34, plan-20260714 Part C
   §C.4.2)**: the `bisect_state` row is keyed by `worktree_id` (main worktree =
   `""`, matching the sequencer convention), so each worktree's session —
