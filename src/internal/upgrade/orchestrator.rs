@@ -409,7 +409,8 @@ mod tests {
     #[test]
     fn http_date_parsing_rejects_garbage() {
         assert!(parse_http_date_to_unix("not a date").is_none());
-        let ts = parse_http_date_to_unix("Wed, 01 Jul 2026 00:00:00 GMT").unwrap();
+        let ts = parse_http_date_to_unix("Wed, 01 Jul 2026 00:00:00 GMT")
+            .expect("test fixture operation should succeed");
         assert!(ts > 1_700_000_000);
     }
 

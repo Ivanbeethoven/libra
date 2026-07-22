@@ -3,7 +3,7 @@
 //! Every subcommand dispatches to a real handler: `status`/`list` (capability
 //! matrix), `enable`/`add` and `disable`/`remove` (hook install/uninstall
 //! aliases), `session`, `checkpoint`, `clean`, `doctor`, `push`, `hooks`, and
-//! `import`, and `rpc`. See `docs/development/commands/_general.md` section 9 and
+//! `import`, `graph`, and `rpc`. See `docs/development/commands/_general.md` section 9 and
 //! `docs/development/tracing/agent.md` for the external-agent capture surface.
 
 use clap::{Args, Subcommand};
@@ -22,6 +22,7 @@ use crate::{
 mod checkpoint;
 mod clean;
 mod doctor;
+mod graph;
 mod hooks;
 mod import;
 mod list;
@@ -41,9 +42,10 @@ mod status;
 
 #[doc(hidden)]
 pub use import::{
-    IMPORT_DISCOVERY_HELPER_ARG, IMPORT_DISCOVERY_HELPER_FRAME_CAP, IMPORT_PREPARATION_HELPER_ARG,
+    IMPORT_DISCOVERY_HELPER_ARG, IMPORT_DISCOVERY_HELPER_FRAME_CAP, IMPORT_INDEX_REPAIR_HELPER_ARG,
+    IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP, IMPORT_PREPARATION_HELPER_ARG,
     IMPORT_PREPARATION_HELPER_INPUT_CAP, IMPORT_PREPARATION_HELPER_OUTPUT_CAP,
-    run_import_discovery_helper, run_import_preparation_helper,
+    run_import_discovery_helper, run_import_index_repair_helper, run_import_preparation_helper,
 };
 
 /// A0-06: derive a safe display/record name from a `review/investigate attach`
@@ -66,7 +68,7 @@ pub(crate) fn sanitize_attachment_name(path: &std::path::Path) -> String {
 ///
 /// `agent` is the operator surface for the external Agent capture
 /// pipeline. It exposes the visible status, list, import, enable, disable,
-/// session, checkpoint, clean, doctor, push, skill, and rpc commands plus a
+/// session, checkpoint, graph, clean, doctor, push, skill, and rpc commands plus a
 /// hidden `hooks` entry point invoked by installed provider hooks.
 /// The banner pins the canonical invocation per sub-command plus the
 /// `--all` clean form, a named `--remote` push, and a JSON variant
@@ -80,6 +82,8 @@ EXAMPLES:
     libra agent list --json                         Capability matrix as JSON (stable schema for automation)
     libra agent list --schema-version 2 --json      Capability matrix with transcript import/export methods
     libra agent import --session <id> --agent claude-code --yes  Import one historical transcript after consent
+    libra agent graph <session>                    Browse captured turns, revisions, and subagent links
+    libra --json agent graph <session>             Capture graph as frozen JSON schema v1
     libra agent add claude-code                     Enable Claude Code capture and install its hooks (alias of enable)
     libra agent add                                 Enable every supported agent
     libra agent remove claude-code                  Disable Claude Code capture and uninstall its hooks (alias of disable)
@@ -125,6 +129,10 @@ pub enum AgentSubcommand {
     /// Import historical external-agent transcripts after explicit consent.
     #[command(about = "Import historical external-agent transcripts")]
     Import(import::ImportArgs),
+
+    /// Browse the read-only turn/revision graph for a captured session.
+    #[command(about = "Browse a captured agent session graph")]
+    Graph(graph::GraphArgs),
 
     /// Enable an external Agent and install its hooks.
     #[command(about = "Enable an external agent and install its hooks")]
@@ -346,6 +354,7 @@ pub async fn execute_safe(args: AgentArgs, output: &OutputConfig) -> CliResult<(
         AgentSubcommand::Status(args) => status::execute_safe(args, output).await,
         AgentSubcommand::List(args) => list::execute_safe(args, output).await,
         AgentSubcommand::Import(args) => import::execute_safe(args, output).await,
+        AgentSubcommand::Graph(args) => graph::execute_safe(args, output).await,
         AgentSubcommand::Enable(args) => enable_agents(&args.agents, output),
         AgentSubcommand::Add(args) => enable_agents(&args.agents, output),
         AgentSubcommand::Disable(args) => disable_agents(&args.agents, output),

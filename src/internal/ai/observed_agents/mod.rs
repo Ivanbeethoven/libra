@@ -52,14 +52,14 @@ use builtin::stable_promoted::{
 };
 pub use builtin::{
     ClaudeCodeObservedAgent, FlushOutcome, GeminiObservedAgent, STABLE_PROMOTED_SPECS,
-    StablePromotedAgent, claude_project_slug, claude_session_dir, find_codex_rollout, flush_wait,
-    resolve_session_file, rfc3339_boundary_for_unix_seconds, stable_promoted_spec_for,
-    write_truncated_transcript,
+    StablePromotedAgent, claude_project_slug, claude_session_dir,
+    claude_session_id_is_safe_path_component, find_codex_rollout, flush_wait, resolve_session_file,
+    rfc3339_boundary_for_unix_seconds, stable_promoted_spec_for, write_truncated_transcript,
 };
 pub use capability::{
     CapabilityDeclarer, DeclaredAgentCaps, HookResponseWriter, ModelExtractor, PromptExtractor,
     SkillEvent, SkillEventExtractor, SkillEventSignal, SkillEventSource, SkillEventType, SkillRef,
-    SubagentAwareExtractor, TextGenerator, TokenCalculator, TranscriptAnalyzer,
+    SubagentAwareExtractor, SubagentExtraction, TextGenerator, TokenCalculator, TranscriptAnalyzer,
     TranscriptCompactor, TranscriptPreparer,
 };
 pub use coverage::{
@@ -95,8 +95,8 @@ pub use transcript_source::{
     resolve_transcript_source, transcript_path_within_provider_root,
 };
 pub(crate) use transcript_source::{
-    open_provider_directory_for_discovery, pinned_provider_directory_path,
-    resolve_import_transcript_source_until,
+    open_file_beneath_pinned_provider_directory, open_provider_directory_for_discovery,
+    pinned_provider_directory_path, resolve_import_transcript_source_until,
 };
 pub use trust::{
     DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY, Provenance,

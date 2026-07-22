@@ -147,12 +147,16 @@ mod tests {
     use super::*;
 
     fn install_dir_with_target(contents: &[u8]) -> (tempfile::TempDir, InstallDir) {
-        let guard = tempfile::tempdir().unwrap();
-        let path = guard.path().canonicalize().unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let dir = InstallDir::open_validated(&path).unwrap();
+        let guard = tempfile::tempdir().expect("test fixture operation should succeed");
+        let path = guard
+            .path()
+            .canonicalize()
+            .expect("test fixture operation should succeed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test fixture operation should succeed");
+        let dir = InstallDir::open_validated(&path).expect("test fixture operation should succeed");
         dir.write_file_atomic(TARGET_BINARY_NAME, contents, 0o755)
-            .unwrap();
+            .expect("test fixture operation should succeed");
         (guard, dir)
     }
 
@@ -172,10 +176,14 @@ mod tests {
     #[test]
     fn absent_marker_is_simply_non_official() {
         let (_g, dir) = install_dir_with_target(b"binary");
-        assert!(read_marker(&dir).unwrap().is_none());
+        assert!(
+            read_marker(&dir)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
         assert!(
             official_marker_for_target(&dir, "darwin-arm64")
-                .unwrap()
+                .expect("test fixture operation should succeed")
                 .is_none()
         );
     }
@@ -183,9 +191,9 @@ mod tests {
     #[test]
     fn valid_marker_round_trips_and_validates() {
         let (_g, dir) = install_dir_with_target(b"binary");
-        write_marker(&dir, &marker_for(b"binary")).unwrap();
+        write_marker(&dir, &marker_for(b"binary")).expect("test fixture operation should succeed");
         let marker = official_marker_for_target(&dir, "darwin-arm64")
-            .unwrap()
+            .expect("test fixture operation should succeed")
             .expect("official");
         assert_eq!(marker.version, "1.2.3");
         assert_eq!(marker.manifest_key_id, "test-key-1");
@@ -197,14 +205,15 @@ mod tests {
         // Wrong provenance value.
         let mut wrong = marker_for(b"binary");
         wrong.install_source = "manual-copy".into();
-        write_marker(&dir, &wrong).unwrap();
+        write_marker(&dir, &wrong).expect("test fixture operation should succeed");
         assert!(matches!(
             read_marker(&dir),
             Err(MarkerError::WrongSource(_))
         ));
         // Hash mismatch: a marker copied next to a DIFFERENT binary can
         // never establish provenance (§A.2).
-        write_marker(&dir, &marker_for(b"other-binary")).unwrap();
+        write_marker(&dir, &marker_for(b"other-binary"))
+            .expect("test fixture operation should succeed");
         assert!(matches!(
             official_marker_for_target(&dir, "darwin-arm64"),
             Err(MarkerError::TargetMismatch {
@@ -213,7 +222,7 @@ mod tests {
             })
         ));
         // Platform mismatch.
-        write_marker(&dir, &marker_for(b"binary")).unwrap();
+        write_marker(&dir, &marker_for(b"binary")).expect("test fixture operation should succeed");
         assert!(matches!(
             official_marker_for_target(&dir, "linux-amd64"),
             Err(MarkerError::TargetMismatch {
@@ -223,20 +232,21 @@ mod tests {
         ));
         // Corrupt JSON.
         dir.write_file_atomic(MARKER_FILE_NAME, b"{ nope", 0o600)
-            .unwrap();
+            .expect("test fixture operation should succeed");
         assert!(matches!(read_marker(&dir), Err(MarkerError::Corrupt(_))));
         // Unsupported schema.
         let mut future = marker_for(b"binary");
         future.schema_version = 2;
-        write_marker(&dir, &future).unwrap();
+        write_marker(&dir, &future).expect("test fixture operation should succeed");
         assert!(matches!(read_marker(&dir), Err(MarkerError::Schema(2))));
     }
 
     #[test]
     fn missing_target_is_never_official() {
         let (_g, dir) = install_dir_with_target(b"binary");
-        write_marker(&dir, &marker_for(b"binary")).unwrap();
-        dir.remove_file(TARGET_BINARY_NAME).unwrap();
+        write_marker(&dir, &marker_for(b"binary")).expect("test fixture operation should succeed");
+        dir.remove_file(TARGET_BINARY_NAME)
+            .expect("test fixture operation should succeed");
         assert!(matches!(
             official_marker_for_target(&dir, "darwin-arm64"),
             Err(MarkerError::TargetMissing)

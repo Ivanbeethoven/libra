@@ -9,8 +9,12 @@ use std::{
     net::{TcpListener, TcpStream},
     path::Path,
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
+    time::Duration,
 };
 
 use chrono::{TimeZone, Utc};
@@ -601,7 +605,8 @@ struct MockD1Data {
 
 struct MockD1Server {
     base_url: String,
-    _handle: thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl MockD1Server {
@@ -611,14 +616,35 @@ impl MockD1Server {
             .local_addr()
             .expect("mock D1 address should resolve");
         let base_url = format!("http://{addr}/client/v4");
+        listener
+            .set_nonblocking(true)
+            .expect("mock D1 listener should become nonblocking");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            for stream in listener.incoming().take(24).flatten() {
-                handle_mock_d1_request(stream, &data);
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_mock_d1_request(stream, &data),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
             }
         });
         Self {
             base_url,
-            _handle: handle,
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for MockD1Server {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -765,12 +791,36 @@ fn mock_d1_rows(sql: &str, params: &[Value], data: &MockD1Data) -> Result<Vec<Va
     {
         return Ok(data.ai_versions.clone());
     }
-    if sql.contains("FROM object_index WHERE repo_id = ?1") {
-        return Ok(if param_str(params, 0) == Some("repo_456") {
-            data.objects.clone()
-        } else {
-            Vec::new()
-        });
+    if sql.contains("FROM sqlite_master WHERE type = 'table' AND name = ?1") {
+        return match param_str(params, 0) {
+            Some("object_index") => Ok(vec![serde_json::json!({ "present": 1 })]),
+            Some("object_index_catalog_generation")
+            | Some("object_index_catalog_generation_ready") => {
+                // This fixture models a pre-catalog cloud schema. Clone must
+                // preserve the legacy read path until the writer migration
+                // publishes a complete generation fence.
+                Ok(vec![serde_json::json!({ "present": 0 })])
+            }
+            table => Err(format!("unexpected D1 table probe: {table:?}")),
+        };
+    }
+    if sql.contains("FROM object_index") && sql.contains("WHERE repo_id = ?1") {
+        if param_str(params, 0) != Some("repo_456") {
+            return Ok(Vec::new());
+        }
+        let cursor = param_str(params, 2).unwrap_or_default();
+        let mut objects = data
+            .objects
+            .iter()
+            .filter(|row| {
+                row.get("o_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|object_id| object_id > cursor)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        objects.sort_by(|left, right| left["o_id"].as_str().cmp(&right["o_id"].as_str()));
+        return Ok(objects);
     }
 
     Err(format!("unexpected D1 SQL: {sql}"))

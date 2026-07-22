@@ -183,7 +183,7 @@ mod tests {
         VerifiedManifest {
             payload_digest: [3u8; 32],
             signer_key_id: "test-key-1".into(),
-            version: ReleaseVersion::parse(version).unwrap(),
+            version: ReleaseVersion::parse(version).expect("test fixture operation should succeed"),
             version_raw: version.into(),
             control_revision: 5,
             published_at,
@@ -192,7 +192,7 @@ mod tests {
             paused,
             revoked_versions: revoked
                 .iter()
-                .map(|v| ReleaseVersion::parse(v).unwrap())
+                .map(|v| ReleaseVersion::parse(v).expect("test fixture operation should succeed"))
                 .collect(),
             artifacts: Platform::RELEASE_MATRIX
                 .iter()
@@ -218,7 +218,7 @@ mod tests {
             UpgradeState::default(),
             m.published_at,
             platform,
-            ReleaseVersion::parse(installed).unwrap(),
+            ReleaseVersion::parse(installed).expect("test fixture operation should succeed"),
             "2026-07-17T00:00:00Z",
         )
     }

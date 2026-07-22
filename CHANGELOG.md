@@ -4,6 +4,66 @@
 
 ### Changed
 
+- **Captured agent sessions now have a privacy-preserving read-only graph**:
+  `libra agent graph <session>` renders turn, revision, checkpoint, and
+  subagent-link structure in a two-pane TUI, with frozen JSON schema v1 for
+  automation. The projection never reads transcript/object blobs or sensitive
+  metadata columns, preserves shared checkpoint evidence, distinguishes
+  legacy `unindexed`, local `erased`, and unknown sessions, and refuses a TUI
+  before initialization when stdin/stdout are not terminals.
+
+- **Terminal local `object_index` failures are durable and repairable**: every
+  queued object-index row now has an atomic repair marker until the SQLite row
+  is reconciled. Ordinary object-writing commands keep their completed local
+  result and emit a warning instead of producing contradictory success/error
+  JSON; the next schema-aware repository command retries the exact rows, while
+  `cloud sync` fails closed before network work if repair is still impossible.
+  Public in-process CLI invocations are serialized, while task-local failure
+  and pending-work scopes keep concurrent direct storage callers out of the
+  active command's warning and drain accounting. Invocation-scoped updates
+  use a separate bounded FIFO lane, so an earlier direct-library backlog also
+  cannot consume the command's finite drain budget. Command-owned spawned
+  producers register before they start and explicitly inherit the invocation
+  scope, so the drain cannot observe a transient zero before they enqueue;
+  every queued message retains its originating invocation's scope even if it
+  completes after that invocation's drain budget. Terminal index failures are
+  also warned when an earlier input was persisted before a later input made the
+  primary command fail; the original command error and exit code remain
+  authoritative. Queue drain is an
+  async, 60-second bounded wait so embedded Tokio executors remain responsive.
+  Replay uses one database connection, enumerates at most 100,000 raw repair
+  directory entries per page, and owns at most one 100-row database batch per
+  invocation; oversized queues make progress across later commands instead of
+  becoming permanently unreplayable. Replay and queued writers share a
+  process-crash-safe ownership lock from a bounded 65,536-shard OID namespace
+  through the row update and
+  marker retirement, so a delayed writer cannot recreate an index row after
+  destructive cleanup. Marker publishers additionally share a repository-wide
+  generation fence with destructive cleanup; cleanup revalidates candidate
+  OIDs under that fence and holds it through the SQLite prune commit, closing
+  the marker-creation window after command preflight. Foreground lock acquisition has a two-second deadline
+  and returns an actionable retry error instead of hanging behind a stalled
+  process; replay releases object ownership after every database batch;
+  concurrently retired markers are treated as completed work. Cloud operations and
+  destructive `agent clean` runs fail closed while another page remains or a
+  canonical final marker is malformed. New atomic writes use a separate
+  staging directory; bounded replay scavenges legacy `.tmp*` remnants from the
+  final directory and removes at most 256 staging files older than 24 hours per
+  1,024-entry scan, so crash debris cannot starve markers or leak indefinitely.
+  Marker OIDs must match the repository's configured SHA-1/SHA-256 format. A marker
+  created after a successful configured-backend write remains valid when the
+  payload is remote-only. With `--sync-data`, successful marker unlink also
+  fsyncs the marker directory so a power loss cannot restore retired work.
+  Marker creation and retirement failures are surfaced
+  through the owning command's error/warning contract; `add` and `update-index`
+  now return `LBR-IO-002` instead of panicking if marker registration fails,
+  and a normal retry re-registers an already-persisted payload instead of
+  silently skipping its cloud index row. The public `BlobExt::save` API is now
+  fallible and returns `io::Result<ObjectHash>`; `try_save` remains as a
+  fallible compatibility alias, and command paths propagate both with
+  actionable context instead of terminating a library consumer.
+  Agent import retains its stricter `LBR-AGENT-018` durable barrier contract.
+
 - **GC: in-progress sequencer / rebase / bisect state rows are now
   reachability roots (v0.19.39, plan-20260714 Part C §C.9 item 10)**: an
   interrupted cherry-pick's todo commits, a stopped rebase's
@@ -401,6 +461,53 @@
   worktree, per Git's content-addressing.
 
 ### Added
+
+- **Consented historical agent import and source-scoped subagent capture**:
+  adds bounded, redacted Claude Code/Codex/OpenCode transcript backfill with
+  durable replay identity, local erasure tombstones, and partial-progress
+  reporting. Claude child transcripts are captured as independently versioned
+  content checkpoints with fail-closed replay integrity, doctor diagnostics,
+  retention-aware cleanup, and cloud mirror/restore companions. Local capture
+  cloud mirroring uses explicit session/checkpoint/link/claim revisions, versioned remote
+  tables that reject unfenced legacy writers, a token-fenced publication
+  manifest bound to the checkpoint-reachable object-index projection, complete D1/R2
+  traces/object durability checks, bounded requests, and atomic monotonic
+  restore. Existing remote capture
+  catalogs without a generation manifest require one current-version sync
+  before restore; empty legacy capture layers remain restorable and restore
+  never installs remote writer barriers. Adoption removes unrestorable legacy
+  checkpoint orphans before strict dependency validation. Prune rewrites advance
+  a checkpoint generation so stale clones cannot restore the old traces chain;
+  explicit erased-session recovery advances a durable session/source incarnation.
+  Object-index reads use generation-fenced keyset pagination, and manifest
+  completion atomically verifies that generation plus the fenced traces head;
+  full restore reads share a 100,000-row aggregate safety bound across every
+  capture catalog table and the fenced object-index projection. Required R2
+  payloads are content-verified in fixed 32-object concurrency pages, with
+  missing or corrupt objects replaced and read back before manifest completion.
+  Crashed `publishing` generations can be atomically recovered after their
+  server-timestamped five-minute lease, while active writers retain their fence.
+  Local catalog
+  transactions are released before the long object walk and rechecked
+  afterward, so concurrent capture writers are not held behind the cloud scan.
+  Empty checkpoint catalogs reject nonempty traces heads, and prune cleanup
+  orders claim/revision/link/checkpoint removal so every interruption boundary
+  remains resumable.
+  Ordinary checkpoint retention writes durable local/remote prune tombstones so
+  stale clones cannot reintroduce deleted checkpoint identities. Restore checks
+  local fences before downloading objects and defers the traces ref from
+  generic metadata restore until capture ownership is known: a validated
+  generation installs its fenced ref, while an empty legacy capture layer
+  retains the pre-manifest metadata ref. Ordinary repositories larger than
+  100,000 objects remain restorable because the aggregate cap applies only to
+  capture catalog/object projections. Historical-import summaries separately
+  count parent and child checkpoints, and unavailable child discovery is
+  diagnostic rather than a false partial failure. Session
+  erasure still does not propagate a deletion tombstone to D1/R2; an unmarked
+  remote-only checkpoint therefore stops a new capture generation before
+  publication and leaves the previous completed snapshot restorable. A later
+  cloud restore can resurrect a remotely mirrored capture; cross-device erase
+  propagation remains explicitly deferred.
 
 - **`diff.renameLimit` / `diff.renameComparisonBudget` documentation
   (plan-20260714 R0-1)**: documents the per-side inexact-pass limit and the

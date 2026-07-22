@@ -778,6 +778,7 @@ pub(crate) async fn merge_import_session_lifecycle(
             "UPDATE agent_session
              SET working_dir = ?,
                  started_at = MIN(started_at, ?),
+                 sync_revision = sync_revision + 1,
                  state = CASE
                    WHEN state = 'quarantined' THEN state
                    WHEN ? < last_event_at THEN state

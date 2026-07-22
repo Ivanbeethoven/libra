@@ -389,6 +389,24 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 
 每个 `CommitError` 变体都会映射到显式 `StableErrorCode`。
 
+终止性的后台 `object_index` 错误不会回滚已经前移的 commit，也不会把已经输出的
+JSON 成功信封变成相互矛盾的 fatal 结果。Libra 会用原子 repair marker 保留缺失
+索引行的精确身份，在 stderr 输出警告，并在下一条会执行 schema 检查的仓库命令前
+自动重试；如果修复仍不可能，`cloud sync` 会 fail-closed。使用
+`--exit-code-on-warning` 时，已完成的 commit 返回退出码 9 / `LBR-WARN-001`；无需、
+也不能依靠再次执行 `commit` 来修复。
+前台队列 drain 采用异步且最多等待 60 秒。预算用尽时，已创建的 marker 保持可重试，
+已经完成的 commit 会带警告返回；marker 删除失败同样触发该警告以及
+`--exit-code-on-warning` 行为。每条排队更新都会保留其创建调用的归属，因此迟到失败不会
+让后续嵌入式命令误告警或返回退出码 9；task-local pending 记账也避免并发直接存储调用延长
+本命令的 drain 等待。命令归属的索引更新与直接库调用使用两个独立的有界 FIFO lane，
+因此既有的直接调用 backlog 不会耗尽本命令的 60 秒预算。repair 使用有界分页；超大队列会跨后续命令持续
+推进，而不会永久卡死。重放与排队 writer 在索引行更新及 marker 退役期间共享来自固定
+65,536 个 OID 分片命名空间的进程崩溃可恢复 ownership lock，因此迟到 writer 不会在 destructive agent cleanup 消费 marker
+之后重新插回已删除的索引行。marker 发布还必须取得仓库级 generation fence；destructive
+cleanup 在该 fence 下重新核验精确候选 OID，并一直持有到 prune 事务提交。启用
+`--sync-data` 时，marker 退役还会 fsync 其父目录。
+
 | 场景 | 错误码 | 退出码 | 提示 |
 |----------|-----------|------|------|
 | 索引损坏 | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
@@ -415,6 +433,7 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 | 暂存更改计算 | `LBR-REPO-002` | 128 | "failed to compute staged changes" |
 | `commit.status` 无效 | `LBR-CLI-002` | 129 | 修正配置值 |
 | `commit.status` 配置不可读 | `LBR-IO-001` | 128 | 修复 local/global 配置库 |
+| Commit 已完成但云索引修复仍待处理，且使用 `--exit-code-on-warning` | `LBR-WARN-001` | 9 | 修复警告中的数据库/marker 问题；下一条仓库命令会自动重试精确索引行 |
 
 ## 兼容性说明
 

@@ -51,7 +51,7 @@ fn builtin_migrations_register_current_schema_migrations() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071901, 2026072101
+            2026071405, 2026071406, 2026071407, 2026071901, 2026072101
         ]
     );
     assert_eq!(
@@ -86,6 +86,8 @@ fn builtin_migrations_register_current_schema_migrations() {
             "agent_import_tombstone",
             "agent_tombstone_compat_barrier",
             "agent_coverage_conflict",
+            "agent_subagent_content",
+            "agent_subagent_replication",
             "sequencer_worktree_scope",
             "rebase_state_worktree_scope",
         ]
@@ -93,7 +95,7 @@ fn builtin_migrations_register_current_schema_migrations() {
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 31);
+    assert_eq!(runner.len(), 33);
     assert_eq!(runner.max_registered_version(), Some(2026072101));
 }
 
@@ -1085,7 +1087,7 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
             2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
             2026070802, 2026070803, 2026071301, 2026071401, 2026071402, 2026071403, 2026071404,
-            2026071405, 2026071901, 2026072101
+            2026071405, 2026071406, 2026071407, 2026071901, 2026072101
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
@@ -1144,6 +1146,441 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     assert!(table_exists(&conn, "agent_import_tombstone").await);
     assert!(index_exists(&conn, "idx_agent_import_tombstone_provider").await);
     assert!(index_exists(&conn, "idx_agent_import_tombstone_erased_session").await);
+    // plan-20260713 M5: source-scoped subagent content revisions + links.
+    assert!(table_exists(&conn, "agent_subagent_content_claim").await);
+    assert!(table_exists(&conn, "agent_subagent_content_revision").await);
+    assert!(table_exists(&conn, "agent_subagent_link").await);
+    assert!(table_exists(&conn, "agent_capture_incarnation").await);
+    assert!(table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
+    assert!(column_exists(&conn, "agent_session", "sync_revision").await);
+    assert!(column_exists(&conn, "agent_checkpoint", "sync_revision").await);
+    assert!(column_exists(&conn, "agent_subagent_content_claim", "revision_cursor").await);
+    assert!(column_exists(&conn, "agent_subagent_content_claim", "sync_revision").await);
+    assert!(column_exists(&conn, "agent_subagent_link", "sync_revision").await);
+    assert!(index_exists(&conn, "idx_agent_subagent_content_claim_current").await);
+    assert!(index_exists(&conn, "idx_agent_subagent_link_parent_state").await);
+    assert!(index_exists(&conn, "idx_agent_checkpoint_prune_tombstone_session").await);
+}
+
+#[tokio::test]
+async fn agent_subagent_content_up_down_up_and_nonempty_guard() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = builtin_runner().expect("builtin runner");
+    runner.run_pending(&conn).await.expect("M5 up #1");
+    assert!(table_exists(&conn, "agent_subagent_content_claim").await);
+    assert!(table_exists(&conn, "agent_subagent_content_revision").await);
+    assert!(table_exists(&conn, "agent_subagent_link").await);
+    assert!(table_exists(&conn, "agent_capture_incarnation").await);
+    assert!(table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
+    assert!(column_exists(&conn, "agent_checkpoint", "sync_revision").await);
+
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
+    ))
+    .await
+    .expect("seed minimal ai_thread FK target");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at, schema_version
+         ) VALUES ('m5-down-session', 'claude_code', 'm5-down-provider',
+                   'active', '/tmp', '{}', '{}', 1, 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed M5 parent session");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_subagent_content_claim (
+            parent_session_id, provider_kind, source_key, content_schema_version,
+            state, attempt_digest, attempt_checkpoint_id, owner, lease_expires_at,
+            fence_token, created_at, updated_at
+         ) VALUES ('m5-down-session', 'claude_code', 'project/session/subagents/a.jsonl',
+                   1, 'reserved', 'digest', 'attempt', 'owner', 999999, 1, 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed M5 reservation");
+    let error = runner
+        .rollback_to(&conn, 2026071405)
+        .await
+        .expect_err("M5 down must preserve active recovery state");
+    assert!(
+        format!("{error:#}").contains("cannot roll back subagent replication"),
+        "unexpected M5 rollback error: {error:#}"
+    );
+    assert_eq!(
+        runner
+            .current_version(&conn)
+            .await
+            .expect("current M5 version"),
+        Some(2026071407)
+    );
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "DELETE FROM agent_subagent_content_claim".to_string(),
+    ))
+    .await
+    .expect("clear M5 recovery state");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (
+            checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
+            traces_commit, created_at
+         ) VALUES ('m5-link-only-checkpoint', 'm5-down-session', 'subagent',
+                   '1111111111111111111111111111111111111111',
+                   '2222222222222222222222222222222222222222',
+                   '3333333333333333333333333333333333333333', 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed link-only M5 checkpoint");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_subagent_link (
+            content_checkpoint_id, parent_session_id, link_state,
+            boundary_checkpoint_id, stable_subagent_id, created_at, updated_at
+         ) VALUES ('m5-link-only-checkpoint', 'm5-down-session', 'unresolved',
+                   NULL, NULL, 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed link-only M5 attribution");
+    let error = runner
+        .rollback_to(&conn, 2026071405)
+        .await
+        .expect_err("M5 down must preserve link-only attribution");
+    assert!(
+        format!("{error:#}").contains("cannot roll back subagent content attribution"),
+        "unexpected link-only rollback error: {error:#}"
+    );
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "DELETE FROM agent_subagent_link".to_string(),
+    ))
+    .await
+    .expect("clear link-only M5 link");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "DELETE FROM agent_checkpoint WHERE checkpoint_id = 'm5-link-only-checkpoint'".to_string(),
+    ))
+    .await
+    .expect("clear link-only M5 checkpoint");
+    assert_eq!(
+        runner
+            .run_pending(&conn)
+            .await
+            .expect("restore 1407 after the 1406 link-only rollback guard"),
+        vec![2026071407, 2026071901, 2026072101]
+    );
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint_prune_tombstone (checkpoint_id, session_id, pruned_at)
+         VALUES ('m5-pruned', 'm5-down-session', 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed ordinary prune tombstone");
+    let error = runner
+        .rollback_to(&conn, 2026071405)
+        .await
+        .expect_err("M5 down must preserve cloud prune fences");
+    assert!(
+        format!("{error:#}").contains("cannot roll back subagent replication"),
+        "unexpected prune-fence rollback error: {error:#}"
+    );
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "DELETE FROM agent_checkpoint_prune_tombstone".to_string(),
+    ))
+    .await
+    .expect("clear ordinary prune tombstone");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "UPDATE agent_session SET sync_revision = 2 WHERE session_id = 'm5-down-session'"
+            .to_string(),
+    ))
+    .await
+    .expect("advance session cloud generation");
+    let error = runner
+        .rollback_to(&conn, 2026071405)
+        .await
+        .expect_err("M5 down must preserve advanced session generations");
+    assert!(
+        format!("{error:#}").contains("cannot roll back subagent replication"),
+        "unexpected session-generation rollback error: {error:#}"
+    );
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "UPDATE agent_session SET sync_revision = 1 WHERE session_id = 'm5-down-session'"
+            .to_string(),
+    ))
+    .await
+    .expect("reset session generation for clean down/up exercise");
+    assert_eq!(
+        runner
+            .rollback_to(&conn, 2026071405)
+            .await
+            .expect("M5 down after clearing state"),
+        vec![2026071407, 2026071406]
+    );
+    assert!(!table_exists(&conn, "agent_subagent_content_claim").await);
+    assert!(!table_exists(&conn, "agent_capture_incarnation").await);
+    assert!(!table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
+    assert!(!column_exists(&conn, "agent_session", "sync_revision").await);
+    assert!(!column_exists(&conn, "agent_checkpoint", "sync_revision").await);
+    assert_eq!(
+        runner.run_pending(&conn).await.expect("M5 up #2"),
+        vec![2026071406, 2026071407, 2026071901, 2026072101]
+    );
+    assert!(table_exists(&conn, "agent_subagent_content_claim").await);
+    assert!(table_exists(&conn, "agent_capture_incarnation").await);
+    assert!(table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
+    assert!(column_exists(&conn, "agent_session", "sync_revision").await);
+    assert!(column_exists(&conn, "agent_checkpoint", "sync_revision").await);
+}
+
+/// Early M5 builds applied the immutable 1406 claim/revision/link schema
+/// before revision allocation and cloud generations moved to their own
+/// migration.  Those repositories must receive 1407 instead of being left
+/// with runtime queries against missing columns.
+#[tokio::test]
+async fn existing_agent_subagent_1406_schema_upgrades_to_replication() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let mut base_runner = MigrationRunner::new();
+    base_runner
+        .extend(
+            builtin_migrations()
+                .into_iter()
+                .filter(|migration| migration.version <= 2026071406),
+        )
+        .expect("build immutable 1406 registry");
+    base_runner
+        .run_pending(&conn)
+        .await
+        .expect("construct immutable 1406 schema");
+
+    assert!(!column_exists(&conn, "agent_session", "sync_revision").await);
+    assert!(!column_exists(&conn, "agent_checkpoint", "sync_revision").await);
+    assert!(!column_exists(&conn, "agent_subagent_content_claim", "revision_cursor").await);
+    assert!(!column_exists(&conn, "agent_subagent_content_claim", "sync_revision").await);
+    assert!(!column_exists(&conn, "agent_subagent_link", "sync_revision").await);
+    assert!(!table_exists(&conn, "agent_capture_incarnation").await);
+    assert!(!table_exists(&conn, "agent_capture_cloud_base").await);
+    assert!(!table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
+
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
+    ))
+    .await
+    .expect("seed immutable 1406 ai_thread FK target");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at, schema_version
+         ) VALUES ('m5-compat-session', 'claude_code', 'm5-compat-provider',
+                   'active', '/tmp', '{}', '{}', 1, 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed immutable 1406 parent session");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (
+            checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
+            traces_commit, created_at
+         ) VALUES ('m5-compat-checkpoint', 'm5-compat-session', 'subagent',
+                   '1111111111111111111111111111111111111111',
+                   '2222222222222222222222222222222222222222',
+                   '3333333333333333333333333333333333333333', 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed immutable 1406 checkpoint");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_subagent_content_claim (
+            parent_session_id, provider_kind, source_key, content_schema_version,
+            current_revision, current_checkpoint_id, current_digest, state,
+            fence_token, created_at, updated_at
+         ) VALUES ('m5-compat-session', 'claude_code', 'source/sha256/compat', 1,
+                   3, 'm5-compat-checkpoint', 'digest-3', 'idle', 3, 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed immutable 1406 current claim");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_subagent_content_revision (
+            parent_session_id, provider_kind, source_key, content_schema_version,
+            revision, checkpoint_id, content_digest, source_channel, partial, created_at
+         ) VALUES ('m5-compat-session', 'claude_code', 'source/sha256/compat', 1,
+                   3, 'm5-compat-checkpoint', 'digest-3', 'import', 0, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed immutable 1406 revision");
+
+    let runner = builtin_runner().expect("current builtin runner");
+    assert_eq!(
+        runner
+            .run_pending(&conn)
+            .await
+            .expect("upgrade immutable 1406 schema"),
+        vec![2026071407, 2026071901, 2026072101]
+    );
+    let claim = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT revision_cursor, sync_revision
+             FROM agent_subagent_content_claim
+             WHERE parent_session_id = 'm5-compat-session'"
+                .to_string(),
+        ))
+        .await
+        .expect("read upgraded M5 claim")
+        .expect("upgraded M5 claim exists");
+    assert_eq!(
+        claim
+            .try_get_by::<i64, _>("revision_cursor")
+            .expect("revision cursor"),
+        3
+    );
+    assert_eq!(
+        claim
+            .try_get_by::<i64, _>("sync_revision")
+            .expect("claim sync revision"),
+        1
+    );
+    assert!(column_exists(&conn, "agent_session", "sync_revision").await);
+    assert!(column_exists(&conn, "agent_checkpoint", "sync_revision").await);
+    assert!(column_exists(&conn, "agent_subagent_link", "sync_revision").await);
+    assert!(table_exists(&conn, "agent_capture_incarnation").await);
+    assert!(table_exists(&conn, "agent_capture_cloud_base").await);
+    assert!(table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
+    assert!(trigger_exists(&conn, "trg_agent_subagent_boundary_delete").await);
+}
+
+/// Later M5 development builds had already folded the replication columns
+/// into 1406.  The 1407 compatibility migration must probe them instead of
+/// issuing duplicate ALTER statements (the shape used by long-lived global
+/// config databases during the live gate).
+#[tokio::test]
+async fn evolved_agent_subagent_1406_columns_upgrade_idempotently() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let mut base_runner = MigrationRunner::new();
+    base_runner
+        .extend(
+            builtin_migrations()
+                .into_iter()
+                .filter(|migration| migration.version <= 2026071406),
+        )
+        .expect("build immutable 1406 registry");
+    base_runner
+        .run_pending(&conn)
+        .await
+        .expect("construct immutable 1406 schema");
+    for alter in [
+        "ALTER TABLE agent_session ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE agent_checkpoint ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE agent_subagent_content_claim ADD COLUMN revision_cursor INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE agent_subagent_content_claim ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE agent_subagent_link ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
+    ] {
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            alter.to_string(),
+        ))
+        .await
+        .expect("construct evolved 1406 column shape");
+    }
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "CREATE TABLE IF NOT EXISTS ai_thread (thread_id TEXT PRIMARY KEY)".to_string(),
+    ))
+    .await
+    .expect("seed evolved 1406 ai_thread FK target");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_session (
+            session_id, agent_kind, provider_session_id, state, working_dir,
+            metadata_json, redaction_report, started_at, last_event_at,
+            schema_version, sync_revision
+         ) VALUES ('m5-evolved-session', 'claude_code', 'm5-evolved-provider',
+                   'active', '/tmp', '{}', '{}', 1, 1, 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed evolved 1406 parent session");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_checkpoint (
+            checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid,
+            traces_commit, created_at, sync_revision
+         ) VALUES ('m5-evolved-checkpoint', 'm5-evolved-session', 'subagent',
+                   '1111111111111111111111111111111111111111',
+                   '2222222222222222222222222222222222222222',
+                   '3333333333333333333333333333333333333333', 1, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed evolved 1406 checkpoint");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_subagent_content_claim (
+            parent_session_id, provider_kind, source_key, content_schema_version,
+            current_revision, current_checkpoint_id, current_digest, state,
+            fence_token, created_at, updated_at, revision_cursor, sync_revision
+         ) VALUES ('m5-evolved-session', 'claude_code', 'source/sha256/evolved', 1,
+                   3, 'm5-evolved-checkpoint', 'digest-3', 'idle', 3, 1, 1, 0, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed evolved 1406 stale cursor");
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_subagent_content_revision (
+            parent_session_id, provider_kind, source_key, content_schema_version,
+            revision, checkpoint_id, content_digest, source_channel, partial, created_at
+         ) VALUES ('m5-evolved-session', 'claude_code', 'source/sha256/evolved', 1,
+                   3, 'm5-evolved-checkpoint', 'digest-3', 'import', 0, 1)"
+            .to_string(),
+    ))
+    .await
+    .expect("seed evolved 1406 revision");
+
+    let runner = builtin_runner().expect("current builtin runner");
+    assert_eq!(
+        runner
+            .run_pending(&conn)
+            .await
+            .expect("upgrade evolved 1406 schema"),
+        vec![2026071407, 2026071901, 2026072101]
+    );
+    let cursor = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT revision_cursor FROM agent_subagent_content_claim
+             WHERE parent_session_id = 'm5-evolved-session'"
+                .to_string(),
+        ))
+        .await
+        .expect("read evolved 1406 upgraded cursor")
+        .expect("evolved 1406 claim exists")
+        .try_get_by::<i64, _>("revision_cursor")
+        .expect("decode evolved 1406 upgraded cursor");
+    assert_eq!(cursor, 3);
+    assert!(table_exists(&conn, "agent_capture_incarnation").await);
+    assert!(table_exists(&conn, "agent_capture_cloud_base").await);
+    assert!(table_exists(&conn, "agent_checkpoint_prune_tombstone").await);
+    assert!(trigger_exists(&conn, "trg_agent_subagent_boundary_delete").await);
 }
 
 /// M4 migration gate: both import tables roll back in reverse order and
@@ -1168,7 +1605,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072101, 2026071901, 2026071405, 2026071404, 2026071403, 2026071402
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
+            2026071402
         ]
     );
     assert!(!table_exists(&conn, "agent_import_identity").await);
@@ -1183,7 +1621,8 @@ async fn agent_import_identity_tombstone_up_down_up_round_trip() {
     assert_eq!(
         reapplied,
         vec![
-            2026071402, 2026071403, 2026071404, 2026071405, 2026071901, 2026072101
+            2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
+            2026072101
         ]
     );
     assert!(table_exists(&conn, "agent_import_identity").await);
@@ -1211,7 +1650,12 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         .rollback_to(&conn, 2026071403)
         .await
         .expect("construct released 1403 schema shape");
-    assert_eq!(rolled, vec![2026072101, 2026071901, 2026071405, 2026071404]);
+    assert_eq!(
+        rolled,
+        vec![
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404
+        ]
+    );
     assert!(table_exists(&conn, "agent_import_tombstone").await);
     assert!(!trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
     assert!(!trigger_exists(&conn, "agent_tombstone_block_session_update").await);
@@ -1223,7 +1667,9 @@ async fn existing_agent_tombstone_1403_schema_upgrades_to_compat_barrier() {
         .expect("upgrade existing 1403 schema");
     assert_eq!(
         applied,
-        vec![2026071404, 2026071405, 2026071901, 2026072101]
+        vec![
+            2026071404, 2026071405, 2026071406, 2026071407, 2026071901, 2026072101
+        ]
     );
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_insert").await);
     assert!(trigger_exists(&conn, "agent_tombstone_block_session_update").await);
@@ -1567,10 +2013,11 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026072101, 2026071901, 2026071405, 2026071404, 2026071403, 2026071402, 2026071401,
-            2026071301, 2026070803, 2026070802, 2026070801, 2026070701, 2026070601, 2026070501,
-            2026070401, 2026070301, 2026070202, 2026070201, 2026062301, 2026061401, 2026060801,
-            2026060401, 2026060201, 2026053101, 2026052301, 2026050801, 2026050601
+            2026072101, 2026071901, 2026071407, 2026071406, 2026071405, 2026071404, 2026071403,
+            2026071402, 2026071401, 2026071301, 2026070803, 2026070802, 2026070801, 2026070701,
+            2026070601, 2026070501, 2026070401, 2026070301, 2026070202, 2026070201, 2026062301,
+            2026061401, 2026060801, 2026060401, 2026060201, 2026053101, 2026052301, 2026050801,
+            2026050601
         ]
     );
     assert!(
@@ -1597,7 +2044,8 @@ async fn approved_permission_up_down_up_round_trip() {
             2026050601, 2026050801, 2026052301, 2026053101, 2026060201, 2026060401, 2026060801,
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
             2026070601, 2026070701, 2026070801, 2026070802, 2026070803, 2026071301, 2026071401,
-            2026071402, 2026071403, 2026071404, 2026071405, 2026071901, 2026072101
+            2026071402, 2026071403, 2026071404, 2026071405, 2026071406, 2026071407, 2026071901,
+            2026072101
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);

@@ -11,8 +11,11 @@
 //! M2 scope: real BY-ID lookups against the developer machine's actual
 //! `~/.claude/projects` (DR-02) and `~/.codex/sessions` (DR-03) stores. M4
 //! adds real three-provider import/idempotency, cross-repo, and erase/restore.
+//! M5 adds real Claude subagent-file content attribution and a fail-closed
+//! assertion that a real Codex native hook produced boundary evidence.
 
 use std::{
+    collections::BTreeMap,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -260,8 +263,10 @@ async fn live_m4_historical_import_three_provider_acceptance() {
     let db = Database::connect(&db_url)
         .await
         .expect("open current repository capture database");
-    let mut fresh_claude = None;
+    let gate_owned_claude = std::env::var("LIBRA_LIVE_M4_GATE_OWNED_CLAUDE_SESSION").ok();
+    let mut selected_claude = None;
     for (sid, path) in &claude_candidates {
+        let explicitly_gate_owned = gate_owned_claude.as_deref() == Some(sid.as_str());
         let existing = db
             .query_one(Statement::from_sql_and_values(
                 db.get_database_backend(),
@@ -272,14 +277,64 @@ async fn live_m4_historical_import_three_provider_acceptance() {
             .await
             .expect("query pre-existing Claude capture")
             .is_some();
-        if !existing {
-            fresh_claude = Some((sid.clone(), path.clone()));
+        let selected = if gate_owned_claude.is_some() {
+            explicitly_gate_owned
+        } else {
+            !existing
+        };
+        if selected {
+            selected_claude = Some((sid.clone(), path.clone()));
             break;
         }
     }
-    let (claude_sid, _claude_path) = fresh_claude.expect(
-        "live M4 gate needs one uncaptured Claude session so erase/restore cannot delete prior data",
+    let (claude_sid, _claude_path) = selected_claude.expect(
+        "live M4 gate needs one uncaptured Claude session, or an explicit \
+         LIBRA_LIVE_M4_GATE_OWNED_CLAUDE_SESSION, so erase/restore cannot delete unrelated data",
     );
+
+    if gate_owned_claude.is_some() {
+        let tombstone_exists = db
+            .query_one(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT 1 AS one FROM agent_import_tombstone \
+                 WHERE agent_kind = 'claude_code' AND provider_session_id = ?",
+                [claude_sid.clone().into()],
+            ))
+            .await
+            .expect("query gate-owned Claude tombstone")
+            .is_some();
+        if tombstone_exists {
+            let libra_dir = repo.join(".libra");
+            let history = HistoryManager::new_with_ref(
+                Arc::new(ClientStorage::init(libra_dir.join("objects"))),
+                libra_dir,
+                Arc::new(db.clone()),
+                TRACES_BRANCH,
+            );
+            history
+                .erase_session_local(&format!("claude__{claude_sid}"))
+                .await
+                .expect("finish interrupted erasure for the gate-owned Claude capture");
+            drop(history);
+            let restored = run_live_import(repo, "claude-code", "--session", &claude_sid, true);
+            if restored.status.success() {
+                // The audited restore completed in one pass.
+            } else {
+                assert!(
+                    String::from_utf8_lossy(&restored.stderr).contains("LBR-AGENT-018"),
+                    "restore interrupted gate-owned Claude capture: {}",
+                    describe_output(&restored)
+                );
+                let repaired =
+                    run_live_import(repo, "claude-code", "--session", &claude_sid, false);
+                assert!(
+                    repaired.status.success(),
+                    "repair restored gate-owned Claude capture: {}",
+                    describe_output(&repaired)
+                );
+            }
+        }
+    }
 
     let codex_sessions = home.join(".codex/sessions");
     let (codex_sid, _) = find_codex_session_for_repo(&codex_sessions, repo, 0)
@@ -379,11 +434,19 @@ async fn live_m4_historical_import_three_provider_acceptance() {
         describe_output(&blocked)
     );
     let restored = run_live_import(repo, "claude-code", "--session", &claude_sid, true);
-    assert!(
-        restored.status.success(),
-        "audited real-session restore failed: {}",
-        describe_output(&restored)
-    );
+    if !restored.status.success() {
+        assert!(
+            String::from_utf8_lossy(&restored.stderr).contains("LBR-AGENT-018"),
+            "audited real-session restore failed: {}",
+            describe_output(&restored)
+        );
+        let repaired = run_live_import(repo, "claude-code", "--session", &claude_sid, false);
+        assert!(
+            repaired.status.success(),
+            "audited real-session restore repair failed: {}",
+            describe_output(&repaired)
+        );
+    }
     let restored_replay = run_live_import(repo, "claude-code", "--session", &claude_sid, false);
     assert!(restored_replay.status.success());
     assert_eq!(imported_checkpoint_count(&restored_replay), 0);
@@ -391,6 +454,376 @@ async fn live_m4_historical_import_three_provider_acceptance() {
     eprintln!(
         "live M4 import gate ok (claude/codex/opencode replay no-op, cross-repo rejected, erase/restore fenced)"
     );
+}
+
+/// M5 / DR-06 live acceptance. Replaying a real, already-captured Claude
+/// session with real `<session>/subagents/*.jsonl` sources must materialize one
+/// current content leaf per file, keep every Claude link unresolved, and add
+/// no revision on replay. A real Codex native subagent hook must also have
+/// produced at least one distinct boundary checkpoint in this repository.
+#[tokio::test]
+async fn live_m5_subagent_boundary_content_attribution() {
+    if !gate_enabled() {
+        eprintln!("skipped (set LIBRA_RUN_LIVE_AGENT_GATE=1 for the live agent gate)");
+        return;
+    }
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    const HARD_CAP: u64 = 16 * 1024 * 1024;
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let home = home().expect("live M5 gate requires a home directory");
+    let project_dir = home
+        .join(".claude/projects")
+        .join(claude_project_slug(repo));
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&project_dir)
+        .expect("live M5 gate requires the real Claude project directory")
+        .filter_map(Result::ok)
+    {
+        let session_dir = entry.path();
+        if !session_dir.is_dir() {
+            continue;
+        }
+        let Some(session_id) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if session_id.len() != 36
+            || !session_id
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() || character == '-')
+        {
+            continue;
+        }
+        let parent = project_dir.join(format!("{session_id}.jsonl"));
+        let subagents = session_dir.join("subagents");
+        if !parent.is_file() || !subagents.is_dir() {
+            continue;
+        }
+        let child_files = std::fs::read_dir(&subagents)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect::<Vec<_>>();
+        let child_bytes = child_files
+            .iter()
+            .filter_map(|path| path.metadata().ok().map(|metadata| metadata.len()))
+            .sum::<u64>();
+        let parent_bytes = parent
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(u64::MAX);
+        if !child_files.is_empty() && parent_bytes <= HARD_CAP && child_bytes <= HARD_CAP {
+            candidates.push((
+                session_id.to_string(),
+                child_files.len(),
+                parent_bytes.saturating_add(child_bytes),
+            ));
+        }
+    }
+    candidates.sort_by_key(|(_, _, bytes)| *bytes);
+    let (claude_sid, expected_sources, _) = candidates
+        .first()
+        .cloned()
+        .expect("live M5 gate requires a real bounded Claude session with subagent files");
+
+    let first = run_live_import(repo, "claude-code", "--session", &claude_sid, false);
+    assert!(
+        first.status.success(),
+        "real Claude subagent import failed: {}",
+        describe_output(&first)
+    );
+    let db = Database::connect(format!(
+        "sqlite://{}",
+        repo.join(".libra/libra.db").display()
+    ))
+    .await
+    .expect("open M5 live capture database");
+    let parent_session_id = format!("claude__{claude_sid}");
+    let rows = db
+        .query_all(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT c.current_revision, c.source_key, cp.parent_checkpoint_id,
+                    l.link_state, l.boundary_checkpoint_id
+             FROM agent_subagent_content_claim c
+             JOIN agent_checkpoint cp ON cp.checkpoint_id = c.current_checkpoint_id
+             JOIN agent_subagent_link l ON l.content_checkpoint_id = c.current_checkpoint_id
+             WHERE c.parent_session_id = ? AND c.provider_kind = 'claude_code'
+             ORDER BY c.source_key",
+            [parent_session_id.clone().into()],
+        ))
+        .await
+        .expect("read live Claude subagent attribution");
+    assert_eq!(rows.len(), expected_sources);
+    for row in &rows {
+        assert!(
+            row.try_get_by::<i64, _>("current_revision")
+                .expect("current revision")
+                >= 1
+        );
+        let source_key: String = row.try_get_by("source_key").expect("source key");
+        assert!(!Path::new(&source_key).is_absolute());
+        assert!(source_key.starts_with("source/sha256/"));
+        assert_eq!(source_key.len(), "source/sha256/".len() + 64);
+        assert!(!source_key.contains(&claude_sid));
+        assert_eq!(
+            row.try_get_by::<Option<String>, _>("parent_checkpoint_id")
+                .expect("structural parent"),
+            None
+        );
+        assert_eq!(
+            row.try_get_by::<String, _>("link_state")
+                .expect("link state"),
+            "unresolved"
+        );
+        assert_eq!(
+            row.try_get_by::<Option<String>, _>("boundary_checkpoint_id")
+                .expect("boundary link"),
+            None
+        );
+    }
+    let before_replay_revisions = subagent_revision_count(&db, &parent_session_id).await;
+    let replay = run_live_import(repo, "claude-code", "--session", &claude_sid, false);
+    assert!(
+        replay.status.success(),
+        "real Claude subagent replay failed: {}",
+        describe_output(&replay)
+    );
+    assert_eq!(
+        subagent_revision_count(&db, &parent_session_id).await,
+        before_replay_revisions,
+        "real Claude subagent replay must not append revisions"
+    );
+
+    let codex_boundaries = db
+        .query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT COUNT(*) AS n
+             FROM agent_checkpoint cp
+             JOIN agent_session s ON s.session_id = cp.session_id
+             LEFT JOIN agent_subagent_link l ON l.content_checkpoint_id = cp.checkpoint_id
+             WHERE s.agent_kind = 'codex' AND cp.scope = 'subagent'
+               AND l.content_checkpoint_id IS NULL"
+                .to_string(),
+        ))
+        .await
+        .expect("read live Codex boundary count")
+        .expect("Codex boundary count row")
+        .try_get_by::<i64, _>("n")
+        .expect("Codex boundary count");
+    assert!(
+        codex_boundaries > 0,
+        "live M5 gate requires a real Codex native SubagentStart/Stop boundary capture"
+    );
+
+    eprintln!(
+        "live M5 subagent gate ok (Claude content sources/replay/unresolved, Codex native boundary)"
+    );
+}
+
+/// M6 / DR-07 live acceptance. Render a real indexed capture through the
+/// public JSON command, prove non-TTY calls fail before TUI initialization,
+/// and compare every capture/import/export catalog row before and after.
+///
+/// Erased-state rendering is covered by the deterministic L1 fixture because
+/// this gate must not erase an operator-owned live capture merely to manufacture
+/// a tombstone. If a prior gate-owned erased tombstone exists, it is also read
+/// through the public command here.
+#[tokio::test]
+async fn live_m6_agent_graph_real_capture_is_private_and_readonly() {
+    if !gate_enabled() {
+        eprintln!("skipped (set LIBRA_RUN_LIVE_AGENT_GATE=1 for the live agent gate)");
+        return;
+    }
+    use sea_orm::{ConnectionTrait, Database, Statement};
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let db = Database::connect(format!(
+        "sqlite://{}",
+        repo.join(".libra/libra.db").display()
+    ))
+    .await
+    .expect("open M6 live capture database");
+    let session_id = db
+        .query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT s.session_id
+             FROM agent_session s
+             WHERE EXISTS (
+                 SELECT 1 FROM agent_coverage_claim c
+                 WHERE c.session_id = s.session_id AND c.state = 'catalog_committed'
+             )
+             ORDER BY s.last_event_at DESC, s.session_id
+             LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("query a real indexed capture")
+        .expect("live M6 gate requires a real indexed captured session")
+        .try_get_by::<String, _>("session_id")
+        .expect("real capture session id");
+
+    let before = live_capture_snapshot(&db).await;
+    let json = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .current_dir(repo)
+        .args(["--json", "agent", "graph", &session_id])
+        .output()
+        .expect("run live agent graph JSON");
+    assert!(
+        json.status.success(),
+        "real capture graph failed: {}",
+        describe_output(&json)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("real graph stdout is JSON");
+    let data = &envelope["data"];
+    assert_eq!(data["schema_version"], 1);
+    assert_eq!(data["state"], "present");
+    assert_eq!(data["session"]["session_id"], session_id);
+    assert!(
+        !data["turns"]
+            .as_array()
+            .expect("real graph turns")
+            .is_empty(),
+        "real indexed capture must expose at least one turn"
+    );
+
+    let stdout = String::from_utf8_lossy(&json.stdout);
+    for forbidden in [
+        "working_dir",
+        "metadata_json",
+        "description",
+        "redaction_report",
+        "coverage_digest",
+        "tree_oid",
+        "metadata_blob_oid",
+        "traces_commit",
+        "parent_commit",
+        repo.to_string_lossy().as_ref(),
+    ] {
+        assert!(
+            !stdout.contains(forbidden),
+            "real capture graph leaked forbidden field/value `{forbidden}`"
+        );
+    }
+
+    let non_tty = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .current_dir(repo)
+        .args(["agent", "graph", &session_id])
+        .output()
+        .expect("run live non-TTY graph");
+    assert_eq!(non_tty.status.code(), Some(129));
+    assert!(String::from_utf8_lossy(&non_tty.stderr).contains("LBR-CLI-002"));
+
+    let erased_session_id = db
+        .query_one(Statement::from_string(
+            db.get_database_backend(),
+            "SELECT erased_session_id
+             FROM agent_import_tombstone
+             WHERE erased_session_id IS NOT NULL
+             ORDER BY erased_at DESC
+             LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("query optional gate-owned erased tombstone")
+        .and_then(|row| row.try_get_by::<String, _>("erased_session_id").ok());
+    if let Some(erased_session_id) = erased_session_id {
+        let erased = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .current_dir(repo)
+            .args(["--json", "agent", "graph", &erased_session_id])
+            .output()
+            .expect("render live erased graph");
+        assert!(erased.status.success(), "{}", describe_output(&erased));
+        let erased: serde_json::Value =
+            serde_json::from_slice(&erased.stdout).expect("erased graph stdout is JSON");
+        assert_eq!(erased["data"]["state"], "erased");
+        assert!(erased["data"]["session"].is_null());
+        assert_eq!(erased["data"]["turns"], serde_json::json!([]));
+    }
+
+    let after = live_capture_snapshot(&db).await;
+    assert_eq!(
+        before, after,
+        "agent graph changed a live capture/import/export catalog row"
+    );
+    eprintln!(
+        "live M6 graph gate ok (real indexed JSON/private/non-TTY/zero-write; erased state independently pinned by L1)"
+    );
+}
+
+async fn live_capture_snapshot(
+    connection: &sea_orm::DatabaseConnection,
+) -> BTreeMap<String, String> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let tables = [
+        "agent_session",
+        "agent_checkpoint",
+        "agent_coverage_claim",
+        "agent_coverage_revision",
+        "agent_import_tombstone",
+        "agent_import_identity",
+        "agent_export_job",
+        "agent_subagent_content_claim",
+        "agent_subagent_content_revision",
+        "agent_subagent_link",
+    ];
+    let mut snapshot = BTreeMap::new();
+    for table in tables {
+        let columns = connection
+            .query_all(Statement::from_string(
+                connection.get_database_backend(),
+                format!("PRAGMA table_info({table})"),
+            ))
+            .await
+            .expect("read live capture table columns")
+            .into_iter()
+            .map(|row| row.try_get_by::<String, _>("name").expect("column name"))
+            .collect::<Vec<_>>();
+        let signature = columns
+            .iter()
+            .map(|column| format!("quote(\"{column}\")"))
+            .collect::<Vec<_>>()
+            .join(" || char(31) || ");
+        let row = connection
+            .query_one(Statement::from_string(
+                connection.get_database_backend(),
+                format!(
+                    "SELECT COALESCE(group_concat(row_signature, char(30)), '') AS snapshot
+                     FROM (SELECT {signature} AS row_signature FROM {table} ORDER BY row_signature)"
+                ),
+            ))
+            .await
+            .expect("snapshot live capture table")
+            .expect("snapshot aggregate row");
+        snapshot.insert(
+            table.to_string(),
+            row.try_get_by("snapshot").expect("snapshot string"),
+        );
+    }
+    snapshot
+}
+
+async fn subagent_revision_count(conn: &sea_orm::DatabaseConnection, session_id: &str) -> i64 {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    conn.query_one(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "SELECT COUNT(*) AS n FROM agent_subagent_content_revision
+         WHERE parent_session_id = ?",
+        [session_id.into()],
+    ))
+    .await
+    .expect("query subagent revision count")
+    .expect("subagent revision count row")
+    .try_get_by("n")
+    .expect("subagent revision count")
 }
 
 fn run_live_import(

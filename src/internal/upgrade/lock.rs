@@ -429,9 +429,13 @@ mod tests {
     use super::*;
 
     fn owned_dir() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().canonicalize().unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = tempfile::tempdir().expect("test fixture operation should succeed");
+        let path = dir
+            .path()
+            .canonicalize()
+            .expect("test fixture operation should succeed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test fixture operation should succeed");
         (dir, path)
     }
 
@@ -444,25 +448,27 @@ mod tests {
         ));
         // Group/world-writable.
         let (_guard, path) = owned_dir();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777))
+            .expect("test fixture operation should succeed");
         assert!(matches!(
             InstallDir::open_validated(&path),
             Err(InstallDirError::Validation { .. })
         ));
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test fixture operation should succeed");
         // A symlink pointing at the directory: canonicalize resolves it, and
         // the resolved REAL directory must still pass its own checks — but a
         // dangling/looping link fails open.
         let (_g2, base) = owned_dir();
         let link = base.join("link");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
+        std::os::unix::fs::symlink(&path, &link).expect("test fixture operation should succeed");
         assert!(InstallDir::open_validated(&link).is_ok());
     }
 
     #[test]
     fn entry_name_discipline() {
         let (_guard, path) = owned_dir();
-        let dir = InstallDir::open_validated(&path).unwrap();
+        let dir = InstallDir::open_validated(&path).expect("test fixture operation should succeed");
         for bad in ["a/b", ".", "..", "", "x\0y"] {
             assert!(
                 matches!(dir.read_file(bad), Err(InstallDirError::BadEntryName(_))),
@@ -474,11 +480,24 @@ mod tests {
     #[test]
     fn atomic_write_read_rename_remove_roundtrip() {
         let (_guard, path) = owned_dir();
-        let dir = InstallDir::open_validated(&path).unwrap();
-        assert_eq!(dir.read_file("f").unwrap(), None);
-        dir.write_file_atomic("f", b"hello", 0o600).unwrap();
-        assert_eq!(dir.read_file("f").unwrap().as_deref(), Some(&b"hello"[..]));
-        match dir.stat_entry("f").unwrap() {
+        let dir = InstallDir::open_validated(&path).expect("test fixture operation should succeed");
+        assert_eq!(
+            dir.read_file("f")
+                .expect("test fixture operation should succeed"),
+            None
+        );
+        dir.write_file_atomic("f", b"hello", 0o600)
+            .expect("test fixture operation should succeed");
+        assert_eq!(
+            dir.read_file("f")
+                .expect("test fixture operation should succeed")
+                .as_deref(),
+            Some(&b"hello"[..])
+        );
+        match dir
+            .stat_entry("f")
+            .expect("test fixture operation should succeed")
+        {
             Some(EntryKind::Regular { size, mode }) => {
                 assert_eq!(size, 5);
                 assert_eq!(mode, 0o600);
@@ -486,28 +505,50 @@ mod tests {
             other => panic!("expected regular file, got {other:?}"),
         }
         // Overwrite is atomic and leaves no temp files behind.
-        dir.write_file_atomic("f", b"world!", 0o600).unwrap();
-        assert_eq!(dir.read_file("f").unwrap().as_deref(), Some(&b"world!"[..]));
+        dir.write_file_atomic("f", b"world!", 0o600)
+            .expect("test fixture operation should succeed");
+        assert_eq!(
+            dir.read_file("f")
+                .expect("test fixture operation should succeed")
+                .as_deref(),
+            Some(&b"world!"[..])
+        );
         let leftovers: Vec<_> = std::fs::read_dir(&path)
-            .unwrap()
+            .expect("test fixture operation should succeed")
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
-        dir.rename_entry("f", "g").unwrap();
-        assert_eq!(dir.read_file("f").unwrap(), None);
-        assert!(dir.remove_file("g").unwrap());
-        assert!(!dir.remove_file("g").unwrap());
+        dir.rename_entry("f", "g")
+            .expect("test fixture operation should succeed");
+        assert_eq!(
+            dir.read_file("f")
+                .expect("test fixture operation should succeed"),
+            None
+        );
+        assert!(
+            dir.remove_file("g")
+                .expect("test fixture operation should succeed")
+        );
+        assert!(
+            !dir.remove_file("g")
+                .expect("test fixture operation should succeed")
+        );
     }
 
     #[test]
     fn read_refuses_symlink_entries() {
         let (_guard, path) = owned_dir();
-        let dir = InstallDir::open_validated(&path).unwrap();
-        std::fs::write(path.join("real"), b"x").unwrap();
-        std::os::unix::fs::symlink(path.join("real"), path.join("sneaky")).unwrap();
-        assert_eq!(dir.stat_entry("sneaky").unwrap(), Some(EntryKind::Symlink));
+        let dir = InstallDir::open_validated(&path).expect("test fixture operation should succeed");
+        std::fs::write(path.join("real"), b"x").expect("test fixture operation should succeed");
+        std::os::unix::fs::symlink(path.join("real"), path.join("sneaky"))
+            .expect("test fixture operation should succeed");
+        assert_eq!(
+            dir.stat_entry("sneaky")
+                .expect("test fixture operation should succeed"),
+            Some(EntryKind::Symlink)
+        );
         // openat with O_NOFOLLOW fails on the symlink (ELOOP/EMLINK).
         assert!(dir.read_file("sneaky").is_err());
     }
@@ -515,11 +556,24 @@ mod tests {
     #[test]
     fn try_lock_is_exclusive_and_released_on_drop() {
         let (_guard, path) = owned_dir();
-        let a = InstallDir::open_validated(&path).unwrap();
-        let b = InstallDir::open_validated(&path).unwrap();
-        let held = a.try_lock().unwrap().expect("first lock acquired");
-        assert!(b.try_lock().unwrap().is_none(), "second locker must skip");
+        let a = InstallDir::open_validated(&path).expect("test fixture operation should succeed");
+        let b = InstallDir::open_validated(&path).expect("test fixture operation should succeed");
+        let held = a
+            .try_lock()
+            .expect("test fixture operation should succeed")
+            .expect("first lock acquired");
+        assert!(
+            b.try_lock()
+                .expect("test fixture operation should succeed")
+                .is_none(),
+            "second locker must skip"
+        );
         drop(held);
-        assert!(b.try_lock().unwrap().is_some(), "released on drop");
+        assert!(
+            b.try_lock()
+                .expect("test fixture operation should succeed")
+                .is_some(),
+            "released on drop"
+        );
     }
 }

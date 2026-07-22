@@ -473,7 +473,8 @@ Root commit:
 - `--json` writes one success envelope to `stdout`
 - `--machine` writes the same schema as compact single-line JSON
 - both suppress hook stdout/stderr (piped instead of inherited)
-- `stderr` stays clean on success
+- `stderr` stays clean on success unless a completed local commit leaves a
+  durable cloud object-index repair warning (described below)
 
 Example:
 
@@ -636,6 +637,33 @@ documented explicitly because post hooks are otherwise advisory.
 
 Every `CommitError` variant maps to an explicit `StableErrorCode`.
 
+A terminal background `object_index` error does not roll back an already
+advanced commit and does not turn its JSON success envelope into a contradictory
+fatal result. Libra retains the exact missing rows in atomic repair markers,
+warns on stderr, and retries them before the next schema-aware repository
+command. `cloud sync` fails closed if repair is still impossible. With
+`--exit-code-on-warning`, the completed commit returns exit 9 / `LBR-WARN-001`;
+rerunning `commit` is neither required nor useful.
+The foreground queue drain is asynchronous and bounded to 60 seconds. On budget
+expiry the already-created markers remain retryable and the completed commit is
+reported with a warning; marker-retirement failures also trigger that warning
+and `--exit-code-on-warning` behavior. Each queued update retains the invocation
+that created it, so a late failure cannot make a later embedded command warn or
+return exit 9. Task-local pending accounting likewise prevents a concurrent
+direct storage caller from extending this command's drain wait. Repair
+work uses a separate bounded FIFO lane from direct-library indexing, so a
+pre-existing direct backlog cannot consume the command's 60-second budget.
+Repair
+processes bounded pages; an oversized queue advances over
+successive commands instead of becoming permanently stuck. Replay and queued
+writers share a process-crash-safe ownership lock from a bounded 65,536-shard
+OID namespace through row update and
+marker retirement, so a delayed writer cannot recreate a row after destructive
+agent cleanup has consumed that marker. Marker publication also takes a
+repository-wide generation fence; destructive cleanup revalidates its exact
+candidate OIDs while holding that fence through the prune transaction. With
+`--sync-data`, retiring a marker fsyncs its parent directory.
+
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
 | Index corrupted | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
@@ -662,6 +690,7 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | Auto-stage source read/hash failed | `LBR-IO-001` | 128 | Check the named working-tree file |
 | Auto-stage preview/object/LFS write failed | `LBR-IO-002` | 128 | Check space and permissions for the named target |
 | Staged changes computation | `LBR-REPO-002` | 128 | "failed to compute staged changes" |
+| Commit completed but cloud index repair remains pending, with `--exit-code-on-warning` | `LBR-WARN-001` | 9 | Fix the reported database/marker error; any next repo command retries the exact rows |
 
 ## Compatibility Notes
 

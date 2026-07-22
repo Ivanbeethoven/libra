@@ -34,6 +34,20 @@ saves the index.
   `--add`, a positional path must already be tracked.
 - `--remove <path>...` drops the named paths from the index.
 
+Working-tree staging returns `LBR-IO-002` if the blob or its durable cloud
+index marker cannot be written; it does not panic or save an index entry that
+lacks repair ownership. A normal retry re-registers a payload that the failed
+attempt already persisted.
+
+Local index persistence and the later cloud-catalog update have separate
+durability boundaries. If a terminal background `object_index` error happens
+after the blob and index are saved, `update-index` keeps its normal success
+output, emits an actionable stderr warning, and retains an atomic repair marker
+for the next schema-aware repository command. `cloud sync` and destructive
+agent cleanup fail closed while repair remains pending. With
+`--exit-code-on-warning`, the completed local update returns exit 9 /
+`LBR-WARN-001`; retrying `update-index` is unnecessary.
+
 ## Options
 
 | Option | Description | Example |
@@ -48,7 +62,9 @@ saves the index.
 | Code | Meaning |
 |------|---------|
 | `0` | The index was updated and saved. |
+| `9` / `LBR-WARN-001` | The local index was saved, but cloud index repair remains pending and `--exit-code-on-warning` was used. |
 | `128` | Not inside a repository, a usage error (bad `--cacheinfo`, untracked path without `--add`), or a missing working-tree file. |
+| `128` / `LBR-IO-002` | Working-tree blob or durable cloud index-marker persistence failed; fix storage permissions and retry. |
 
 ## Examples
 

@@ -40,7 +40,9 @@ use serde::{Deserialize, Serialize};
 use super::CleanArgs;
 use crate::{
     internal::{
-        ai::history::{CheckpointPruneGuardError, HistoryManager},
+        ai::history::{
+            CheckpointPruneGuardError, HistoryManager, SubagentContentReservationPruneGuard,
+        },
         branch::TRACES_BRANCH,
         db::get_db_conn_instance,
     },
@@ -400,6 +402,14 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
 /// window-guard refusals distinguishable (they are deterministic and
 /// user-resolvable, not storage corruption).
 fn map_prune_error(err: anyhow::Error) -> CliError {
+    if err
+        .downcast_ref::<SubagentContentReservationPruneGuard>()
+        .is_some()
+    {
+        return CliError::conflict(format!("{err}"))
+            .with_hint("an external-agent subagent content write is still reserved")
+            .with_hint("retry once the writer finishes or its reservation lease expires");
+    }
     match err.downcast_ref::<CheckpointPruneGuardError>() {
         Some(CheckpointPruneGuardError::LiveWriterMarker { .. }) => {
             CliError::conflict(format!("{err}"))

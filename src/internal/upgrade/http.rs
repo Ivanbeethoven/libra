@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn size_gate_rejects_oversized_content_length_before_body() {
-        let gate = SizeGate::new(100).unwrap();
+        let gate = SizeGate::new(100).expect("test fixture operation should succeed");
         assert!(gate.check_declared(Some(101)).is_err());
         assert!(gate.check_declared(Some(100)).is_ok());
         // A smaller/absent declaration is allowed; the exact-count rule at
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn size_gate_aborts_mid_stream_and_requires_exact_end() {
-        let mut gate = SizeGate::new(10).unwrap();
+        let mut gate = SizeGate::new(10).expect("test fixture operation should succeed");
         assert!(gate.push_chunk(6).is_ok());
         assert!(gate.finish().is_err(), "short stream must fail");
         assert!(gate.push_chunk(4).is_ok());
@@ -272,7 +272,8 @@ mod tests {
 
     #[test]
     fn size_gate_overflow_is_saturating_not_wrapping() {
-        let mut gate = SizeGate::new(MAX_ARTIFACT_BYTES).unwrap();
+        let mut gate =
+            SizeGate::new(MAX_ARTIFACT_BYTES).expect("test fixture operation should succeed");
         assert!(gate.push_chunk(u64::MAX).is_err());
     }
 

@@ -67,6 +67,9 @@ pub mod agent_run;
 // Kept outside `observed_agents` so the capture adapters remain independent
 // from checkpoint/runtime persistence layers.
 pub mod agent_import;
+// Provider-root subagent transcript discovery and source-scoped content
+// revisions (plan-20260713 M5 / DR-06).
+pub mod subagent_content;
 // Capability packages (CEX-S2-17): auditable, checksum-verified bundles of
 // skills / commands / sources / sub-agent definitions plus the per-repo
 // installed-package store the session bootstrap reads.

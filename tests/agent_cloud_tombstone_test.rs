@@ -1,11 +1,12 @@
 //! A0-10 cloud-mirror tombstone propagation for agent capture data.
 //!
 //! Ground truth (verified against `src/command/cloud.rs`): the D1 agent-capture
-//! MIRROR is live — `libra cloud sync` upserts `agent_session` /
+//! MIRROR is live — `libra cloud sync` publishes fenced `agent_session` /
 //! `agent_checkpoint` to D1 on every sync (`sync_agent_capture_tables`) and
 //! `libra cloud restore` reads them back (`restore_agent_capture_from_d1`).
-//! What is DEFERRED is delete/tombstone propagation: local agent-capture
-//! erasure ([`HistoryManager::erase_session_local`]) rewrites `refs/libra/traces`
+//! Ordinary checkpoint retention now propagates a durable D1 prune fence.
+//! What remains DEFERRED is session-erasure propagation:
+//! [`HistoryManager::erase_session_local`] rewrites `refs/libra/traces`
 //! and deletes the LOCAL `agent_session` / `agent_checkpoint` rows +
 //! `object_index`, but does **not** delete the D1 mirror rows or write a
 //! tombstone. A subsequent `libra cloud restore` can therefore REVIVE erased
@@ -28,7 +29,9 @@ use libra::{
     internal::{ai::history::HistoryManager, branch::TRACES_BRANCH},
     utils::{
         client_storage::ClientStorage,
-        d1_client::{AgentCheckpointRow, AgentSessionRow, D1Client},
+        d1_client::{
+            AgentCheckpointPruneTombstoneRow, AgentCheckpointV2Row, AgentSessionV2Row, D1Client,
+        },
     },
 };
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement, Value};
@@ -132,8 +135,8 @@ async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
     row.try_get_by::<i64, _>("n").expect("decode count")
 }
 
-fn sample_session_row(session_id: &str) -> AgentSessionRow {
-    AgentSessionRow {
+fn sample_session_row(session_id: &str) -> AgentSessionV2Row {
+    AgentSessionV2Row {
         session_id: session_id.to_string(),
         agent_kind: "claude_code".to_string(),
         provider_session_id: format!("provider-{session_id}"),
@@ -148,11 +151,12 @@ fn sample_session_row(session_id: &str) -> AgentSessionRow {
         last_event_at: 2,
         stopped_at: Some(3),
         schema_version: 1,
+        sync_revision: 1,
     }
 }
 
-fn sample_checkpoint_row(checkpoint_id: &str, session_id: &str) -> AgentCheckpointRow {
-    AgentCheckpointRow {
+fn sample_checkpoint_row(checkpoint_id: &str, session_id: &str) -> AgentCheckpointV2Row {
+    AgentCheckpointV2Row {
         checkpoint_id: checkpoint_id.to_string(),
         session_id: session_id.to_string(),
         parent_checkpoint_id: None,
@@ -165,6 +169,7 @@ fn sample_checkpoint_row(checkpoint_id: &str, session_id: &str) -> AgentCheckpoi
         subagent_session_id: None,
         description: None,
         created_at: 900,
+        sync_revision: 1,
     }
 }
 
@@ -211,13 +216,48 @@ async fn cloud_tombstone_propagation_is_deferred_for_agent_capture() {
         .await
         .expect("ensure agent_checkpoint table on D1");
     client
-        .upsert_agent_session(&repo_id, &sample_session_row(&session_id))
+        .ensure_agent_capture_generation_table()
+        .await
+        .expect("ensure fenced capture generation table on D1");
+    client
+        .ensure_agent_checkpoint_prune_tombstone_table()
+        .await
+        .expect("ensure checkpoint prune fences on D1");
+    client
+        .ensure_agent_subagent_content_tables()
+        .await
+        .expect("ensure companion tables used by prune cleanup");
+    let publish_token = Uuid::new_v4().to_string();
+    client
+        .begin_agent_capture_generation(
+            &repo_id,
+            &publish_token,
+            libra::utils::d1_client::AgentCaptureGenerationManifest {
+                object_index_digest: "live-tombstone-fixture-no-objects",
+                object_index_count: 0,
+                object_index_scope: "checkpoint_projection",
+                object_index_generation: 0,
+                traces_head: None,
+            },
+        )
+        .await
+        .expect("begin fenced capture generation");
+    client
+        .sync_agent_sessions_batch(&repo_id, &publish_token, &[sample_session_row(&session_id)])
         .await
         .expect("mirror one agent_session row to D1");
     client
-        .upsert_agent_checkpoint(&repo_id, &sample_checkpoint_row("cp-tomb", &session_id))
+        .sync_agent_checkpoints_batch(
+            &repo_id,
+            &publish_token,
+            &[sample_checkpoint_row("cp-tomb", &session_id)],
+        )
         .await
         .expect("mirror one agent_checkpoint row to D1");
+    client
+        .complete_agent_capture_generation(&repo_id, &publish_token, 0)
+        .await
+        .expect("complete fenced capture generation");
     let mirrored_sessions = client
         .list_agent_sessions(&repo_id)
         .await
@@ -256,22 +296,97 @@ async fn cloud_tombstone_propagation_is_deferred_for_agent_capture() {
         .expect("re-list checkpoints after local erase")
         .len();
 
+    // Ordinary retention is intentionally different from session erasure:
+    // its durable D1 fence removes the checkpoint and rejects a stale clone.
+    let prune_token = Uuid::new_v4().to_string();
+    client
+        .begin_agent_capture_generation(
+            &repo_id,
+            &prune_token,
+            libra::utils::d1_client::AgentCaptureGenerationManifest {
+                object_index_digest: "live-prune-fixture-no-objects",
+                object_index_count: 0,
+                object_index_scope: "checkpoint_projection",
+                object_index_generation: 0,
+                traces_head: None,
+            },
+        )
+        .await
+        .expect("begin ordinary prune generation");
+    client
+        .sync_agent_checkpoint_prune_tombstones_batch(
+            &repo_id,
+            &prune_token,
+            &[AgentCheckpointPruneTombstoneRow {
+                checkpoint_id: "cp-tomb".to_string(),
+                session_id: session_id.clone(),
+                pruned_at: 4,
+            }],
+        )
+        .await
+        .expect("publish ordinary checkpoint prune fence");
+    client
+        .complete_agent_capture_generation(&repo_id, &prune_token, 0)
+        .await
+        .expect("complete ordinary prune generation");
+    let checkpoints_after_ordinary_prune = client
+        .list_agent_checkpoints(&repo_id)
+        .await
+        .expect("list checkpoints after ordinary prune")
+        .len();
+    let stale_token = Uuid::new_v4().to_string();
+    client
+        .begin_agent_capture_generation(
+            &repo_id,
+            &stale_token,
+            libra::utils::d1_client::AgentCaptureGenerationManifest {
+                object_index_digest: "live-stale-fixture-no-objects",
+                object_index_count: 0,
+                object_index_scope: "checkpoint_projection",
+                object_index_generation: 0,
+                traces_head: None,
+            },
+        )
+        .await
+        .expect("begin stale-clone generation");
+    let stale_reinsert = client
+        .sync_agent_checkpoints_batch(
+            &repo_id,
+            &stale_token,
+            &[sample_checkpoint_row("cp-tomb", &session_id)],
+        )
+        .await;
+
     // Cleanup runs BEFORE any value assertion, so a failing assert never leaks
     // the throwaway mirror rows.
     client
         .execute(
-            "DELETE FROM agent_session WHERE repo_id = ?1",
+            "DELETE FROM agent_capture_checkpoint_v2 WHERE repo_id = ?1",
+            Some(vec![serde_json::json!(repo_id)]),
+        )
+        .await
+        .expect("cleanup throwaway checkpoint mirror rows");
+    client
+        .execute(
+            "DELETE FROM agent_capture_session_v2 WHERE repo_id = ?1",
             Some(vec![serde_json::json!(repo_id)]),
         )
         .await
         .expect("cleanup throwaway session mirror rows");
     client
         .execute(
-            "DELETE FROM agent_checkpoint WHERE repo_id = ?1",
+            "DELETE FROM agent_checkpoint_prune_tombstone WHERE repo_id = ?1",
             Some(vec![serde_json::json!(repo_id)]),
         )
         .await
-        .expect("cleanup throwaway checkpoint mirror rows");
+        .expect("cleanup throwaway checkpoint prune fences");
+    client
+        .execute(
+            "DELETE FROM agent_capture_generation WHERE repo_id = ?1",
+            Some(vec![serde_json::json!(repo_id)]),
+        )
+        .await
+        .expect("cleanup throwaway capture generation");
     let residual_sessions = client
         .list_agent_sessions(&repo_id)
         .await
@@ -305,6 +420,17 @@ async fn cloud_tombstone_propagation_is_deferred_for_agent_capture() {
         checkpoints_after, 1,
         "cloud tombstone propagation is deferred: a local erase does not delete \
          the D1 checkpoint mirror row either",
+    );
+    assert_eq!(
+        checkpoints_after_ordinary_prune, 0,
+        "ordinary checkpoint retention propagates its D1 deletion fence"
+    );
+    assert!(
+        stale_reinsert
+            .expect_err("stale clone must not reinsert a pruned checkpoint")
+            .message
+            .contains("fenced"),
+        "stale checkpoint write should report its prune fence"
     );
     assert_eq!(
         residual_sessions, 0,

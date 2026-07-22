@@ -12,7 +12,11 @@
 
 use std::{fs, io::Write};
 
-use libra::internal::{ai::automation::AutomationHistory, db::get_db_conn_instance};
+use libra::{
+    internal::{ai::automation::AutomationHistory, db::get_db_conn_instance},
+    utils::{error::StableErrorCode, output::OutputConfig},
+};
+use sea_orm::{ConnectionTrait, Statement};
 
 use super::*;
 
@@ -53,6 +57,89 @@ async fn test_add_single_file() {
     let changes = changes_to_be_committed().await;
 
     assert!(changes.new.iter().any(|x| x.to_str().unwrap() == file_path));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_add_reports_marker_registration_failure_without_panicking() {
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+    fs::write(
+        test_dir.path().join(".libra/object-index-repair"),
+        b"conflicting non-directory",
+    )
+    .unwrap();
+    fs::write("marker-failure.txt", "content").unwrap();
+
+    let error = add::execute_safe(
+        AddArgs {
+            pathspec: vec!["marker-failure.txt".to_string()],
+            all: false,
+            update: false,
+            refresh: false,
+            force: false,
+            verbose: false,
+            dry_run: false,
+            ignore_errors: false,
+            pathspec_from_file: None,
+            pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .expect_err("marker registration failure must be returned");
+
+    assert_eq!(error.stable_code(), StableErrorCode::IoWriteFailed);
+    assert!(
+        error
+            .to_string()
+            .contains("failed to store object for 'marker-failure.txt'"),
+        "unexpected error: {error}"
+    );
+
+    fs::remove_file(test_dir.path().join(".libra/object-index-repair"))
+        .expect("remove injected marker-directory conflict");
+    add::execute_safe(
+        AddArgs {
+            pathspec: vec!["marker-failure.txt".to_string()],
+            all: false,
+            update: false,
+            refresh: false,
+            force: false,
+            verbose: false,
+            dry_run: false,
+            ignore_errors: false,
+            pathspec_from_file: None,
+            pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .expect("a normal retry should stage and re-register the existing blob");
+    libra::utils::client_storage::ClientStorage::wait_for_background_tasks();
+    let conn = get_db_conn_instance().await;
+    let row = conn
+        .query_one(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) AS n FROM object_index WHERE o_type = 'blob' AND o_size = 7"
+                .to_string(),
+        ))
+        .await
+        .expect("query retried blob index row")
+        .expect("count query should return one row");
+    assert_eq!(
+        row.try_get_by::<i64, _>("n")
+            .expect("decode retried blob count"),
+        1,
+        "retry staged the existing blob without restoring its cloud index row"
+    );
 }
 
 #[tokio::test]

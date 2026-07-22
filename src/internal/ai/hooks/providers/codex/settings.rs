@@ -918,6 +918,36 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn codex_hook_forward_map_installs_and_parses_subagent_boundaries() {
+        assert!(CODEX_HOOK_FORWARD_MAP.contains(&("SubagentStart", "subagent-start")));
+        assert!(CODEX_HOOK_FORWARD_MAP.contains(&("SubagentStop", "subagent-end")));
+        let mut hooks = CodexHooksFile::default();
+        assert!(upsert_codex_hooks(&mut hooks, BINARY, 30));
+        assert!(hooks.hooks.contains_key("SubagentStart"));
+        assert!(hooks.hooks.contains_key("SubagentStop"));
+
+        let envelope = crate::internal::ai::hooks::SessionHookEnvelope {
+            hook_event_name: "SubagentStart".to_string(),
+            session_id: "session-1".to_string(),
+            cwd: "/tmp".to_string(),
+            transcript_path: None,
+            extra: serde_json::Map::new(),
+        };
+        let start = super::super::parser::parse_codex_hook_event("SubagentStart", &envelope)
+            .expect("parse installed start boundary");
+        let stop = super::super::parser::parse_codex_hook_event("SubagentStop", &envelope)
+            .expect("parse installed stop boundary");
+        assert_eq!(
+            start.kind,
+            crate::internal::ai::hooks::LifecycleEventKind::SubagentStart
+        );
+        assert_eq!(
+            stop.kind,
+            crate::internal::ai::hooks::LifecycleEventKind::SubagentEnd
+        );
+    }
+
     const BINARY: &str = "/opt/libra";
 
     fn hooks_path_of(codex_home: &Path) -> PathBuf {

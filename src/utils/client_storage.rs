@@ -18,6 +18,8 @@
 //! Search supports Git's revision navigation suffixes (`HEAD`, `~`, `^`).
 
 use std::{
+    collections::{HashMap, HashSet},
+    fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -42,9 +44,10 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Statement,
     Value,
 };
+use serde::{Deserialize, Serialize};
 use tokio::{
     runtime::Runtime,
-    sync::mpsc::{Sender, channel, error::TrySendError},
+    sync::mpsc::{Receiver, Sender, channel, error::TrySendError},
 };
 use uuid::Uuid;
 
@@ -88,55 +91,667 @@ struct IndexUpdateMsg {
     obj_type: String,
     size: i64,
     db_path: PathBuf,
+    marker_path: Option<PathBuf>,
+    // Replay keeps this cross-process lock through the SQLite upsert and
+    // marker retirement. Queued writers acquire the same bounded OID-shard lock
+    // immediately before touching SQLite, so a marker retired by replay is a
+    // durable ownership fence rather than a racy existence hint.
+    _marker_lock: Option<Arc<ObjectIndexRepairLock>>,
+    failure_counter: Arc<AtomicUsize>,
+    pending_counter: Arc<AtomicUsize>,
+}
+
+const INDEX_REPAIR_MARKER_DIR: &str = "object-index-repair";
+const INDEX_REPAIR_MARKER_STAGING_DIR: &str = "object-index-repair-tmp";
+const INDEX_REPAIR_LOCK_DIR: &str = "object-index-repair-locks";
+const INDEX_REPAIR_GENERATION_LOCK: &str = "object-index-repair-generation.lock";
+// Four hexadecimal digits cap the persistent cross-process lock namespace at
+// 65,536 files while keeping unrelated object writes well distributed.
+const INDEX_REPAIR_LOCK_SHARD_HEX_LEN: usize = 4;
+const INDEX_REPAIR_MARKER_SCHEMA_VERSION: u8 = 1;
+const INDEX_REPAIR_MARKER_READ_CAP: u64 = 16 * 1024;
+const INDEX_REPAIR_STAGING_SCAN_CAP: usize = 1_024;
+const INDEX_REPAIR_STAGING_REMOVE_CAP: usize = 256;
+const INDEX_REPAIR_STAGING_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+#[cfg(not(test))]
+const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const INDEX_REPAIR_LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+const INDEX_REPAIR_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const INDEX_REPAIR_MARKER_PAGE_CAP: usize = 100_000;
+#[cfg(test)]
+const INDEX_REPAIR_MARKER_PAGE_CAP: usize = 3;
+#[cfg(not(test))]
+const INDEX_REPAIR_BATCH_SIZE: usize = 100;
+#[cfg(test)]
+const INDEX_REPAIR_BATCH_SIZE: usize = 2;
+
+struct PendingObjectIndexPage {
+    updates: Vec<IndexUpdateMsg>,
+    has_more: bool,
+    // Held from the directory snapshot through the batch upsert and durable
+    // marker retirement. Publishers, queued writers, replay, and destructive
+    // deletion therefore observe one total order for marker generations.
+    _generation_lock: Option<ObjectIndexRepairLock>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObjectIndexRepairOutcome {
+    pub(crate) repaired: usize,
+    pub(crate) remaining: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PendingObjectIndexUpdate {
+    schema_version: u8,
+    o_id: String,
+    o_type: String,
+    o_size: i64,
+}
+
+/// Process-crash-safe advisory ownership for one bounded OID shard. Lock files
+/// remain stable after marker retirement so a delayed writer cannot acquire a
+/// newly created inode and bypass a replay process that still owns the old one.
+#[derive(Debug)]
+struct ObjectIndexRepairLock {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    file: fs::File,
+}
+
+fn index_repair_lock_shard(oid: &str) -> io::Result<String> {
+    if !valid_supported_index_repair_oid(oid) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "object-index repair lock identity contains an invalid object id",
+        ));
+    }
+    Ok(oid[..INDEX_REPAIR_LOCK_SHARD_HEX_LEN].to_string())
+}
+
+fn index_repair_lock_path(db_path: &Path, oid: &str) -> io::Result<PathBuf> {
+    let lock_shard = index_repair_lock_shard(oid)?;
+    let storage_dir = db_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "repository database path has no storage directory: {}",
+                db_path.display()
+            ),
+        )
+    })?;
+    Ok(storage_dir
+        .join(INDEX_REPAIR_LOCK_DIR)
+        .join(format!("{lock_shard}.lock")))
+}
+
+fn index_repair_generation_lock_path(db_path: &Path) -> io::Result<PathBuf> {
+    let storage_dir = db_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "repository database path has no storage directory: {}",
+                db_path.display()
+            ),
+        )
+    })?;
+    Ok(storage_dir
+        .join(INDEX_REPAIR_LOCK_DIR)
+        .join(INDEX_REPAIR_GENERATION_LOCK))
+}
+
+#[cfg(unix)]
+fn open_index_repair_lock_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_index_repair_lock_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        // A zero share mode is released by the kernel on process death and is
+        // Windows' equivalent of the Unix advisory lock used below.
+        .share_mode(0)
+        .open(path)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn open_index_repair_lock_file(_path: &Path) -> io::Result<fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cross-process object-index repair locking is unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
+    use std::os::fd::AsRawFd;
+
+    let file = open_index_repair_lock_file(path)?;
+    // SAFETY: flock operates on an owned descriptor and does not outlive it.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(Some(ObjectIndexRepairLock { file }));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
+        _ => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
+    match open_index_repair_lock_file(path) {
+        Ok(file) => Ok(Some(ObjectIndexRepairLock { file })),
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION mean another
+        // process owns this zero-share handle.
+        Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn try_acquire_index_repair_lock_file(path: &Path) -> io::Result<Option<ObjectIndexRepairLock>> {
+    open_index_repair_lock_file(path).map(|file| Some(ObjectIndexRepairLock { file }))
+}
+
+fn try_acquire_index_repair_lock(
+    db_path: &Path,
+    oid: &str,
+) -> io::Result<Option<ObjectIndexRepairLock>> {
+    try_acquire_index_repair_lock_file(&index_repair_lock_path(db_path, oid)?)
+}
+
+fn acquire_index_repair_lock_file(
+    lock_path: &Path,
+    identity: &str,
+) -> io::Result<ObjectIndexRepairLock> {
+    let started = Instant::now();
+    loop {
+        if let Some(lock) = try_acquire_index_repair_lock_file(lock_path)? {
+            return Ok(lock);
+        }
+        if started.elapsed() >= INDEX_REPAIR_LOCK_WAIT_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for object-index repair lock '{}' for {identity}; another Libra process may be stalled",
+                    lock_path.display()
+                ),
+            ));
+        }
+        std::thread::sleep(INDEX_REPAIR_LOCK_RETRY_INTERVAL);
+    }
+}
+
+fn acquire_index_repair_lock(db_path: &Path, oid: &str) -> io::Result<ObjectIndexRepairLock> {
+    acquire_index_repair_lock_file(
+        &index_repair_lock_path(db_path, oid)?,
+        &format!("object {oid}"),
+    )
+}
+
+fn acquire_index_repair_generation_lock(db_path: &Path) -> io::Result<ObjectIndexRepairLock> {
+    acquire_index_repair_lock_file(
+        &index_repair_generation_lock_path(db_path)?,
+        "repair-marker generation",
+    )
+}
+
+#[cfg(unix)]
+impl Drop for ObjectIndexRepairLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the descriptor is owned by this guard. Closing would also
+        // release the lock; explicit unlock makes the lifetime obvious.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// Repository-wide fence for destructive `object_index` deletion. Marker
+/// publishers take the same generation lock before their atomic rename. Once
+/// this guard has verified that none of the candidate OIDs has a durable
+/// marker, holding it through the SQLite commit prevents a delayed publisher
+/// from recreating one of the deleted rows afterward.
+#[derive(Debug)]
+pub(crate) struct ObjectIndexDeletionFence {
+    _generation_lock: ObjectIndexRepairLock,
+}
+
+pub(crate) async fn acquire_object_index_deletion_fence(
+    db_path: &Path,
+    oids: &[String],
+) -> io::Result<Option<ObjectIndexDeletionFence>> {
+    if oids.is_empty() {
+        return Ok(None);
+    }
+    let db_path = db_path.to_path_buf();
+    let oids = oids.iter().cloned().collect::<HashSet<_>>();
+    tokio::task::spawn_blocking(move || {
+        if let Some(invalid) = oids
+            .iter()
+            .find(|oid| !valid_supported_index_repair_oid(oid))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot fence object-index deletion for invalid object id {invalid}"),
+            ));
+        }
+
+        let generation_lock = acquire_index_repair_generation_lock(&db_path)?;
+        let marker_dir = db_path
+            .parent()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "repository database path has no storage directory: {}",
+                        db_path.display()
+                    ),
+                )
+            })?
+            .join(INDEX_REPAIR_MARKER_DIR);
+        let entries = match fs::read_dir(&marker_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Some(ObjectIndexDeletionFence {
+                    _generation_lock: generation_lock,
+                }));
+            }
+            Err(error) => return Err(error),
+        };
+
+        for (scanned_entries, entry) in entries.enumerate() {
+            if scanned_entries >= INDEX_REPAIR_MARKER_PAGE_CAP {
+                return Err(io::Error::other(format!(
+                    "refusing object-index deletion because repair-marker validation exceeded the bounded limit of {INDEX_REPAIR_MARKER_PAGE_CAP} entries"
+                )));
+            }
+            let entry = entry?;
+            let path = entry.path();
+            let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+                io::Error::other(format!(
+                    "object-index repair directory contains a non-UTF-8 entry: {}",
+                    path.display()
+                ))
+            })?;
+            let marker_oid = name
+                .strip_suffix(".json")
+                .and_then(|identity| identity.split_once('.'))
+                .map(|(oid, _)| oid);
+            if let Some(marker_oid) = marker_oid
+                && oids.contains(marker_oid)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "refusing object-index deletion because object {} still has durable repair marker '{}'",
+                        marker_oid,
+                        path.display()
+                    ),
+                ));
+            }
+        }
+
+        Ok(Some(ObjectIndexDeletionFence {
+            _generation_lock: generation_lock,
+        }))
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("object-index deletion fence task failed: {error}")))?
+}
+
+fn index_repair_marker_path(db_path: &Path, oid: &str, object_type: &str) -> io::Result<PathBuf> {
+    if !valid_supported_index_repair_oid(oid) || !valid_index_repair_type(object_type) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "object-index repair identity contains an invalid object id or type",
+        ));
+    }
+    let storage_dir = db_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "repository database path has no storage directory: {}",
+                db_path.display()
+            ),
+        )
+    })?;
+    Ok(storage_dir
+        .join(INDEX_REPAIR_MARKER_DIR)
+        .join(format!("{oid}.{object_type}.json")))
+}
+
+fn persist_index_repair_marker(msg: &IndexUpdateMsg) -> io::Result<PathBuf> {
+    let marker_path = index_repair_marker_path(&msg.db_path, &msg.hash, &msg.obj_type)?;
+    // Marker creation participates in a repository-wide generation fence.
+    // Destructive cleanup holds this lock from its final marker revalidation
+    // through the catalog transaction, so a new durable repair job cannot be
+    // published in the deletion window.
+    let _generation_lock = acquire_index_repair_generation_lock(&msg.db_path)?;
+    let _lock = acquire_index_repair_lock(&msg.db_path, &msg.hash)?;
+    let marker = PendingObjectIndexUpdate {
+        schema_version: INDEX_REPAIR_MARKER_SCHEMA_VERSION,
+        o_id: msg.hash.clone(),
+        o_type: msg.obj_type.clone(),
+        o_size: msg.size,
+    };
+    let bytes = serde_json::to_vec(&marker)
+        .map_err(|error| io::Error::other(format!("encode object-index repair marker: {error}")))?;
+    let staging_dir = msg
+        .db_path
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "repository database path has no storage directory: {}",
+                    msg.db_path.display()
+                ),
+            )
+        })?
+        .join(INDEX_REPAIR_MARKER_STAGING_DIR);
+    let mut writer = crate::utils::atomic_stream::StreamingAtomicFile::new_in(
+        &staging_dir,
+        crate::utils::atomic_write::sync_data_enabled(),
+    )?;
+    writer.write_all(&bytes)?;
+    writer.persist(&marker_path)?;
+    Ok(marker_path)
+}
+
+fn retire_index_repair_marker(path: &Path) -> io::Result<()> {
+    if cfg!(debug_assertions)
+        && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_MARKER_RETIRE_FAIL").is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected object-index repair marker retirement failure",
+        ));
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if crate::utils::atomic_write::sync_data_enabled() {
+                let parent = path.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "object-index repair marker has no parent directory: {}",
+                            path.display()
+                        ),
+                    )
+                })?;
+                crate::utils::atomic_write::fsync_parent_dir(parent)?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn current_index_work_scope() -> IndexWorkScope {
+    ACTIVE_INDEX_WORK_SCOPE
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| UNSCOPED_INDEX_WORK_SCOPE.clone())
+}
+
+fn current_index_failure_counter() -> Arc<AtomicUsize> {
+    current_index_work_scope().failures
+}
+
+fn current_index_pending_counter() -> Arc<AtomicUsize> {
+    current_index_work_scope().pending
+}
+
+fn record_index_update_failure(msg: &IndexUpdateMsg) {
+    msg.failure_counter.fetch_add(1, Ordering::SeqCst);
+}
+
+fn enqueue_index_update(msg: IndexUpdateMsg, context: &'static str) {
+    PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
+    msg.pending_counter.fetch_add(1, Ordering::Relaxed);
+    let sender = if Arc::ptr_eq(&msg.pending_counter, &UNSCOPED_INDEX_WORK_SCOPE.pending) {
+        &INDEX_UPDATE_CHANNELS.unscoped
+    } else {
+        &INDEX_UPDATE_CHANNELS.scoped
+    };
+    match sender.try_send(msg) {
+        Ok(()) => {}
+        Err(TrySendError::Full(msg)) => {
+            let sender = sender.clone();
+            RUNTIME.spawn(async move {
+                if let Err(error) = sender.send(msg).await {
+                    record_index_update_failure(&error.0);
+                    error.0.pending_counter.fetch_sub(1, Ordering::Release);
+                    PENDING_TASKS.fetch_sub(1, Ordering::Release);
+                    tracing::warn!("Failed to queue {context}: channel closed");
+                }
+            });
+        }
+        Err(TrySendError::Closed(msg)) => {
+            record_index_update_failure(&msg);
+            msg.pending_counter.fetch_sub(1, Ordering::Release);
+            PENDING_TASKS.fetch_sub(1, Ordering::Release);
+            tracing::warn!("Failed to queue {context}: channel closed");
+        }
+    }
 }
 
 // RAII guard that decrements PENDING_TASKS exactly once even if the consumer task panics.
 // Drop runs on both the success path and during unwinding, so the pending counter
 // observed by `wait_for_background_tasks` cannot drift on errors.
-struct TaskGuard;
+struct TaskGuard {
+    pending_counter: Arc<AtomicUsize>,
+}
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        PENDING_TASKS.fetch_sub(1, Ordering::Relaxed);
+        // Release pairs with barrier Acquire loads so a foreground caller
+        // that observes zero also observes the terminal failure counter write.
+        self.pending_counter.fetch_sub(1, Ordering::Release);
+        PENDING_TASKS.fetch_sub(1, Ordering::Release);
     }
 }
 
-// Global channel for index updates.
-// Bounded (1000) so a runaway producer cannot exhaust memory; producers fall back to
-// the runtime-spawned `send` path when `try_send` reports `Full`. The consumer runs
-// serially on RUNTIME to avoid SQLite write contention on `.libra/libra.db`.
-static INDEX_UPDATE_CHANNEL: Lazy<Sender<IndexUpdateMsg>> = Lazy::new(|| {
-    let (tx, mut rx) = channel::<IndexUpdateMsg>(1000);
+fn register_pending_index_work(scope: &IndexWorkScope) -> TaskGuard {
+    PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
+    scope.pending.fetch_add(1, Ordering::Relaxed);
+    TaskGuard {
+        pending_counter: Arc::clone(&scope.pending),
+    }
+}
 
-    RUNTIME.spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            // Guard ensures decrement happens on drop (scope exit or panic)
-            let _guard = TaskGuard;
+// Invocation-scoped updates and unrelated direct-library updates use separate
+// bounded FIFO lanes. A slow direct backlog therefore cannot consume a CLI
+// invocation's finite drain budget. Each lane remains serial, while SQLite's
+// bounded busy retry coordinates the rare case where both lanes target the
+// same repository concurrently.
+struct IndexUpdateChannels {
+    scoped: Sender<IndexUpdateMsg>,
+    unscoped: Sender<IndexUpdateMsg>,
+}
 
-            // Wrap in AssertUnwindSafe to catch panics from DB operations.
-            // This prevents the consumer loop from dying if one update fails hard —
-            // a panic here would otherwise stall every subsequent index update for the
-            // process lifetime.
-            let future = async {
-                if let Err(e) =
-                    update_object_index(&msg.db_path, &msg.hash, &msg.obj_type, msg.size).await
-                {
-                    tracing::warn!("Failed to update object index for {}: {}", msg.hash, e);
+static INDEX_UPDATE_CHANNELS: Lazy<IndexUpdateChannels> = Lazy::new(|| {
+    let (scoped, scoped_rx) = channel::<IndexUpdateMsg>(1000);
+    let (unscoped, unscoped_rx) = channel::<IndexUpdateMsg>(1000);
+    RUNTIME.spawn(run_index_update_consumer(scoped_rx));
+    RUNTIME.spawn(run_index_update_consumer(unscoped_rx));
+    IndexUpdateChannels { scoped, unscoped }
+});
+
+async fn run_index_update_consumer(mut rx: Receiver<IndexUpdateMsg>) {
+    while let Some(msg) = rx.recv().await {
+        // Guard ensures decrement happens on drop (scope exit or panic).
+        let _guard = TaskGuard {
+            pending_counter: Arc::clone(&msg.pending_counter),
+        };
+
+        // Catch one update's panic so the lane continues processing later
+        // durable markers instead of becoming permanently wedged.
+        let future = async {
+            if cfg!(debug_assertions)
+                && let Ok(value) = std::env::var("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS")
+                && let Ok(delay_ms) = value.parse::<u64>()
+                && delay_ms > 0
+            {
+                tokio::time::sleep(Duration::from_millis(delay_ms.min(30_000))).await;
+            }
+            match apply_queued_index_update(&msg).await {
+                Ok(()) => {}
+                Err(error) => {
+                    // ClientStorage::put registers the marker before queueing, so
+                    // terminal failure remains replayable after the foreground
+                    // command has already advanced refs or printed success.
+                    record_index_update_failure(&msg);
+                    tracing::warn!("Failed to update object index for {}: {}", msg.hash, error);
                 }
-            };
-            let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+            }
+        };
+        let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
 
-            if let Err(payload) = result {
-                tracing::error!("Panic in background index update task: {:?}", payload);
+        if let Err(payload) = result {
+            record_index_update_failure(&msg);
+            tracing::error!("Panic in background index update task: {:?}", payload);
+        }
+    }
+}
+
+async fn apply_queued_index_update(msg: &IndexUpdateMsg) -> Result<(), String> {
+    let db_path = msg.db_path.clone();
+    let generation_lock =
+        tokio::task::spawn_blocking(move || acquire_index_repair_generation_lock(&db_path))
+            .await
+            .map_err(|error| {
+                format!(
+                    "object-index repair generation task failed for {}: {error}",
+                    msg.hash
+                )
+            })?
+            .map_err(|error| {
+                format!(
+                    "failed to acquire object-index repair generation for {}: {error}",
+                    msg.hash
+                )
+            })?;
+    let _ownership = if let Some(marker_path) = msg.marker_path.as_deref() {
+        let db_path = msg.db_path.clone();
+        let oid = msg.hash.clone();
+        let lock = tokio::task::spawn_blocking(move || acquire_index_repair_lock(&db_path, &oid))
+            .await
+            .map_err(|error| {
+                format!(
+                    "object-index repair ownership task failed for {}: {error}",
+                    msg.hash
+                )
+            })?
+            .map_err(|error| {
+                format!(
+                    "failed to acquire object-index repair ownership for {}: {error}",
+                    msg.hash
+                )
+            })?;
+
+        match fs::symlink_metadata(marker_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "object-index repair marker is not a regular file: {}",
+                    marker_path.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A replay owner already reconciled and retired this exact
+                // marker while the queued writer was delayed. Skipping under
+                // the same OID-shard lock is what prevents post-clean resurrection.
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to inspect object-index repair marker '{}': {error}",
+                    marker_path.display()
+                ));
             }
         }
-    });
+        Some(lock)
+    } else {
+        None
+    };
 
-    tx
-});
+    update_object_index(&msg.db_path, &msg.hash, &msg.obj_type, msg.size).await?;
+    if let Some(marker_path) = msg.marker_path.as_deref() {
+        retire_index_repair_marker(marker_path).map_err(|error| {
+            format!(
+                "object index updated for {}, but its repair marker '{}' could not be retired: {error}",
+                msg.hash,
+                marker_path.display()
+            )
+        })?;
+    }
+    drop(generation_lock);
+    Ok(())
+}
 
 // Counter for active background tasks. Read by `wait_for_background_tasks` so the CLI
 // can drain pending index updates before exiting.
 static PENDING_TASKS: AtomicUsize = AtomicUsize::new(0);
+// Each top-level embedded CLI invocation owns a distinct failure counter.
+// Queue messages clone that counter at enqueue time, so a task that finishes
+// after the 60-second foreground budget cannot charge the next invocation.
+// Direct library callers outside a CLI invocation share the fallback counter.
+#[derive(Clone)]
+struct IndexWorkScope {
+    failures: Arc<AtomicUsize>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl IndexWorkScope {
+    fn new() -> Self {
+        Self {
+            failures: Arc::new(AtomicUsize::new(0)),
+            pending: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+static UNSCOPED_INDEX_WORK_SCOPE: Lazy<IndexWorkScope> = Lazy::new(IndexWorkScope::new);
+
+tokio::task_local! {
+    static ACTIVE_INDEX_WORK_SCOPE: IndexWorkScope;
+}
+
+pub(crate) struct BackgroundIndexFailureScope {
+    scope: IndexWorkScope,
+}
+
+impl BackgroundIndexFailureScope {
+    pub(crate) fn failure_count(&self) -> usize {
+        self.scope.failures.load(Ordering::SeqCst)
+    }
+}
 
 // Object-index updates run behind foreground repository writes. SQLite can keep
 // the repository database locked for longer than a single short busy timeout, so
@@ -763,7 +1378,7 @@ impl ClientStorage {
         // Wait until all tasks finish
         let mut waited = 0;
         loop {
-            let pending = PENDING_TASKS.load(Ordering::Relaxed);
+            let pending = PENDING_TASKS.load(Ordering::Acquire);
             if pending == 0 {
                 break;
             }
@@ -779,8 +1394,9 @@ impl ClientStorage {
     /// Asynchronously wait for the object-index queue without allowing a
     /// foreground operation to block forever behind a wedged consumer.
     pub async fn wait_for_background_tasks_until(deadline: Instant) -> bool {
+        let pending_counter = current_index_pending_counter();
         loop {
-            if PENDING_TASKS.load(Ordering::Relaxed) == 0 {
+            if pending_counter.load(Ordering::Acquire) == 0 {
                 return true;
             }
             let now = Instant::now();
@@ -794,6 +1410,122 @@ impl ClientStorage {
             )
             .await;
         }
+    }
+
+    /// Start invocation-local attribution for subsequently enqueued index work.
+    /// The CLI serializes invocations, while each queued message retains this
+    /// counter independently if it outlives the foreground drain budget.
+    pub(crate) fn begin_background_index_failure_scope() -> BackgroundIndexFailureScope {
+        BackgroundIndexFailureScope {
+            scope: current_index_work_scope(),
+        }
+    }
+
+    /// Run one top-level embedded CLI invocation with isolated background
+    /// index failure and pending-work attribution. Tokio task locals do not
+    /// leak into concurrent direct storage callers or independently spawned
+    /// tasks, unlike a process-global "active invocation" slot.
+    pub(crate) async fn with_background_index_failure_scope<F>(future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        ACTIVE_INDEX_WORK_SCOPE
+            .scope(IndexWorkScope::new(), future)
+            .await
+    }
+
+    /// Spawn command-owned work that may enqueue object-index updates.
+    ///
+    /// Tokio task-local state is not inherited by `tokio::spawn`. Registering
+    /// the producer before spawning prevents the foreground drain from seeing
+    /// a transient zero, and re-entering the captured scope keeps both pending
+    /// work and terminal failures attributed to the command that created it.
+    pub(crate) fn spawn_background_index_work<F>(future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let scope = current_index_work_scope();
+        let pending_guard = register_pending_index_work(&scope);
+        tokio::spawn(async move {
+            let _pending_guard = pending_guard;
+            ACTIVE_INDEX_WORK_SCOPE.scope(scope, future).await
+        })
+    }
+
+    /// Counter for terminal background index errors attributed to the active
+    /// top-level CLI invocation (or the process-wide fallback for direct
+    /// library callers). Queued messages retain the counter that was active
+    /// when they were created.
+    pub(crate) fn background_index_failure_count() -> usize {
+        current_index_failure_counter().load(Ordering::SeqCst)
+    }
+
+    /// Replay durable object-index updates left by terminal background failures.
+    ///
+    /// Schema-aware CLI preflight calls this before every ordinary repository
+    /// command. `cloud sync` treats an error as fatal so it cannot upload from an
+    /// incomplete catalogue; other commands may continue after a recorded warning.
+    pub(crate) async fn repair_pending_object_index_updates(
+        db_path: &Path,
+    ) -> Result<ObjectIndexRepairOutcome, String> {
+        let db_path = db_path.to_path_buf();
+        let db_path_str = db_path.to_str().ok_or_else(|| {
+            format!(
+                "database path is not valid UTF-8 for object index repair: {}",
+                db_path.display()
+            )
+        })?;
+        let db_conn =
+            establish_connection_with_busy_timeout(db_path_str, Duration::from_millis(200))
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to connect to object index database {} for repair: {error}",
+                        db_path.display()
+                    )
+                })?;
+        let expected_oid_len = expected_index_repair_oid_len(&db_conn).await?;
+        let load_path = db_path.clone();
+        let page = tokio::task::spawn_blocking(move || {
+            load_pending_object_index_updates(&load_path, expected_oid_len)
+        })
+        .await
+        .map_err(|error| format!("object-index repair marker reader failed: {error}"))?
+        .map_err(|error| format!("failed to read object-index repair markers: {error}"))?;
+
+        if page.updates.is_empty() {
+            return Ok(ObjectIndexRepairOutcome {
+                repaired: 0,
+                remaining: page.has_more,
+            });
+        }
+        if cfg!(debug_assertions)
+            && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL").is_some()
+        {
+            return Err("injected object index update failure".to_string());
+        }
+        let repo_id = resolve_repo_id_for_index(&db_conn).await?;
+        let mut repaired = 0;
+        for batch in page.updates.chunks(INDEX_REPAIR_BATCH_SIZE) {
+            update_object_index_batch(&db_conn, &db_path, &repo_id, batch).await?;
+            for msg in batch {
+                if let Some(marker_path) = msg.marker_path.as_deref() {
+                    retire_index_repair_marker(marker_path).map_err(|error| {
+                        format!(
+                            "updated object index for {}, but failed to retire repair marker '{}': {error}",
+                            msg.hash,
+                            marker_path.display()
+                        )
+                    })?;
+                }
+                repaired += 1;
+            }
+        }
+        Ok(ObjectIndexRepairOutcome {
+            repaired,
+            remaining: page.has_more,
+        })
     }
 
     /// Read a Git object's *raw payload* by its hash.
@@ -902,18 +1634,20 @@ impl ClientStorage {
         self.block_on_storage(async move { storage.heal(&hash).await })
     }
 
-    /// Persist a Git object and queue a background index update.
+    /// Persist a Git object and queue a recoverable background index update.
     ///
     /// Functional scope:
     /// - Writes the object via the configured backend (synchronously, on the storage
-    ///   runtime), then enqueues an [`IndexUpdateMsg`] so the cloud-backup object
-    ///   index reflects the new entry.
+    ///   runtime), records an atomic repair marker, then enqueues an [`IndexUpdateMsg`]
+    ///   so the cloud-backup object index reflects the new entry.
     ///
     /// Boundary conditions:
-    /// - The index update is best-effort: if the bounded channel is full, the message
-    ///   is forwarded to a runtime task that performs the blocking `send`. If the
-    ///   channel is closed (RUNTIME tearing down), the index update is dropped with a
-    ///   `tracing::warn` and the put still succeeds.
+    /// - If the bounded channel is full, the message is forwarded to a runtime task
+    ///   that waits for capacity. A closed channel or terminal database error leaves
+    ///   the marker in `<storage>/object-index-repair`; the next schema-aware repo
+    ///   command retries it, and `cloud sync` refuses to proceed while repair fails.
+    /// - Failure to register the marker is returned to the caller before the queue
+    ///   operation, so a completed command can never lose its only repair identity.
     /// - Returns `io::Error` (instead of `GitError`) so callers using `std::io`
     ///   abstractions can propagate the error directly.
     /// - The index update is skipped silently when the database path cannot be
@@ -941,45 +1675,66 @@ impl ClientStorage {
                 .map_err(|e| io::Error::other(e.to_string()))
         })?;
 
-        // Update object index asynchronously (via sequential queue)
-        // This ensures CLI commands don't block on indexing, and avoids DB lock contention.
+        self.enqueue_stored_object_index(&hash_str, &type_str, data_len)?;
+
+        Ok(result)
+    }
+
+    /// Register an object that is already present in the configured storage.
+    /// This is the retry path for callers whose payload write succeeded but
+    /// durable marker registration failed. It intentionally avoids rewriting a
+    /// potentially remote payload while still recreating the exact repair work.
+    pub(crate) fn ensure_existing_object_index(
+        &self,
+        obj_id: &ObjectHash,
+        content_len: usize,
+        obj_type: ObjectType,
+    ) -> io::Result<()> {
+        if !self.exist(obj_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "cannot register object {} in the cloud index because its payload is no longer present",
+                    obj_id
+                ),
+            ));
+        }
+        self.enqueue_stored_object_index(&obj_id.to_string(), &obj_type.to_string(), content_len)
+    }
+
+    fn enqueue_stored_object_index(
+        &self,
+        hash_str: &str,
+        type_str: &str,
+        data_len: usize,
+    ) -> io::Result<()> {
+        // Update object index asynchronously (via sequential queue). This keeps
+        // foreground writes nonblocking while the marker makes retry durable.
         if let Some(db_path) = Self::index_db_path_from_base(&self.base_path)
             && db_path.exists()
         {
-            let hash_str = hash_str.clone();
-            let type_str = type_str.clone();
-
-            PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
-
-            // Send to global channel
-            // If channel is closed (runtime shutting down), we can't do much, but that's unlikely in normal CLI flow.
-            let msg = IndexUpdateMsg {
-                hash: hash_str,
-                obj_type: type_str,
+            let mut msg = IndexUpdateMsg {
+                hash: hash_str.to_string(),
+                obj_type: type_str.to_string(),
                 size: data_len as i64,
                 db_path,
+                marker_path: None,
+                _marker_lock: None,
+                failure_counter: current_index_failure_counter(),
+                pending_counter: current_index_pending_counter(),
             };
-
-            match INDEX_UPDATE_CHANNEL.try_send(msg) {
-                Ok(_) => {}
-                Err(TrySendError::Full(msg)) => {
-                    // Avoid blocking the caller thread if the bounded queue is
-                    // full; wait for capacity on the dedicated storage runtime.
-                    RUNTIME.spawn(async move {
-                        if INDEX_UPDATE_CHANNEL.send(msg).await.is_err() {
-                            PENDING_TASKS.fetch_sub(1, Ordering::Relaxed);
-                            tracing::warn!("Failed to queue object index update: channel closed");
-                        }
-                    });
-                }
-                Err(TrySendError::Closed(_)) => {
-                    PENDING_TASKS.fetch_sub(1, Ordering::Relaxed);
-                    tracing::warn!("Failed to queue object index update: channel closed");
-                }
-            }
+            msg.marker_path = Some(persist_index_repair_marker(&msg).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "stored object {hash_str}, but failed to register its cloud object-index repair marker: {error}"
+                    ),
+                )
+            })?);
+            enqueue_index_update(msg, "object index update");
         }
 
-        Ok(result)
+        Ok(())
     }
 
     /// Physically delete an object's payload (lore.md 2.5) from the durable
@@ -1267,52 +2022,44 @@ impl ClientStorage {
 /// path because agent capture callers already hold a `repo_path` shaped that
 /// way; the db lives at `<libra_dir>/<DATABASE>`. Returns immediately when
 /// the database file is absent so legacy bootstrap and tempdir tests stay
-/// quiet.
+/// quiet. Marker persistence is a hard precondition: callers receive an error
+/// and no queue item is created when durable repair ownership cannot be recorded.
 ///
 /// `pub(crate)` — there is no validation that the (`o_id`, `o_type`,
 /// `o_size`) triple matches an actual on-disk Git object, so this is an
-/// internal escape hatch for callers that already hold the truth (only
-/// `HistoryManager` today). External crates / users must go through
+/// internal escape hatch for agent-history/review/investigate callers that
+/// already hold the truth. External crates / users must go through
 /// `ClientStorage::put`, which both writes the object and indexes it.
 pub(crate) fn enqueue_agent_blob_object_index_update(
     libra_dir: &Path,
     o_id: &str,
     o_type: &str,
     o_size: i64,
-) {
+) -> io::Result<()> {
     let db_path = libra_dir.join(DATABASE);
     if !db_path.exists() {
-        return;
+        return Ok(());
     }
-    let msg = IndexUpdateMsg {
+    let mut msg = IndexUpdateMsg {
         hash: o_id.to_string(),
         obj_type: o_type.to_string(),
         size: o_size,
         db_path,
+        marker_path: None,
+        _marker_lock: None,
+        failure_counter: current_index_failure_counter(),
+        pending_counter: current_index_pending_counter(),
     };
-    PENDING_TASKS.fetch_add(1, Ordering::Relaxed);
-    match INDEX_UPDATE_CHANNEL.try_send(msg) {
-        Ok(_) => {}
-        Err(TrySendError::Full(msg)) => {
-            // Bounded queue is full. Don't block the caller — spawn the
-            // send onto the storage runtime so the agent capture hook
-            // path keeps moving even when the foreground commit pipeline
-            // is producing index updates faster than the consumer can
-            // drain them. Mirrors the policy used by `ClientStorage::put`.
-            RUNTIME.spawn(async move {
-                if INDEX_UPDATE_CHANNEL.send(msg).await.is_err() {
-                    PENDING_TASKS.fetch_sub(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        "Failed to queue agent blob object index update: channel closed"
-                    );
-                }
-            });
-        }
-        Err(TrySendError::Closed(_)) => {
-            PENDING_TASKS.fetch_sub(1, Ordering::Relaxed);
-            tracing::warn!("Failed to queue agent blob object index update: channel closed");
-        }
-    }
+    msg.marker_path = Some(persist_index_repair_marker(&msg).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "agent object {o_id} was stored, but its durable cloud object-index repair marker could not be registered: {error}"
+            ),
+        )
+    })?);
+    enqueue_index_update(msg, "agent blob object index update");
+    Ok(())
 }
 
 /// Delete `object_index` rows for the given OIDs in the current repo
@@ -1321,8 +2068,9 @@ pub(crate) fn enqueue_agent_blob_object_index_update(
 ///
 /// Functional scope:
 /// - Resolves the repo id the same way the indexing writer does
-///   (`libra.repoid` config, falling back to `unknown-repo`) so the delete
-///   predicate matches the rows the writer created.
+///   (`libra.repoid` config, falling back to `unknown-repo` only when the
+///   value is absent or blank) so the delete predicate matches the rows the
+///   writer created.
 /// - Deletes in bounded `IN (...)` chunks and returns the total number of
 ///   rows removed. Idempotent: OIDs without a row simply delete nothing.
 ///
@@ -1352,30 +2100,27 @@ pub(crate) async fn remove_object_index_rows_with_conn<C: ConnectionTrait>(
         return Ok(0);
     }
 
-    // Resolve the repo id exactly like the indexing writer
-    // (`resolve_repo_id_for_index`): `libra.repoid` config with an
-    // `unknown-repo` fallback — including on lookup failure, mirroring the
-    // writer's tolerance so the delete predicate matches the rows it wrote
-    // (a wrong fallback merely deletes nothing, which is safe).
+    // Resolve the repo id exactly like the indexing writer. Query and decode
+    // failures must abort the prune transaction: silently targeting the
+    // `unknown-repo` sentinel would report success while leaving stale cloud
+    // catalogue rows behind.
     let repo_id = match conn
         .query_one(Statement::from_string(
             backend,
             "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
                 .to_string(),
         ))
-        .await
+        .await?
     {
-        Ok(Some(row)) => match row.try_get_by::<String, _>("value") {
-            Ok(value) if !value.trim().is_empty() => value,
-            _ => "unknown-repo".to_string(),
-        },
-        Ok(None) => "unknown-repo".to_string(),
-        Err(err) => {
-            tracing::debug!(
-                "failed to resolve repo id for object index cleanup, using fallback: {err}"
-            );
-            "unknown-repo".to_string()
+        Some(row) => {
+            let value = row.try_get_by::<String, _>("value")?;
+            if value.trim().is_empty() {
+                "unknown-repo".to_string()
+            } else {
+                value
+            }
         }
+        None => "unknown-repo".to_string(),
     };
 
     // SQLite's default host-parameter limit is generous (32k), but keep the
@@ -1708,23 +2453,388 @@ fn get_or_create_repo_id_for_prefix() -> Option<String> {
     rx.recv().ok().flatten()
 }
 
+async fn expected_index_repair_oid_len(db_conn: &DatabaseConnection) -> Result<usize, String> {
+    let object_format = ConfigKv::get_with_conn(db_conn, "core.objectformat")
+        .await
+        .map_err(|error| {
+            format!("failed to read core.objectformat for object-index repair: {error}")
+        })?
+        .map(|entry| entry.value)
+        .unwrap_or_else(|| "sha1".to_string());
+    match object_format.trim() {
+        "sha1" => Ok(40),
+        "sha256" => Ok(64),
+        other => Err(format!(
+            "unsupported core.objectformat '{other}' while validating object-index repair markers"
+        )),
+    }
+}
+
+fn load_pending_object_index_updates(
+    db_path: &Path,
+    expected_oid_len: usize,
+) -> io::Result<PendingObjectIndexPage> {
+    let generation_lock = acquire_index_repair_generation_lock(db_path)?;
+    scavenge_index_repair_staging(db_path)?;
+    let marker_dir = db_path
+        .parent()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "repository database path has no storage directory: {}",
+                    db_path.display()
+                ),
+            )
+        })?
+        .join(INDEX_REPAIR_MARKER_DIR);
+    let entries = match fs::read_dir(&marker_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(PendingObjectIndexPage {
+                updates: Vec::new(),
+                has_more: false,
+                _generation_lock: None,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+
+    let mut marker_paths = Vec::new();
+    let mut held_locks: HashMap<String, Arc<ObjectIndexRepairLock>> = HashMap::new();
+    let mut has_more = false;
+    for (scanned_entries, entry) in entries.enumerate() {
+        let entry = entry?;
+        // A replay invocation owns at most one SQLite batch. This releases all
+        // OID-shard locks after each batch instead of blocking foreground
+        // writers for the lifetime of a potentially 100,000-marker page.
+        if marker_paths.len() >= INDEX_REPAIR_BATCH_SIZE {
+            has_more = true;
+            break;
+        }
+        // Bound raw directory enumeration, not just retained markers. The
+        // extra entry is only a sentinel: validating it would turn a bounded
+        // page into another full-directory scan under a very large outage.
+        if scanned_entries >= INDEX_REPAIR_MARKER_PAGE_CAP {
+            has_more = true;
+            break;
+        }
+        let path = entry.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "object-index repair directory contains a non-UTF-8 entry: {}",
+                    path.display()
+                ))
+            })?;
+        let Some(identity) = name.strip_suffix(".json") else {
+            // Current writers stage in a sibling directory, so any `.tmp*`
+            // entry here is a legacy crash remnant. Remove it within the raw
+            // enumeration budget; otherwise enough abandoned scratch files
+            // could permanently hide every real marker behind the page cap.
+            if name.starts_with(".tmp") {
+                let metadata = match fs::symlink_metadata(&path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                if !metadata.file_type().is_file() {
+                    return Err(io::Error::other(format!(
+                        "object-index repair scratch entry is not a regular file: {}",
+                        path.display()
+                    )));
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+            return Err(io::Error::other(format!(
+                "unexpected entry in object-index repair directory: {}",
+                path.display()
+            )));
+        };
+        let (oid, object_type) = identity.split_once('.').ok_or_else(|| {
+            io::Error::other(format!(
+                "invalid object-index repair marker filename: {}",
+                path.display()
+            ))
+        })?;
+        if !valid_index_repair_oid(oid, expected_oid_len) || !valid_index_repair_type(object_type) {
+            return Err(io::Error::other(format!(
+                "invalid object-index repair marker filename: {}",
+                path.display()
+            )));
+        }
+        let lock_shard = index_repair_lock_shard(oid)?;
+        let marker_lock = if let Some(lock) = held_locks.get(&lock_shard) {
+            Arc::clone(lock)
+        } else {
+            let Some(lock) = try_acquire_index_repair_lock(db_path, oid)? else {
+                // A queued writer or another replay owns this marker. Leave it
+                // for a later bounded page rather than blocking an async CLI
+                // preflight.
+                has_more = true;
+                continue;
+            };
+            let lock = Arc::new(lock);
+            held_locks.insert(lock_shard, Arc::clone(&lock));
+            lock
+        };
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(format!(
+                "object-index repair marker is not a regular file: {}",
+                path.display()
+            )));
+        }
+        marker_paths.push((path, marker_lock));
+    }
+    marker_paths.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut pending = Vec::with_capacity(marker_paths.len());
+    for (marker_path, marker_lock) in marker_paths {
+        let mut file = match fs::File::open(&marker_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(INDEX_REPAIR_MARKER_READ_CAP.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > INDEX_REPAIR_MARKER_READ_CAP {
+            return Err(io::Error::other(format!(
+                "object-index repair marker exceeds {} bytes: {}",
+                INDEX_REPAIR_MARKER_READ_CAP,
+                marker_path.display()
+            )));
+        }
+        let marker: PendingObjectIndexUpdate = serde_json::from_slice(&bytes).map_err(|error| {
+            io::Error::other(format!(
+                "invalid object-index repair marker '{}': {error}",
+                marker_path.display()
+            ))
+        })?;
+        let file_identity = marker_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(|identity| identity.split_once('.'));
+        if marker.schema_version != INDEX_REPAIR_MARKER_SCHEMA_VERSION
+            || file_identity != Some((marker.o_id.as_str(), marker.o_type.as_str()))
+            || !valid_index_repair_oid(&marker.o_id, expected_oid_len)
+            || !valid_index_repair_type(&marker.o_type)
+            || marker.o_size < 0
+        {
+            return Err(io::Error::other(format!(
+                "object-index repair marker failed validation: {}",
+                marker_path.display()
+            )));
+        }
+        pending.push(IndexUpdateMsg {
+            hash: marker.o_id,
+            obj_type: marker.o_type,
+            size: marker.o_size,
+            db_path: db_path.to_path_buf(),
+            marker_path: Some(marker_path),
+            _marker_lock: Some(marker_lock),
+            failure_counter: current_index_failure_counter(),
+            pending_counter: current_index_pending_counter(),
+        });
+    }
+    Ok(PendingObjectIndexPage {
+        updates: pending,
+        has_more,
+        _generation_lock: Some(generation_lock),
+    })
+}
+
+fn scavenge_index_repair_staging(db_path: &Path) -> io::Result<()> {
+    let storage_dir = db_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "repository database path has no storage directory: {}",
+                db_path.display()
+            ),
+        )
+    })?;
+    let staging_dir = storage_dir.join(INDEX_REPAIR_MARKER_STAGING_DIR);
+    let entries = match fs::read_dir(&staging_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0_usize;
+    for entry in entries.take(INDEX_REPAIR_STAGING_SCAN_CAP) {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with(".tmp") {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(format!(
+                "object-index repair staging entry is not a regular file: {}",
+                path.display()
+            )));
+        }
+        let modified = metadata.modified()?;
+        if now.duration_since(modified).unwrap_or_default() < INDEX_REPAIR_STAGING_STALE_AFTER {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if removed >= INDEX_REPAIR_STAGING_REMOVE_CAP {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn valid_supported_index_repair_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_index_repair_oid(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len && valid_supported_index_repair_oid(value)
+}
+
+fn valid_index_repair_type(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Reconcile one bounded page of durable repair markers with a single SQLite
+/// statement on an already-open connection. The marker itself is sufficient
+/// provenance that the content-addressed payload write completed: ordinary
+/// storage creates it only after the configured backend succeeds, and agent
+/// capture creates it only after its direct local object write succeeds.
+/// Payloads may subsequently be local, packed, alternate-backed, or remote-only;
+/// cloud sync remains responsible for reading and validating them before upload.
+async fn update_object_index_batch(
+    db_conn: &DatabaseConnection,
+    db_path: &Path,
+    repo_id: &str,
+    updates: &[IndexUpdateMsg],
+) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+
+    let created_at = chrono::Utc::now().timestamp();
+    let mut sql = String::from(
+        "INSERT INTO object_index \
+         (o_id, o_type, o_size, repo_id, created_at, is_synced) VALUES ",
+    );
+    let mut values = Vec::with_capacity(updates.len() * 5);
+    for (index, update) in updates.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?, ?, ?, 0)");
+        values.extend([
+            Value::from(update.hash.clone()),
+            Value::from(update.obj_type.clone()),
+            Value::from(update.size),
+            Value::from(repo_id.to_string()),
+            Value::from(created_at),
+        ]);
+    }
+    // A generic blob row may race the semantic agent row for the same OID.
+    // Promote to the agent type and mark it unsynced, but never demote an
+    // already-semantic row when the generic marker is replayed later.
+    sql.push_str(
+        " ON CONFLICT(repo_id, o_id) DO UPDATE SET \
+         o_type = CASE \
+           WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+            AND substr(object_index.o_type, 1, 6) != 'agent_' \
+           THEN excluded.o_type ELSE object_index.o_type END, \
+         o_size = CASE \
+           WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+            AND substr(object_index.o_type, 1, 6) != 'agent_' \
+           THEN excluded.o_size ELSE object_index.o_size END, \
+         is_synced = CASE \
+           WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+            AND substr(object_index.o_type, 1, 6) != 'agent_' \
+           THEN 0 ELSE object_index.is_synced END",
+    );
+
+    let mut last_error = None;
+    for attempt in 1..=INDEX_UPDATE_MAX_ATTEMPTS {
+        let statement = Statement::from_sql_and_values(
+            db_conn.get_database_backend(),
+            sql.clone(),
+            values.clone(),
+        );
+        match db_conn.execute(statement).await {
+            Ok(_) if db_path.is_file() => return Ok(()),
+            Ok(_) => {
+                return Err(format!(
+                    "object-index database disappeared during durable repair: {}",
+                    db_path.display()
+                ));
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < INDEX_UPDATE_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "failed to reconcile {} durable object-index repair marker(s) in {}: {}",
+        updates.len(),
+        db_path.display(),
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "database update failed".to_string())
+    ))
+}
+
 /// Resolve repository ID for object-index rows.
 ///
-/// Best effort only: if config cannot be read (e.g. temp repo already removed),
-/// use a stable fallback to avoid panicking background tasks.
-///
 /// Boundary conditions:
-/// - Returns the literal string `"unknown-repo"` when the entry is missing, blank,
-///   or unreadable. This sentinel is also recognised by `get_or_create_repo_id_for_prefix`
+/// - Returns the literal string `"unknown-repo"` only when the entry is missing or
+///   blank. This sentinel is also recognised by `get_or_create_repo_id_for_prefix`
 ///   as a placeholder that should be re-rolled on first use.
-async fn resolve_repo_id_for_index(db_conn: &DatabaseConnection) -> String {
+/// - Propagates query failures. Import turns them into its durable partial/repair
+///   contract; ordinary writers retain an atomic repair marker and the top-level
+///   CLI warns until a later schema-aware preflight replays it.
+async fn resolve_repo_id_for_index(db_conn: &DatabaseConnection) -> Result<String, String> {
     match ConfigKv::get_with_conn(db_conn, "libra.repoid").await {
-        Ok(Some(entry)) if !entry.value.trim().is_empty() => entry.value,
-        Ok(_) => "unknown-repo".to_string(),
-        Err(err) => {
-            tracing::debug!("Failed to resolve repo id for object index update: {}", err);
-            "unknown-repo".to_string()
-        }
+        Ok(Some(entry)) if !entry.value.trim().is_empty() => Ok(entry.value),
+        Ok(_) => Ok("unknown-repo".to_string()),
+        Err(err) => Err(format!(
+            "Failed to resolve repo id for object index update: {err}"
+        )),
     }
 }
 
@@ -1738,20 +2848,23 @@ async fn resolve_repo_id_for_index(db_conn: &DatabaseConnection) -> String {
 ///   upload an incomplete object graph.
 ///
 /// Boundary conditions:
-/// - Returns `Ok(())` (without retry) when the database file disappears between
-///   attempts, which happens in test cleanup.
+/// - A missing database is an error. Every production caller owns a durable
+///   repair marker, so treating repository removal or replacement as success
+///   would retire the only evidence for a row that was never reconciled.
 async fn update_object_index(
     db_path: &Path,
     o_id: &str,
     o_type: &str,
     o_size: i64,
 ) -> Result<(), String> {
+    if cfg!(debug_assertions) && std::env::var_os("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL").is_some() {
+        return Err("injected object index update failure".to_string());
+    }
     let mut last_err = None;
 
     for attempt in 1..=INDEX_UPDATE_MAX_ATTEMPTS {
         match update_object_index_once(db_path, o_id, o_type, o_size).await {
             Ok(()) => return Ok(()),
-            Err(_err) if !db_path.exists() => return Ok(()),
             Err(err) => {
                 if attempt == INDEX_UPDATE_MAX_ATTEMPTS {
                     last_err = Some(err);
@@ -1778,18 +2891,18 @@ async fn update_object_index(
 /// Update `object_index` for cloud backup tracking — single attempt.
 ///
 /// Functional scope:
-/// - Skips entirely when the database file is absent (e.g. temp repo torn down).
 /// - Looks up the existing `(o_id, repo_id)` row; inserts only when missing.
 /// - Uses a short 200 ms busy timeout so foreground commit/reflog/etc. operations
 ///   are not blocked by indexing. The outer retry loop gives longer lock windows
 ///   time to clear without holding contention for a full second at a time.
 ///
 /// Boundary conditions:
-/// - Returns `Ok(())` for any error encountered after the database file disappears
-///   (test teardown), preventing spurious failures from racing tempdirs.
+/// - Returns `Err` when the database is absent or disappears. The queue keeps
+///   its durable repair marker so a later schema-aware command can replay it.
 /// - Returns `Err` when the database path is not valid UTF-8 — sea-orm requires a
 ///   string URL.
-/// - See: `update_object_index_skips_missing_database_without_error`.
+/// - See: `update_object_index_rejects_missing_database` and
+///   `queued_update_keeps_marker_until_a_moved_database_is_restored`.
 async fn update_object_index_once(
     db_path: &Path,
     o_id: &str,
@@ -1797,7 +2910,10 @@ async fn update_object_index_once(
     o_size: i64,
 ) -> Result<(), String> {
     if !db_path.exists() {
-        return Ok(());
+        return Err(format!(
+            "object-index database is missing while reconciling durable repair: {}",
+            db_path.display()
+        ));
     }
 
     let db_path_str = db_path.to_str().ok_or_else(|| {
@@ -1814,7 +2930,6 @@ async fn update_object_index_once(
             .await
         {
             Ok(conn) => conn,
-            Err(err) if err.kind() == io::ErrorKind::NotFound || !db_path.exists() => return Ok(()),
             Err(err) => {
                 return Err(format!(
                     "Failed to connect to object index database {}: {}",
@@ -1824,7 +2939,7 @@ async fn update_object_index_once(
             }
         };
 
-    let repo_id = resolve_repo_id_for_index(&db_conn).await;
+    let repo_id = resolve_repo_id_for_index(&db_conn).await?;
     let created_at = chrono::Utc::now().timestamp();
 
     // Check if object already exists
@@ -1838,12 +2953,7 @@ async fn update_object_index_once(
 
     let existing = match existing {
         Ok(existing) => existing,
-        Err(err) => {
-            if !db_path.exists() {
-                return Ok(());
-            }
-            return Err(format!("Database query failed: {}", err));
-        }
+        Err(err) => return Err(format!("Database query failed: {}", err)),
     };
 
     if let Some(existing_row) = existing {
@@ -1863,12 +2973,16 @@ async fn update_object_index_once(
         {
             let mut active: object_index::ActiveModel = existing_row.into();
             active.o_type = Set(o_type.to_string());
+            active.is_synced = Set(0);
             if let Err(err) = active.update(&db_conn).await {
-                if !db_path.exists() {
-                    return Ok(());
-                }
                 return Err(format!("Failed to upgrade object_index o_type: {}", err));
             }
+        }
+        if !db_path.is_file() {
+            return Err(format!(
+                "object-index database disappeared after row reconciliation: {}",
+                db_path.display()
+            ));
         }
         return Ok(());
     }
@@ -1885,10 +2999,14 @@ async fn update_object_index_once(
     };
 
     if let Err(err) = entry.insert(&db_conn).await {
-        if !db_path.exists() {
-            return Ok(());
-        }
         return Err(format!("Failed to insert object index: {}", err));
+    }
+
+    if !db_path.is_file() {
+        return Err(format!(
+            "object-index database disappeared after row reconciliation: {}",
+            db_path.display()
+        ));
     }
 
     Ok(())
@@ -1900,7 +3018,7 @@ mod tests {
         ffi::OsString,
         fs,
         path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use git_internal::{
@@ -1912,13 +3030,14 @@ mod tests {
             pack::{encode::PackEncoder, entry::Entry},
         },
     };
-    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
     use serial_test::serial;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
     use super::{
-        ClientStorage, ObjectReadFailure, resolve_env_sync, update_object_index,
+        ClientStorage, ObjectReadFailure, acquire_index_repair_lock,
+        remove_object_index_rows_with_conn, resolve_env_sync, update_object_index,
         update_object_index_once,
     };
     use crate::{
@@ -1927,7 +3046,10 @@ mod tests {
             db,
             model::{object_index, reference},
         },
-        utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
+        utils::{
+            object_ext::BlobExt,
+            test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
+        },
     };
 
     /// Test helper that clears an env var on construction and restores it on drop.
@@ -2019,6 +3141,63 @@ mod tests {
         let pack_path = pack_dir.join(format!("client-storage-{label}-{unique}.pack"));
         fs::write(&pack_path, pack_bytes)?;
         Ok((dir, objects_dir, pack_path))
+    }
+
+    #[test]
+    fn object_index_repair_lock_wait_is_bounded() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let oid = "a".repeat(40);
+        let _held = acquire_index_repair_lock(&db_path, &oid).expect("acquire first repair lock");
+
+        let started = Instant::now();
+        let error = match acquire_index_repair_lock(&db_path, &oid) {
+            Ok(_) => panic!("a competing repair lock must time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= super::INDEX_REPAIR_LOCK_WAIT_TIMEOUT);
+        assert!(
+            error
+                .to_string()
+                .contains("another Libra process may be stalled")
+        );
+    }
+
+    #[test]
+    fn object_index_repair_locks_are_isolated_across_shards() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let first_oid = format!("aa{}", "1".repeat(38));
+        let second_oid = format!("aa{}", "2".repeat(38));
+        let _first = acquire_index_repair_lock(&db_path, &first_oid)
+            .expect("acquire first object-index repair shard");
+        let _second = acquire_index_repair_lock(&db_path, &second_oid)
+            .expect("objects in different shards must use independent repair locks");
+    }
+
+    #[test]
+    fn object_index_repair_lock_namespace_is_bounded_and_stable() {
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join("libra.db");
+        let first_oid = format!("abcd{}", "1".repeat(36));
+        let same_shard_oid = format!("abcd{}", "2".repeat(36));
+        let other_shard_oid = format!("abce{}", "1".repeat(36));
+
+        let first_path = super::index_repair_lock_path(&db_path, &first_oid)
+            .expect("resolve first object-index repair lock path");
+        let same_shard_path = super::index_repair_lock_path(&db_path, &same_shard_oid)
+            .expect("resolve same-shard object-index repair lock path");
+        let other_shard_path = super::index_repair_lock_path(&db_path, &other_shard_oid)
+            .expect("resolve other-shard object-index repair lock path");
+
+        assert_eq!(first_path, same_shard_path);
+        assert_ne!(first_path, other_shard_path);
+        assert_eq!(
+            first_path.file_name().and_then(|name| name.to_str()),
+            Some("abcd.lock")
+        );
     }
 
     /// Scenario: a freshly-built SHA-1 pack must be readable through `ClientStorage`
@@ -2281,17 +3460,902 @@ mod tests {
         assert!(row.is_some());
     }
 
-    /// Scenario: index updates must tolerate a missing database file rather than
-    /// returning an error and triggering retry storms. This is common during test
-    /// teardown when a temp repo is removed before its background index task drains.
     #[tokio::test]
     #[serial]
-    async fn update_object_index_skips_missing_database_without_error() {
+    async fn durable_index_marker_survives_failure_and_repairs_idempotently() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "repair-repo", false)
+            .await
+            .expect("set repo id");
+        let payload = b"durable repair payload";
+        let oid = crate::utils::object::write_git_object(storage.path(), "blob", payload)
+            .expect("write repair fixture object");
+        let oid = oid.to_string();
+
+        let msg = super::IndexUpdateMsg {
+            hash: oid.clone(),
+            obj_type: "blob".to_string(),
+            size: payload.len() as i64,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        };
+        let marker_path = super::persist_index_repair_marker(&msg)
+            .expect("persist repair marker before queueing");
+        let agent_marker_path = super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: oid.clone(),
+            obj_type: "agent_transcript".to_string(),
+            size: payload.len() as i64,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist distinct semantic-type repair marker");
+        assert_ne!(marker_path, agent_marker_path);
+        let loose_path = storage
+            .path()
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        fs::remove_file(&loose_path)
+            .expect("evict local payload after its successful write and durable marker");
+
+        {
+            let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
+            let error = ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect_err("injected index failure should preserve the marker");
+            assert!(error.contains("injected object index update failure"));
+            assert!(marker_path.is_file());
+            assert!(agent_marker_path.is_file());
+        }
+
+        assert_eq!(
+            ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect("repair pending row")
+                .repaired,
+            2
+        );
+        assert!(!marker_path.exists());
+        assert!(!agent_marker_path.exists());
+        let row = object_index::Entity::find()
+            .filter(object_index::Column::OId.eq(&oid))
+            .filter(object_index::Column::RepoId.eq("repair-repo"))
+            .one(&db_conn)
+            .await
+            .expect("query repaired row");
+        assert!(row.is_some());
+        assert_eq!(
+            row.expect("repaired row should exist").o_type,
+            "agent_transcript",
+            "generic replay must not demote the agent-specific semantic type"
+        );
+        assert_eq!(
+            ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect("second repair should be a no-op")
+                .repaired,
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn blob_save_returns_marker_error_and_retry_recreates_the_marker() {
+        ClientStorage::wait_for_background_tasks();
+        let repo = tempdir().expect("create temporary repository");
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        let marker_dir = repo.path().join(".libra/object-index-repair");
+        fs::write(&marker_dir, b"conflicting non-directory")
+            .expect("inject marker-directory creation failure");
+        let blob = Blob::from_content("legacy save repair retry");
+
+        let first = blob.save();
+        assert!(
+            first.is_err(),
+            "the fallible public API must return marker registration failures"
+        );
+        let oid = blob.id.to_string();
+        assert!(
+            crate::utils::path::objects()
+                .join(&oid[..2])
+                .join(&oid[2..])
+                .is_file(),
+            "the injected failure should happen after the payload write"
+        );
+
+        fs::remove_file(&marker_dir).expect("remove marker-directory conflict");
+        assert_eq!(
+            blob.save().expect("retry fallible blob save"),
+            blob.id,
+            "retrying the public API should register the existing payload"
+        );
+        ClientStorage::wait_for_background_tasks();
+
+        let db_conn = db::get_db_conn_instance().await;
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::OId.eq(oid))
+                .count(&db_conn)
+                .await
+                .expect("count object-index rows after legacy save retry"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repair_queue_replays_bounded_pages_without_permanent_cap_failure() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "paged-repair-repo", false)
+            .await
+            .expect("set repo id");
+
+        for index in 1..=super::INDEX_REPAIR_MARKER_PAGE_CAP + 1 {
+            super::persist_index_repair_marker(&super::IndexUpdateMsg {
+                hash: format!("{index:040x}"),
+                obj_type: "blob".to_string(),
+                size: index as i64,
+                db_path: db_path.clone(),
+                marker_path: None,
+                _marker_lock: None,
+                failure_counter: super::current_index_failure_counter(),
+                pending_counter: super::current_index_pending_counter(),
+            })
+            .expect("persist paged repair marker");
+        }
+
+        let first = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("repair first bounded page");
+        assert_eq!(first.repaired, super::INDEX_REPAIR_BATCH_SIZE);
+        assert!(
+            first.remaining,
+            "one batch should remain for the next replay"
+        );
+
+        let second = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("repair final bounded page");
+        assert_eq!(
+            second.repaired,
+            super::INDEX_REPAIR_MARKER_PAGE_CAP + 1 - super::INDEX_REPAIR_BATCH_SIZE
+        );
+        assert!(!second.remaining);
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("paged-repair-repo"))
+                .count(&db_conn)
+                .await
+                .expect("count repaired rows"),
+            (super::INDEX_REPAIR_MARKER_PAGE_CAP + 1) as u64
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn legacy_scratch_cannot_starve_a_real_repair_marker() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "scratch-repair-repo", false)
+            .await
+            .expect("set repo id");
+        let marker_dir = storage.path().join(super::INDEX_REPAIR_MARKER_DIR);
+        fs::create_dir_all(&marker_dir).expect("create marker directory");
+        for index in 0..=super::INDEX_REPAIR_MARKER_PAGE_CAP {
+            fs::write(marker_dir.join(format!(".tmpLegacy{index:04}")), b"partial")
+                .expect("write legacy scratch fixture");
+        }
+        super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist real repair marker behind scratch fixtures");
+
+        let mut repaired = 0;
+        let mut remaining = true;
+        for _ in 0..=super::INDEX_REPAIR_MARKER_PAGE_CAP + 2 {
+            let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect("bounded repair invocation should make progress");
+            repaired += outcome.repaired;
+            remaining = outcome.remaining;
+            if !remaining {
+                break;
+            }
+        }
+        assert_eq!(repaired, 1, "the real marker must eventually be replayed");
+        assert!(
+            !remaining,
+            "all scratch and marker entries must be consumed"
+        );
+        assert_eq!(
+            fs::read_dir(&marker_dir)
+                .expect("read repaired marker directory")
+                .count(),
+            0,
+            "legacy scratch remnants must be scavenged"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_final_repair_filename_fails_closed_but_legacy_scratch_is_scavenged() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        let marker_dir = storage.path().join(super::INDEX_REPAIR_MARKER_DIR);
+        fs::create_dir_all(&marker_dir).expect("create marker directory");
+        fs::write(marker_dir.join(".tmpAbCd12"), b"partial")
+            .expect("write abandoned atomic scratch file");
+
+        let empty = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("known legacy atomic scratch file should be scavenged");
+        assert_eq!(empty.repaired, 0);
+        assert!(!empty.remaining);
+        assert!(
+            !marker_dir.join(".tmpAbCd12").exists(),
+            "legacy scratch must be removed so it cannot consume every future page"
+        );
+
+        fs::write(marker_dir.join("broken.json"), b"{}").expect("write malformed final marker");
+        let error = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect_err("malformed final marker filename must fail closed");
+        assert!(
+            error.contains("invalid object-index repair marker filename"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repair_rejects_marker_oid_from_the_wrong_repository_hash_format() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist structurally valid SHA-256 marker");
+
+        let error = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect_err("a SHA-1 repository must reject a SHA-256 marker");
+        assert!(
+            error.contains("invalid object-index repair marker filename"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repair_accepts_marker_oid_matching_sha256_repository_format() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "core.objectformat", "sha256", false)
+            .await
+            .expect("set SHA-256 object format");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "sha256-repair-repo", false)
+            .await
+            .expect("set repo id");
+        super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist SHA-256 repair marker");
+
+        let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("matching SHA-256 marker should repair");
+        assert_eq!(outcome.repaired, 1);
+        assert!(!outcome.remaining);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn repair_scavenges_bounded_stale_staging_files() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        let staging_dir = storage.path().join(super::INDEX_REPAIR_MARKER_STAGING_DIR);
+        fs::create_dir_all(&staging_dir).expect("create marker staging directory");
+        let stale = staging_dir.join(".tmpAbandoned");
+        fs::write(&stale, b"partial marker").expect("write abandoned staging file");
+        let old = SystemTime::now()
+            .checked_sub(super::INDEX_REPAIR_STAGING_STALE_AFTER + Duration::from_secs(1))
+            .expect("construct stale timestamp");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .expect("open stale staging file")
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .expect("age staging file");
+
+        let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("repair should scavenge stale staging state");
+        assert_eq!(outcome.repaired, 0);
+        assert!(!outcome.remaining);
+        assert!(!stale.exists(), "stale staging file was not scavenged");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn agent_indexing_fails_before_enqueue_when_marker_cannot_be_persisted() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        fs::write(
+            storage.path().join(super::INDEX_REPAIR_MARKER_DIR),
+            b"conflicting non-directory",
+        )
+        .expect("create conflicting marker path");
+
+        let error = super::enqueue_agent_blob_object_index_update(
+            storage.path(),
+            "0123456789abcdef0123456789abcdef01234567",
+            "agent_transcript",
+            42,
+        )
+        .expect_err("agent indexing must fail before enqueue without a durable marker");
+        assert!(
+            error
+                .to_string()
+                .contains("durable cloud object-index repair marker could not be registered"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn marker_retirement_failure_is_counted_and_remains_repairable() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "retire-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+        let blob = Blob::from_content("retirement warning");
+        let failures_before = ClientStorage::background_index_failure_count();
+        {
+            let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_MARKER_RETIRE_FAIL", "1");
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object and marker");
+            ClientStorage::wait_for_background_tasks();
+        }
+        assert_eq!(
+            ClientStorage::background_index_failure_count(),
+            failures_before + 1,
+            "marker retirement failure did not enter the foreground warning counter"
+        );
+        assert_eq!(
+            ClientStorage::repair_pending_object_index_updates(&db_path)
+                .await
+                .expect("retry retained marker")
+                .repaired,
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn late_failure_stays_with_the_invocation_that_enqueued_it() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "scope-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
+        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "100");
+        let blob = Blob::from_content("late invocation-scoped failure");
+        let first_scope = ClientStorage::with_background_index_failure_scope(async {
+            let scope = ClientStorage::begin_background_index_failure_scope();
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object and enqueue delayed index update");
+            scope
+        })
+        .await;
+
+        // A later embedded invocation starts before the old queue task reaches
+        // its terminal failure. The message must retain the first scope.
+        let second_scope = ClientStorage::with_background_index_failure_scope(async {
+            let scope = ClientStorage::begin_background_index_failure_scope();
+            ClientStorage::wait_for_background_tasks();
+            scope
+        })
+        .await;
+        assert_eq!(first_scope.failure_count(), 1);
+        assert_eq!(
+            second_scope.failure_count(),
+            0,
+            "late work from the prior invocation leaked into the next warning scope"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_direct_storage_work_is_not_charged_to_cli_scope() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "direct-scope-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
+        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "100");
+        let scope = ClientStorage::with_background_index_failure_scope(async {
+            let scope = ClientStorage::begin_background_index_failure_scope();
+            let direct_client = client.clone();
+            tokio::spawn(async move {
+                let blob = Blob::from_content("concurrent unscoped storage failure");
+                direct_client
+                    .put(&blob.id, &blob.data, blob.get_type())
+                    .expect("store direct object and enqueue delayed index update");
+            })
+            .await
+            .expect("direct storage task should not panic");
+
+            assert!(
+                ClientStorage::wait_for_background_tasks_until(
+                    Instant::now() + Duration::from_millis(25)
+                )
+                .await,
+                "an unrelated direct write must not enter the CLI pending-work scope"
+            );
+            scope
+        })
+        .await;
+
+        ClientStorage::wait_for_background_tasks();
+        assert_eq!(
+            scope.failure_count(),
+            0,
+            "an unrelated direct write must not enter the CLI failure scope"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_fifo_backlog_does_not_delay_invocation_scoped_updates() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "lane-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "100");
+        for index in 0..8 {
+            let blob = Blob::from_content(&format!("unscoped backlog {index}"));
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("enqueue unscoped backlog object");
+        }
+
+        ClientStorage::with_background_index_failure_scope(async {
+            let blob = Blob::from_content("invocation-scoped lane object");
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("enqueue invocation-scoped object");
+            assert!(
+                ClientStorage::wait_for_background_tasks_until(
+                    Instant::now() + Duration::from_millis(400)
+                )
+                .await,
+                "the invocation lane must drain independently of the earlier direct FIFO backlog"
+            );
+        })
+        .await;
+
+        ClientStorage::wait_for_background_tasks();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn command_owned_spawn_is_registered_before_it_enqueues_index_work() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "spawn-scope-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+
+        let _failure = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1");
+        let scope = ClientStorage::with_background_index_failure_scope(async move {
+            let scope = ClientStorage::begin_background_index_failure_scope();
+            let producer = ClientStorage::spawn_background_index_work(async move {
+                tokio::task::yield_now().await;
+                let blob = Blob::from_content("command-owned spawned storage failure");
+                client
+                    .put(&blob.id, &blob.data, blob.get_type())
+                    .expect("store spawned object and enqueue index update");
+            });
+
+            assert!(
+                ClientStorage::wait_for_background_tasks_until(
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .await,
+                "the invocation drain must wait for the producer and its queued update"
+            );
+            producer.await.expect("spawned producer should not panic");
+            scope
+        })
+        .await;
+
+        assert_eq!(
+            scope.failure_count(),
+            1,
+            "the spawned producer's terminal failure must stay with its invocation"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replay_retirement_fences_a_delayed_queued_writer_after_prune() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should be UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "ownership-repo", false)
+            .await
+            .expect("set repo id");
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+        let blob = Blob::from_content("delayed writer must not resurrect a pruned row");
+
+        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "500");
+        client
+            .put(&blob.id, &blob.data, blob.get_type())
+            .expect("store object and enqueue delayed index update");
+
+        let replay = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("foreground replay owns and retires the marker");
+        assert_eq!(replay.repaired, 1);
+        assert!(!replay.remaining);
+
+        object_index::Entity::delete_many()
+            .filter(object_index::Column::RepoId.eq("ownership-repo"))
+            .filter(object_index::Column::OId.eq(blob.id.to_string()))
+            .exec(&db_conn)
+            .await
+            .expect("simulate destructive prune after replay");
+        ClientStorage::wait_for_background_tasks();
+
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("ownership-repo"))
+                .filter(object_index::Column::OId.eq(blob.id.to_string()))
+                .count(&db_conn)
+                .await
+                .expect("count rows after delayed writer drains"),
+            0,
+            "a queued writer whose marker ownership was retired must not resurrect the row"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn deletion_fence_refuses_an_oid_with_a_durable_marker() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let oid = "0123456789abcdef0123456789abcdef01234567".to_string();
+        super::persist_index_repair_marker(&super::IndexUpdateMsg {
+            hash: oid.clone(),
+            obj_type: "blob".to_string(),
+            size: 42,
+            db_path: db_path.clone(),
+            marker_path: None,
+            _marker_lock: None,
+            failure_counter: super::current_index_failure_counter(),
+            pending_counter: super::current_index_pending_counter(),
+        })
+        .expect("persist deletion-conflict marker");
+
+        let error = super::acquire_object_index_deletion_fence(&db_path, &[oid])
+            .await
+            .expect_err("destructive deletion must fail closed while a marker exists");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("durable repair marker"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn deletion_fence_blocks_new_marker_publication_until_released() {
+        let storage = tempdir().expect("create storage dir");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let oid = "fedcba9876543210fedcba9876543210fedcba98".to_string();
+        let fence =
+            super::acquire_object_index_deletion_fence(&db_path, std::slice::from_ref(&oid))
+                .await
+                .expect("acquire deletion fence")
+                .expect("non-empty OID set must return a fence");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            started_tx.send(()).ok();
+            let result = super::persist_index_repair_marker(&super::IndexUpdateMsg {
+                hash: oid,
+                obj_type: "blob".to_string(),
+                size: 42,
+                db_path,
+                marker_path: None,
+                _marker_lock: None,
+                failure_counter: super::current_index_failure_counter(),
+                pending_counter: super::current_index_pending_counter(),
+            });
+            result_tx.send(result).ok();
+        });
+        started_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("marker publisher started");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "marker publication crossed a held destructive-deletion fence"
+        );
+
+        drop(fence);
+        result_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("marker publisher resumed after fence release")
+            .expect("persist marker after fence release");
+        publisher.join().expect("marker publisher thread");
+    }
+
+    /// A missing database cannot be treated as successful reconciliation: doing
+    /// so would let the queue retire its only durable repair marker.
+    #[tokio::test]
+    #[serial]
+    async fn update_object_index_rejects_missing_database() {
         let missing_root = tempdir().unwrap();
         let missing_db = missing_root.path().join(crate::utils::util::DATABASE);
 
         let result = update_object_index(&missing_db, "deadbeef", "blob", 12).await;
-        assert!(result.is_ok());
+        let error = result.expect_err("a missing repository database must preserve repair work");
+        assert!(error.contains("object-index database is missing"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn queued_update_keeps_marker_until_a_moved_database_is_restored() {
+        ClientStorage::wait_for_background_tasks();
+        let storage = tempdir().expect("create storage directory");
+        let db_path = storage.path().join(crate::utils::util::DATABASE);
+        let db_conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("temporary database path should contain valid UTF-8"),
+        )
+        .await
+        .expect("create database");
+        ConfigKv::set_with_conn(&db_conn, "libra.repoid", "moved-db-repo", false)
+            .await
+            .expect("set repository id");
+        db_conn.close().await.expect("close setup database");
+
+        let objects = storage.path().join("objects");
+        fs::create_dir_all(&objects).expect("create object directory");
+        let client = ClientStorage::init_local(objects);
+        let blob = Blob::from_content("database path must remain durable");
+        let marker_path = super::index_repair_marker_path(&db_path, &blob.id.to_string(), "blob")
+            .expect("derive marker path");
+        let moved_db_path = storage.path().join("libra.db.moved");
+
+        let _delay = ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "250");
+        let scope = ClientStorage::with_background_index_failure_scope(async {
+            client
+                .put(&blob.id, &blob.data, blob.get_type())
+                .expect("store object and durable repair marker");
+            assert!(marker_path.is_file(), "marker must precede queue execution");
+            fs::rename(&db_path, &moved_db_path).expect("move database out of canonical path");
+            ClientStorage::wait_for_background_tasks();
+            ClientStorage::begin_background_index_failure_scope()
+        })
+        .await;
+
+        assert_eq!(scope.failure_count(), 1);
+        assert!(
+            marker_path.is_file(),
+            "a missing canonical database must leave the marker retryable"
+        );
+        fs::rename(&moved_db_path, &db_path).expect("restore canonical database path");
+        let outcome = ClientStorage::repair_pending_object_index_updates(&db_path)
+            .await
+            .expect("replay marker after restoring database");
+        assert_eq!(outcome.repaired, 1);
+        assert!(!outcome.remaining);
+        assert!(!marker_path.exists());
+
+        let db_conn = db::get_db_conn_instance_for_path(&db_path)
+            .await
+            .expect("reopen restored database");
+        assert_eq!(
+            object_index::Entity::find()
+                .filter(object_index::Column::RepoId.eq("moved-db-repo"))
+                .filter(object_index::Column::OId.eq(blob.id.to_string()))
+                .count(&db_conn)
+                .await
+                .expect("count replayed object-index row"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_object_index_rows_fails_when_repo_id_cannot_be_resolved() {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let tmp = tempdir().expect("create temporary database directory");
+        let db_path = tmp.path().join(crate::utils::util::DATABASE);
+        let conn = db::create_database(
+            db_path
+                .to_str()
+                .expect("test database path must contain valid UTF-8"),
+        )
+        .await
+        .expect("create test database");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "DROP TABLE config_kv".to_string(),
+        ))
+        .await
+        .expect("remove repository-id source table");
+
+        let error = remove_object_index_rows_with_conn(
+            &conn,
+            &["0123456789012345678901234567890123456789".to_string()],
+        )
+        .await
+        .expect_err("repository-id lookup failure must abort object-index cleanup");
+
+        assert!(
+            error.to_string().contains("no such table: config_kv"),
+            "unexpected cleanup error: {error}"
+        );
     }
 
     /// Phase 3.5c codex round-2 follow-up: a row written first by the
@@ -2323,7 +4387,7 @@ mod tests {
         conn.execute(Statement::from_sql_and_values(
             backend,
             "INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced) \
-             VALUES (?, 'blob', 42, 'unknown-repo', 0, 0)",
+             VALUES (?, 'blob', 42, 'unknown-repo', 0, 1)",
             [OID.into()],
         ))
         .await
@@ -2338,7 +4402,7 @@ mod tests {
         let row = conn
             .query_one(Statement::from_sql_and_values(
                 backend,
-                "SELECT o_type FROM object_index WHERE o_id = ? LIMIT 1",
+                "SELECT o_type, is_synced FROM object_index WHERE o_id = ? LIMIT 1",
                 [OID.into()],
             ))
             .await
@@ -2348,6 +4412,11 @@ mod tests {
             row.try_get_by::<String, _>("o_type").unwrap(),
             "agent_transcript",
             "blob row must upgrade to agent_transcript"
+        );
+        assert_eq!(
+            row.try_get_by::<i64, _>("is_synced").unwrap(),
+            0,
+            "a promoted row must be offered to cloud sync again"
         );
 
         // Second call: a *generic* tag arrives for an OID that is

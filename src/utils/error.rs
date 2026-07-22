@@ -303,6 +303,9 @@ pub enum StableErrorCode {
     AgentImportErased,
     /// A transcript File/Bytes source lacked the required authorization proof.
     AgentTranscriptAuthorizationMissing,
+    /// `libra agent graph` was given a session id absent from both the live
+    /// capture catalog and the local erasure tombstone catalog.
+    AgentGraphSessionUnknown,
     /// The reserved upgrade settings file (`{LIBRA_HOME}/upgrade/settings.json`)
     /// is unreadable, corrupt, or written by an unsupported schema version
     /// (plan-20260714 §A.3). Unsupported `config` spellings targeting the
@@ -372,6 +375,7 @@ impl StableErrorCode {
             Self::AgentImportPartialBatch => "LBR-AGENT-018",
             Self::AgentImportErased => "LBR-AGENT-019",
             Self::AgentTranscriptAuthorizationMissing => "LBR-AGENT-020",
+            Self::AgentGraphSessionUnknown => "LBR-AGENT-021",
             Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
         }
     }
@@ -431,7 +435,8 @@ impl StableErrorCode {
             | Self::AgentImportWorkingDirInvalid
             | Self::AgentImportPartialBatch
             | Self::AgentImportErased
-            | Self::AgentTranscriptAuthorizationMissing => CliErrorCategory::Internal,
+            | Self::AgentTranscriptAuthorizationMissing
+            | Self::AgentGraphSessionUnknown => CliErrorCategory::Internal,
         }
     }
 
@@ -596,6 +601,9 @@ impl StableErrorCode {
             }
             Self::AgentTranscriptAuthorizationMissing => {
                 "Transcript source lacks a valid provider-root or trusted-export authorization proof."
+            }
+            Self::AgentGraphSessionUnknown => {
+                "The requested captured-agent session does not exist in this repository."
             }
             Self::UpgradeSettingsInvalid => {
                 "The reserved upgrade settings file ({LIBRA_HOME}/upgrade/settings.json) is unreadable or corrupt; rewrite it with libra config set --global upgrade.mode <auto|manual|off>."
@@ -2041,6 +2049,7 @@ mod tests {
                 StableErrorCode::AgentTranscriptAuthorizationMissing,
                 "LBR-AGENT-020",
             ),
+            (StableErrorCode::AgentGraphSessionUnknown, "LBR-AGENT-021"),
         ] {
             assert_eq!(variant.as_str(), code);
         }
@@ -2184,6 +2193,7 @@ mod tests {
             StableErrorCode::AgentImportPartialBatch,
             StableErrorCode::AgentImportErased,
             StableErrorCode::AgentTranscriptAuthorizationMissing,
+            StableErrorCode::AgentGraphSessionUnknown,
         ] {
             assert_eq!(variant.category(), CliErrorCategory::Internal);
         }

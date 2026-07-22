@@ -130,6 +130,7 @@ structured report is always present.
 | `128` | `LBR-AGENT-018` | `internal` | Historical import completed only partially; failed selections remain retryable | a bounded batch containing one valid session and one fenced or malformed session |
 | `128` | `LBR-AGENT-019` | `internal` | Local anti-resurrection tombstone blocked historical import | re-importing a provider session after local session erasure without an explicit audited restore |
 | `128` | `LBR-AGENT-020` | `internal` | Transcript source lacks a valid provider-root or trusted-export authorization proof | attempting to import through a symlink or an untrusted exporter |
+| `128` | `LBR-AGENT-021` | `internal` | Requested captured-agent session is absent from both the session catalog and local erasure tombstones | `libra agent graph unknown-session` |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 ## Stable Codes By Category
@@ -217,6 +218,7 @@ structured report is always present.
 | `LBR-AGENT-018` | Historical import completed only partially; failed selections remain retryable |
 | `LBR-AGENT-019` | Local anti-resurrection tombstone blocked historical import until an explicit audited restore |
 | `LBR-AGENT-020` | Transcript source lacks a valid provider-root or trusted-export authorization proof |
+| `LBR-AGENT-021` | Requested captured-agent session does not exist in this repository |
 
 ### Unsupported
 

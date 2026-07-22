@@ -82,10 +82,12 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    path::Path,
     str::FromStr,
     sync::Arc,
 };
 
+use anyhow::{Context, bail};
 use chrono::Utc;
 use git_internal::{
     hash::ObjectHash,
@@ -95,7 +97,7 @@ use git_internal::{
         tree::{Tree, TreeItemMode},
     },
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -130,6 +132,23 @@ use crate::{
 /// (cyclic) chain from hanging doctor. Hitting the cap truncates the walk
 /// with a note; truncation only ever *under*-detects (fail-safe direction).
 const MAX_TRACES_WALK_COMMITS: usize = 100_000;
+const MAX_IMPORT_INDEX_REPAIR_CHECKPOINTS: usize = 4_096;
+
+fn import_index_repair_test_pause_after_lock() -> anyhow::Result<()> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let Ok(ready_path) = std::env::var("LIBRA_TEST_IMPORT_INDEX_REPAIR_READY_FILE") else {
+        return Ok(());
+    };
+    let continue_path = std::env::var("LIBRA_TEST_IMPORT_INDEX_REPAIR_CONTINUE_FILE")
+        .context("index repair pause requires a continue-file path")?;
+    std::fs::write(&ready_path, b"ready").context("publish test-only import index-repair pause")?;
+    while !Path::new(&continue_path).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
+}
 
 /// Stable `inconsistency_type` values (also the span field values).
 const CLASS_MISSING_OBJECTS: &str = "missing_objects";
@@ -139,6 +158,8 @@ const CLASS_MISSING_OBJECT_INDEX: &str = "missing_object_index";
 const CLASS_INVALID_INFLIGHT_MARKER: &str = "invalid_inflight_marker";
 const CLASS_EXPIRED_INFLIGHT_MARKER: &str = "expired_inflight_marker";
 const CLASS_CONFLICTED_COVERAGE_CLAIM: &str = "conflicted_coverage_claim";
+const CLASS_UNRESOLVED_SUBAGENT_LINK: &str = "unresolved_subagent_link";
+const CLASS_INCONSISTENT_SUBAGENT_CONTENT: &str = "inconsistent_subagent_content";
 /// A0-06: a run manifest's `findings_oid` points at a blob missing from the
 /// object store.
 const CLASS_MISSING_FINDINGS_OBJECT: &str = "missing_findings_object";
@@ -238,8 +259,8 @@ struct CheckpointFinding {
 /// `manual_required` is accurate even without `--repair`.
 #[derive(Debug)]
 enum RepairPlan {
-    /// A valid expired writer marker: run the serialized all-ref
-    /// reachability drain. Empty markers are simply cleared.
+    /// A valid expired writer marker: run the serialized root-fenced
+    /// ownership retirement. Empty markers are simply cleared.
     RepairExpiredInflightMarker {
         session_id: String,
         attempt_id: String,
@@ -451,6 +472,14 @@ struct CheckpointMetadataProbe {
     tool_use_id: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    subagent: Option<SubagentMetadataProbe>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SubagentMetadataProbe {
+    #[serde(default)]
+    provenance: Option<String>,
 }
 
 /// `Libra-*` trailers from a traces checkpoint commit message.
@@ -541,6 +570,9 @@ struct E4Sweep {
     present: Vec<E4Object>,
     /// `"path oid"` descriptors of missing/unreadable objects.
     missing: Vec<String>,
+    /// The inner checkpoint tree carries the M4+ manifest entry. Legacy-v1
+    /// checkpoints are deliberately outside automatic import replay repair.
+    manifest_present: bool,
 }
 
 impl E4Sweep {
@@ -662,6 +694,7 @@ fn sweep_e4_checkpoint_objects(
         .tree_items
         .iter()
         .find(|item| item.name == "manifest.json" && item.mode != TreeItemMode::Tree);
+    sweep.manifest_present = manifest_item.is_some();
     if let Some(manifest_item) = manifest_item
         && let Ok(bytes) = reader.read_raw(&manifest_item.id)
         && let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -936,10 +969,137 @@ async fn scan_checkpoint_store(
         }
     }
 
+    if table_exists(conn, "agent_subagent_link").await? {
+        let inconsistent = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT c.parent_session_id, c.provider_kind, c.source_key,
+                        c.content_schema_version, c.current_revision,
+                        c.current_checkpoint_id, c.current_digest,
+                        r.checkpoint_id AS revision_checkpoint_id,
+                        r.content_digest AS revision_digest,
+                        cp.checkpoint_id AS catalog_checkpoint_id,
+                        l.content_checkpoint_id AS link_checkpoint_id,
+                        l.parent_session_id AS link_parent_session_id
+                 FROM agent_subagent_content_claim c
+                 LEFT JOIN agent_subagent_content_revision r
+                   ON r.parent_session_id = c.parent_session_id
+                  AND r.provider_kind = c.provider_kind
+                  AND r.source_key = c.source_key
+                  AND r.content_schema_version = c.content_schema_version
+                  AND r.revision = c.current_revision
+                 LEFT JOIN agent_checkpoint cp
+                   ON cp.checkpoint_id = c.current_checkpoint_id
+                  AND cp.session_id = c.parent_session_id
+                  AND cp.scope = 'subagent'
+                 LEFT JOIN agent_subagent_link l
+                   ON l.content_checkpoint_id = c.current_checkpoint_id
+                  AND l.parent_session_id = c.parent_session_id
+                 WHERE c.current_revision > 0
+                   AND (
+                     c.current_checkpoint_id IS NULL OR c.current_digest IS NULL
+                     OR r.checkpoint_id IS NULL OR r.content_digest IS NULL
+                     OR r.checkpoint_id <> c.current_checkpoint_id
+                     OR r.content_digest <> c.current_digest
+                     OR cp.checkpoint_id IS NULL OR l.content_checkpoint_id IS NULL
+                   )
+                 ORDER BY c.parent_session_id, c.provider_kind, c.source_key,
+                          c.content_schema_version"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to inspect current subagent content relations: {error}"
+                ))
+            })?;
+        for row in inconsistent {
+            let parent_session_id: String =
+                row.try_get_by("parent_session_id").map_err(|error| {
+                    CliError::fatal(format!("failed to read subagent content parent: {error}"))
+                })?;
+            let provider_kind: String = row.try_get_by("provider_kind").map_err(|error| {
+                CliError::fatal(format!("failed to read subagent content provider: {error}"))
+            })?;
+            let source_key: String = row.try_get_by("source_key").map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to read subagent content source identity: {error}"
+                ))
+            })?;
+            let schema_version: i64 =
+                row.try_get_by("content_schema_version").map_err(|error| {
+                    CliError::fatal(format!("failed to read subagent content schema: {error}"))
+                })?;
+            let current_revision: i64 = row.try_get_by("current_revision").map_err(|error| {
+                CliError::fatal(format!("failed to read subagent content revision: {error}"))
+            })?;
+            let checkpoint_id: Option<String> =
+                row.try_get_by("current_checkpoint_id").map_err(|error| {
+                    CliError::fatal(format!("failed to read subagent checkpoint id: {error}"))
+                })?;
+            let mut identity = Sha256::new();
+            identity.update(parent_session_id.as_bytes());
+            identity.update([0]);
+            identity.update(provider_kind.as_bytes());
+            identity.update([0]);
+            identity.update(source_key.as_bytes());
+            identity.update([0]);
+            identity.update(schema_version.to_be_bytes());
+            let identity = hex::encode(identity.finalize());
+            findings.push(CheckpointFinding {
+                inconsistency_type: CLASS_INCONSISTENT_SUBAGENT_CONTENT.to_string(),
+                checkpoint_id: checkpoint_id
+                    .unwrap_or_else(|| format!("subagent-content-{identity}")),
+                detail: format!(
+                    "current subagent content relation {identity} at revision {current_revision} is missing or disagrees across its claim, immutable revision, checkpoint catalog, and association link; replay is fail-closed and automatic reconstruction is unsafe"
+                ),
+                repaired: false,
+                manual_required: true,
+            });
+            plans.push(RepairPlan::Manual);
+        }
+
+        let unresolved = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT l.content_checkpoint_id
+                 FROM agent_subagent_link l
+                 JOIN agent_subagent_content_claim c
+                   ON c.parent_session_id = l.parent_session_id
+                  AND c.current_checkpoint_id = l.content_checkpoint_id
+                 WHERE l.link_state = 'unresolved'
+                 ORDER BY l.created_at, l.content_checkpoint_id"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to inspect unresolved subagent content links: {error}"
+                ))
+            })?;
+        for row in unresolved {
+            let checkpoint_id: String =
+                row.try_get_by("content_checkpoint_id").map_err(|error| {
+                    CliError::fatal(format!(
+                        "failed to read unresolved subagent checkpoint id: {error}"
+                    ))
+                })?;
+            findings.push(CheckpointFinding {
+                inconsistency_type: CLASS_UNRESOLVED_SUBAGENT_LINK.to_string(),
+                checkpoint_id,
+                detail: "subagent content has no unique provider-stable boundary match; content and boundary evidence remain independently preserved, and automatic guessing is unsafe"
+                    .to_string(),
+                repaired: false,
+                manual_required: true,
+            });
+            plans.push(RepairPlan::Manual);
+        }
+    }
+
     // Inspect raw marker rows so malformed state is surfaced instead of being
     // silently skipped. Live valid markers protect window A/B. Valid expired
     // markers and cleanup-pending markers are safely repairable through the
-    // serialized reachability drain. Cleanup-pending means the writer already
+    // serialized root-fenced retirement. Cleanup-pending means the writer already
     // exited, so its ordinary TTL never delays repair. Malformed rows remain
     // manual-required because their OID ownership cannot be inferred from
     // untrusted JSON.
@@ -969,7 +1129,7 @@ async fn scan_checkpoint_store(
                     inconsistency_type: CLASS_EXPIRED_INFLIGHT_MARKER.to_string(),
                     checkpoint_id: marker.attempt_id.clone(),
                     detail: format!(
-                        "expired or cleanup-pending traces marker for session '{}' owns {} candidate object(s) (cleanup_pending={}); `libra agent doctor --repair` will run the serialized all-ref reachability drain",
+                        "expired or cleanup-pending traces marker for session '{}' owns {} candidate object(s) (cleanup_pending={}); `libra agent doctor --repair` will run serialized root-fenced ownership retirement; repository GC owns payload reachability and reclamation",
                         marker.session_id,
                         marker.oids.len(),
                         marker.cleanup_pending
@@ -1488,7 +1648,8 @@ async fn execute_repair(
                 .execute(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_checkpoint \
-                     SET tree_oid = ?, metadata_blob_oid = ?, traces_commit = ? \
+                     SET tree_oid = ?, metadata_blob_oid = ?, traces_commit = ?, \
+                         sync_revision = sync_revision + 1 \
                      WHERE checkpoint_id = ?",
                     [
                         tree_oid.as_str().into(),
@@ -1581,6 +1742,19 @@ async fn build_class2_plan(
         .clone()
         .or_else(|| rc.scope_trailer.clone())
         .unwrap_or_else(|| "committed".to_string());
+    if metadata
+        .subagent
+        .as_ref()
+        .and_then(|subagent| subagent.provenance.as_deref())
+        == Some("content")
+    {
+        return Ok((
+            format!(
+                "{base}; content checkpoint requires claim/revision/link recovery and cannot be repaired as a boundary-only catalog row — manual review"
+            ),
+            RepairPlan::Manual,
+        ));
+    }
     // Shared classification boundary (plan-20260713 DR-05c-0): doctor and
     // claim recovery both rebuild catalog rows through
     // `rebuild_catalog_row_from_traces_ref`, so an unknown scope fails
@@ -2105,7 +2279,7 @@ async fn scan_agent_findings(
     Ok(report)
 }
 
-async fn resolve_repo_id(conn: &DatabaseConnection) -> String {
+async fn resolve_repo_id<C: ConnectionTrait>(conn: &C) -> String {
     match ConfigKv::get_with_conn(conn, "libra.repoid").await {
         Ok(Some(entry)) if !entry.value.trim().is_empty() => entry.value,
         _ => "unknown-repo".to_string(),
@@ -2117,8 +2291,8 @@ async fn resolve_repo_id(conn: &DatabaseConnection) -> String {
 /// a row that exists but drifted (e.g. a transcript blob indexed as a
 /// generic `blob`) is as broken for cloud-sync semantics as a missing
 /// one and must be repairable in place.
-async fn object_index_row_shape(
-    conn: &DatabaseConnection,
+async fn object_index_row_shape<C: ConnectionTrait>(
+    conn: &C,
     o_id: &str,
     repo_id: &str,
 ) -> CliResult<Option<(String, i64)>> {
@@ -2145,8 +2319,8 @@ async fn object_index_row_shape(
 
 /// Update a drifted `object_index` row in place to the writer-expected
 /// shape (idempotent; matched on `(o_id, repo_id)`).
-async fn update_object_index_row_shape(
-    conn: &DatabaseConnection,
+async fn update_object_index_row_shape<C: ConnectionTrait>(
+    conn: &C,
     o_id: &str,
     o_type: &str,
     o_size: i64,
@@ -2155,7 +2329,9 @@ async fn update_object_index_row_shape(
     let backend = conn.get_database_backend();
     conn.execute(Statement::from_sql_and_values(
         backend,
-        "UPDATE object_index SET o_type = ?, o_size = ? WHERE o_id = ? AND repo_id = ?",
+        "UPDATE object_index
+         SET o_type = ?, o_size = ?, is_synced = 0
+         WHERE o_id = ? AND repo_id = ?",
         [o_type.into(), o_size.into(), o_id.into(), repo_id.into()],
     ))
     .await
@@ -2166,8 +2342,8 @@ async fn update_object_index_row_shape(
 /// `client_storage::update_object_index_once` (`is_synced = 0` so the next
 /// `libra cloud sync` picks the object up). The `WHERE NOT EXISTS` guard
 /// makes a doctor re-run (or a race with the background indexer) a no-op.
-async fn insert_object_index_row(
-    conn: &DatabaseConnection,
+async fn insert_object_index_row<C: ConnectionTrait>(
+    conn: &C,
     o_id: &str,
     o_type: &str,
     o_size: i64,
@@ -2191,6 +2367,206 @@ async fn insert_object_index_row(
     ))
     .await
     .map(|_| ())
+}
+
+/// Foreground, idempotent repair used by historical-import replay after its
+/// previous background object-index barrier timed out or observed an update
+/// error. The caller runs this function in a killable helper process, so local
+/// or tiered object reads cannot extend the import command's absolute deadline.
+/// Transcript payloads are never read: their sizes come from the E4 manifest.
+pub(crate) async fn repair_session_object_index(
+    conn: &DatabaseConnection,
+    repo_path: &Path,
+    session_id: &str,
+    marker_owner: &str,
+    marker_generation: &str,
+    agent_kind: &str,
+    provider_session_id: &str,
+) -> anyhow::Result<usize> {
+    let txn = conn
+        .begin()
+        .await
+        .context("begin fenced import object-index repair")?;
+    // Acquire the SQLite writer slot before reading either the marker or the
+    // session. Erasure uses the same database writer serialization, so it
+    // cannot prune the catalog and then race these index inserts back in.
+    let locked = txn
+        .execute(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "UPDATE metadata_kv SET updated_at = updated_at
+             WHERE scope = 'agent_import_index_repair'
+               AND target = ? AND key = 'object-index-v1'",
+            [session_id.into()],
+        ))
+        .await
+        .context("lock import object-index repair marker")?;
+    if locked.rows_affected() != 1 {
+        bail!("import object-index repair marker disappeared or is no longer owned");
+    }
+    let marker = txn
+        .query_one(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT value FROM metadata_kv
+             WHERE scope = 'agent_import_index_repair'
+               AND target = ? AND key = 'object-index-v1'",
+            [session_id.into()],
+        ))
+        .await
+        .context("read fenced import object-index repair marker")?
+        .context("import object-index repair marker disappeared after lock")?;
+    let marker_value: String = marker
+        .try_get_by("value")
+        .context("decode fenced import object-index repair marker")?;
+    let marker_json: serde_json::Value = serde_json::from_str(&marker_value)
+        .context("decode fenced import object-index repair marker JSON")?;
+    if marker_json.get("owner").and_then(serde_json::Value::as_str) != Some(marker_owner)
+        || marker_json
+            .get("generation")
+            .and_then(serde_json::Value::as_str)
+            != Some(marker_generation)
+        || marker_json
+            .get("agent_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some(agent_kind)
+        || marker_json
+            .get("provider_session_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(provider_session_id)
+    {
+        bail!("import object-index repair marker ownership changed");
+    }
+    let tombstone = txn
+        .query_one(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT 1 FROM agent_import_tombstone
+             WHERE agent_kind = ? AND provider_session_id = ?",
+            [agent_kind.into(), provider_session_id.into()],
+        ))
+        .await
+        .context("check erasure tombstone during import object-index repair")?;
+    if tombstone.is_some() {
+        bail!("session was erased while its import object-index repair was pending");
+    }
+    let session = txn
+        .query_one(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT agent_kind, provider_session_id FROM agent_session WHERE session_id = ?",
+            [session_id.into()],
+        ))
+        .await
+        .context("validate session ownership during import object-index repair")?;
+    if let Some(session) = session {
+        let stored_agent_kind: String = session
+            .try_get_by("agent_kind")
+            .context("decode repair session agent kind")?;
+        let stored_provider_session_id: String = session
+            .try_get_by("provider_session_id")
+            .context("decode repair provider session id")?;
+        if stored_agent_kind != agent_kind || stored_provider_session_id != provider_session_id {
+            bail!("session ownership changed while import object-index repair was pending");
+        }
+    }
+    import_index_repair_test_pause_after_lock()?;
+    let rows = txn
+        .query_all(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT checkpoint_id, tree_oid, traces_commit
+             FROM agent_checkpoint
+             WHERE session_id = ?
+             ORDER BY created_at, checkpoint_id
+             LIMIT ?",
+            [
+                session_id.into(),
+                i64::try_from(MAX_IMPORT_INDEX_REPAIR_CHECKPOINTS + 1)
+                    .context("import index repair checkpoint bound overflow")?
+                    .into(),
+            ],
+        ))
+        .await
+        .context("load checkpoints for import object-index repair")?;
+    if rows.len() > MAX_IMPORT_INDEX_REPAIR_CHECKPOINTS {
+        bail!(
+            "session exceeds the bounded import object-index repair limit; run `libra agent doctor --repair`"
+        );
+    }
+
+    let reader = ObjectReader {
+        storage: Arc::new(ClientStorage::init_local_existing(
+            repo_path.join("objects"),
+        )),
+    };
+    let repo_id = resolve_repo_id(&txn).await;
+    let mut repaired = 0_usize;
+    for row in rows {
+        let checkpoint_id: String = row
+            .try_get_by("checkpoint_id")
+            .context("decode import index repair checkpoint id")?;
+        let tree_oid: String = row
+            .try_get_by("tree_oid")
+            .context("decode import index repair root tree")?;
+        let traces_commit: String = row
+            .try_get_by("traces_commit")
+            .context("decode import index repair traces commit")?;
+        let sweep = sweep_e4_checkpoint_objects(&reader, &tree_oid, &checkpoint_id);
+        if !sweep.manifest_present {
+            continue;
+        }
+        if !sweep.missing.is_empty() {
+            bail!(
+                "checkpoint {checkpoint_id} is missing object-store data required for index repair: {}; run `libra agent doctor --repair`",
+                sweep.missing.join(", ")
+            );
+        }
+        let mut targets = vec![(traces_commit, "commit", None)];
+        targets.extend(
+            sweep
+                .present
+                .into_iter()
+                .map(|object| (object.oid, object.o_type, object.size)),
+        );
+        let mut seen = BTreeSet::new();
+        for (oid, o_type, declared_size) in targets {
+            if !seen.insert(oid.clone()) {
+                continue;
+            }
+            let size = match declared_size {
+                Some(size) => size,
+                None if o_type == "agent_transcript" => bail!(
+                    "checkpoint {checkpoint_id} transcript size is absent from manifest; run `libra agent doctor --repair`"
+                ),
+                None => {
+                    let hash = ObjectHash::from_str(&oid).map_err(|error| {
+                        anyhow::anyhow!("invalid checkpoint object id {oid}: {error}")
+                    })?;
+                    i64::try_from(reader.read_raw(&hash)?.len())
+                        .context("checkpoint object exceeds object-index size range")?
+                }
+            };
+            match object_index_row_shape(&txn, &oid, &repo_id)
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            {
+                Some((existing_type, existing_size))
+                    if existing_type == o_type && existing_size == size => {}
+                Some(_) => {
+                    update_object_index_row_shape(&txn, &oid, o_type, size, &repo_id)
+                        .await
+                        .with_context(|| format!("repair object-index row {oid}"))?;
+                    repaired = repaired.saturating_add(1);
+                }
+                None => {
+                    insert_object_index_row(&txn, &oid, o_type, size, &repo_id)
+                        .await
+                        .with_context(|| format!("insert object-index row {oid}"))?;
+                    repaired = repaired.saturating_add(1);
+                }
+            }
+        }
+    }
+    txn.commit()
+        .await
+        .context("commit fenced import object-index repair")?;
+    Ok(repaired)
 }
 
 // ---------------------------------------------------------------------------
@@ -2340,12 +2716,42 @@ fn emit_report(report: &DoctorReport, output: &OutputConfig) -> CliResult<()> {
              inconsistency(ies) automatically."
         );
     }
-    if store.manual_required > 0 {
+    let unresolved_links = store
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.manual_required && finding.inconsistency_type == CLASS_UNRESOLVED_SUBAGENT_LINK
+        })
+        .count();
+    let missing_objects = store
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.manual_required && finding.inconsistency_type == CLASS_MISSING_OBJECTS
+        })
+        .count();
+    let other_manual = store
+        .manual_required
+        .saturating_sub(unresolved_links.saturating_add(missing_objects));
+    if unresolved_links > 0 {
+        println!(
+            "Hint: {unresolved_links} subagent content link(s) have no unique provider-stable \
+             boundary; the content remains durable and no object repair is needed. Keep the \
+             association unresolved unless provider-stable boundary evidence becomes available."
+        );
+    }
+    if missing_objects > 0 {
         println!(
             "Hint: {} inconsistency(ies) need manual action — objects are missing \
              from the store (try `libra fsck --heal` or restore them from a \
              cloud/backup remote before re-running doctor).",
-            store.manual_required
+            missing_objects
+        );
+    }
+    if other_manual > 0 {
+        println!(
+            "Hint: {other_manual} other inconsistency(ies) need manual action; inspect the \
+             finding details and choose an explicit recovery instead of guessing."
         );
     }
     if report.gemini_hooks_remnant {

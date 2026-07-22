@@ -366,6 +366,14 @@ overrides.
 
 Every `AddError` variant maps to an explicit `StableErrorCode`.
 
+Local staging and the later cloud-catalog update have separate durability
+boundaries. If a terminal background `object_index` error occurs after the blob
+and index are saved, `add` keeps its normal success output, emits an actionable
+stderr warning, and retains an atomic repair marker for the next schema-aware
+repository command. `cloud sync` and destructive agent cleanup fail closed
+while repair remains pending. With `--exit-code-on-warning`, the completed local
+staging operation returns exit 9 / `LBR-WARN-001`; retrying `add` is unnecessary.
+
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
 | Not inside a repository | `LBR-REPO-001` | 128 | "run 'libra init' to create a repository" |
@@ -376,6 +384,8 @@ Every `AddError` variant maps to an explicit `StableErrorCode`.
 | Failed to save index | `LBR-IO-002` | 128 | "check disk space and file permissions" |
 | Refresh failed | `LBR-IO-001` | 128 | -- |
 | Entry creation failed | `LBR-IO-002` | 128 | -- |
+| Object or durable index-marker write failed | `LBR-IO-002` | 128 | Check storage permissions and retry; the error is returned without a panic |
+| Paths staged but cloud index repair remains pending, with `--exit-code-on-warning` | `LBR-WARN-001` | 9 | Fix the reported database/marker error; the next repository command retries automatically |
 | Working directory error | `LBR-REPO-001` | 128 | "cannot determine the working tree" |
 | Status computation failed | `LBR-REPO-002` | 128 | -- |
 | All paths ignored (nothing staged) | `LBR-ADD-001` | 128 | "use -f if you really want to add them" |

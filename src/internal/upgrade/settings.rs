@@ -240,7 +240,7 @@ mod tests {
     use crate::utils::test::ScopedEnvVar;
 
     fn scoped_home() -> (tempfile::TempDir, ScopedEnvVar) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test fixture operation should succeed");
         let env = ScopedEnvVar::set(super::super::home::LIBRA_HOME_ENV, dir.path());
         (dir, env)
     }
@@ -277,9 +277,14 @@ mod tests {
     #[serial]
     fn padded_on_disk_mode_is_rejected() {
         let (_dir, _env) = scoped_home();
-        let path = settings_path().unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, br#"{ "schema_version": 1, "mode": " auto " }"#).unwrap();
+        let path = settings_path().expect("test fixture operation should succeed");
+        fs::create_dir_all(
+            path.parent()
+                .expect("test fixture operation should succeed"),
+        )
+        .expect("test fixture operation should succeed");
+        fs::write(&path, br#"{ "schema_version": 1, "mode": " auto " }"#)
+            .expect("test fixture operation should succeed");
         assert!(matches!(
             read_mode(),
             Err(UpgradeSettingsError::Invalid { .. })
@@ -291,9 +296,13 @@ mod tests {
     fn lenient_read_warns_exactly_once_per_process() {
         use crate::utils::output::{reset_warning_tracker, warning_was_emitted};
         let (_dir, _env) = scoped_home();
-        let path = settings_path().unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"{ corrupt").unwrap();
+        let path = settings_path().expect("test fixture operation should succeed");
+        fs::create_dir_all(
+            path.parent()
+                .expect("test fixture operation should succeed"),
+        )
+        .expect("test fixture operation should succeed");
+        fs::write(&path, b"{ corrupt").expect("test fixture operation should succeed");
 
         reset_lenient_warning_for_tests();
         reset_warning_tracker();
@@ -316,19 +325,28 @@ mod tests {
     #[serial]
     fn missing_file_reads_as_none() {
         let (_dir, _env) = scoped_home();
-        assert_eq!(read_mode().unwrap(), None);
+        assert_eq!(
+            read_mode().expect("test fixture operation should succeed"),
+            None
+        );
     }
 
     #[test]
     #[serial]
     fn write_then_read_roundtrips_and_keeps_file_on_off() {
         let (_dir, _env) = scoped_home();
-        let path = write_mode(UpgradeMode::Auto).unwrap();
-        assert_eq!(read_mode().unwrap(), Some(UpgradeMode::Auto));
+        let path = write_mode(UpgradeMode::Auto).expect("test fixture operation should succeed");
+        assert_eq!(
+            read_mode().expect("test fixture operation should succeed"),
+            Some(UpgradeMode::Auto)
+        );
         // `unset` semantics: write off, keep the file.
-        write_mode(UpgradeMode::Off).unwrap();
+        write_mode(UpgradeMode::Off).expect("test fixture operation should succeed");
         assert!(path.exists(), "unset must keep the settings file");
-        assert_eq!(read_mode().unwrap(), Some(UpgradeMode::Off));
+        assert_eq!(
+            read_mode().expect("test fixture operation should succeed"),
+            Some(UpgradeMode::Off)
+        );
     }
 
     #[test]
@@ -337,12 +355,19 @@ mod tests {
     fn written_file_and_dir_have_private_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, _env) = scoped_home();
-        let path = write_mode(UpgradeMode::Manual).unwrap();
-        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        let dir_mode = fs::metadata(path.parent().unwrap())
-            .unwrap()
+        let path = write_mode(UpgradeMode::Manual).expect("test fixture operation should succeed");
+        let file_mode = fs::metadata(&path)
+            .expect("test fixture operation should succeed")
             .permissions()
             .mode()
+            & 0o777;
+        let dir_mode = fs::metadata(
+            path.parent()
+                .expect("test fixture operation should succeed"),
+        )
+        .expect("test fixture operation should succeed")
+        .permissions()
+        .mode()
             & 0o777;
         assert_eq!(file_mode, 0o600);
         assert_eq!(dir_mode, 0o700);
@@ -352,9 +377,13 @@ mod tests {
     #[serial]
     fn corrupt_json_is_a_strict_error_but_lenient_off() {
         let (_dir, _env) = scoped_home();
-        let path = settings_path().unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"{ not json").unwrap();
+        let path = settings_path().expect("test fixture operation should succeed");
+        fs::create_dir_all(
+            path.parent()
+                .expect("test fixture operation should succeed"),
+        )
+        .expect("test fixture operation should succeed");
+        fs::write(&path, b"{ not json").expect("test fixture operation should succeed");
         assert!(matches!(
             read_mode(),
             Err(UpgradeSettingsError::Invalid { .. })
@@ -366,9 +395,14 @@ mod tests {
     #[serial]
     fn invalid_mode_value_is_a_strict_error() {
         let (_dir, _env) = scoped_home();
-        let path = settings_path().unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, br#"{ "schema_version": 1, "mode": "sometimes" }"#).unwrap();
+        let path = settings_path().expect("test fixture operation should succeed");
+        fs::create_dir_all(
+            path.parent()
+                .expect("test fixture operation should succeed"),
+        )
+        .expect("test fixture operation should succeed");
+        fs::write(&path, br#"{ "schema_version": 1, "mode": "sometimes" }"#)
+            .expect("test fixture operation should succeed");
         assert!(matches!(
             read_mode(),
             Err(UpgradeSettingsError::Invalid { .. })
@@ -379,9 +413,14 @@ mod tests {
     #[serial]
     fn newer_schema_version_is_rejected() {
         let (_dir, _env) = scoped_home();
-        let path = settings_path().unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, br#"{ "schema_version": 2, "mode": "auto" }"#).unwrap();
+        let path = settings_path().expect("test fixture operation should succeed");
+        fs::create_dir_all(
+            path.parent()
+                .expect("test fixture operation should succeed"),
+        )
+        .expect("test fixture operation should succeed");
+        fs::write(&path, br#"{ "schema_version": 2, "mode": "auto" }"#)
+            .expect("test fixture operation should succeed");
         assert!(matches!(
             read_mode(),
             Err(UpgradeSettingsError::Invalid { .. })
@@ -392,8 +431,12 @@ mod tests {
     #[serial]
     fn missing_or_null_mode_field_is_damaged_state() {
         let (_dir, _env) = scoped_home();
-        let path = settings_path().unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = settings_path().expect("test fixture operation should succeed");
+        fs::create_dir_all(
+            path.parent()
+                .expect("test fixture operation should succeed"),
+        )
+        .expect("test fixture operation should succeed");
         // An existing file must carry a valid mode: missing/null must NOT be
         // conflated with an explicit `off`.
         for body in [
@@ -401,7 +444,7 @@ mod tests {
             br#"{ "schema_version": 1 }"#.as_slice(),
             br#"{ "schema_version": 1, "mode": null }"#.as_slice(),
         ] {
-            fs::write(&path, body).unwrap();
+            fs::write(&path, body).expect("test fixture operation should succeed");
             assert!(
                 matches!(read_mode(), Err(UpgradeSettingsError::Invalid { .. })),
                 "body {:?} must be a strict error",
@@ -414,13 +457,20 @@ mod tests {
     #[serial]
     fn unknown_fields_are_ignored() {
         let (_dir, _env) = scoped_home();
-        let path = settings_path().unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let path = settings_path().expect("test fixture operation should succeed");
+        fs::create_dir_all(
+            path.parent()
+                .expect("test fixture operation should succeed"),
+        )
+        .expect("test fixture operation should succeed");
         fs::write(
             &path,
             br#"{ "schema_version": 1, "mode": "manual", "future_field": true }"#,
         )
-        .unwrap();
-        assert_eq!(read_mode().unwrap(), Some(UpgradeMode::Manual));
+        .expect("test fixture operation should succeed");
+        assert_eq!(
+            read_mode().expect("test fixture operation should succeed"),
+            Some(UpgradeMode::Manual)
+        );
     }
 }

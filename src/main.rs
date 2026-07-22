@@ -181,6 +181,86 @@ fn run_import_preparation_helper_if_requested() -> Option<i32> {
     Some(0)
 }
 
+fn run_import_index_repair_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str() != Some(libra::command::agent::IMPORT_INDEX_REPAIR_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(libra::command::agent::IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP.saturating_add(1))
+        .read_to_end(&mut input)
+        .is_err()
+        || input.len() as u64 > libra::command::agent::IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP
+    {
+        return Some(2);
+    }
+    let output = match libra::command::agent::run_import_index_repair_helper(&input) {
+        Ok(output)
+            if output.len() as u64
+                <= libra::command::agent::IMPORT_INDEX_REPAIR_HELPER_FRAME_CAP =>
+        {
+            output
+        }
+        Ok(_) | Err(_) => return Some(2),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
+        return Some(1);
+    }
+    Some(0)
+}
+
+fn run_subagent_discovery_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _program = args.next()?;
+    if args.next()?.to_str()
+        != Some(libra::internal::ai::subagent_content::SUBAGENT_DISCOVERY_HELPER_ARG)
+        || args.next().is_some()
+    {
+        return None;
+    }
+    if cfg!(debug_assertions)
+        && let Ok(value) = std::env::var("LIBRA_TEST_SUBAGENT_DISCOVERY_HELPER_DELAY_MS")
+        && let Ok(delay_ms) = value.parse::<u64>()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(
+            libra::internal::ai::subagent_content::SUBAGENT_DISCOVERY_HELPER_INPUT_CAP
+                .saturating_add(1),
+        )
+        .read_to_end(&mut input)
+        .is_err()
+        || input.len() as u64
+            > libra::internal::ai::subagent_content::SUBAGENT_DISCOVERY_HELPER_INPUT_CAP
+    {
+        return Some(2);
+    }
+    let output = match libra::internal::ai::subagent_content::run_subagent_discovery_helper(&input)
+    {
+        Ok(output)
+            if output.len() as u64
+                <= libra::internal::ai::subagent_content::SUBAGENT_DISCOVERY_HELPER_OUTPUT_CAP =>
+        {
+            output
+        }
+        Ok(_) | Err(_) => return Some(2),
+    };
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&output).is_err() || stdout.flush().is_err() {
+        return Some(1);
+    }
+    Some(0)
+}
+
 /// Killable subprocess boundary for held-descriptor transcript reads. This is
 /// handled before CLI/log initialization so stdout contains only the private
 /// binary frame consumed by the parent importer.
@@ -267,6 +347,18 @@ fn main() {
         return;
     }
     if let Some(exit_code) = run_import_preparation_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    if let Some(exit_code) = run_import_index_repair_helper_if_requested() {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return;
+    }
+    if let Some(exit_code) = run_subagent_discovery_helper_if_requested() {
         if exit_code != 0 {
             std::process::exit(exit_code);
         }

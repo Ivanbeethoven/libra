@@ -442,6 +442,7 @@ async fn apply_one_migration(
                 let backend = txn.get_database_backend();
                 // Apply the user DDL first; if it fails the schema_versions
                 // insert never happens and the transaction rolls back.
+                apply_migration_compatibility(txn, version, name).await?;
                 txn.execute(Statement::from_string(backend, up)).await?;
                 // `INSERT OR IGNORE` plus `changes()` lets us tell whether
                 // we won the race or not without a separate read query.
@@ -473,6 +474,103 @@ async fn apply_one_migration(
             sea_orm::TransactionError::Transaction(db) => MigrationError::Database(db),
         })?;
     Ok(inserted)
+}
+
+/// Install additive columns that SQLite cannot express idempotently in a SQL
+/// migration (`ADD COLUMN IF NOT EXISTS` is unsupported).  Early M5
+/// development repositories applied the 1406 base schema, while later ones
+/// applied an evolved 1406 containing some or all of these columns.  Probe each
+/// column inside the 1407 transaction so both shapes converge without a
+/// duplicate-column failure and without publishing the version row early.
+async fn apply_migration_compatibility<C: ConnectionTrait>(
+    conn: &C,
+    version: i64,
+    name: &str,
+) -> Result<(), DbErr> {
+    if version != 2026071407 || name != "agent_subagent_replication" {
+        return Ok(());
+    }
+    add_column_if_missing(
+        conn,
+        "agent_session",
+        "sync_revision",
+        "ALTER TABLE `agent_session` ADD COLUMN `sync_revision` INTEGER NOT NULL DEFAULT 1",
+        None,
+    )
+    .await?;
+    add_column_if_missing(
+        conn,
+        "agent_checkpoint",
+        "sync_revision",
+        "ALTER TABLE `agent_checkpoint` ADD COLUMN `sync_revision` INTEGER NOT NULL DEFAULT 1",
+        None,
+    )
+    .await?;
+    add_column_if_missing(
+        conn,
+        "agent_subagent_content_claim",
+        "revision_cursor",
+        "ALTER TABLE `agent_subagent_content_claim` ADD COLUMN `revision_cursor` INTEGER NOT NULL DEFAULT 0",
+        None,
+    )
+    .await?;
+    // Some development builds had already installed the column with its
+    // default-zero value before 1407 existed. Backfill independently from
+    // column creation so every evolved 1406 shape preserves the allocated
+    // revision high-water mark.
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "UPDATE `agent_subagent_content_claim`
+         SET `revision_cursor` = `current_revision`
+         WHERE `revision_cursor` < `current_revision`",
+    ))
+    .await?;
+    add_column_if_missing(
+        conn,
+        "agent_subagent_content_claim",
+        "sync_revision",
+        "ALTER TABLE `agent_subagent_content_claim` ADD COLUMN `sync_revision` INTEGER NOT NULL DEFAULT 1",
+        None,
+    )
+    .await?;
+    add_column_if_missing(
+        conn,
+        "agent_subagent_link",
+        "sync_revision",
+        "ALTER TABLE `agent_subagent_link` ADD COLUMN `sync_revision` INTEGER NOT NULL DEFAULT 1",
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn add_column_if_missing<C: ConnectionTrait>(
+    conn: &C,
+    table: &str,
+    column: &str,
+    alter_sql: &'static str,
+    initialize_sql: Option<&'static str>,
+) -> Result<(), DbErr> {
+    let backend = conn.get_database_backend();
+    let probe = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ? LIMIT 1");
+    if conn
+        .query_one(Statement::from_sql_and_values(
+            backend,
+            probe,
+            [column.into()],
+        ))
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    conn.execute(Statement::from_string(backend, alter_sql))
+        .await?;
+    if let Some(initialize_sql) = initialize_sql {
+        conn.execute(Statement::from_string(backend, initialize_sql))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Apply one migration's down DDL atomically. Returns `true` when this
@@ -814,6 +912,24 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026071405_agent_coverage_conflict.sql"),
             include_str!("../../../sql/migrations/2026071405_agent_coverage_conflict_down.sql"),
         ),
+        // M5 / DR-06: provider-root-relative subagent content identity,
+        // append-only source revisions, and boundary/content association.
+        sql_migration(
+            2026071406,
+            "agent_subagent_content",
+            include_str!("../../../sql/migrations/2026071406_agent_subagent_content.sql"),
+            include_str!("../../../sql/migrations/2026071406_agent_subagent_content_down.sql"),
+        ),
+        // M5 compatibility hardening: 2026071406 was exercised by live
+        // development repositories before replication generations, revision
+        // cursors, and prune fences were added.  Keep the base migration
+        // immutable and install those additions monotonically.
+        sql_migration(
+            2026071407,
+            "agent_subagent_replication",
+            include_str!("../../../sql/migrations/2026071407_agent_subagent_replication.sql"),
+            include_str!("../../../sql/migrations/2026071407_agent_subagent_replication_down.sql"),
+        ),
         // plan-20260714 Part C W1 (§C.4.2): re-key `sequence_state` from the
         // repository-global `CHECK(id = 1)` single row to one row per worktree
         // (`worktree_id`, main = ""), so a cherry-pick/am/revert sequence in one
@@ -1027,7 +1143,7 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 31);
+        assert_eq!(runner.len(), 33);
         assert!(!runner.is_empty());
         assert_eq!(runner.max_registered_version(), Some(2026072101));
     }

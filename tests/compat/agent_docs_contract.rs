@@ -76,16 +76,17 @@ fn agent_doc_declares_cloud_tombstone_deferred() {
     // A0-10 doc-guard. Ground truth (verified against src/command/cloud.rs):
     // the D1/R2 agent-capture MIRROR is live — `libra cloud sync` upserts
     // agent_session/agent_checkpoint to D1 on every sync and `libra cloud
-    // restore` reads them back. What is DEFERRED is delete/tombstone
-    // propagation: a local `erase_session_local` does not delete the D1/R2
-    // mirror rows, so `libra cloud restore` can REVIVE erased capture. The
-    // doc must keep declaring exactly this, and must never regress to the
-    // (false) "mirror not enabled" wording or overclaim that propagation is
-    // implemented.
+    // restore` reads them back. Ordinary checkpoint retention now propagates
+    // a D1 prune fence and removes capture-catalog rows. What remains DEFERRED
+    // under the compatibility term "delete/tombstone propagation" is session
+    // erasure plus R2 physical deletion: a local `erase_session_local` does
+    // not delete the remote session, so restore can REVIVE it. The doc must
+    // preserve that distinction.
     for required in [
         "cloud mirror tombstone propagation for agent capture data",
         "delete/tombstone propagation",
-        "复活已本地擦除的 capture",
+        "普通 checkpoint retention",
+        "复活已本地擦除的 session",
         // Positive truth: the mirror IS live via cloud sync/restore.
         "libra cloud sync",
         "libra cloud restore",

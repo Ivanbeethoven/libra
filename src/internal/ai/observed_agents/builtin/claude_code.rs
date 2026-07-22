@@ -26,7 +26,7 @@ use super::super::{
     adapter::{AgentKind, AgentSessionCtx, ObservedAgent, TranscriptTruncator},
     capability::{
         ModelExtractor, PromptExtractor, SkillEvent, SkillEventExtractor, SubagentAwareExtractor,
-        TokenCalculator, TranscriptAnalyzer, TranscriptPreparer,
+        SubagentExtraction, TokenCalculator, TranscriptAnalyzer, TranscriptPreparer,
     },
     extract,
 };
@@ -178,9 +178,53 @@ impl SubagentAwareExtractor for ClaudeCodeObservedAgent {
             .map(PathBuf::from)
             .collect())
     }
+
     fn total_token_usage_including_subagents(&self, data: &[u8]) -> Result<CompletionUsageSummary> {
-        let summary = extract::extract_claude_code(data);
-        Ok(summary.subagent_usage.or(summary.usage).unwrap_or_default())
+        Ok(extract::extract_claude_code(data).usage.unwrap_or_default())
+    }
+
+    fn extract_parent_and_subagents(
+        &self,
+        parent: &[u8],
+        subagents: &[&[u8]],
+    ) -> Result<SubagentExtraction> {
+        let parent_summary = extract::extract_claude_code(parent);
+        let mut modified_files = parent_summary.modified_files.clone();
+        let mut aggregate_usage = parent_summary.usage.clone().unwrap_or_default();
+        let mut subagent_usage: Option<CompletionUsageSummary> = None;
+        let mut partial = parent_summary.partial;
+        let mut warnings = parent_summary.warnings;
+
+        for data in subagents {
+            let summary = extract::extract_claude_code(data);
+            for path in summary.modified_files {
+                if !modified_files.iter().any(|existing| existing == &path) {
+                    modified_files.push(path);
+                }
+            }
+            if let Some(usage) = summary.usage {
+                aggregate_usage.merge(&usage);
+                match &mut subagent_usage {
+                    Some(total) => total.merge(&usage),
+                    None => subagent_usage = Some(usage),
+                }
+            }
+            partial |= summary.partial;
+            warnings.extend(
+                summary
+                    .warnings
+                    .into_iter()
+                    .map(|warning| format!("subagent transcript: {warning}")),
+            );
+        }
+
+        Ok(SubagentExtraction {
+            modified_files: modified_files.into_iter().map(PathBuf::from).collect(),
+            aggregate_usage,
+            subagent_usage,
+            partial,
+            warnings,
+        })
     }
 }
 
@@ -602,19 +646,27 @@ pub fn claude_session_dir(cwd: &Path) -> Option<PathBuf> {
     )
 }
 
+/// Path-component contract shared by explicit historical imports and Claude
+/// transcript/subagent discovery. Older Claude releases emitted identifiers
+/// containing dots or underscores, so the resolver must accept those safe
+/// legacy forms as well as today's UUID-like ids.
+pub fn claude_session_id_is_safe_path_component(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && !matches!(session_id, "." | "..")
+        && session_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+}
+
 /// Locate the on-disk session JSONL for `(cwd, session_id)` without a hook
 /// pointer (DR-02 `resolve_session_file`). Fail-closed: an invalid id, a
 /// symlink, or a path escaping the projects root is an error; an absent
 /// file is `Ok(None)`.
 pub fn resolve_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>> {
-    let valid = !session_id.is_empty()
-        && session_id.len() <= 64
-        && session_id
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == '-');
-    if !valid {
+    if !claude_session_id_is_safe_path_component(session_id) {
         return Err(anyhow!(
-            "invalid Claude session id (expected hex/dash, ≤64 chars)"
+            "invalid Claude session id (expected alphanumeric/dot/dash/underscore, at most 128 characters)"
         ));
     }
     let Some(dir) = claude_session_dir(cwd) else {

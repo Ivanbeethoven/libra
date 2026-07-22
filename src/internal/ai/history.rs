@@ -30,7 +30,7 @@
 //! caller.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -41,6 +41,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use git_internal::internal::object::types::ObjectType;
 use git_internal::{
     hash::{ObjectHash, get_hash_kind},
     internal::object::{
@@ -48,7 +50,6 @@ use git_internal::{
         commit::Commit,
         signature::{Signature, SignatureType},
         tree::{Tree, TreeItem, TreeItemMode},
-        types::ObjectType,
     },
 };
 use sea_orm::{
@@ -62,6 +63,8 @@ use tokio::{
     time::sleep,
 };
 
+#[cfg(test)]
+use crate::utils::storage::tiered::verify_fetched_object;
 use crate::{
     internal::{
         ai::observed_agents::RedactedBytes,
@@ -72,7 +75,7 @@ use crate::{
             git_object_hash, read_git_object, read_git_object_bounded_validated, write_git_object,
             write_git_object_with_status,
         },
-        storage::{Storage, tiered::verify_fetched_object},
+        storage::Storage,
     },
 };
 
@@ -98,7 +101,6 @@ const SQLITE_BUSY_RETRY_BASE_MS: u64 = 100;
 /// concurrent writer advances the ref between read and CAS. The bound is
 /// generous because each retry is purely local (no network I/O).
 const HISTORY_HEAD_CONFLICT_MAX_RETRIES: usize = 32;
-const REJECTED_CLEANUP_MAX_INFLATED_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 const REJECTED_CLEANUP_MAX_VISITED_OBJECTS: usize = 250_000;
 const REJECTED_CLEANUP_MAX_TRAVERSAL_DURATION: Duration = Duration::from_secs(30);
 const OBJECT_INDEX_FOREGROUND_DRAIN_BUDGET: Duration = Duration::from_millis(500);
@@ -113,6 +115,24 @@ pub const CHECKPOINT_OBJECT_IO_HELPER_ARG: &str = "--libra-internal-checkpoint-o
 pub const CHECKPOINT_OBJECT_IO_HELPER_INPUT_CAP: u64 = 32 * 1024 * 1024;
 pub const CHECKPOINT_OBJECT_IO_HELPER_OUTPUT_CAP: u64 = 32 * 1024 * 1024;
 const CHECKPOINT_OBJECT_READ_MAX_INFLATED_BYTES: u64 = 16 * 1024 * 1024;
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_CHECKPOINT_SNAPSHOT_VERIFY_COUNT: std::cell::Cell<usize>;
+}
+
+#[cfg(test)]
+pub(crate) async fn count_checkpoint_snapshot_verifications<F: std::future::Future>(
+    future: F,
+) -> (F::Output, usize) {
+    TEST_CHECKPOINT_SNAPSHOT_VERIFY_COUNT
+        .scope(std::cell::Cell::new(0), async move {
+            let output = future.await;
+            let count = TEST_CHECKPOINT_SNAPSHOT_VERIFY_COUNT.with(std::cell::Cell::get);
+            (output, count)
+        })
+        .await
+}
 
 fn rejected_cleanup_traversal_duration() -> Duration {
     if cfg!(debug_assertions)
@@ -179,6 +199,19 @@ enum CheckpointObjectIoOperation {
         object_type: String,
         data_base64: String,
     },
+    VerifySnapshot {
+        head: String,
+        cataloged_commits: Vec<String>,
+        checkpoints: Vec<CheckpointDurabilityHelperSpec>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CheckpointDurabilityHelperSpec {
+    checkpoint_id: String,
+    traces_commit: String,
+    tree_oid: String,
+    metadata_blob_oid: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -192,6 +225,9 @@ enum CheckpointObjectIoHelperResponse {
     Written {
         oid: String,
         was_created: bool,
+    },
+    Verified {
+        oids: Vec<String>,
     },
     Error {
         message: String,
@@ -760,6 +796,51 @@ pub fn run_checkpoint_object_io_helper(input: &[u8]) -> Result<Vec<u8>> {
                     }
                 }
             }
+            CheckpointObjectIoOperation::VerifySnapshot {
+                head,
+                cataloged_commits,
+                checkpoints,
+            } => {
+                if cfg!(debug_assertions)
+                    && let Some(ready) = std::env::var_os("LIBRA_TEST_CHECKPOINT_VERIFY_READY_FILE")
+                {
+                    let _ = std::fs::write(ready, b"ready");
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                let specs = checkpoints
+                    .iter()
+                    .map(|checkpoint| CheckpointDurabilitySpec {
+                        checkpoint_id: &checkpoint.checkpoint_id,
+                        traces_commit: &checkpoint.traces_commit,
+                        tree_oid: &checkpoint.tree_oid,
+                        metadata_blob_oid: &checkpoint.metadata_blob_oid,
+                    })
+                    .collect::<Vec<_>>();
+                match parse_cataloged_traces_commits(&cataloged_commits).and_then(
+                    |cataloged_commits| {
+                        let head = ObjectHash::from_str(&head)
+                            .map_err(|error| anyhow!("invalid traces snapshot head: {error}"))?;
+                        checkpoint_snapshot_durable_oids_from_head(
+                            &repo_path,
+                            head,
+                            &cataloged_commits,
+                            &specs,
+                            None,
+                        )
+                    },
+                ) {
+                    Ok(oids) => {
+                        let mut oids = oids.into_iter().collect::<Vec<_>>();
+                        oids.sort();
+                        CheckpointObjectIoHelperResponse::Verified { oids }
+                    }
+                    Err(error) => CheckpointObjectIoHelperResponse::Error {
+                        message: format!("checkpoint snapshot is not durable: {error:#}"),
+                    },
+                }
+            }
         },
     };
     serde_json::to_vec(&response).context("encode checkpoint object-I/O helper response")
@@ -796,7 +877,7 @@ async fn invoke_checkpoint_object_helper(
         );
     }
     if Instant::now() >= deadline {
-        bail!("checkpoint append exceeded the historical import execution deadline");
+        bail!("checkpoint object I/O exceeded its command deadline");
     }
 
     let program = std::env::current_exe().context("resolve checkpoint object-I/O helper")?;
@@ -837,7 +918,7 @@ async fn invoke_checkpoint_object_helper(
         }
         Err(_) => {
             terminate_checkpoint_object_helper(child, stdout_task);
-            bail!("checkpoint append exceeded the historical import execution deadline");
+            bail!("checkpoint object I/O exceeded its command deadline");
         }
     }
     drop(stdin);
@@ -848,15 +929,13 @@ async fn invoke_checkpoint_object_helper(
             Ok(result) => result.context("wait for checkpoint object-I/O helper")?,
             Err(_) => {
                 terminate_checkpoint_object_helper(child, stdout_task);
-                bail!("checkpoint append exceeded the historical import execution deadline");
+                bail!("checkpoint object I/O exceeded its command deadline");
             }
         };
     let response_bytes =
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), stdout_task)
             .await
-            .map_err(|_| {
-                anyhow!("checkpoint append exceeded the historical import execution deadline")
-            })?
+            .map_err(|_| anyhow!("checkpoint object I/O exceeded its command deadline"))?
             .context("join checkpoint object-I/O response reader")?
             .context("read checkpoint object-I/O response")?;
     if !status.success() || response_bytes.len() as u64 > CHECKPOINT_OBJECT_IO_HELPER_OUTPUT_CAP {
@@ -1371,7 +1450,8 @@ impl HistoryManager {
             &hash.to_string(),
             o_type,
             size as i64,
-        );
+        )
+        .with_context(|| format!("register durable object-index repair for tree {hash}"))?;
         Ok(hash)
     }
 
@@ -1662,6 +1742,9 @@ impl HistoryManager {
                 CheckpointObjectIoHelperResponse::Read { .. } => {
                     bail!("checkpoint object-I/O helper returned a read response for a write")
                 }
+                CheckpointObjectIoHelperResponse::Verified { .. } => {
+                    bail!("checkpoint object-I/O helper returned a verify response for a write")
+                }
             }
         } else {
             write_git_object_with_status(&self.repo_path, object_type, data)
@@ -1686,7 +1769,8 @@ impl HistoryManager {
             &oid.to_string(),
             index_type,
             data.len() as i64,
-        );
+        )
+        .with_context(|| format!("register durable object-index repair for {what} {oid}"))?;
         Ok(oid)
     }
 
@@ -1733,6 +1817,9 @@ impl HistoryManager {
             }
             CheckpointObjectIoHelperResponse::Written { .. } => {
                 bail!("checkpoint object-I/O helper returned a write response for a read")
+            }
+            CheckpointObjectIoHelperResponse::Verified { .. } => {
+                bail!("checkpoint object-I/O helper returned a verify response for a read")
             }
         }
     }
@@ -2794,6 +2881,7 @@ impl HistoryManager {
         .await
     }
 
+    #[cfg(test)]
     async fn reachable_rejected_objects_with_limits(
         &self,
         ref_heads: Vec<ObjectHash>,
@@ -2975,7 +3063,7 @@ impl HistoryManager {
     }
 
     /// Drain all durable rejected-append cleanup jobs in one serialized
-    /// reachability pass. A non-cleanup live writer defers the pass; pending
+    /// root-fenced ownership retirement. A non-cleanup live writer defers retirement; pending
     /// jobs themselves may be expired and are still never forgotten.
     async fn drain_rejected_checkpoint_cleanup_jobs(&self) -> Result<()> {
         self.drain_rejected_checkpoint_cleanup_jobs_ignoring(None)
@@ -2983,10 +3071,10 @@ impl HistoryManager {
     }
 
     /// Doctor repair entry point for one valid expired marker. The shared
-    /// serialized drain performs a fail-closed all-ref reachability diagnostic
-    /// before retiring ownership. Physical payload reclamation remains the
-    /// repository GC's responsibility. Returns whether the named marker was
-    /// fully retired.
+    /// serialized drain revalidates repository roots and writer state before
+    /// retiring ownership. Physical payload reachability and reclamation remain
+    /// the repository GC's responsibility. Returns whether the named marker
+    /// was fully retired.
     pub async fn repair_expired_traces_inflight_marker(
         &self,
         session_id: &str,
@@ -3037,9 +3125,9 @@ impl HistoryManager {
         }
         let cleanup_deadline = Instant::now() + rejected_cleanup_traversal_duration();
 
-        // Snapshot all DB and filesystem GC roots without a SQLite writer
-        // transaction. The potentially expensive object walk below therefore
-        // never stalls ordinary repository writes.
+        // Snapshot all DB and filesystem roots without a SQLite writer
+        // transaction. Index helpers remain bounded and therefore do not hold
+        // the repository writer lock while inspecting filesystem state.
         let initial = self
             .rejected_cleanup_root_snapshot(self.db_conn.as_ref(), cleanup_deadline)
             .await
@@ -3080,56 +3168,18 @@ impl HistoryManager {
             .into());
         }
 
-        let candidates = initial.db.candidates.clone();
-        let mut reachable = if candidates.is_empty() {
-            HashSet::new()
-        } else {
-            let heads = initial
-                .db
-                .graph_roots
-                .iter()
-                .map(|value| {
-                    ObjectHash::from_str(value).map_err(|error| {
-                        anyhow!("repository cleanup root {value} is invalid: {error}")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            self.reachable_rejected_objects_with_limits(
-                heads,
-                &candidates,
-                REJECTED_CLEANUP_MAX_INFLATED_OBJECT_BYTES,
-                REJECTED_CLEANUP_MAX_VISITED_OBJECTS,
-                cleanup_deadline,
-            )
-            .await
-            .map_err(|error| RejectedCheckpointCleanupDeferred {
-                reason: format!("repository reachability could not be proven: {error:#}"),
-            })?
-        };
-        reachable.extend(candidates.intersection(&initial.index_roots).cloned());
-        for marker in initial
-            .db
-            .markers
-            .iter()
-            .filter(|marker| !marker.cleanup_pending && marker.is_live(now_ms))
-        {
-            reachable.extend(
-                marker
-                    .oids
-                    .iter()
-                    .chain(&marker.created_oids)
-                    .filter(|oid| candidates.contains(*oid))
-                    .cloned(),
-            );
-        }
-        let unreachable = candidates
-            .difference(&reachable)
-            .cloned()
-            .collect::<Vec<_>>();
+        // Rejected-checkpoint cleanup is deliberately non-destructive: it
+        // retires durable writer ownership but leaves both payloads and
+        // object-index rows for repository GC. Walking every ref graph here
+        // therefore cannot make a deletion safer, while a large unrelated
+        // history can make the marker impossible to retire. The stable root
+        // snapshots below still fence concurrent writers and repository
+        // operations; GC performs the eventual reachability proof when it
+        // actually reclaims objects.
 
-        // Re-read every root after traversal. Any concurrent ref, reflog,
+        // Re-read every root before retirement. Any concurrent ref, reflog,
         // worktree-index, operation-state, marker, or catalog change makes
-        // the proof stale and leaves the durable cleanup job for a retry.
+        // the fence stale and leaves the durable cleanup job for a retry.
         let revalidated = self
             .rejected_cleanup_root_snapshot(self.db_conn.as_ref(), cleanup_deadline)
             .await
@@ -3138,8 +3188,7 @@ impl HistoryManager {
             })?;
         if revalidated != initial {
             return Err(RejectedCheckpointCleanupDeferred {
-                reason: "repository cleanup roots changed during reachability traversal"
-                    .to_string(),
+                reason: "repository cleanup roots changed before ownership retirement".to_string(),
             }
             .into());
         }
@@ -3164,7 +3213,7 @@ impl HistoryManager {
         if locked_db != revalidated.db {
             txn.rollback().await.ok();
             return Err(RejectedCheckpointCleanupDeferred {
-                reason: "database cleanup roots changed before the deletion lock was acquired"
+                reason: "database cleanup roots changed before the retirement lock was acquired"
                     .to_string(),
             }
             .into());
@@ -3194,7 +3243,7 @@ impl HistoryManager {
         {
             txn.rollback().await.ok();
             return Err(RejectedCheckpointCleanupDeferred {
-                reason: "filesystem cleanup roots changed before deletion".to_string(),
+                reason: "filesystem cleanup roots changed before ownership retirement".to_string(),
             }
             .into());
         }
@@ -3225,18 +3274,9 @@ impl HistoryManager {
             }
             .into());
         }
-        if !unreachable.is_empty() {
-            // Do not unlink shared content-addressed payloads here. Worktree
-            // index writers do not participate in this SQLite lock, so an
-            // index could begin referencing a candidate after the final root
-            // snapshot. Retire attempt ownership and leave the payload plus
-            // object_index row for repository GC, whose grace/locking policy
-            // is the correct place for physical reclamation.
-            tracing::debug!(
-                orphaned_objects = unreachable.len(),
-                "retiring rejected checkpoint ownership without inline object deletion"
-            );
-        }
+        // Do not unlink shared content-addressed payloads or object-index rows
+        // here. Repository GC owns physical reclamation and its reachability
+        // proof; this transaction only retires exact marker generations.
         for marker in pending {
             clear_traces_inflight_marker(&txn, &marker.session_id, &marker.attempt_id).await?;
         }
@@ -3263,6 +3303,15 @@ impl HistoryManager {
     pub async fn prune_checkpoint_commits(
         &self,
         checkpoint_ids_to_remove: &[String],
+    ) -> Result<CheckpointPruneOutcome> {
+        self.prune_checkpoint_commits_inner(checkpoint_ids_to_remove, true)
+            .await
+    }
+
+    async fn prune_checkpoint_commits_inner(
+        &self,
+        checkpoint_ids_to_remove: &[String],
+        record_cloud_tombstones: bool,
     ) -> Result<CheckpointPruneOutcome> {
         // AG-20 observability (`agent.md` §6): one `agent.clean.prune` span
         // per prune. Required fields: deleted_objects, deleted_sessions,
@@ -3324,16 +3373,23 @@ impl HistoryManager {
 
             // AG-20 window A/B guards — both must pass before any rewrite.
             if let Err(guard_err) = self.enforce_prune_window_guards(expected_head, &rows).await {
-                let guard_label = match guard_err.downcast_ref::<CheckpointPruneGuardError>() {
-                    Some(CheckpointPruneGuardError::LiveWriterMarker { .. }) => {
-                        "live_marker_blocked"
+                let guard_label = if guard_err
+                    .downcast_ref::<SubagentContentReservationPruneGuard>()
+                    .is_some()
+                {
+                    "subagent_reservation_blocked"
+                } else {
+                    match guard_err.downcast_ref::<CheckpointPruneGuardError>() {
+                        Some(CheckpointPruneGuardError::LiveWriterMarker { .. }) => {
+                            "live_marker_blocked"
+                        }
+                        Some(CheckpointPruneGuardError::RefCatalogOrphans { .. }) => {
+                            "catalog_orphans_blocked"
+                        }
+                        // A guard that cannot complete (unreadable chain,
+                        // marker-listing failure) still fails the prune closed.
+                        None => "guard_check_failed",
                     }
-                    Some(CheckpointPruneGuardError::RefCatalogOrphans { .. }) => {
-                        "catalog_orphans_blocked"
-                    }
-                    // A guard that cannot complete (unreadable chain,
-                    // marker-listing failure) still fails the prune closed.
-                    None => "guard_check_failed",
                 };
                 finish_span(guard_label, 0);
                 return Err(guard_err);
@@ -3358,6 +3414,7 @@ impl HistoryManager {
                     &rewritten,
                     &existing_remove_ids,
                     &unreachable_oids,
+                    record_cloud_tombstones,
                 )
                 .await?
             {
@@ -3448,6 +3505,44 @@ impl HistoryManager {
                 .begin()
                 .await
                 .context("begin agent erasure tombstone transaction")?;
+            let incarnation_namespace = uuid::Uuid::new_v4().simple().to_string();
+            let incarnation = txn
+                .execute(Statement::from_sql_and_values(
+                    backend,
+                    "INSERT INTO agent_capture_incarnation (
+                        agent_kind, provider_session_id, next_session_sync_revision,
+                        source_namespace, updated_at
+                     )
+                     SELECT agent_kind, provider_session_id,
+                            MAX(sync_revision + 1, 2), ?, ?
+                     FROM agent_session WHERE session_id = ?
+                     ON CONFLICT(agent_kind, provider_session_id) DO UPDATE SET
+                        next_session_sync_revision = MAX(
+                            agent_capture_incarnation.next_session_sync_revision,
+                            excluded.next_session_sync_revision
+                        ),
+                        source_namespace = excluded.source_namespace,
+                        updated_at = excluded.updated_at",
+                    [
+                        incarnation_namespace.into(),
+                        chrono::Utc::now().timestamp_millis().into(),
+                        session_id.into(),
+                    ],
+                ))
+                .await
+                .context("preserve agent capture replication incarnation before erasure")?;
+            if incarnation.rows_affected() != 1 {
+                if let Err(rollback) = txn.rollback().await {
+                    bail!(
+                        "agent session disappeared while preserving its cloud replication \
+                         incarnation, and rolling back that failed transaction also failed: \
+                         {rollback}; retry the erase after checking the local database"
+                    );
+                }
+                bail!(
+                    "agent session disappeared while preserving its cloud replication incarnation; retry the erase"
+                );
+            }
             txn.execute(Statement::from_sql_and_values(
                 backend,
                 "INSERT INTO agent_import_tombstone (
@@ -3565,7 +3660,12 @@ impl HistoryManager {
 
         // Prune the checkpoints (ref rewrite + row + object_index) BEFORE
         // deleting the session row.
-        let prune = self.prune_checkpoint_commits(&checkpoint_ids).await?;
+        // Session erasure deliberately remains local-only (ADR-DR-15). Do not
+        // create ordinary retention tombstones here: a later cloud restore is
+        // documented to be able to resurrect the remote session snapshot.
+        let prune = self
+            .prune_checkpoint_commits_inner(&checkpoint_ids, false)
+            .await?;
 
         // Delete the session row (cascades claims/revisions/checkpoints) and
         // application-owned import/export job rows together. The tombstone is
@@ -3583,6 +3683,18 @@ impl HistoryManager {
             ))
             .await
             .context("delete agent_session row for erasure")?;
+        txn.execute(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM metadata_kv WHERE scope = ? AND target = ?",
+            [
+                crate::internal::metadata::MetadataScope::AgentImportIndexRepair
+                    .as_str()
+                    .into(),
+                session_id.into(),
+            ],
+        ))
+        .await
+        .context("delete import object-index repair marker for erased session")?;
         if let Some((agent_kind, provider_session_id)) = provider_identity {
             txn.execute(Statement::from_sql_and_values(
                 backend,
@@ -3648,6 +3760,34 @@ impl HistoryManager {
                 session_id: marker.session_id.clone(),
                 attempt_id: marker.attempt_id.clone(),
                 ttl_ms: marker.ttl_ms,
+            }
+            .into());
+        }
+
+        // DR-06 closes the short reservation→marker window: a subagent
+        // source claim is durable before its marker can be registered. A
+        // whole-chain prune in that interval could delete the claim's current
+        // leaf and invalidate the writer's source revision base, so fail
+        // closed on every unexpired reservation just as we do for markers.
+        let reserved = self
+            .db_conn
+            .query_one(Statement::from_sql_and_values(
+                self.db_conn.get_database_backend(),
+                "SELECT parent_session_id, attempt_checkpoint_id, lease_expires_at
+                 FROM agent_subagent_content_claim
+                 WHERE state = 'reserved' AND lease_expires_at > ?
+                 ORDER BY lease_expires_at LIMIT 1",
+                [now_ms.into()],
+            ))
+            .await
+            .context("failed to verify subagent content reservations (prune fails closed)")?;
+        if let Some(row) = reserved {
+            return Err(SubagentContentReservationPruneGuard {
+                session_id: row.try_get_by("parent_session_id")?,
+                attempt_id: row
+                    .try_get_by::<Option<String>, _>("attempt_checkpoint_id")?
+                    .unwrap_or_else(|| "reservation-before-checkpoint-bind".to_string()),
+                lease_expires_at: row.try_get_by("lease_expires_at")?,
             }
             .into());
         }
@@ -3830,7 +3970,10 @@ impl HistoryManager {
             &commit_hash.to_string(),
             "commit",
             commit_data.len() as i64,
-        );
+        )
+        .with_context(|| {
+            format!("register durable object-index repair for rewritten commit {commit_hash}")
+        })?;
         Ok(commit_hash)
     }
 
@@ -3851,9 +3994,19 @@ impl HistoryManager {
         rewritten: &[RewrittenCheckpoint],
         remove_ids: &HashSet<String>,
         unreachable_oids: &[String],
+        record_cloud_tombstones: bool,
     ) -> Result<(RefUpdateOutcome, u64, u64, u64)> {
         let expected_commit = expected_head.map(|hash| hash.to_string());
         let new_commit = new_head.map(|hash| hash.to_string());
+        let _object_index_deletion_fence =
+            crate::utils::client_storage::acquire_object_index_deletion_fence(
+                &self.repo_path.join(crate::utils::util::DATABASE),
+                unreachable_oids,
+            )
+            .await
+            .with_context(|| {
+                "refusing checkpoint prune because concurrent object-index repair work could recreate a deleted catalog row; retry after the repair marker drains"
+            })?;
 
         'retry_sqlite: for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
             let txn: DatabaseTransaction = match self.db_conn.begin().await {
@@ -3931,7 +4084,8 @@ impl HistoryManager {
                 if let Err(err) = txn
                     .execute(Statement::from_sql_and_values(
                         backend,
-                        "UPDATE agent_checkpoint SET traces_commit = ?, tree_oid = ? \
+                        "UPDATE agent_checkpoint SET traces_commit = ?, tree_oid = ?, \
+                            sync_revision = sync_revision + 1 \
                          WHERE checkpoint_id = ?",
                         vec![
                             Value::from(item.traces_commit.to_string()),
@@ -3955,6 +4109,81 @@ impl HistoryManager {
 
             let mut removed = 0;
             for id in remove_ids {
+                if record_cloud_tombstones {
+                    txn.execute(Statement::from_sql_and_values(
+                        backend,
+                        "INSERT INTO agent_checkpoint_prune_tombstone (
+                            checkpoint_id, session_id, pruned_at
+                         )
+                         SELECT checkpoint_id, session_id, ?
+                         FROM agent_checkpoint WHERE checkpoint_id = ?
+                         ON CONFLICT(checkpoint_id) DO UPDATE SET
+                            session_id = excluded.session_id,
+                            pruned_at = MAX(
+                                agent_checkpoint_prune_tombstone.pruned_at,
+                                excluded.pruned_at
+                            )",
+                        [
+                            Value::from(chrono::Utc::now().timestamp_millis()),
+                            Value::from(id.clone()),
+                        ],
+                    ))
+                    .await
+                    .context("record cloud fence for pruned checkpoint")?;
+                }
+                // DR-06: subagent content revisions are source-scoped, not
+                // checkpoint-parent scoped. Repoint the current source leaf
+                // to its newest surviving revision before the checkpoint FK
+                // cascades its revision/link.  Keep an empty claim as the
+                // durable revision high-water mark so a later capture cannot
+                // reuse an audited revision number for different content.
+                txn.execute(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM agent_subagent_content_revision
+                     WHERE checkpoint_id = ?",
+                    [Value::from(id.clone())],
+                ))
+                .await
+                .context("delete subagent content revision for pruned checkpoint")?;
+                txn.execute(Statement::from_sql_and_values(
+                    backend,
+                    "UPDATE agent_subagent_content_claim
+                     SET sync_revision = sync_revision + 1,
+                         current_revision = COALESCE((
+                           SELECT r.revision FROM agent_subagent_content_revision r
+                           WHERE r.parent_session_id = agent_subagent_content_claim.parent_session_id
+                             AND r.provider_kind = agent_subagent_content_claim.provider_kind
+                             AND r.source_key = agent_subagent_content_claim.source_key
+                             AND r.content_schema_version = agent_subagent_content_claim.content_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ), 0),
+                         current_checkpoint_id = (
+                           SELECT r.checkpoint_id FROM agent_subagent_content_revision r
+                           WHERE r.parent_session_id = agent_subagent_content_claim.parent_session_id
+                             AND r.provider_kind = agent_subagent_content_claim.provider_kind
+                             AND r.source_key = agent_subagent_content_claim.source_key
+                             AND r.content_schema_version = agent_subagent_content_claim.content_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ),
+                         current_digest = (
+                           SELECT r.content_digest FROM agent_subagent_content_revision r
+                           WHERE r.parent_session_id = agent_subagent_content_claim.parent_session_id
+                             AND r.provider_kind = agent_subagent_content_claim.provider_kind
+                             AND r.source_key = agent_subagent_content_claim.source_key
+                             AND r.content_schema_version = agent_subagent_content_claim.content_schema_version
+                           ORDER BY r.revision DESC LIMIT 1
+                         ),
+                         state = 'idle', attempt_digest = NULL,
+                         attempt_checkpoint_id = NULL, owner = NULL,
+                         lease_expires_at = NULL, updated_at = ?
+                     WHERE current_checkpoint_id = ?",
+                    [
+                        Value::from(chrono::Utc::now().timestamp_millis()),
+                        Value::from(id.clone()),
+                    ],
+                ))
+                .await
+                .context("repoint subagent content claim after checkpoint prune")?;
                 // GC-DR-11: coverage revisions/current pointers and import
                 // attempt cursors are part of the same catalog fact as the
                 // checkpoint. Reconcile them before deleting the row so no
@@ -4601,6 +4830,20 @@ pub struct CheckpointPruneOutcome {
 )]
 struct RejectedCheckpointCleanupDeferred {
     reason: String,
+}
+
+/// M5 reservation→marker guard kept crate-private so adding this refusal does
+/// not add a variant to the exhaustively matchable public guard enum.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "refusing to prune traces checkpoints: a subagent content write is reserved \
+     (session '{session_id}', attempt '{attempt_id}', lease expires at \
+     {lease_expires_at}); retry once the writer finishes or the lease expires"
+)]
+pub(crate) struct SubagentContentReservationPruneGuard {
+    session_id: String,
+    attempt_id: String,
+    lease_expires_at: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -5380,6 +5623,416 @@ pub async fn agent_checkpoint_id_for_traces_commit<C: ConnectionTrait>(
     .transpose()
 }
 
+#[cfg(test)]
+pub(crate) async fn checkpoint_leaf_durable_oids<C: ConnectionTrait>(
+    conn: &C,
+    repo_path: &Path,
+    checkpoint_id: &str,
+    traces_commit: &str,
+    tree_oid: &str,
+    metadata_blob_oid: &str,
+) -> Result<HashSet<String>> {
+    checkpoint_snapshot_durable_oids(
+        conn,
+        repo_path,
+        &[CheckpointDurabilitySpec {
+            checkpoint_id,
+            traces_commit,
+            tree_oid,
+            metadata_blob_oid,
+        }],
+        None,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CheckpointDurabilitySpec<'a> {
+    pub checkpoint_id: &'a str,
+    pub traces_commit: &'a str,
+    pub tree_oid: &'a str,
+    pub metadata_blob_oid: &'a str,
+}
+
+const CHECKPOINT_DURABILITY_MAX_REACHABLE_COMMITS: usize = 100_000;
+const CHECKPOINT_DURABILITY_MAX_OBJECTS: usize = 100_000;
+
+fn insert_durable_oid_bounded(
+    durable_oids: &mut HashSet<String>,
+    oid: String,
+    max_objects: usize,
+) -> Result<()> {
+    if !durable_oids.contains(&oid) && durable_oids.len() >= max_objects {
+        bail!("checkpoint durability verification exceeded its aggregate object limit");
+    }
+    durable_oids.insert(oid);
+    Ok(())
+}
+
+/// Verify a whole capture snapshot with one first-parent traversal. The older
+/// per-leaf probe is intentionally retained as a one-item wrapper above for
+/// unchanged-replay callers, while cloud sync uses this bounded batch form to
+/// avoid quadratic commit reads.
+pub(crate) async fn checkpoint_snapshot_durable_oids<C: ConnectionTrait>(
+    conn: &C,
+    repo_path: &Path,
+    checkpoints: &[CheckpointDurabilitySpec<'_>],
+    deadline: Option<Instant>,
+) -> Result<HashSet<String>> {
+    #[cfg(test)]
+    TEST_CHECKPOINT_SNAPSHOT_VERIFY_COUNT
+        .try_with(|count| count.set(count.get().saturating_add(1)))
+        .ok();
+    if checkpoints.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let catalog_rows = conn
+        .query_all(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT traces_commit FROM agent_checkpoint ORDER BY traces_commit".to_string(),
+        ))
+        .await
+        .context("load checkpoint catalog while verifying traces durability")?;
+    if catalog_rows.len() > CHECKPOINT_DURABILITY_MAX_REACHABLE_COMMITS {
+        bail!("checkpoint catalog exceeds its durability verification limit");
+    }
+    let cataloged_commits = catalog_rows
+        .into_iter()
+        .map(|row| row.try_get_by::<String, _>("traces_commit"))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("decode checkpoint catalog traces commits")?;
+    checkpoint_snapshot_durable_oids_with_catalog(
+        conn,
+        repo_path,
+        checkpoints,
+        cataloged_commits,
+        deadline,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn checkpoint_rows_snapshot_durable_oids<C: ConnectionTrait>(
+    conn: &C,
+    repo_path: &Path,
+    checkpoints: &[CheckpointDurabilitySpec<'_>],
+    deadline: Option<Instant>,
+) -> Result<HashSet<String>> {
+    if checkpoints.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let cataloged_commits = checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.traces_commit.to_string())
+        .collect::<Vec<_>>();
+    checkpoint_snapshot_durable_oids_with_catalog(
+        conn,
+        repo_path,
+        checkpoints,
+        cataloged_commits,
+        deadline,
+    )
+    .await
+}
+
+async fn checkpoint_snapshot_durable_oids_with_catalog<C: ConnectionTrait>(
+    conn: &C,
+    repo_path: &Path,
+    checkpoints: &[CheckpointDurabilitySpec<'_>],
+    cataloged_commits: Vec<String>,
+    deadline: Option<Instant>,
+) -> Result<HashSet<String>> {
+    let head_row = conn
+        .query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT `commit` FROM reference
+             WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
+            [crate::internal::branch::TRACES_BRANCH.into()],
+        ))
+        .await
+        .context("resolve traces ref while verifying unchanged checkpoint")?;
+    let head = head_row
+        .map(|row| {
+            row.try_get_by::<Option<String>, _>("commit")
+                .context("decode refs/libra/traces head")
+        })
+        .transpose()?
+        .flatten()
+        .context("refs/libra/traces is missing while verifying unchanged checkpoint")?;
+    checkpoint_rows_snapshot_durable_oids_from_head(
+        repo_path,
+        &head,
+        &cataloged_commits,
+        checkpoints,
+        deadline,
+    )
+    .await
+}
+
+/// Verify a supplied checkpoint catalog against an explicitly fenced traces
+/// head. Cloud restore uses the head stored in the completed capture manifest
+/// instead of trusting independently uploaded generic reference metadata.
+pub(crate) async fn checkpoint_rows_snapshot_durable_oids_from_head(
+    repo_path: &Path,
+    head: &str,
+    cataloged_commits: &[String],
+    checkpoints: &[CheckpointDurabilitySpec<'_>],
+    deadline: Option<Instant>,
+) -> Result<HashSet<String>> {
+    let parsed_head = ObjectHash::from_str(head)
+        .map_err(|error| anyhow!("invalid fenced refs/libra/traces head: {error}"))?;
+
+    #[cfg(not(test))]
+    if let Some(deadline) = deadline {
+        let checkpoints = checkpoints
+            .iter()
+            .map(|checkpoint| CheckpointDurabilityHelperSpec {
+                checkpoint_id: checkpoint.checkpoint_id.to_string(),
+                traces_commit: checkpoint.traces_commit.to_string(),
+                tree_oid: checkpoint.tree_oid.to_string(),
+                metadata_blob_oid: checkpoint.metadata_blob_oid.to_string(),
+            })
+            .collect();
+        return match invoke_checkpoint_object_helper(
+            repo_path,
+            CheckpointObjectIoOperation::VerifySnapshot {
+                head: head.to_string(),
+                cataloged_commits: cataloged_commits.to_vec(),
+                checkpoints,
+            },
+            deadline,
+        )
+        .await?
+        {
+            CheckpointObjectIoHelperResponse::Verified { oids } => Ok(oids.into_iter().collect()),
+            CheckpointObjectIoHelperResponse::Error { message } => bail!("{message}"),
+            CheckpointObjectIoHelperResponse::Read { .. }
+            | CheckpointObjectIoHelperResponse::Written { .. } => {
+                bail!("checkpoint object-I/O helper returned a non-verify response")
+            }
+        };
+    }
+
+    let cataloged_commits = parse_cataloged_traces_commits(cataloged_commits)?;
+    checkpoint_snapshot_durable_oids_from_head(
+        repo_path,
+        parsed_head,
+        &cataloged_commits,
+        checkpoints,
+        deadline,
+    )
+}
+
+fn parse_cataloged_traces_commits(commits: &[String]) -> Result<HashSet<String>> {
+    if commits.len() > CHECKPOINT_DURABILITY_MAX_REACHABLE_COMMITS {
+        bail!("checkpoint catalog exceeds its durability verification limit");
+    }
+    Ok(commits.iter().cloned().collect())
+}
+
+fn checkpoint_snapshot_durable_oids_from_head(
+    repo_path: &Path,
+    head: ObjectHash,
+    cataloged_commits: &HashSet<String>,
+    checkpoints: &[CheckpointDurabilitySpec<'_>],
+    deadline: Option<Instant>,
+) -> Result<HashSet<String>> {
+    const MAX_CHECKPOINT_OBJECTS: usize = 16_384;
+    const MAX_COMMIT_OR_TREE_BYTES: u64 = 4 * 1024 * 1024;
+    const MAX_CHECKPOINT_BLOB_BYTES: u64 = 32 * 1024 * 1024;
+
+    let mut expected = HashMap::new();
+    for checkpoint in checkpoints {
+        let commit = ObjectHash::from_str(checkpoint.traces_commit)
+            .map_err(|error| anyhow!("invalid checkpoint traces commit: {error}"))?;
+        let tree = ObjectHash::from_str(checkpoint.tree_oid)
+            .map_err(|error| anyhow!("invalid checkpoint root tree: {error}"))?;
+        if expected.insert(commit, tree).is_some() {
+            bail!("multiple checkpoints share one traces commit");
+        }
+    }
+
+    let mut next = Some(head);
+    let mut visited = HashSet::new();
+    let mut durable_oids = HashSet::new();
+    let mut found_trees = HashMap::new();
+    while let Some(oid) = next {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!("checkpoint snapshot durability verification exceeded its deadline");
+        }
+        if !visited.insert(oid) {
+            bail!("refs/libra/traces contains a first-parent cycle");
+        }
+        let oid_text = oid.to_string();
+        insert_durable_oid_bounded(
+            &mut durable_oids,
+            oid_text.clone(),
+            CHECKPOINT_DURABILITY_MAX_OBJECTS,
+        )?;
+        if visited.len() > CHECKPOINT_DURABILITY_MAX_REACHABLE_COMMITS {
+            bail!("refs/libra/traces reachability probe exceeded its commit limit");
+        }
+        if !cataloged_commits.contains(&oid_text) {
+            bail!(
+                "refs/libra/traces reaches uncataloged commit {oid}; run `libra agent doctor --repair` before cloud sync or replay"
+            );
+        }
+        let (object_type, data) =
+            read_git_object_bounded_validated(repo_path, &oid, MAX_COMMIT_OR_TREE_BYTES)
+                .with_context(|| format!("read traces commit {oid}"))?;
+        if object_type != "commit" {
+            bail!("traces ref points through non-commit object {oid}");
+        }
+        let commit = Commit::from_bytes(&data, oid)
+            .map_err(|error| anyhow!("parse traces commit {oid}: {error}"))?;
+        if let Some(expected_tree) = expected.get(&oid) {
+            if commit.tree_id != *expected_tree {
+                bail!("checkpoint commit root tree no longer matches its catalog row");
+            }
+            found_trees.insert(oid, commit.tree_id);
+        }
+        next = commit.parent_commit_ids.first().copied();
+    }
+    if found_trees.len() != expected.len() {
+        bail!("one or more checkpoint commits are no longer reachable from refs/libra/traces");
+    }
+
+    for checkpoint in checkpoints {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!("checkpoint snapshot durability verification exceeded its deadline");
+        }
+        let expected_tree = ObjectHash::from_str(checkpoint.tree_oid)
+            .map_err(|error| anyhow!("invalid checkpoint root tree: {error}"))?;
+        let expected_metadata = ObjectHash::from_str(checkpoint.metadata_blob_oid)
+            .map_err(|error| anyhow!("invalid checkpoint metadata blob: {error}"))?;
+        let mut leaf_oids = checkpoint_leaf_tree_durable_oids(
+            repo_path,
+            checkpoint.checkpoint_id,
+            expected_tree,
+            expected_metadata,
+            deadline,
+            MAX_CHECKPOINT_OBJECTS,
+            MAX_COMMIT_OR_TREE_BYTES,
+            MAX_CHECKPOINT_BLOB_BYTES,
+        )?;
+        for oid in leaf_oids.drain() {
+            insert_durable_oid_bounded(&mut durable_oids, oid, CHECKPOINT_DURABILITY_MAX_OBJECTS)?;
+        }
+    }
+    Ok(durable_oids)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_leaf_tree_durable_oids(
+    repo_path: &Path,
+    checkpoint_id: &str,
+    expected_tree: ObjectHash,
+    expected_metadata: ObjectHash,
+    deadline: Option<Instant>,
+    max_checkpoint_objects: usize,
+    max_commit_or_tree_bytes: u64,
+    max_checkpoint_blob_bytes: u64,
+) -> Result<HashSet<String>> {
+    let mut durable_oids = HashSet::new();
+    let (root_type, root_bytes) =
+        read_git_object_bounded_validated(repo_path, &expected_tree, max_commit_or_tree_bytes)
+            .context("read checkpoint root tree")?;
+    if root_type != "tree" {
+        bail!("checkpoint root object is not a tree");
+    }
+    durable_oids.insert(expected_tree.to_string());
+    let root = Tree::from_bytes(&root_bytes, expected_tree)
+        .map_err(|error| anyhow!("parse checkpoint root tree: {error}"))?;
+    let (prefix, rest) = checkpoint_tree_path(checkpoint_id)?;
+    let (checkpoint_root_oid, checkpoint_root) =
+        tree_child(repo_path, &root.tree_items, "checkpoint")?
+            .context("checkpoint root tree has no checkpoint directory")?;
+    durable_oids.insert(checkpoint_root_oid.to_string());
+    let (prefix_root_oid, prefix_root) = tree_child(repo_path, &checkpoint_root, &prefix)?
+        .context("checkpoint root tree has no checkpoint prefix directory")?;
+    durable_oids.insert(prefix_root_oid.to_string());
+    let leaf_oid = prefix_root
+        .iter()
+        .find(|item| item.name == rest && item.mode == TreeItemMode::Tree)
+        .map(|item| item.id)
+        .context("checkpoint root tree has no durable leaf for the checkpoint id")?;
+
+    let mut stack = vec![leaf_oid];
+    let mut object_count = 0_usize;
+    let mut metadata_matches = false;
+    let mut seen = HashSet::new();
+    while let Some(oid) = stack.pop() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!("checkpoint snapshot durability verification exceeded its deadline");
+        }
+        if !seen.insert(oid) {
+            continue;
+        }
+        durable_oids.insert(oid.to_string());
+        object_count = object_count.saturating_add(1);
+        if object_count > max_checkpoint_objects {
+            bail!("checkpoint object verification exceeded its object limit");
+        }
+        let (object_type, data) =
+            read_git_object_bounded_validated(repo_path, &oid, max_checkpoint_blob_bytes)
+                .with_context(|| format!("read checkpoint object {oid}"))?;
+        if object_type != "tree" {
+            bail!("checkpoint directory object {oid} is not a tree");
+        }
+        let tree = Tree::from_bytes(&data, oid)
+            .map_err(|error| anyhow!("parse checkpoint tree {oid}: {error}"))?;
+        for item in tree.tree_items {
+            if oid == leaf_oid && item.name == "metadata.json" {
+                if item.mode == TreeItemMode::Tree || item.id != expected_metadata {
+                    bail!("checkpoint metadata blob no longer matches its catalog row");
+                }
+                metadata_matches = true;
+            }
+            if item.mode == TreeItemMode::Tree {
+                stack.push(item.id);
+                continue;
+            }
+            let (object_type, _) =
+                read_git_object_bounded_validated(repo_path, &item.id, max_checkpoint_blob_bytes)
+                    .with_context(|| format!("read checkpoint blob {}", item.id))?;
+            if object_type != "blob" {
+                bail!("checkpoint leaf {} is not a blob", item.id);
+            }
+            durable_oids.insert(item.id.to_string());
+            object_count = object_count.saturating_add(1);
+            if object_count > max_checkpoint_objects {
+                bail!("checkpoint object verification exceeded its object limit");
+            }
+        }
+    }
+    if !metadata_matches {
+        bail!("checkpoint leaf has no matching metadata.json blob");
+    }
+    Ok(durable_oids)
+}
+
+fn tree_child(
+    repo_path: &Path,
+    items: &[TreeItem],
+    name: &str,
+) -> Result<Option<(ObjectHash, Vec<TreeItem>)>> {
+    let Some(entry) = items
+        .iter()
+        .find(|item| item.name == name && item.mode == TreeItemMode::Tree)
+    else {
+        return Ok(None);
+    };
+    let (object_type, data) =
+        read_git_object_bounded_validated(repo_path, &entry.id, 4 * 1024 * 1024)
+            .with_context(|| format!("read checkpoint tree component {name}"))?;
+    if object_type != "tree" {
+        bail!("checkpoint tree component {name} is not a tree");
+    }
+    let tree = Tree::from_bytes(&data, entry.id)
+        .map_err(|error| anyhow!("parse checkpoint tree component {name}: {error}"))?;
+    Ok(Some((entry.id, tree.tree_items)))
+}
+
 #[derive(Debug, Clone)]
 struct CheckpointHistoryRow {
     checkpoint_id: String,
@@ -5527,6 +6180,34 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, Schema, Statement};
     use tempfile::tempdir;
     use tokio::time::sleep;
+
+    #[test]
+    fn checkpoint_durability_aggregate_object_bound_is_fail_closed() {
+        let mut durable = HashSet::new();
+        insert_durable_oid_bounded(&mut durable, "one".to_string(), 2).expect("first object");
+        insert_durable_oid_bounded(&mut durable, "two".to_string(), 2).expect("second object");
+        insert_durable_oid_bounded(&mut durable, "two".to_string(), 2)
+            .expect("duplicate does not consume the bound");
+        let error = insert_durable_oid_bounded(&mut durable, "three".to_string(), 2)
+            .expect_err("a distinct object beyond the aggregate bound must fail");
+        assert!(error.to_string().contains("aggregate object limit"));
+        assert_eq!(durable.len(), 2);
+    }
+
+    #[test]
+    fn subagent_content_reservation_error_display_is_stable_and_actionable() {
+        let error = SubagentContentReservationPruneGuard {
+            session_id: "session-7".to_string(),
+            attempt_id: "checkpoint-9".to_string(),
+            lease_expires_at: 1_700_000_123_456,
+        };
+        assert_eq!(
+            error.to_string(),
+            "refusing to prune traces checkpoints: a subagent content write is reserved \
+             (session 'session-7', attempt 'checkpoint-9', lease expires at \
+             1700000123456); retry once the writer finishes or the lease expires"
+        );
+    }
 
     #[test]
     fn checkpoint_object_helper_rejects_compression_bomb_before_unbounded_inflate() {
@@ -6811,7 +7492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_ref_defers_rejected_cleanup_and_preserves_ownership() {
+    async fn corrupt_unrelated_ref_does_not_block_nondestructive_rejected_cleanup() {
         use std::io::Write as _;
 
         let dir = tempdir().unwrap();
@@ -6885,14 +7566,25 @@ mod tests {
                 .exists(),
             "fail-closed cleanup deleted a candidate"
         );
-        let error = manager
+        manager
             .drain_rejected_checkpoint_cleanup_jobs()
             .await
-            .expect_err("destructive cleanup must fail closed on a corrupt ref");
-        let rendered = format!("{error:#}");
+            .expect("non-destructive marker retirement must not read an unrelated corrupt ref");
         assert!(
-            rendered.contains("failed integrity check") && rendered.contains("payload hashes to"),
-            "unexpected error: {error:#}"
+            list_all_traces_inflight_markers(&*db_conn)
+                .await
+                .expect("list markers after non-destructive cleanup")
+                .is_empty(),
+            "cleanup ownership marker survived successful retirement"
+        );
+        let candidate = candidate.to_string();
+        assert!(
+            repo_path
+                .join("objects")
+                .join(&candidate[..2])
+                .join(&candidate[2..])
+                .exists(),
+            "non-destructive cleanup removed a rejected payload"
         );
     }
 

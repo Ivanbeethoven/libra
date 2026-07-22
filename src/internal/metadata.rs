@@ -60,6 +60,9 @@ pub const MAX_VALUE_LEN: usize = 1024 * 1024;
 pub enum MetadataScope {
     Branch,
     AgentTracesInflight,
+    /// Durable import-side marker requiring foreground object-index repair
+    /// before an otherwise idempotent replay may become a no-op.
+    AgentImportIndexRepair,
 }
 
 impl MetadataScope {
@@ -67,6 +70,7 @@ impl MetadataScope {
         match self {
             MetadataScope::Branch => "branch",
             MetadataScope::AgentTracesInflight => "agent_traces_inflight",
+            MetadataScope::AgentImportIndexRepair => "agent_import_index_repair",
         }
     }
 }

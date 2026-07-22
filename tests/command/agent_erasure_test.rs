@@ -74,6 +74,47 @@ async fn count(conn: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 #[tokio::test]
+async fn erase_legacy_generation_zero_session_advances_to_fresh_incarnation() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let conn = connect_repo_db(repo.path()).await;
+    seed_session(&conn, "sess-legacy-generation").await;
+    conn.execute(Statement::from_string(
+        conn.get_database_backend(),
+        "UPDATE agent_session SET sync_revision = 0
+         WHERE session_id = 'sess-legacy-generation'"
+            .to_string(),
+    ))
+    .await
+    .expect("model a session restored from the legacy cloud catalog");
+
+    let libra_dir = repo.path().join(".libra");
+    let history = HistoryManager::new_with_ref(
+        Arc::new(ClientStorage::init(libra_dir.join("objects"))),
+        libra_dir,
+        Arc::new(conn.clone()),
+        TRACES_BRANCH,
+    );
+    let outcome = history
+        .erase_session_local("sess-legacy-generation")
+        .await
+        .expect("erase generation-zero legacy session");
+    assert!(outcome.session_deleted);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT next_session_sync_revision AS n
+             FROM agent_capture_incarnation
+             WHERE agent_kind = 'claude_code'
+               AND provider_session_id = 'provider-sess-legacy-generation'"
+        )
+        .await,
+        2,
+        "legacy generation zero must skip to the first post-migration incarnation"
+    );
+}
+
+#[tokio::test]
 async fn erase_session_local_removes_rows_and_preserves_audit_log() {
     let repo = tempfile::tempdir().expect("repo tempdir");
     init_repo_via_cli(repo.path());
@@ -94,6 +135,18 @@ async fn erase_session_local_removes_rows_and_preserves_audit_log() {
     ))
     .await
     .expect("seed audit");
+    for session_id in ["sess-erase", "sess-keep"] {
+        conn.execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO metadata_kv (
+                scope, target, key, value, value_type, created_at, updated_at
+             ) VALUES ('agent_import_index_repair', ?, 'object-index-v1', '{}',
+                       'text', '2026-07-05T00:00:00Z', '2026-07-05T00:00:00Z')",
+            [session_id.into()],
+        ))
+        .await
+        .expect("seed import object-index repair marker");
+    }
 
     let repo_path = repo.path().join(".libra");
     let storage = Arc::new(ClientStorage::init(repo_path.join("objects")));
@@ -155,6 +208,26 @@ async fn erase_session_local_removes_rows_and_preserves_audit_log() {
         .await,
         1,
         "other session's checkpoint untouched"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM metadata_kv
+             WHERE scope = 'agent_import_index_repair' AND target = 'sess-erase'"
+        )
+        .await,
+        0,
+        "erasure must remove the obsolete replay-repair marker"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM metadata_kv
+             WHERE scope = 'agent_import_index_repair' AND target = 'sess-keep'"
+        )
+        .await,
+        1,
+        "erasure must preserve other sessions' repair markers"
     );
 
     // Face 3 (audit): the append-only log is never touched by erasure.
@@ -236,6 +309,29 @@ async fn agent_erasure_local_tombstone() {
         .await,
         1,
         "local import tombstone must survive deletion of agent_session"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_capture_incarnation
+             WHERE agent_kind = 'claude_code'
+               AND provider_session_id = 'provider-sess-tomb'
+               AND next_session_sync_revision = 2
+               AND length(source_namespace) = 32"
+        )
+        .await,
+        1,
+        "local erasure must preserve the next cloud replication incarnation"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_checkpoint_prune_tombstone
+             WHERE session_id = 'sess-tomb'"
+        )
+        .await,
+        0,
+        "session erasure must not opt into deferred cross-device checkpoint deletion"
     );
 
     // Idempotency: re-erasing a session that is already gone is a no-op —

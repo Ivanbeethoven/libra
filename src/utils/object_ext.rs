@@ -38,7 +38,10 @@ pub trait BlobExt {
     fn load(hash: &ObjectHash) -> Blob;
     fn from_file(path: impl AsRef<Path>) -> Blob;
     fn from_lfs_file(path: impl AsRef<Path>) -> Blob;
-    fn save(&self) -> ObjectHash;
+    fn save(&self) -> std::io::Result<ObjectHash>;
+    fn try_save(&self) -> std::io::Result<ObjectHash> {
+        self.save()
+    }
 }
 
 impl TreeExt for Tree {
@@ -212,14 +215,17 @@ impl BlobExt for Blob {
         Blob::from_content(&pointer)
     }
 
-    fn save(&self) -> ObjectHash {
+    fn save(&self) -> std::io::Result<ObjectHash> {
         let storage = util::objects_storage();
         let id = self.id;
         if !storage.exist(&id) {
-            storage
-                .put(&id, &self.data, self.get_type())
-                .unwrap_or_else(|err| panic!("Blob::save({id}): storage.put failed: {err}"));
+            storage.put(&id, &self.data, self.get_type())?;
+        } else {
+            // A prior call may have stored the payload and then failed while
+            // creating its durable index marker. Re-register existing content
+            // so a normal retry cannot silently leave cloud sync incomplete.
+            storage.ensure_existing_object_index(&id, self.data.len(), self.get_type())?;
         }
-        self.id
+        Ok(self.id)
     }
 }

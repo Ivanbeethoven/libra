@@ -8,7 +8,7 @@
 use super::*;
 
 /// `libra agent --help` surfaces the EXAMPLES banner so operators see
-/// the canonical invocation per visible sub-command (status, list, import,
+/// the canonical invocation per visible sub-command (status, list, import, graph,
 /// enable, disable, session, checkpoint, clean, doctor, push, rpc) plus the
 /// `--all` clean form, the `--remote` push form, and the JSON variant
 /// without reading the design doc.
@@ -30,6 +30,8 @@ fn test_agent_help_lists_examples_banner() {
         "libra agent status",
         "libra agent list --schema-version 2 --json",
         "libra agent import --session <id>",
+        "libra agent graph <session>",
+        "libra --json agent graph <session>",
         "libra agent enable --agent claude",
         "libra agent disable --agent claude",
         "libra agent session list",
@@ -48,6 +50,30 @@ fn test_agent_help_lists_examples_banner() {
         assert!(
             stdout.contains(invocation),
             "agent --help should include `{invocation}`, stdout: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_agent_graph_help_pins_session_repo_and_machine_surface() {
+    let repo = tempdir().expect("tempdir for agent graph --help");
+    let output = run_libra_command(&["agent", "graph", "--help"], repo.path());
+    assert!(
+        output.status.success(),
+        "agent graph --help should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for text in [
+        "<SESSION>",
+        "--repo <PATH>",
+        "Captured session id from `libra agent session list`",
+        "libra --json agent graph <session>",
+        "libra --machine agent graph <session>",
+    ] {
+        assert!(
+            stdout.contains(text),
+            "agent graph --help should include `{text}`, stdout: {stdout}"
         );
     }
 }

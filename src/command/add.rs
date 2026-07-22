@@ -179,6 +179,10 @@ pub enum AddError {
     /// `lstat`/`open` error).
     #[error("failed to create index entry for '{path}': {source}")]
     CreateIndexEntry { path: PathBuf, source: io::Error },
+    /// The blob payload was written, but durable local bookkeeping for the
+    /// cloud object index could not be registered.
+    #[error("failed to store object for '{path}': {source}")]
+    ObjectSave { path: PathBuf, source: io::Error },
     /// Path bytes are not valid UTF-8 — Libra's index does not yet preserve
     /// non-UTF-8 paths verbatim.
     #[error("path '{path}' is not valid UTF-8")]
@@ -223,7 +227,7 @@ impl From<AddError> for CliError {
             AddError::RefreshFailed { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
-            AddError::CreateIndexEntry { .. } => {
+            AddError::CreateIndexEntry { .. } | AddError::ObjectSave { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
             AddError::InvalidPathEncoding { .. } => CliError::fatal(error.to_string())
@@ -917,7 +921,10 @@ fn renormalize_entry(
         path: file.to_path_buf(),
         source,
     })?;
-    blob.save();
+    blob.try_save().map_err(|source| AddError::ObjectSave {
+        path: file.to_path_buf(),
+        source,
+    })?;
     index.update(
         IndexEntry::new_from_file(file, blob.id, workdir).map_err(|source| {
             AddError::CreateIndexEntry {
@@ -1358,7 +1365,10 @@ async fn stage_a_file(
                     path: file.to_path_buf(),
                     source,
                 })?;
-            blob.save();
+            blob.try_save().map_err(|source| AddError::ObjectSave {
+                path: file.to_path_buf(),
+                source,
+            })?;
             index.add(
                 IndexEntry::new_from_file(file, blob.id, workdir).map_err(|source| {
                     AddError::CreateIndexEntry {
@@ -1377,7 +1387,10 @@ async fn stage_a_file(
                         source,
                     })?;
                 if !index.verify_hash(file_str, 0, &blob.id) {
-                    blob.save();
+                    blob.try_save().map_err(|source| AddError::ObjectSave {
+                        path: file.to_path_buf(),
+                        source,
+                    })?;
                     index.update(IndexEntry::new_from_file(file, blob.id, workdir).map_err(
                         |source| AddError::CreateIndexEntry {
                             path: file.to_path_buf(),

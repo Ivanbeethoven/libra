@@ -9,7 +9,12 @@
 //! repository's recorded `core.objectformat`, this module is the single point where
 //! that global is configured before any handler runs.
 
-use std::{env, io::Write, path::Path};
+use std::{
+    env,
+    io::Write,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use clap::{
     CommandFactory, Parser, Subcommand,
@@ -79,6 +84,12 @@ const CLOUD_GLOBAL_CONFIG_KEYS: &[&str] = &[
     "LIBRA_D1_API_TOKEN",
     "LIBRA_D1_DATABASE_ID",
 ];
+
+// Libra's CLI dispatcher mutates process-global CWD/hash/output state and the
+// object-index queue is process-global as well. Serializing public `exec_async`
+// invocations keeps each command's drain/warning accounting isolated instead of
+// attributing a sibling invocation's terminal index failure to the wrong caller.
+static CLI_INVOCATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Read the repository's `core.objectformat` and pin the global hash algorithm.
 ///
@@ -1472,10 +1483,61 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
                 .map_err(|_| repo_not_found_error(graph_args.repo.as_deref()))?;
             Ok(CommandPreflight::repo(storage))
         }
+        Commands::Agent(command::agent::AgentArgs {
+            command: command::agent::AgentSubcommand::Graph(graph_args),
+        }) => {
+            let storage = utils::util::try_get_storage_path(graph_args.repo.clone())
+                .map_err(|_| repo_not_found_error(graph_args.repo.as_deref()))?;
+            Ok(CommandPreflight::repo(storage))
+        }
         _ => {
             let storage =
                 utils::util::try_get_storage_path(None).map_err(|_| repo_not_found_error(None))?;
             Ok(CommandPreflight::repo(storage))
+        }
+    }
+}
+
+fn command_requires_complete_object_index(command: &Commands) -> bool {
+    matches!(command, Commands::Cloud(_))
+        || matches!(
+            command,
+            Commands::Agent(command::agent::AgentArgs {
+                command: command::agent::AgentSubcommand::Clean(args),
+            }) if !args.dry_run
+        )
+}
+
+async fn repair_pending_object_index_updates_before_command(
+    storage: &Path,
+    require_complete: bool,
+) -> CliResult<()> {
+    let db_path = storage.join(utils::util::DATABASE);
+    match utils::client_storage::ClientStorage::repair_pending_object_index_updates(&db_path).await {
+        Ok(outcome) if outcome.remaining && require_complete => Err(CliError::fatal(format!(
+            "cannot run this operation while durable local object-index repair is pending: repaired {} marker(s), but more remain for a later bounded replay",
+            outcome.repaired
+        ))
+        .with_stable_code(utils::error::StableErrorCode::IoWriteFailed)
+        .with_hint("rerun the command until the bounded repair queue is empty; if it does not shrink, inspect the repository database and repair-marker directory.")),
+        Ok(outcome) if outcome.remaining => {
+            utils::error::emit_warning(format!(
+                "replayed {} durable cloud object-index repair marker(s), but more remain for the next repository command; cloud operations and destructive agent cleanup stay fail-closed until the queue is empty",
+                outcome.repaired
+            ));
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if require_complete => Err(CliError::fatal(format!(
+            "cannot run this operation while durable local object-index repair is pending: {error}"
+        ))
+        .with_stable_code(utils::error::StableErrorCode::IoWriteFailed)
+        .with_hint("resolve the repository database or repair-marker error, then rerun the command.")),
+        Err(error) => {
+            utils::error::emit_warning(format!(
+                "durable cloud object-index repair is still pending: {error}; the next repository command will retry it, and cloud operations plus destructive agent cleanup will fail closed until it succeeds"
+            ));
+            Ok(())
         }
     }
 }
@@ -1743,14 +1805,17 @@ async fn run_auto_upgrade_check_hook(output: &OutputConfig) {
 ///    [`CliError`] (see [`classify_parse_error`]).
 /// 5. Validates command-specific arg constraints that clap cannot express (e.g.
 ///    [`command::tag::validate_cli_args`]).
-/// 6. For commands that operate on a repository, runs [`command_preflight_storage`]
-///    and primes the global hash kind via [`set_local_hash_kind_for_storage`].
+/// 6. For commands that operate on a repository, runs [`command_preflight_storage`],
+///    primes the global hash kind via [`set_local_hash_kind_for_storage`], and
+///    replays durable object-index repair markers.
 /// 7. Resolves the global output flags into a single [`OutputConfig`] and dispatches
 ///    to the matching `command::*::execute_safe` handler.
-/// 8. After the command returns, waits for any background storage tasks (object
-///    indexing, cache flushes) so they cannot be killed by process exit.
+/// 8. After success or failure, asynchronously waits up to 60 seconds for background
+///    object indexing; durable markers preserve any work that exceeds the budget.
 ///
 /// Boundary conditions:
+/// - Concurrent in-process invocations are serialized because dispatch mutates
+///   process-global state and drains one shared object-index queue.
 /// - `--help` / `--version` are still rendered through clap so output matches user
 ///   expectations exactly; the function then returns `Ok(())` without dispatching.
 /// - The `Init` arm explicitly restores the original CWD afterwards because the
@@ -1773,6 +1838,14 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     if let Some(probe) = command::upgrade::parse_probe_argv(&argv) {
         return command::upgrade::run_probe(probe);
     }
+    let _invocation_guard = CLI_INVOCATION_LOCK.lock().await;
+    utils::client_storage::ClientStorage::with_background_index_failure_scope(parse_async_scoped(
+        argv,
+    ))
+    .await
+}
+
+async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);
@@ -1807,6 +1880,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     if let Commands::Tag(tag_args) = &args.command {
         command::tag::validate_cli_args(tag_args)?;
     }
+    let require_complete_object_index = command_requires_complete_object_index(&args.command);
     let preflight = command_preflight(&args.command)?;
     if let Some(storage) = preflight.storage.as_deref() {
         if preflight.set_hash_kind {
@@ -1815,6 +1889,11 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
                 // schema migrations (see `db::establish_connection`), so an
                 // older repository is brought up to date transparently.
                 set_local_hash_kind_for_storage(storage).await?;
+                repair_pending_object_index_updates_before_command(
+                    storage,
+                    require_complete_object_index,
+                )
+                .await?;
             } else {
                 set_local_hash_kind_for_storage_without_schema_guard(storage).await?;
             }
@@ -1839,6 +1918,20 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     );
     output.apply_color_override();
 
+    // Most object-writing commands enqueue recoverable cloud-index work and
+    // report terminal failures as a durable-pending warning. Import has its own
+    // durable barrier and LBR-AGENT-018 partial-result contract, so it samples
+    // this same counter internally and must keep that more specific outcome.
+    let background_index_scope =
+        utils::client_storage::ClientStorage::begin_background_index_failure_scope();
+    let background_index_failures_before = background_index_scope.failure_count();
+    let command_handles_background_index_failures = matches!(
+        &args.command,
+        Commands::Agent(command::agent::AgentArgs {
+            command: command::agent::AgentSubcommand::Import(_),
+        })
+    );
+
     // Auto-upgrade check (§A.8): when `upgrade.mode=auto` (and release keys
     // exist), check for and install a newer signed release. It is fully
     // isolated — it never returns an error and never trips
@@ -1846,215 +1939,322 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     // is inert (no I/O) until keys are provisioned.
     run_auto_upgrade_check_hook(&output).await;
 
-    // parse the command and execute the corresponding function with its args
-    match args.command {
-        Commands::Init(cmd_args) => {
-            let original_dir = utils::util::cur_dir();
-            let init_target = if Path::new(&cmd_args.repo_directory).is_absolute() {
-                Path::new(&cmd_args.repo_directory).to_path_buf()
-            } else {
-                original_dir.join(&cmd_args.repo_directory)
-            };
-            let storage = if cmd_args.bare {
-                init_target
-            } else {
-                init_target.join(utils::util::ROOT_DIR)
-            };
+    // Dispatch is captured as a Result so both success and early `?` failures can
+    // await the queue without blocking the caller's Tokio executor thread.
+    let background_index_guard = BackgroundIndexDrainGuard::new(
+        background_index_failures_before,
+        command_handles_background_index_failures,
+        background_index_scope,
+    );
 
-            command::init::execute_safe(cmd_args, &output).await?;
-            set_local_hash_kind_for_storage(&storage).await?;
-            #[cfg(test)]
-            let _cwd_lock = crate::utils::test::cwd_lock_guard();
-            env::set_current_dir(&original_dir).map_err(|e| {
-                CliError::fatal(format!(
-                    "failed to restore working directory '{}': {}",
-                    original_dir.display(),
-                    e
-                ))
-            })?;
+    let command_result: CliResult<()> = async {
+        match args.command {
+            Commands::Init(cmd_args) => {
+                let original_dir = utils::util::cur_dir();
+                let init_target = if Path::new(&cmd_args.repo_directory).is_absolute() {
+                    Path::new(&cmd_args.repo_directory).to_path_buf()
+                } else {
+                    original_dir.join(&cmd_args.repo_directory)
+                };
+                let storage = if cmd_args.bare {
+                    init_target
+                } else {
+                    init_target.join(utils::util::ROOT_DIR)
+                };
+
+                command::init::execute_safe(cmd_args, &output).await?;
+                set_local_hash_kind_for_storage(&storage).await?;
+                #[cfg(test)]
+                let _cwd_lock = crate::utils::test::cwd_lock_guard();
+                env::set_current_dir(&original_dir).map_err(|e| {
+                    CliError::fatal(format!(
+                        "failed to restore working directory '{}': {}",
+                        original_dir.display(),
+                        e
+                    ))
+                })?;
+            }
+            Commands::Clone(cmd_args) => command::clone::execute_safe(cmd_args, &output).await?,
+            Commands::Code(cmd_args) => command::code::execute(cmd_args, &output).await?,
+            Commands::CodeControl(cmd_args) => command::code_control::execute(cmd_args).await?,
+            Commands::Automation(cmd_args) => {
+                command::automation::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Usage(cmd_args) => command::usage::execute_safe(cmd_args, &output).await?,
+            Commands::Graph(cmd_args) => command::graph::execute_safe(cmd_args, &output).await?,
+            Commands::Sandbox(cmd_args) => {
+                command::sandbox::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Add(cmd_args) => command::add::execute_safe(cmd_args, &output).await?,
+            Commands::Rm(cmd_args) => command::remove::execute_safe(cmd_args, &output).await?,
+            Commands::Restore(cmd_args) => {
+                command::restore::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Status(cmd_args) => command::status::execute_safe(cmd_args, &output).await?,
+            Commands::Clean(cmd_args) => command::clean::execute_safe(cmd_args, &output).await?,
+            Commands::Stash(cmd) => command::stash::execute_safe(cmd, &output).await?,
+            Commands::Lfs(cmd) => command::lfs::execute_safe(cmd, &output).await?,
+            Commands::LsFiles(cmd_args) => {
+                command::ls_files::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Log(cmd_args) => command::log::execute_safe(cmd_args, &output).await?,
+            Commands::Logfile(cmd_args) => {
+                command::logfile::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
+            Commands::Layer(cmd_args) => command::layer::execute_safe(cmd_args, &output).await?,
+            Commands::File(cmd_args) => command::file::execute_safe(cmd_args, &output).await?,
+            Commands::Alternates(cmd_args) => {
+                command::alternates::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Deps(cmd_args) => command::deps::execute_safe(cmd_args, &output).await?,
+            Commands::Hydrate(cmd_args) => {
+                command::hydrate::execute_safe(cmd_args, &output).await?
+            }
+            #[cfg(feature = "fastcdc")]
+            Commands::Media(cmd_args) => command::media::execute_safe(cmd_args, &output).await?,
+            Commands::SparseView(cmd_args) => {
+                command::sparse_view::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Metadata(cmd_args) => {
+                command::metadata::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
+            Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,
+            Commands::Login(cmd_args) => command::account::login(cmd_args, &output).await?,
+            Commands::Whoami(cmd_args) => command::account::whoami(cmd_args, &output).await?,
+            Commands::Logout(cmd_args) => command::account::logout(cmd_args, &output).await?,
+            Commands::Revision(cmd_args) => {
+                command::revision::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Service(cmd_args) => {
+                command::service::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Shortlog(cmd_args) => {
+                command::shortlog::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Show(cmd_args) => command::show::execute_safe(cmd_args, &output).await?,
+            Commands::ShowRef(cmd_args) => {
+                command::show_ref::execute_safe(cmd_args, &output).await?
+            }
+            Commands::FormatPatch(cmd_args) => {
+                command::format_patch::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Am(cmd_args) => command::am::execute_safe(cmd_args, &output).await?,
+            Commands::Mailinfo(cmd_args) => command::mailinfo::execute_safe(cmd_args, &output)?,
+            Commands::ForEachRef(cmd_args) => {
+                command::for_each_ref::execute_safe(cmd_args, &output).await?
+            }
+            Commands::LsRemote(cmd_args) => {
+                command::ls_remote::execute_safe(cmd_args, &output).await?
+            }
+            Commands::LsTree(cmd_args) => command::ls_tree::execute_safe(cmd_args, &output).await?,
+            Commands::SymbolicRef(cmd_args) => {
+                command::symbolic_ref::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Branch(cmd_args) => command::branch::execute_safe(cmd_args, &output).await?,
+            Commands::Tag(cmd_args) => command::tag::execute_safe(cmd_args, &output).await?,
+            Commands::Commit(cmd_args) => command::commit::execute_safe(cmd_args, &output).await?,
+            Commands::Switch(cmd_args) => command::switch::execute_safe(cmd_args, &output).await?,
+            Commands::Rebase(cmd_args) => command::rebase::execute_safe(cmd_args, &output).await?,
+            Commands::Merge(cmd_args) => command::merge::execute_safe(cmd_args, &output).await?,
+            Commands::MergeFile(cmd_args) => {
+                command::merge_file::execute_safe(cmd_args, &output).await?
+            }
+            Commands::MergeBase(cmd_args) => {
+                command::merge_base::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Apply(cmd_args) => command::apply::execute_safe(cmd_args, &output).await?,
+            Commands::DiffTree(cmd_args) => {
+                command::diff_plumbing::execute_tree_safe(cmd_args, &output).await?
+            }
+            Commands::DiffIndex(cmd_args) => {
+                command::diff_plumbing::execute_index_safe(cmd_args, &output).await?
+            }
+            Commands::DiffFiles(cmd_args) => {
+                command::diff_plumbing::execute_files_safe(cmd_args, &output).await?
+            }
+            Commands::Credential(cmd_args) => {
+                command::credential::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Rerere(cmd_args) => command::rerere::execute_safe(cmd_args, &output).await?,
+            Commands::Reset(cmd_args) => command::reset::execute_safe(cmd_args, &output).await?,
+            Commands::RevParse(cmd_args) => {
+                command::rev_parse::execute_safe(cmd_args, &output).await?
+            }
+            Commands::RevList(cmd_args) => {
+                command::rev_list::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Mv(cmd_args) => command::mv::execute_safe(cmd_args, &output).await?,
+            Commands::Describe(cmd_args) => {
+                command::describe::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Notes(cmd_args) => {
+                command::notes::execute_safe(cmd_args, &output, &argv).await?
+            }
+            Commands::CherryPick(cmd_args) => {
+                command::cherry_pick::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Push(cmd_args) => command::push::execute_safe(cmd_args, &output).await?,
+            Commands::CatFile(cmd_args) => {
+                command::cat_file::execute_safe(cmd_args, &output).await?
+            }
+            Commands::CheckIgnore(cmd_args) => {
+                command::check_ignore::execute_safe(cmd_args, &output).await?
+            }
+            Commands::CheckAttr(cmd_args) => {
+                command::check_attr::execute_safe(cmd_args, &output).await?
+            }
+            Commands::CheckMailmap(cmd_args) => {
+                command::check_mailmap::execute_safe(cmd_args, &output).await?
+            }
+            Commands::FastExport(cmd_args) => {
+                command::fast_export::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Bundle(cmd_args) => command::bundle::execute_safe(cmd_args, &output).await?,
+            Commands::FastImport(cmd_args) => {
+                command::fast_import::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Completions(cmd_args) => {
+                command::completions::execute_safe(cmd_args, Cli::command(), &output)?
+            }
+            Commands::WriteTree(cmd_args) => {
+                command::write_tree::execute_safe(cmd_args, &output).await?
+            }
+            Commands::CommitTree(cmd_args) => {
+                command::commit_tree::execute_safe(cmd_args, &output).await?
+            }
+            Commands::ReadTree(cmd_args) => {
+                command::read_tree::execute_safe(cmd_args, &output).await?
+            }
+            Commands::UpdateIndex(cmd_args) => {
+                command::update_index::execute_safe(cmd_args, &output).await?
+            }
+            Commands::UpdateRef(cmd_args) => {
+                command::update_ref::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Archive(cmd_args) => {
+                command::archive::execute_safe(cmd_args, &output).await?
+            }
+            Commands::HashObject(cmd_args) => {
+                command::hash_object::execute_safe(cmd_args, &output).await?
+            }
+            Commands::VerifyPack(cmd_args) => {
+                command::verify_pack::execute_safe(cmd_args, &output).await?
+            }
+            Commands::IndexPack(cmd_args) => command::index_pack::execute_safe(cmd_args, &output)?,
+            Commands::PackObjects(cmd_args) => {
+                command::pack_objects::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Fetch(cmd_args) => command::fetch::execute_safe(cmd_args, &output).await?,
+            Commands::Fsck(cmd_args) => command::fsck::execute_safe(cmd_args, &output).await?,
+            Commands::Maintenance(cmd_args) => {
+                command::maintenance::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Repack(cmd_args) => command::repack::execute_safe(cmd_args, &output).await?,
+            Commands::Diff(cmd_args) => command::diff::execute_safe(cmd_args, &output).await?,
+            Commands::Grep(cmd_args) => command::grep::execute_safe(cmd_args, &output).await?,
+            Commands::Blame(cmd_args) => command::blame::execute_safe(cmd_args, &output).await?,
+            Commands::Revert(cmd_args) => command::revert::execute_safe(cmd_args, &output).await?,
+            Commands::Replace(cmd_args) => {
+                command::replace::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Remote(cmd) => command::remote::execute_safe(cmd, &output).await?,
+            Commands::Open(cmd_args) => command::open::execute_safe(cmd_args, &output).await?,
+            Commands::Pull(cmd_args) => command::pull::execute_safe(cmd_args, &output).await?,
+            Commands::Config(cmd_args) => command::config::execute_safe(cmd_args, &output).await?,
+            Commands::Checkout(cmd_args) => {
+                command::checkout::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Reflog(cmd_args) => command::reflog::execute_safe(cmd_args, &output).await?,
+            Commands::Op(cmd_args) => command::op::execute_safe(cmd_args, &output).await?,
+            Commands::Worktree(cmd_args) => {
+                command::worktree::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Cloud(cmd_args) => command::cloud::execute_safe(cmd_args, &output).await?,
+            Commands::Publish(cmd_args) => {
+                command::publish::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Agent(cmd_args) => command::agent::execute_safe(cmd_args, &output).await?,
+            Commands::Review(cmd_args) => {
+                command::agent::review::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Investigate(cmd_args) => {
+                command::agent::investigate::execute_safe(cmd_args, &output).await?
+            }
+            Commands::Hooks(cmd_args) => command::hooks::execute_safe(cmd_args, &output).await?,
+            Commands::Bisect(bisect_cmd) => {
+                command::bisect::execute_safe(bisect_cmd, &output).await?
+            }
         }
-        Commands::Clone(cmd_args) => command::clone::execute_safe(cmd_args, &output).await?,
-        Commands::Code(cmd_args) => command::code::execute(cmd_args, &output).await?,
-        Commands::CodeControl(cmd_args) => command::code_control::execute(cmd_args).await?,
-        Commands::Automation(cmd_args) => {
-            command::automation::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Usage(cmd_args) => command::usage::execute_safe(cmd_args, &output).await?,
-        Commands::Graph(cmd_args) => command::graph::execute_safe(cmd_args, &output).await?,
-        Commands::Sandbox(cmd_args) => command::sandbox::execute_safe(cmd_args, &output).await?,
-        Commands::Add(cmd_args) => command::add::execute_safe(cmd_args, &output).await?,
-        Commands::Rm(cmd_args) => command::remove::execute_safe(cmd_args, &output).await?,
-        Commands::Restore(cmd_args) => command::restore::execute_safe(cmd_args, &output).await?,
-        Commands::Status(cmd_args) => command::status::execute_safe(cmd_args, &output).await?,
-        Commands::Clean(cmd_args) => command::clean::execute_safe(cmd_args, &output).await?,
-        Commands::Stash(cmd) => command::stash::execute_safe(cmd, &output).await?,
-        Commands::Lfs(cmd) => command::lfs::execute_safe(cmd, &output).await?,
-        Commands::LsFiles(cmd_args) => command::ls_files::execute_safe(cmd_args, &output).await?,
-        Commands::Log(cmd_args) => command::log::execute_safe(cmd_args, &output).await?,
-        Commands::Logfile(cmd_args) => command::logfile::execute_safe(cmd_args, &output).await?,
-        Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
-        Commands::Layer(cmd_args) => command::layer::execute_safe(cmd_args, &output).await?,
-        Commands::File(cmd_args) => command::file::execute_safe(cmd_args, &output).await?,
-        Commands::Alternates(cmd_args) => {
-            command::alternates::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Deps(cmd_args) => command::deps::execute_safe(cmd_args, &output).await?,
-        Commands::Hydrate(cmd_args) => command::hydrate::execute_safe(cmd_args, &output).await?,
-        #[cfg(feature = "fastcdc")]
-        Commands::Media(cmd_args) => command::media::execute_safe(cmd_args, &output).await?,
-        Commands::SparseView(cmd_args) => {
-            command::sparse_view::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Metadata(cmd_args) => command::metadata::execute_safe(cmd_args, &output).await?,
-        Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
-        Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,
-        Commands::Login(cmd_args) => command::account::login(cmd_args, &output).await?,
-        Commands::Whoami(cmd_args) => command::account::whoami(cmd_args, &output).await?,
-        Commands::Logout(cmd_args) => command::account::logout(cmd_args, &output).await?,
-        Commands::Revision(cmd_args) => command::revision::execute_safe(cmd_args, &output).await?,
-        Commands::Service(cmd_args) => command::service::execute_safe(cmd_args, &output).await?,
-        Commands::Shortlog(cmd_args) => command::shortlog::execute_safe(cmd_args, &output).await?,
-        Commands::Show(cmd_args) => command::show::execute_safe(cmd_args, &output).await?,
-        Commands::ShowRef(cmd_args) => command::show_ref::execute_safe(cmd_args, &output).await?,
-        Commands::FormatPatch(cmd_args) => {
-            command::format_patch::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Am(cmd_args) => command::am::execute_safe(cmd_args, &output).await?,
-        Commands::Mailinfo(cmd_args) => command::mailinfo::execute_safe(cmd_args, &output)?,
-        Commands::ForEachRef(cmd_args) => {
-            command::for_each_ref::execute_safe(cmd_args, &output).await?
-        }
-        Commands::LsRemote(cmd_args) => command::ls_remote::execute_safe(cmd_args, &output).await?,
-        Commands::LsTree(cmd_args) => command::ls_tree::execute_safe(cmd_args, &output).await?,
-        Commands::SymbolicRef(cmd_args) => {
-            command::symbolic_ref::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Branch(cmd_args) => command::branch::execute_safe(cmd_args, &output).await?,
-        Commands::Tag(cmd_args) => command::tag::execute_safe(cmd_args, &output).await?,
-        Commands::Commit(cmd_args) => command::commit::execute_safe(cmd_args, &output).await?,
-        Commands::Switch(cmd_args) => command::switch::execute_safe(cmd_args, &output).await?,
-        Commands::Rebase(cmd_args) => command::rebase::execute_safe(cmd_args, &output).await?,
-        Commands::Merge(cmd_args) => command::merge::execute_safe(cmd_args, &output).await?,
-        Commands::MergeFile(cmd_args) => {
-            command::merge_file::execute_safe(cmd_args, &output).await?
-        }
-        Commands::MergeBase(cmd_args) => {
-            command::merge_base::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Apply(cmd_args) => command::apply::execute_safe(cmd_args, &output).await?,
-        Commands::DiffTree(cmd_args) => {
-            command::diff_plumbing::execute_tree_safe(cmd_args, &output).await?
-        }
-        Commands::DiffIndex(cmd_args) => {
-            command::diff_plumbing::execute_index_safe(cmd_args, &output).await?
-        }
-        Commands::DiffFiles(cmd_args) => {
-            command::diff_plumbing::execute_files_safe(cmd_args, &output).await?
-        }
-        Commands::Credential(cmd_args) => {
-            command::credential::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Rerere(cmd_args) => command::rerere::execute_safe(cmd_args, &output).await?,
-        Commands::Reset(cmd_args) => command::reset::execute_safe(cmd_args, &output).await?,
-        Commands::RevParse(cmd_args) => command::rev_parse::execute_safe(cmd_args, &output).await?,
-        Commands::RevList(cmd_args) => command::rev_list::execute_safe(cmd_args, &output).await?,
-        Commands::Mv(cmd_args) => command::mv::execute_safe(cmd_args, &output).await?,
-        Commands::Describe(cmd_args) => command::describe::execute_safe(cmd_args, &output).await?,
-        Commands::Notes(cmd_args) => command::notes::execute_safe(cmd_args, &output, &argv).await?,
-        Commands::CherryPick(cmd_args) => {
-            command::cherry_pick::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Push(cmd_args) => command::push::execute_safe(cmd_args, &output).await?,
-        Commands::CatFile(cmd_args) => command::cat_file::execute_safe(cmd_args, &output).await?,
-        Commands::CheckIgnore(cmd_args) => {
-            command::check_ignore::execute_safe(cmd_args, &output).await?
-        }
-        Commands::CheckAttr(cmd_args) => {
-            command::check_attr::execute_safe(cmd_args, &output).await?
-        }
-        Commands::CheckMailmap(cmd_args) => {
-            command::check_mailmap::execute_safe(cmd_args, &output).await?
-        }
-        Commands::FastExport(cmd_args) => {
-            command::fast_export::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Bundle(cmd_args) => command::bundle::execute_safe(cmd_args, &output).await?,
-        Commands::FastImport(cmd_args) => {
-            command::fast_import::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Completions(cmd_args) => {
-            command::completions::execute_safe(cmd_args, Cli::command(), &output)?
-        }
-        Commands::WriteTree(cmd_args) => {
-            command::write_tree::execute_safe(cmd_args, &output).await?
-        }
-        Commands::CommitTree(cmd_args) => {
-            command::commit_tree::execute_safe(cmd_args, &output).await?
-        }
-        Commands::ReadTree(cmd_args) => command::read_tree::execute_safe(cmd_args, &output).await?,
-        Commands::UpdateIndex(cmd_args) => {
-            command::update_index::execute_safe(cmd_args, &output).await?
-        }
-        Commands::UpdateRef(cmd_args) => {
-            command::update_ref::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Archive(cmd_args) => command::archive::execute_safe(cmd_args, &output).await?,
-        Commands::HashObject(cmd_args) => {
-            command::hash_object::execute_safe(cmd_args, &output).await?
-        }
-        Commands::VerifyPack(cmd_args) => {
-            command::verify_pack::execute_safe(cmd_args, &output).await?
-        }
-        Commands::IndexPack(cmd_args) => command::index_pack::execute_safe(cmd_args, &output)?,
-        Commands::PackObjects(cmd_args) => {
-            command::pack_objects::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Fetch(cmd_args) => command::fetch::execute_safe(cmd_args, &output).await?,
-        Commands::Fsck(cmd_args) => command::fsck::execute_safe(cmd_args, &output).await?,
-        Commands::Maintenance(cmd_args) => {
-            command::maintenance::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Repack(cmd_args) => command::repack::execute_safe(cmd_args, &output).await?,
-        Commands::Diff(cmd_args) => command::diff::execute_safe(cmd_args, &output).await?,
-        Commands::Grep(cmd_args) => command::grep::execute_safe(cmd_args, &output).await?,
-        Commands::Blame(cmd_args) => command::blame::execute_safe(cmd_args, &output).await?,
-        Commands::Revert(cmd_args) => command::revert::execute_safe(cmd_args, &output).await?,
-        Commands::Replace(cmd_args) => command::replace::execute_safe(cmd_args, &output).await?,
-        Commands::Remote(cmd) => command::remote::execute_safe(cmd, &output).await?,
-        Commands::Open(cmd_args) => command::open::execute_safe(cmd_args, &output).await?,
-        Commands::Pull(cmd_args) => command::pull::execute_safe(cmd_args, &output).await?,
-        Commands::Config(cmd_args) => command::config::execute_safe(cmd_args, &output).await?,
-        Commands::Checkout(cmd_args) => command::checkout::execute_safe(cmd_args, &output).await?,
-        Commands::Reflog(cmd_args) => command::reflog::execute_safe(cmd_args, &output).await?,
-        Commands::Op(cmd_args) => command::op::execute_safe(cmd_args, &output).await?,
-        Commands::Worktree(cmd_args) => command::worktree::execute_safe(cmd_args, &output).await?,
-        Commands::Cloud(cmd_args) => command::cloud::execute_safe(cmd_args, &output).await?,
-        Commands::Publish(cmd_args) => command::publish::execute_safe(cmd_args, &output).await?,
-        Commands::Agent(cmd_args) => command::agent::execute_safe(cmd_args, &output).await?,
-        Commands::Review(cmd_args) => {
-            command::agent::review::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Investigate(cmd_args) => {
-            command::agent::investigate::execute_safe(cmd_args, &output).await?
-        }
-        Commands::Hooks(cmd_args) => command::hooks::execute_safe(cmd_args, &output).await?,
-        Commands::Bisect(bisect_cmd) => command::bisect::execute_safe(bisect_cmd, &output).await?,
+        Ok(())
     }
+    .await;
 
-    // Check for warnings when --exit-code-on-warning is active.
+    background_index_guard.finish().await;
+    command_result?;
+
+    // Check only after the queue outcome has been recorded, so
+    // --exit-code-on-warning also covers durable pending index repair.
     if output.exit_code_on_warning && utils::output::warning_was_emitted() {
         return Err(CliError::failure("command completed with warnings")
             .with_stable_code(utils::error::StableErrorCode::WarningEmitted));
     }
 
-    // Wait for any background storage tasks (e.g. object indexing) to complete
-    // This prevents tasks from being killed when the process exits
-    let _ = tokio::task::spawn_blocking(|| {
-        utils::client_storage::ClientStorage::wait_for_background_tasks();
-    })
-    .await;
-
     Ok(())
+}
+
+struct BackgroundIndexDrainGuard {
+    failures_before: usize,
+    command_handles_failures: bool,
+    failure_scope: utils::client_storage::BackgroundIndexFailureScope,
+}
+
+impl BackgroundIndexDrainGuard {
+    fn new(
+        failures_before: usize,
+        command_handles_failures: bool,
+        failure_scope: utils::client_storage::BackgroundIndexFailureScope,
+    ) -> Self {
+        Self {
+            failures_before,
+            command_handles_failures,
+            failure_scope,
+        }
+    }
+
+    async fn finish(self) {
+        const DRAIN_BUDGET: Duration = Duration::from_secs(60);
+        let drained = utils::client_storage::ClientStorage::wait_for_background_tasks_until(
+            Instant::now() + DRAIN_BUDGET,
+        )
+        .await;
+        if !drained && !self.command_handles_failures {
+            utils::error::emit_warning(format!(
+                "cloud object-index updates did not drain within {} seconds; their durable repair markers remain pending and the next repository command will retry them",
+                DRAIN_BUDGET.as_secs()
+            ));
+        }
+        report_background_index_update_outcome(
+            self.failures_before,
+            self.failure_scope.failure_count(),
+            self.command_handles_failures,
+        );
+    }
+}
+
+fn report_background_index_update_outcome(
+    failures_before: usize,
+    failures_after: usize,
+    command_handles_failures: bool,
+) {
+    let new_failures = failures_after.saturating_sub(failures_before);
+    if new_failures == 0 || command_handles_failures {
+        return;
+    }
+    utils::error::emit_warning(format!(
+        "{new_failures} cloud object-index update(s) remain in the durable repair queue; the next repository command will retry them, and `libra cloud sync` will fail closed until repair succeeds"
+    ));
 }
 
 #[cfg(test)]
@@ -2064,6 +2264,34 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    #[test]
+    #[serial]
+    fn background_index_failures_warn_unless_command_owns_stricter_barrier() {
+        output::reset_warning_tracker();
+        report_background_index_update_outcome(4, 6, false);
+        assert!(output::warning_was_emitted());
+
+        output::reset_warning_tracker();
+        report_background_index_update_outcome(4, 6, true);
+        assert!(!output::warning_was_emitted());
+        report_background_index_update_outcome(6, 6, false);
+        assert!(!output::warning_was_emitted());
+    }
+
+    #[test]
+    fn destructive_agent_clean_requires_a_complete_object_index() {
+        let destructive = Cli::try_parse_from(["libra", "agent", "clean", "--gc"])
+            .expect("valid destructive agent clean arguments");
+        assert!(command_requires_complete_object_index(&destructive.command));
+
+        let preview = Cli::try_parse_from(["libra", "agent", "clean", "--gc", "--dry-run"])
+            .expect("valid agent clean preview arguments");
+        assert!(
+            !command_requires_complete_object_index(&preview.command),
+            "a no-write preview need not wait for catalog repair"
+        );
+    }
 
     #[test]
     fn cherry_pick_short_gpg_sign_survives_root_cli_parsing() {

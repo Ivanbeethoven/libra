@@ -580,7 +580,8 @@ async fn mutate_session_state(
     conn.execute(Statement::from_sql_and_values(
         backend,
         "UPDATE agent_session \
-         SET state = ?, last_event_at = ?, stopped_at = ? \
+         SET state = ?, last_event_at = ?, stopped_at = ?, \
+             sync_revision = sync_revision + 1 \
          WHERE session_id = ?",
         vec![
             new_state.into(),

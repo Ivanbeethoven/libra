@@ -5,7 +5,7 @@ use std::fs;
 
 use super::{
     assert_cli_success, init_repo_via_cli, parse_cli_error_stderr, parse_json_stdout,
-    run_libra_command, run_libra_command_with_stdin,
+    run_libra_command, run_libra_command_with_stdin, run_libra_command_with_stdin_and_env,
 };
 
 #[tokio::test]
@@ -195,6 +195,100 @@ async fn hash_object_write_persists_blob_for_cat_file() {
 }
 
 #[tokio::test]
+async fn hash_object_write_retains_terminal_index_failure_for_next_command_repair() {
+    let repo = tempfile::tempdir().expect("create temp repo");
+    init_repo_via_cli(repo.path());
+
+    let output = run_libra_command_with_stdin_and_env(
+        &["hash-object", "--stdin", "-w", "--json"],
+        repo.path(),
+        "persist despite index failure",
+        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
+    );
+    assert_cli_success(
+        &output,
+        "local write should succeed with durable cloud-index repair pending",
+    );
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["ok"], true);
+    let oid = json["data"]["objects"][0]["oid"]
+        .as_str()
+        .expect("hash-object JSON should contain an oid")
+        .to_string();
+    assert_eq!(oid.len(), 40);
+    let warning = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        warning.contains("durable repair queue"),
+        "warning should describe automatic repair: {warning}"
+    );
+    let marker = repo
+        .path()
+        .join(".libra/object-index-repair")
+        .join(format!("{oid}.blob.json"));
+    assert!(
+        marker.is_file(),
+        "terminal failure must retain its identity"
+    );
+
+    let blocked_sync = run_libra_command_with_stdin_and_env(
+        &["cloud", "sync"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
+    );
+    assert_eq!(blocked_sync.status.code(), Some(128));
+    let (human, report) = parse_cli_error_stderr(&blocked_sync.stderr);
+    assert_eq!(report.error_code, "LBR-IO-002");
+    assert!(
+        human.contains(
+            "cannot run this operation while durable local object-index repair is pending"
+        ),
+        "cloud sync must fail before credentials or uploads: {human}"
+    );
+    assert!(marker.is_file(), "failed repair must retain its marker");
+
+    let persisted = run_libra_command(&["cat-file", "-p", &oid], repo.path());
+    assert_cli_success(&persisted, "object payload should remain readable");
+    assert_eq!(
+        String::from_utf8_lossy(&persisted.stdout),
+        "persist despite index failure"
+    );
+    assert!(
+        !marker.exists(),
+        "the next schema-aware repository command should repair and retire the marker"
+    );
+}
+
+#[tokio::test]
+async fn hash_object_pending_index_honors_exit_code_on_warning_and_keeps_success_payload() {
+    let repo = tempfile::tempdir().expect("create temp repo");
+    init_repo_via_cli(repo.path());
+
+    let output = run_libra_command_with_stdin_and_env(
+        &[
+            "--json",
+            "--exit-code-on-warning",
+            "hash-object",
+            "--stdin",
+            "-w",
+        ],
+        repo.path(),
+        "warning exit payload",
+        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
+    );
+    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(parse_json_stdout(&output)["ok"], true);
+    let (human, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-WARN-001");
+    assert!(human.contains("durable repair queue"));
+
+    assert_cli_success(
+        &run_libra_command(&["status", "--short"], repo.path()),
+        "a later command should repair the warning-exit write",
+    );
+}
+
+#[tokio::test]
 async fn hash_object_batch_prints_successes_before_later_failure() {
     let repo = tempfile::tempdir().expect("create temp repo");
     init_repo_via_cli(repo.path());
@@ -217,6 +311,44 @@ async fn hash_object_batch_prints_successes_before_later_failure() {
         "human stderr should explain unreadable input: {human}"
     );
     assert_eq!(report.error_code, "LBR-IO-001");
+}
+
+#[tokio::test]
+async fn hash_object_partial_write_failure_still_reports_pending_index_repair() {
+    let repo = tempfile::tempdir().expect("create temp repo");
+    init_repo_via_cli(repo.path());
+    fs::write(repo.path().join("first.txt"), b"first").expect("write fixture");
+
+    let output = run_libra_command_with_stdin_and_env(
+        &["hash-object", "-w", "first.txt", "missing.txt"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
+    );
+
+    assert_eq!(output.status.code(), Some(128));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "fe4f02ad058b43f6ed467fdf65b935107529564b"
+    );
+    let (human, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-IO-001");
+    assert!(human.contains("failed to read 'missing.txt'"));
+    assert!(
+        human.contains("durable repair queue"),
+        "the primary error must retain the repair warning: {human}"
+    );
+
+    let marker = repo
+        .path()
+        .join(".libra/object-index-repair")
+        .join("fe4f02ad058b43f6ed467fdf65b935107529564b.blob.json");
+    assert!(marker.is_file(), "failed indexing must remain repairable");
+    assert_cli_success(
+        &run_libra_command(&["status", "--short"], repo.path()),
+        "a later command should repair the partial write",
+    );
+    assert!(!marker.exists(), "repair should retire the durable marker");
 }
 
 #[tokio::test]

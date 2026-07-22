@@ -89,6 +89,24 @@ b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0
 }
 ```
 
+使用 `-w` 时，本地对象持久化与云 catalog 索引具有独立的耐久边界。如果对象已经
+写入，但后台 `object_index` 更新遇到终止性数据库错误，命令仍保留正常成功输出
+（JSON 只输出一个 `ok: true` 信封），同时向 stderr 写出可操作警告，并在仓库存储
+目录中保留原子 repair marker。下一条会执行 schema 检查的仓库命令会自动重试该
+精确索引行；只要 marker 无法修复，`libra cloud sync` 就会 fail-closed。使用
+`--exit-code-on-warning` 时，这次本地成功写入会返回退出码 9 / `LBR-WARN-001`，但
+不会撤销已经持久化的对象。
+队列 drain 采用异步且最多等待 60 秒；预算用尽时命令会告警并把 marker 留给下一次
+preflight，而不会阻塞嵌入式 Tokio executor。若 marker 无法创建，命令会在报告索引
+写入完成前返回错误；索引行成功但 marker 无法删除时，也会进入相同告警契约。
+如果多输入写入已持久化前面的对象、随后因后面的输入失败，原始读取/校验错误及退出码仍是
+主结果，同时 stderr 也会报告前面已完成写入留下的耐久修复任务。命令拥有的后台持久化任务
+会在启动前登记，迟到失败仍归属于排队它的调用。repair 采用有界分页，因此超大队列会跨后续命令持续推进；
+在队列清空前，cloud 与实际执行删除的 agent cleanup 都保持 fail-closed。重放与排队 writer
+在索引行更新及 marker 退役期间共享来自固定 65,536 个 OID 分片命名空间的进程崩溃可恢复
+ownership lock，因此迟到的排队
+写入不会在重放和实际清理消费 marker 后重新插回索引行。
+
 ## 兼容性
 
 | 功能 | Libra | Git | Jujutsu |
@@ -111,3 +129,4 @@ b6fc4c620b67d95f953a5c1c1230aaab5db5a1b0
 | 内容不是 `-t <type>` 的良构对象（且未加 `--literally`） | `LBR-CLI-002` | 129 | `pass --literally to hash malformed content without validation` |
 | 无法读取输入文件 | `LBR-IO-001` | 128 | 确认路径存在且可读 |
 | 无法写入对象 | `LBR-IO-002` | 128 | 检查对象存储权限和磁盘空间 |
+| 对象已写入但云索引修复仍待处理，且使用 `--exit-code-on-warning` | `LBR-WARN-001` | 9 | 修复警告中的仓库数据库/marker 问题；下一条仓库命令会自动重试 |

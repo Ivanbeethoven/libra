@@ -6,7 +6,7 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{parse_json_stdout, run_libra_command};
+use super::{parse_cli_error_stderr, parse_json_stdout, run_libra_command};
 
 fn init_repo() -> tempfile::TempDir {
     let repo = tempdir().expect("tempdir");
@@ -81,6 +81,56 @@ fn add_stages_a_working_tree_file() {
         stdout_trimmed(&ls).lines().any(|l| l == "new.txt"),
         "{}",
         stdout_trimmed(&ls)
+    );
+}
+
+#[test]
+fn add_returns_marker_registration_failure_without_saving_the_index() {
+    let repo = init_repo();
+    fs::write(repo.path().join("marker-failure.txt"), "content").unwrap();
+    fs::write(
+        repo.path().join(".libra/object-index-repair"),
+        "conflicting non-directory",
+    )
+    .unwrap();
+
+    let failed = run_libra_command(
+        &["--json", "update-index", "--add", "marker-failure.txt"],
+        repo.path(),
+    );
+    assert_eq!(failed.status.code(), Some(128));
+    let (_human, report) = parse_cli_error_stderr(&failed.stderr);
+    assert_eq!(report.error_code, "LBR-IO-002");
+    assert!(
+        report.message.contains("failed to store object"),
+        "unexpected error report: {report:?}"
+    );
+    let ls = run_libra_command(&["ls-files"], repo.path());
+    assert!(
+        !stdout_trimmed(&ls)
+            .lines()
+            .any(|line| line == "marker-failure.txt"),
+        "failed object registration must not save the index: {}",
+        stdout_trimmed(&ls)
+    );
+
+    fs::remove_file(repo.path().join(".libra/object-index-repair"))
+        .expect("remove injected marker-directory conflict");
+    let retried = run_libra_command(
+        &["update-index", "--add", "marker-failure.txt"],
+        repo.path(),
+    );
+    assert_eq!(
+        retried.status.code(),
+        Some(0),
+        "normal retry must register the existing payload: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let ls = run_libra_command(&["ls-files"], repo.path());
+    assert!(
+        stdout_trimmed(&ls)
+            .lines()
+            .any(|line| line == "marker-failure.txt")
     );
 }
 

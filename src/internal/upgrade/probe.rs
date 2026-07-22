@@ -277,10 +277,12 @@ mod tests {
     /// Write an executable `/bin/sh` script into a temp dir and return its
     /// path (kept alive by the returned guard).
     fn script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test fixture operation should succeed");
         let path = dir.path().join("probe.sh");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n"))
+            .expect("test fixture operation should succeed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("test fixture operation should succeed");
         (dir, path)
     }
 
@@ -347,18 +349,21 @@ mod tests {
     fn sync_probe_passes_fails_and_times_out() {
         let (_g, ok) = script("exit 0");
         assert_eq!(
-            run_sync_probe(&ok, "post-install", "1.2.3", DEFAULT_PROBE_TIMEOUT).unwrap(),
+            run_sync_probe(&ok, "post-install", "1.2.3", DEFAULT_PROBE_TIMEOUT)
+                .expect("test fixture operation should succeed"),
             ProbeOutcome::Passed
         );
         let (_g2, bad) = script("exit 5");
         assert!(matches!(
-            run_sync_probe(&bad, "version", "1.2.3", DEFAULT_PROBE_TIMEOUT).unwrap(),
+            run_sync_probe(&bad, "version", "1.2.3", DEFAULT_PROBE_TIMEOUT)
+                .expect("test fixture operation should succeed"),
             ProbeOutcome::Failed { .. }
         ));
         let (_g3, hang) = script("sleep 300 & sleep 300");
         let start = std::time::Instant::now();
         assert_eq!(
-            run_sync_probe(&hang, "version", "1.2.3", Duration::from_millis(400)).unwrap(),
+            run_sync_probe(&hang, "version", "1.2.3", Duration::from_millis(400))
+                .expect("test fixture operation should succeed"),
             ProbeOutcome::TimedOut
         );
         assert!(start.elapsed() < Duration::from_secs(5));

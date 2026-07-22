@@ -16,6 +16,8 @@
 //! unique index when it detects the legacy shape, so users upgrading from older
 //! Libra versions do not need to drop their D1 backup database manually.
 
+use std::{collections::HashSet, time::Duration};
+
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +27,210 @@ use crate::{
 };
 
 const DEFAULT_D1_API_BASE_URL: &str = "https://api.cloudflare.com/client/v4";
+const AGENT_CAPTURE_PAGE_SIZE: usize = 256;
+const AGENT_CAPTURE_MAX_ROWS_PER_TABLE: usize = 100_000;
+// A cloud publication is itself bounded to 120 seconds. Giving an active
+// writer more than twice that window avoids stealing a slow-but-live write,
+// while still making a crashed `publishing` generation recoverable without
+// manual D1 surgery.
+const AGENT_CAPTURE_GENERATION_LEASE_SECONDS: i64 = 300;
+const OBJECT_INDEX_SNAPSHOT_MAX_RETRIES: usize = 3;
+const AGENT_CAPTURE_BEGIN_GENERATION_FROM_SQL: &str = r#"
+    UPDATE agent_capture_generation SET
+        generation = generation + 1,
+        state = 'publishing',
+        writer_token = ?2,
+        object_index_digest = ?3,
+        object_index_count = ?4,
+        object_index_scope = ?5,
+        object_index_generation = ?6,
+        traces_head = ?7,
+        started_at = CAST(strftime('%s', 'now') AS INTEGER),
+        completed_at = NULL
+    WHERE repo_id = ?1 AND generation = ?8
+      AND (
+        state = 'complete'
+        OR (
+            state = 'publishing'
+            AND started_at <= CAST(strftime('%s', 'now') AS INTEGER) - ?9
+        )
+      )
+    RETURNING repo_id, generation, state, writer_token, object_index_digest,
+              object_index_count, object_index_scope, object_index_generation,
+              traces_head, started_at, completed_at
+"#;
+const AGENT_CAPTURE_COMPLETE_GENERATION_SQL: &str = r#"
+    UPDATE agent_capture_generation
+       SET state = 'complete', writer_token = NULL,
+           completed_at = CAST(strftime('%s', 'now') AS INTEGER)
+     WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?2
+       AND object_index_generation = ?3
+       AND COALESCE((
+           SELECT generation FROM object_index_catalog_generation g
+           WHERE g.repo_id = ?1
+       ), 0) = ?3
+    RETURNING repo_id, generation, state, writer_token, object_index_digest,
+              object_index_count, object_index_scope, object_index_generation,
+              traces_head, started_at, completed_at
+"#;
+const OBJECT_INDEX_CATALOG_SEED_SQL: &str =
+    "INSERT INTO object_index_catalog_generation (repo_id, generation)
+     SELECT DISTINCT repo_id, 0 FROM object_index
+     WHERE 1
+     ON CONFLICT(repo_id) DO NOTHING";
+const OBJECT_INDEX_CATALOG_READY_TABLE: &str = "object_index_catalog_generation_ready";
+const OBJECT_INDEX_CATALOG_READY_TABLE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS object_index_catalog_generation_ready (
+         singleton INTEGER PRIMARY KEY CHECK(singleton = 1)
+     )";
+const OBJECT_INDEX_CATALOG_INVALIDATE_SQL: &str =
+    "DELETE FROM object_index_catalog_generation_ready WHERE singleton = 1";
+const OBJECT_INDEX_CATALOG_PUBLISH_READY_SQL: &str =
+    "INSERT INTO object_index_catalog_generation_ready (singleton) VALUES (1)
+     ON CONFLICT(singleton) DO NOTHING";
+const AGENT_SUBAGENT_CLAIM_UPDATE_GUARD: &str =
+    "excluded.revision_cursor >= agent_subagent_content_claim.revision_cursor
+     AND (excluded.sync_revision > agent_subagent_content_claim.sync_revision
+       OR (excluded.sync_revision = agent_subagent_content_claim.sync_revision
+           AND excluded.revision_cursor IS agent_subagent_content_claim.revision_cursor
+           AND excluded.current_revision IS agent_subagent_content_claim.current_revision
+           AND excluded.current_checkpoint_id IS agent_subagent_content_claim.current_checkpoint_id
+           AND excluded.current_digest IS agent_subagent_content_claim.current_digest))";
+const OBJECT_INDEX_CATALOG_TRIGGERS: [&str; 3] = [
+    "CREATE TRIGGER IF NOT EXISTS object_index_catalog_insert
+     AFTER INSERT ON object_index BEGIN
+       INSERT INTO object_index_catalog_generation (repo_id, generation)
+       VALUES (NEW.repo_id, 1)
+       ON CONFLICT(repo_id) DO UPDATE SET generation = generation + 1;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS object_index_catalog_update
+     AFTER UPDATE ON object_index BEGIN
+       INSERT INTO object_index_catalog_generation (repo_id, generation)
+       VALUES (NEW.repo_id, 1)
+       ON CONFLICT(repo_id) DO UPDATE SET generation = generation + 1;
+       INSERT INTO object_index_catalog_generation (repo_id, generation)
+       SELECT OLD.repo_id, 1 WHERE OLD.repo_id <> NEW.repo_id
+       ON CONFLICT(repo_id) DO UPDATE SET generation = generation + 1;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS object_index_catalog_delete
+     AFTER DELETE ON object_index BEGIN
+       INSERT INTO object_index_catalog_generation (repo_id, generation)
+       VALUES (OLD.repo_id, 1)
+       ON CONFLICT(repo_id) DO UPDATE SET generation = generation + 1;
+     END",
+];
+const D1_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const D1_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn charge_agent_capture_restore_rows(
+    remaining_rows: &mut usize,
+    row_count: usize,
+    label: &str,
+) -> Result<(), D1Error> {
+    if row_count > *remaining_rows {
+        return Err(D1Error {
+            code: 2011,
+            message: format!(
+                "remote agent-capture restore exceeds its aggregate row safety bound while reading {label}"
+            ),
+        });
+    }
+    *remaining_rows -= row_count;
+    Ok(())
+}
+const AGENT_CAPTURE_LEGACY_WRITE_BARRIERS: [&str; 6] = [
+    "CREATE TRIGGER IF NOT EXISTS agent_session_v2_insert_barrier
+     BEFORE INSERT ON agent_session BEGIN
+       SELECT RAISE(ABORT, 'legacy agent capture writer is fenced; upgrade Libra');
+     END",
+    "CREATE TRIGGER IF NOT EXISTS agent_session_v2_update_barrier
+     BEFORE UPDATE ON agent_session BEGIN
+       SELECT RAISE(ABORT, 'legacy agent capture writer is fenced; upgrade Libra');
+     END",
+    "CREATE TRIGGER IF NOT EXISTS agent_session_v2_delete_barrier
+     BEFORE DELETE ON agent_session BEGIN
+       SELECT RAISE(ABORT, 'legacy agent capture writer is fenced; upgrade Libra');
+     END",
+    "CREATE TRIGGER IF NOT EXISTS agent_checkpoint_v2_insert_barrier
+     BEFORE INSERT ON agent_checkpoint BEGIN
+       SELECT RAISE(ABORT, 'legacy agent capture writer is fenced; upgrade Libra');
+     END",
+    "CREATE TRIGGER IF NOT EXISTS agent_checkpoint_v2_update_barrier
+     BEFORE UPDATE ON agent_checkpoint BEGIN
+       SELECT RAISE(ABORT, 'legacy agent capture writer is fenced; upgrade Libra');
+     END",
+    "CREATE TRIGGER IF NOT EXISTS agent_checkpoint_v2_delete_barrier
+     BEFORE DELETE ON agent_checkpoint BEGIN
+       SELECT RAISE(ABORT, 'legacy agent capture writer is fenced; upgrade Libra');
+     END",
+];
+const AGENT_CAPTURE_LEGACY_SESSION_ADOPTION_SQL: &str = r#"
+    INSERT INTO agent_capture_session_v2 (
+        session_id, repo_id, agent_kind, provider_session_id, state, working_dir,
+        worktree_id, parent_commit, parent_session_id, metadata_json,
+        redaction_report, started_at, last_event_at, stopped_at, schema_version,
+        sync_revision, synced_at
+    )
+    SELECT session_id, repo_id, agent_kind, provider_session_id, state, working_dir,
+           worktree_id, parent_commit, parent_session_id, metadata_json,
+           redaction_report, started_at, last_event_at, stopped_at, schema_version,
+           0, synced_at
+    FROM agent_session
+    WHERE NOT EXISTS (
+        SELECT 1 FROM agent_capture_schema_migration
+        WHERE version = 2 AND state = 'complete'
+    )
+    ON CONFLICT(repo_id, session_id) DO NOTHING
+"#;
+const AGENT_CAPTURE_LEGACY_CHECKPOINT_ADOPTION_SQL: &str = r#"
+    INSERT INTO agent_capture_checkpoint_v2 (
+        checkpoint_id, repo_id, session_id, parent_checkpoint_id, scope,
+        parent_commit, tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
+        subagent_session_id, description, created_at, sync_revision, synced_at
+    )
+    SELECT checkpoint_id, repo_id, session_id, parent_checkpoint_id, scope,
+           parent_commit, tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
+           subagent_session_id, description, created_at, 0, synced_at
+    FROM agent_checkpoint
+    WHERE NOT EXISTS (
+        SELECT 1 FROM agent_capture_schema_migration
+        WHERE version = 2 AND state = 'complete'
+    )
+    ON CONFLICT(repo_id, checkpoint_id) DO NOTHING
+"#;
+const AGENT_CAPTURE_LEGACY_ORPHAN_CLEANUP_SQL: &str = r#"
+    DELETE FROM agent_capture_checkpoint_v2
+    WHERE NOT EXISTS (
+      SELECT 1 FROM agent_capture_session_v2 s
+      WHERE s.repo_id = agent_capture_checkpoint_v2.repo_id
+        AND s.session_id = agent_capture_checkpoint_v2.session_id
+    )
+"#;
+
+fn reject_unfenced_agent_capture_write(label: &str) -> Result<(), D1Error> {
+    Err(D1Error {
+        code: 3003,
+        message: format!(
+            "unfenced single-row {label} writes are disabled; publish through an active agent-capture generation"
+        ),
+    })
+}
+
+fn agent_session_compatibility_table(v2_ready: bool) -> &'static str {
+    if v2_ready {
+        "agent_capture_session_v2"
+    } else {
+        "agent_session"
+    }
+}
+
+fn agent_checkpoint_compatibility_table(v2_ready: bool) -> &'static str {
+    if v2_ready {
+        "agent_capture_checkpoint_v2"
+    } else {
+        "agent_checkpoint"
+    }
+}
 
 /// Top-level wrapper for every Cloudflare D1 API response.
 ///
@@ -107,6 +313,21 @@ pub struct D1Statement {
     pub sql: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct D1TableColumn {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct D1ExistenceProbe {
+    present: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct D1CatalogGeneration {
+    generation: i64,
 }
 
 /// CAS update input for `publish_sites.latest_revision_oid`.
@@ -243,7 +464,9 @@ impl D1Client {
         api_base_url: Url,
         https_only: bool,
     ) -> Self {
-        let mut builder = Client::builder();
+        let mut builder = Client::builder()
+            .connect_timeout(D1_CONNECT_TIMEOUT)
+            .timeout(D1_REQUEST_TIMEOUT);
         if https_only {
             builder = builder.https_only(true);
         }
@@ -321,13 +544,25 @@ impl D1Client {
         let statement_ref = &statement;
 
         retry_idempotent(&policy, move |_attempt| async move {
-            let send_result = client
-                .post(url_ref.clone())
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Content-Type", "application/json")
-                .json(statement_ref)
-                .send()
-                .await;
+            let send_result = match tokio::time::timeout(
+                D1_REQUEST_TIMEOUT,
+                client
+                    .post(url_ref.clone())
+                    .header("Authorization", format!("Bearer {}", token))
+                    .header("Content-Type", "application/json")
+                    .json(statement_ref)
+                    .send(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    return RetryOutcome::Done(Err(D1Error {
+                        code: 2001,
+                        message: "D1 request exceeded its 30-second deadline".to_string(),
+                    }));
+                }
+            };
 
             let response = match send_result {
                 Ok(response) => response,
@@ -374,9 +609,15 @@ impl D1Client {
                 };
             }
 
-            let body = match response.text().await {
-                Ok(body) => body,
-                Err(err) => {
+            let body = match tokio::time::timeout(D1_REQUEST_TIMEOUT, response.text()).await {
+                Ok(Ok(body)) => body,
+                Err(_) => {
+                    return RetryOutcome::Done(Err(D1Error {
+                        code: 2002,
+                        message: "D1 response body exceeded its 30-second deadline".to_string(),
+                    }));
+                }
+                Ok(Err(err)) => {
                     // reqwest's Display can embed the full request URL; route it
                     // through the same host-only redactor as the send path.
                     return RetryOutcome::Done(Err(D1Error {
@@ -521,6 +762,15 @@ impl D1Client {
             )
         "#;
 
+        // Readers trust the generation catalog only while this row exists.
+        // Invalidate it before inspecting or rebuilding `object_index`; a
+        // failed or interrupted schema repair then leaves readers on the
+        // conservative legacy double-read path.
+        self.execute(OBJECT_INDEX_CATALOG_READY_TABLE_SQL, None)
+            .await?;
+        self.execute(OBJECT_INDEX_CATALOG_INVALIDATE_SQL, None)
+            .await?;
+
         let existing: Vec<SqlRow> = self
             .query(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='object_index'",
@@ -584,7 +834,79 @@ impl D1Client {
         )
         .await?;
 
+        self.ensure_object_index_catalog_generation().await?;
+
         Ok(())
+    }
+
+    async fn ensure_object_index_catalog_generation(&self) -> Result<(), D1Error> {
+        self.execute(
+            "CREATE TABLE IF NOT EXISTS object_index_catalog_generation (
+                repo_id TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL
+             )",
+            None,
+        )
+        .await?;
+        self.execute(OBJECT_INDEX_CATALOG_SEED_SQL, None).await?;
+        for statement in OBJECT_INDEX_CATALOG_TRIGGERS {
+            self.execute(statement, None).await?;
+        }
+        // The D1 endpoint commits each schema statement independently. Publish
+        // this table only after every mutation trigger exists so concurrent
+        // read-only clients never mistake a partially installed fence for a
+        // usable generation catalog.
+        self.execute(OBJECT_INDEX_CATALOG_PUBLISH_READY_SQL, None)
+            .await?;
+        Ok(())
+    }
+
+    async fn object_index_catalog_generation_is_ready(&self) -> Result<bool, D1Error> {
+        if !self
+            .remote_table_exists("object_index_catalog_generation")
+            .await?
+        {
+            return Ok(false);
+        }
+        if !self
+            .remote_table_exists(OBJECT_INDEX_CATALOG_READY_TABLE)
+            .await?
+        {
+            return Ok(false);
+        }
+        let rows: Vec<D1ExistenceProbe> = self
+            .query(
+                "SELECT EXISTS(
+                   SELECT 1 FROM object_index_catalog_generation_ready
+                   WHERE singleton = 1
+                 ) AS present",
+                None,
+            )
+            .await?;
+        rows.first()
+            .map(|row| row.present == 1)
+            .ok_or_else(|| D1Error {
+                code: 2011,
+                message: "object-index catalog readiness probe returned no result row".to_string(),
+            })
+    }
+
+    async fn object_index_catalog_generation(&self, repo_id: &str) -> Result<i64, D1Error> {
+        let rows: Vec<D1CatalogGeneration> = self
+            .query(
+                "SELECT COALESCE((
+                    SELECT generation FROM object_index_catalog_generation WHERE repo_id = ?1
+                 ), 0) AS generation",
+                Some(vec![serde_json::json!(repo_id)]),
+            )
+            .await?;
+        rows.into_iter()
+            .next()
+            .map(|row| row.generation)
+            .ok_or_else(|| D1Error {
+                code: 2011,
+                message: "object-index catalog generation probe returned no row".to_string(),
+            })
     }
 
     /// Upsert an `object_index` row keyed by `(repo_id, o_id)`.
@@ -624,15 +946,232 @@ impl D1Client {
         Ok(())
     }
 
-    /// Fetch every `object_index` row that belongs to `repo_id`.
+    /// Fetch every `object_index` row that belongs to `repo_id` in bounded
+    /// pages. Full cloud restore needs the complete list, while agent-capture
+    /// fencing uses the explicitly bounded projections below to avoid scanning
+    /// unrelated repository history.
     ///
     /// Boundary conditions:
     /// - Returns an empty vector for an unknown `repo_id`; this is treated as "no
     ///   prior backup".
+    /// - The compatibility API is intentionally not capped at the much lower
+    ///   agent-capture catalog bound; large repositories can legitimately have
+    ///   more than 100,000 ordinary objects.
     pub async fn get_object_indexes(&self, repo_id: &str) -> Result<Vec<ObjectIndexRow>, D1Error> {
-        let sql = "SELECT o_id, o_type, o_size, repo_id, created_at, is_synced FROM object_index WHERE repo_id = ?1";
-        self.query(sql, Some(vec![serde_json::json!(repo_id)]))
+        self.get_object_indexes_with_generation(repo_id)
             .await
+            .map(|(rows, _)| rows)
+    }
+
+    pub async fn get_object_indexes_with_generation(
+        &self,
+        repo_id: &str,
+    ) -> Result<(Vec<ObjectIndexRow>, i64), D1Error> {
+        self.get_object_indexes_inner(repo_id, None).await
+    }
+
+    /// Fetch a full repository object-index projection, failing before more
+    /// than `max_rows` are retained. Agent-capture's remote-retention fallback
+    /// uses this rather than the unbounded general restore compatibility API.
+    pub async fn get_object_indexes_bounded(
+        &self,
+        repo_id: &str,
+        max_rows: usize,
+    ) -> Result<Vec<ObjectIndexRow>, D1Error> {
+        self.get_object_indexes_bounded_with_generation(repo_id, max_rows)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    pub async fn get_object_indexes_bounded_with_generation(
+        &self,
+        repo_id: &str,
+        max_rows: usize,
+    ) -> Result<(Vec<ObjectIndexRow>, i64), D1Error> {
+        self.get_object_indexes_inner(repo_id, Some(max_rows)).await
+    }
+
+    async fn get_object_indexes_inner(
+        &self,
+        repo_id: &str,
+        max_rows: Option<usize>,
+    ) -> Result<(Vec<ObjectIndexRow>, i64), D1Error> {
+        // Restore/status callers may hold a read-only D1 token. Schema
+        // creation belongs to sync; reads must not issue DDL or mutate a
+        // legacy backup as a side effect. A backup predating object indexes is
+        // therefore an empty generation-zero catalog.
+        if !self.remote_table_exists("object_index").await? {
+            return Ok((Vec::new(), 0));
+        }
+        let generation_fenced = self.object_index_catalog_generation_is_ready().await?;
+        let sql = "SELECT o_id, o_type, o_size, repo_id, created_at, is_synced
+                   FROM object_index
+                   WHERE repo_id = ?1 AND o_id > ?3
+                   ORDER BY o_id LIMIT ?2";
+        let mut previous_legacy_rows: Option<Vec<ObjectIndexRow>> = None;
+        for attempt in 0..OBJECT_INDEX_SNAPSHOT_MAX_RETRIES {
+            let before = if generation_fenced {
+                self.object_index_catalog_generation(repo_id).await?
+            } else {
+                0
+            };
+            let mut rows = Vec::new();
+            let mut cursor = String::new();
+            loop {
+                let page: Vec<ObjectIndexRow> = self
+                    .query(
+                        sql,
+                        Some(vec![
+                            serde_json::json!(repo_id),
+                            serde_json::json!(AGENT_CAPTURE_PAGE_SIZE),
+                            serde_json::json!(cursor),
+                        ]),
+                    )
+                    .await?;
+                let page_len = page.len();
+                if let Some(max_rows) = max_rows
+                    && rows.len().saturating_add(page_len) > max_rows
+                {
+                    return Err(D1Error {
+                        code: 2011,
+                        message: format!(
+                            "remote object-index projection exceeds its {max_rows}-row safety bound"
+                        ),
+                    });
+                }
+                if let Some(last) = page.last() {
+                    cursor = last.o_id.clone();
+                }
+                rows.extend(page);
+                if page_len < AGENT_CAPTURE_PAGE_SIZE {
+                    break;
+                }
+            }
+            let after = if generation_fenced {
+                self.object_index_catalog_generation(repo_id).await?
+            } else {
+                0
+            };
+            if generation_fenced && before == after {
+                return Ok((rows, after));
+            }
+            if !generation_fenced {
+                if previous_legacy_rows.as_ref() == Some(&rows) {
+                    return Ok((rows, 0));
+                }
+                previous_legacy_rows = Some(rows);
+            }
+            if attempt + 1 == OBJECT_INDEX_SNAPSHOT_MAX_RETRIES {
+                return Err(D1Error {
+                    code: 2011,
+                    message: "remote object-index catalog changed during three bounded reads; retry when cloud sync is idle".to_string(),
+                });
+            }
+        }
+        Err(D1Error {
+            code: 2011,
+            message: "remote object-index snapshot retry loop ended unexpectedly".to_string(),
+        })
+    }
+
+    /// Read only the requested object-index identities, splitting the lookup
+    /// into bounded JSON-table requests. Missing OIDs are omitted so callers
+    /// can fail closed with context appropriate to their generation fence.
+    pub async fn get_object_indexes_by_oids(
+        &self,
+        repo_id: &str,
+        oids: &[String],
+    ) -> Result<Vec<ObjectIndexRow>, D1Error> {
+        self.get_object_indexes_by_oids_with_generation(repo_id, oids)
+            .await
+            .map(|(rows, _)| rows)
+    }
+
+    pub async fn get_object_indexes_by_oids_with_generation(
+        &self,
+        repo_id: &str,
+        oids: &[String],
+    ) -> Result<(Vec<ObjectIndexRow>, i64), D1Error> {
+        if oids.len() > AGENT_CAPTURE_MAX_ROWS_PER_TABLE {
+            return Err(D1Error {
+                code: 2011,
+                message: format!(
+                    "required remote object-index projection exceeds the {}-row safety bound",
+                    AGENT_CAPTURE_MAX_ROWS_PER_TABLE
+                ),
+            });
+        }
+        // Keep the projection usable with read-only restore credentials and
+        // with pre-fence backups. Sync is responsible for installing current
+        // schema; this read path only probes it.
+        if !self.remote_table_exists("object_index").await? {
+            return Ok((Vec::new(), 0));
+        }
+        let generation_fenced = self.object_index_catalog_generation_is_ready().await?;
+        let mut previous_legacy_rows: Option<Vec<ObjectIndexRow>> = None;
+        for attempt in 0..OBJECT_INDEX_SNAPSHOT_MAX_RETRIES {
+            let before = if generation_fenced {
+                self.object_index_catalog_generation(repo_id).await?
+            } else {
+                0
+            };
+            let mut unique = HashSet::with_capacity(oids.len());
+            let mut ordered = Vec::with_capacity(oids.len());
+            for oid in oids {
+                if unique.insert(oid.as_str()) {
+                    ordered.push(oid);
+                }
+            }
+            let mut rows = Vec::with_capacity(ordered.len());
+            for page in ordered.chunks(AGENT_CAPTURE_PAGE_SIZE) {
+                let encoded = serde_json::to_string(page).map_err(|error| D1Error {
+                    code: 2004,
+                    message: format!("encode required object-index lookup: {error}"),
+                })?;
+                let mut found: Vec<ObjectIndexRow> = self
+                    .query(
+                        "SELECT o_id, o_type, o_size, repo_id, created_at, is_synced
+                         FROM object_index
+                         WHERE repo_id = ?1
+                           AND o_id IN (SELECT value FROM json_each(?2))
+                         ORDER BY o_id",
+                        Some(vec![serde_json::json!(repo_id), serde_json::json!(encoded)]),
+                    )
+                    .await?;
+                rows.append(&mut found);
+            }
+            rows.sort_by(|left, right| left.o_id.cmp(&right.o_id));
+            if rows.windows(2).any(|pair| pair[0].o_id == pair[1].o_id) {
+                return Err(D1Error {
+                    code: 2011,
+                    message: "remote object-index projection contains a duplicate OID".to_string(),
+                });
+            }
+            let after = if generation_fenced {
+                self.object_index_catalog_generation(repo_id).await?
+            } else {
+                0
+            };
+            if generation_fenced && before == after {
+                return Ok((rows, after));
+            }
+            if !generation_fenced {
+                if previous_legacy_rows.as_ref() == Some(&rows) {
+                    return Ok((rows, 0));
+                }
+                previous_legacy_rows = Some(rows);
+            }
+            if attempt + 1 == OBJECT_INDEX_SNAPSHOT_MAX_RETRIES {
+                return Err(D1Error {
+                    code: 2011,
+                    message: "remote object-index projection changed during three bounded reads; retry when cloud sync is idle".to_string(),
+                });
+            }
+        }
+        Err(D1Error {
+            code: 2011,
+            message: "remote object-index projection retry loop ended unexpectedly".to_string(),
+        })
     }
 
     /// Create the `repositories` table on the D1 side if it does not already exist.
@@ -806,11 +1345,18 @@ impl D1Client {
                 last_event_at INTEGER NOT NULL,
                 stopped_at INTEGER,
                 schema_version INTEGER NOT NULL DEFAULT 1,
+                sync_revision INTEGER NOT NULL DEFAULT 1,
                 synced_at INTEGER NOT NULL,
                 PRIMARY KEY (repo_id, session_id)
             )
         "#;
         self.execute(sql, None).await?;
+        self.ensure_remote_column(
+            "agent_session",
+            "sync_revision",
+            "ALTER TABLE agent_session ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
+        )
+        .await?;
         self.execute(
             "CREATE INDEX IF NOT EXISTS idx_d1_agent_session_repo ON agent_session (repo_id)",
             None,
@@ -819,6 +1365,41 @@ impl D1Client {
         self.execute(
             "CREATE INDEX IF NOT EXISTS idx_d1_agent_session_kind \
              ON agent_session (repo_id, agent_kind)",
+            None,
+        )
+        .await?;
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_capture_session_v2 (
+                session_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                agent_kind TEXT NOT NULL CHECK(agent_kind IN (
+                    'claude_code', 'cursor', 'codex', 'gemini',
+                    'opencode', 'copilot', 'factory_ai'
+                )),
+                provider_session_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                working_dir TEXT NOT NULL,
+                worktree_id TEXT,
+                parent_commit TEXT,
+                parent_session_id TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                redaction_report TEXT NOT NULL DEFAULT '{}',
+                started_at INTEGER NOT NULL,
+                last_event_at INTEGER NOT NULL,
+                stopped_at INTEGER,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                sync_revision INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (repo_id, session_id)
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_d1_agent_capture_session_v2_repo \
+             ON agent_capture_session_v2 (repo_id, agent_kind)",
             None,
         )
         .await?;
@@ -869,85 +1450,368 @@ impl D1Client {
             None,
         )
         .await?;
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_capture_checkpoint_v2 (
+                checkpoint_id TEXT NOT NULL,
+                repo_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                parent_checkpoint_id TEXT,
+                scope TEXT NOT NULL CHECK(scope IN ('temporary','committed','subagent')),
+                parent_commit TEXT,
+                tree_oid TEXT NOT NULL,
+                metadata_blob_oid TEXT NOT NULL,
+                traces_commit TEXT NOT NULL,
+                tool_use_id TEXT,
+                subagent_session_id TEXT,
+                description TEXT,
+                created_at INTEGER NOT NULL,
+                sync_revision INTEGER NOT NULL DEFAULT 0,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (repo_id, checkpoint_id)
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.ensure_remote_column(
+            "agent_capture_checkpoint_v2",
+            "sync_revision",
+            "ALTER TABLE agent_capture_checkpoint_v2 ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_d1_agent_capture_checkpoint_v2_session \
+             ON agent_capture_checkpoint_v2 (repo_id, session_id, created_at)",
+            None,
+        )
+        .await?;
         Ok(())
     }
 
-    /// Upsert one `agent_session` row keyed by `(repo_id, session_id)`.
-    ///
-    /// On conflict the latest local view wins — `last_event_at`,
-    /// `stopped_at`, `state`, and `redaction_report` are overwritten so
-    /// repeated `libra cloud sync` runs converge to whatever the local
-    /// SQLite has now.
-    ///
-    /// `synced_at` is stamped server-side via `strftime('%s', 'now')` so
-    /// multi-machine clock skew between Libra clients does not poison the
-    /// observability column. Codex Phase-3.5 review #Q3.
+    pub async fn ensure_agent_checkpoint_prune_tombstone_table(&self) -> Result<(), D1Error> {
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_checkpoint_prune_tombstone (
+                repo_id TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                pruned_at INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (repo_id, checkpoint_id)
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_d1_checkpoint_prune_tombstone_session
+             ON agent_checkpoint_prune_tombstone (repo_id, session_id, pruned_at)",
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Generation fence for the multi-request agent-capture mirror. A writer
+    /// publishes under a unique token; takeover advances the generation and
+    /// fences every older request in the same SQL statement that applies rows.
+    pub async fn ensure_agent_capture_generation_table(&self) -> Result<(), D1Error> {
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_capture_generation (
+                repo_id TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL,
+                state TEXT NOT NULL CHECK(state IN ('publishing', 'complete')),
+                writer_token TEXT,
+                object_index_digest TEXT,
+                object_index_count INTEGER,
+                object_index_scope TEXT,
+                object_index_generation INTEGER,
+                traces_head TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.ensure_remote_column(
+            "agent_capture_generation",
+            "object_index_digest",
+            "ALTER TABLE agent_capture_generation ADD COLUMN object_index_digest TEXT",
+        )
+        .await?;
+        self.ensure_remote_column(
+            "agent_capture_generation",
+            "object_index_count",
+            "ALTER TABLE agent_capture_generation ADD COLUMN object_index_count INTEGER",
+        )
+        .await?;
+        self.ensure_remote_column(
+            "agent_capture_generation",
+            "object_index_scope",
+            "ALTER TABLE agent_capture_generation ADD COLUMN object_index_scope TEXT",
+        )
+        .await?;
+        self.ensure_remote_column(
+            "agent_capture_generation",
+            "object_index_generation",
+            "ALTER TABLE agent_capture_generation ADD COLUMN object_index_generation INTEGER",
+        )
+        .await?;
+        self.ensure_remote_column(
+            "agent_capture_generation",
+            "traces_head",
+            "ALTER TABLE agent_capture_generation ADD COLUMN traces_head TEXT",
+        )
+        .await?;
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_capture_schema_migration (
+                version INTEGER PRIMARY KEY,
+                state TEXT NOT NULL CHECK(state IN ('copying', 'complete')),
+                completed_at INTEGER
+            )
+            "#,
+            None,
+        )
+        .await?;
+        // Fence every legacy writer before taking the one-time adoption
+        // snapshot. Once these triggers exist, an older client can neither
+        // race a mutation between the copy and the completion marker nor
+        // append state that v2 will never adopt. If adoption is interrupted,
+        // the triggers remain installed and the current client safely resumes
+        // the copy on its next attempt.
+        for statement in AGENT_CAPTURE_LEGACY_WRITE_BARRIERS {
+            self.execute(statement, None).await?;
+        }
+        self.execute(
+            "INSERT INTO agent_capture_schema_migration (version, state, completed_at)
+             VALUES (2, 'copying', NULL)
+             ON CONFLICT(version) DO NOTHING",
+            None,
+        )
+        .await?;
+        // Legacy rows are adopted once at generation 0. A current local row
+        // starts at generation 1, so the first fenced sync can deterministically
+        // supersede divergent legacy state. The complete marker prevents any
+        // later legacy writer from being silently imported into the v2 snapshot.
+        self.execute(AGENT_CAPTURE_LEGACY_SESSION_ADOPTION_SQL, None)
+            .await?;
+        self.execute(AGENT_CAPTURE_LEGACY_CHECKPOINT_ADOPTION_SQL, None)
+            .await?;
+        // The previous best-effort mirror deliberately continued checkpoint
+        // uploads after a session-row failure, so a legitimate legacy backup
+        // can contain checkpoint orphans. They were never restorable. Remove
+        // them from the adopted v2 snapshot before enabling strict dependency
+        // validation; current local rows can then republish a coherent pair.
+        self.execute(AGENT_CAPTURE_LEGACY_ORPHAN_CLEANUP_SQL, None)
+            .await?;
+        self.execute(
+            "UPDATE agent_capture_schema_migration
+             SET state = 'complete', completed_at = CAST(strftime('%s', 'now') AS INTEGER)
+             WHERE version = 2 AND state = 'copying'",
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn begin_agent_capture_generation(
+        &self,
+        repo_id: &str,
+        writer_token: &str,
+        manifest: AgentCaptureGenerationManifest<'_>,
+    ) -> Result<AgentCaptureGenerationRow, D1Error> {
+        let expected_generation = self
+            .get_agent_capture_generation(repo_id)
+            .await?
+            .map(|generation| generation.generation);
+        self.begin_agent_capture_generation_from(
+            repo_id,
+            writer_token,
+            expected_generation,
+            manifest,
+        )
+        .await
+    }
+
+    /// Start a publication only if the remote generation still equals the
+    /// caller's observed generation. A completed generation can advance
+    /// immediately; an abandoned `publishing` generation can advance only
+    /// after its server-timestamped lease expires. `None` is valid only for a
+    /// repository that still has no generation row. The source-compatible
+    /// convenience entry point above observes the current generation and then
+    /// delegates here, so both APIs enforce the same compare-and-swap fence.
+    pub async fn begin_agent_capture_generation_from(
+        &self,
+        repo_id: &str,
+        writer_token: &str,
+        expected_generation: Option<i64>,
+        manifest: AgentCaptureGenerationManifest<'_>,
+    ) -> Result<AgentCaptureGenerationRow, D1Error> {
+        let AgentCaptureGenerationManifest {
+            object_index_digest,
+            object_index_count,
+            object_index_scope,
+            object_index_generation,
+            traces_head,
+        } = manifest;
+        self.ensure_object_index_table().await?;
+        let values = vec![
+            serde_json::json!(repo_id),
+            serde_json::json!(writer_token),
+            serde_json::json!(object_index_digest),
+            serde_json::json!(object_index_count),
+            serde_json::json!(object_index_scope),
+            serde_json::json!(object_index_generation),
+            serde_json::json!(traces_head),
+        ];
+        let rows: Vec<AgentCaptureGenerationRow> =
+            if let Some(expected_generation) = expected_generation {
+                let mut values = values;
+                values.push(serde_json::json!(expected_generation));
+                self.query(AGENT_CAPTURE_BEGIN_GENERATION_FROM_SQL, {
+                    values.push(serde_json::json!(AGENT_CAPTURE_GENERATION_LEASE_SECONDS));
+                    Some(values)
+                })
+                .await?
+            } else {
+                self.query(
+                    r#"
+                INSERT INTO agent_capture_generation (
+                    repo_id, generation, state, writer_token, object_index_digest,
+                    object_index_count, object_index_scope, object_index_generation,
+                    traces_head, started_at, completed_at
+                ) VALUES (?1, 1, 'publishing', ?2, ?3, ?4, ?5, ?6, ?7,
+                          CAST(strftime('%s', 'now') AS INTEGER), NULL)
+                ON CONFLICT(repo_id) DO NOTHING
+                RETURNING repo_id, generation, state, writer_token, object_index_digest,
+                          object_index_count, object_index_scope, object_index_generation,
+                          traces_head, started_at, completed_at
+                "#,
+                    Some(values),
+                )
+                .await?
+            };
+        rows.into_iter().next().ok_or_else(|| D1Error {
+            code: 3004,
+            message: "agent-capture remote generation changed or still has an active publisher; retry after the current 5-minute publication lease expires"
+                .to_string(),
+        })
+    }
+
+    pub async fn get_agent_capture_generation(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<AgentCaptureGenerationRow>, D1Error> {
+        let rows: Vec<AgentCaptureGenerationRow> = self
+            .query(
+                "SELECT repo_id, generation, state, writer_token, object_index_digest,
+                        object_index_count, object_index_scope, object_index_generation,
+                        traces_head, started_at, completed_at
+                 FROM agent_capture_generation WHERE repo_id = ?1",
+                Some(vec![serde_json::json!(repo_id)]),
+            )
+            .await?;
+        Ok(rows.into_iter().next())
+    }
+
+    pub async fn complete_agent_capture_generation(
+        &self,
+        repo_id: &str,
+        writer_token: &str,
+        expected_object_index_generation: i64,
+    ) -> Result<AgentCaptureGenerationRow, D1Error> {
+        let rows: Vec<AgentCaptureGenerationRow> = self
+            .query(
+                AGENT_CAPTURE_COMPLETE_GENERATION_SQL,
+                Some(vec![
+                    serde_json::json!(repo_id),
+                    serde_json::json!(writer_token),
+                    serde_json::json!(expected_object_index_generation),
+                ]),
+            )
+            .await?;
+        rows.into_iter().next().ok_or_else(|| D1Error {
+            code: 3003,
+            message: "agent-capture publication lost its remote generation fence".to_string(),
+        })
+    }
+
+    /// Retained source-compatible single-row API. Fenced v2 capture
+    /// generations cannot safely accept an unscoped write, so callers receive
+    /// an upgrade error and must use the generation batch workflow.
     pub async fn upsert_agent_session(
         &self,
         repo_id: &str,
         row: &AgentSessionRow,
     ) -> Result<(), D1Error> {
-        let sql = r#"
-            INSERT INTO agent_session (
-                session_id, repo_id, agent_kind, provider_session_id, state, working_dir,
-                worktree_id, parent_commit, parent_session_id, metadata_json,
-                redaction_report, started_at, last_event_at, stopped_at, schema_version,
-                synced_at
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                CAST(strftime('%s', 'now') AS INTEGER)
-            )
-            ON CONFLICT(repo_id, session_id) DO UPDATE SET
-                state = excluded.state,
-                working_dir = excluded.working_dir,
-                worktree_id = excluded.worktree_id,
-                parent_commit = excluded.parent_commit,
-                parent_session_id = excluded.parent_session_id,
-                metadata_json = excluded.metadata_json,
-                redaction_report = excluded.redaction_report,
-                last_event_at = excluded.last_event_at,
-                stopped_at = excluded.stopped_at,
-                schema_version = excluded.schema_version,
-                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
-        "#;
-        let params = vec![
-            serde_json::json!(row.session_id),
-            serde_json::json!(repo_id),
-            serde_json::json!(row.agent_kind),
-            serde_json::json!(row.provider_session_id),
-            serde_json::json!(row.state),
-            serde_json::json!(row.working_dir),
-            serde_json::json!(row.worktree_id),
-            serde_json::json!(row.parent_commit),
-            serde_json::json!(row.parent_session_id),
-            serde_json::json!(row.metadata_json),
-            serde_json::json!(row.redaction_report),
-            serde_json::json!(row.started_at),
-            serde_json::json!(row.last_event_at),
-            serde_json::json!(row.stopped_at),
-            serde_json::json!(row.schema_version),
-        ];
-        self.execute(sql, Some(params)).await?;
-        Ok(())
+        // Retain this public compatibility surface as a fail-closed API. The
+        // v2 snapshot may only change through the token-fenced batch methods;
+        // accepting an unscoped single-row write would let restore observe a
+        // mutation under an unchanged completed manifest.
+        let _ = (repo_id, row);
+        reject_unfenced_agent_capture_write("agent session")
     }
 
     /// Read every `agent_session` row for a repo. Used by
-    /// `libra cloud restore` to repopulate the local catalog on a fresh
-    /// machine — paired with [`Self::upsert_agent_session`] so a
-    /// round-trip preserves shape.
+    /// external compatibility callers that consume the pre-v2 projection.
+    /// Current cloud restore uses [`Self::list_agent_session_v2_rows`].
     pub async fn list_agent_sessions(
         &self,
         repo_id: &str,
     ) -> Result<Vec<AgentSessionRow>, D1Error> {
-        let sql = r#"
+        let table =
+            agent_session_compatibility_table(self.agent_capture_v2_projection_is_ready().await?);
+        let sql = format!(
+            r#"
             SELECT session_id, agent_kind, provider_session_id, state, working_dir,
                    worktree_id, parent_commit, parent_session_id, metadata_json,
                    redaction_report, started_at, last_event_at, stopped_at, schema_version
-            FROM agent_session
+            FROM {table}
             WHERE repo_id = ?1
-        "#;
-        self.query(sql, Some(vec![serde_json::json!(repo_id)]))
+            ORDER BY session_id
+            LIMIT ?2 OFFSET ?3
+        "#
+        );
+        self.collect_agent_capture_pages(&sql, repo_id, "agent session")
             .await
+    }
+
+    /// Versioned session projection used by token-fenced capture generations.
+    pub async fn list_agent_session_v2_rows(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<AgentSessionV2Row>, D1Error> {
+        let mut remaining_rows = AGENT_CAPTURE_MAX_ROWS_PER_TABLE;
+        self.list_agent_session_v2_rows_with_budget(repo_id, &mut remaining_rows)
+            .await
+    }
+
+    async fn list_agent_session_v2_rows_with_budget(
+        &self,
+        repo_id: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<AgentSessionV2Row>, D1Error> {
+        let sql = r#"
+            SELECT session_id, agent_kind, provider_session_id, state, working_dir,
+                   worktree_id, parent_commit, parent_session_id, metadata_json,
+                   redaction_report, started_at, last_event_at, stopped_at, schema_version,
+                   sync_revision
+            FROM agent_capture_session_v2
+            WHERE repo_id = ?1
+            ORDER BY session_id
+            LIMIT ?2 OFFSET ?3
+        "#;
+        self.collect_agent_capture_pages_with_budget(
+            sql,
+            repo_id,
+            "agent session v2",
+            remaining_rows,
+        )
+        .await
     }
 
     /// Read every `agent_checkpoint` row for a repo. Used by
@@ -957,16 +1821,356 @@ impl D1Client {
         &self,
         repo_id: &str,
     ) -> Result<Vec<AgentCheckpointRow>, D1Error> {
-        let sql = r#"
+        let table = agent_checkpoint_compatibility_table(
+            self.agent_capture_v2_projection_is_ready().await?,
+        );
+        let sql = format!(
+            r#"
             SELECT checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
                    tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
                    subagent_session_id, description, created_at
-            FROM agent_checkpoint
+            FROM {table}
             WHERE repo_id = ?1
-            ORDER BY created_at ASC
-        "#;
-        self.query(sql, Some(vec![serde_json::json!(repo_id)]))
+            ORDER BY created_at ASC, checkpoint_id ASC
+            LIMIT ?2 OFFSET ?3
+        "#
+        );
+        self.collect_agent_capture_pages(&sql, repo_id, "agent checkpoint")
             .await
+    }
+
+    /// Versioned checkpoint projection with the monotonic rewrite generation
+    /// used by the fenced cloud protocol.
+    pub async fn list_agent_checkpoint_v2_rows(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<AgentCheckpointV2Row>, D1Error> {
+        let mut remaining_rows = AGENT_CAPTURE_MAX_ROWS_PER_TABLE;
+        self.list_agent_checkpoint_v2_rows_with_budget(repo_id, &mut remaining_rows)
+            .await
+    }
+
+    async fn list_agent_checkpoint_v2_rows_with_budget(
+        &self,
+        repo_id: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<AgentCheckpointV2Row>, D1Error> {
+        let sql = r#"
+            SELECT checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
+                   tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
+                   subagent_session_id, description, created_at, sync_revision
+            FROM agent_capture_checkpoint_v2
+            WHERE repo_id = ?1
+            ORDER BY created_at ASC, checkpoint_id ASC
+            LIMIT ?2 OFFSET ?3
+        "#;
+        self.collect_agent_capture_pages_with_budget(
+            sql,
+            repo_id,
+            "agent checkpoint v2",
+            remaining_rows,
+        )
+        .await
+    }
+
+    /// Return the subset of checkpoint ids present in the v2 remote catalog.
+    /// Restore preflight uses this bounded lookup to detect local prune fences
+    /// without materializing the entire remote checkpoint table first.
+    pub async fn find_agent_checkpoint_ids_by_ids(
+        &self,
+        repo_id: &str,
+        checkpoint_ids: &[String],
+    ) -> Result<HashSet<String>, D1Error> {
+        if checkpoint_ids.len() > AGENT_CAPTURE_MAX_ROWS_PER_TABLE {
+            return Err(D1Error {
+                code: 2011,
+                message: format!(
+                    "local checkpoint prune preflight exceeds the {}-row safety bound",
+                    AGENT_CAPTURE_MAX_ROWS_PER_TABLE
+                ),
+            });
+        }
+        let mut matches = HashSet::with_capacity(checkpoint_ids.len());
+        for page in checkpoint_ids.chunks(AGENT_CAPTURE_PAGE_SIZE) {
+            let encoded = serde_json::to_string(page).map_err(|error| D1Error {
+                code: 2004,
+                message: format!("encode checkpoint prune preflight lookup: {error}"),
+            })?;
+            let rows: Vec<AgentCheckpointIdRow> = self
+                .query(
+                    "SELECT checkpoint_id FROM agent_capture_checkpoint_v2
+                     WHERE repo_id = ?1
+                       AND checkpoint_id IN (SELECT value FROM json_each(?2))
+                     ORDER BY checkpoint_id",
+                    Some(vec![serde_json::json!(repo_id), serde_json::json!(encoded)]),
+                )
+                .await?;
+            for row in rows {
+                if !matches.insert(row.checkpoint_id.clone()) {
+                    return Err(D1Error {
+                        code: 2011,
+                        message: format!(
+                            "remote checkpoint prune preflight returned duplicate id {}",
+                            row.checkpoint_id
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    pub async fn list_agent_checkpoint_prune_tombstones(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<AgentCheckpointPruneTombstoneRow>, D1Error> {
+        let mut remaining_rows = AGENT_CAPTURE_MAX_ROWS_PER_TABLE;
+        self.list_agent_checkpoint_prune_tombstones_with_budget(repo_id, &mut remaining_rows)
+            .await
+    }
+
+    async fn list_agent_checkpoint_prune_tombstones_with_budget(
+        &self,
+        repo_id: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<AgentCheckpointPruneTombstoneRow>, D1Error> {
+        self.collect_agent_capture_pages_with_budget(
+            "SELECT checkpoint_id, session_id, pruned_at
+             FROM agent_checkpoint_prune_tombstone WHERE repo_id = ?1
+             ORDER BY checkpoint_id LIMIT ?2 OFFSET ?3",
+            repo_id,
+            "checkpoint prune tombstone",
+            remaining_rows,
+        )
+        .await
+    }
+
+    async fn collect_agent_capture_pages<T: for<'de> Deserialize<'de>>(
+        &self,
+        sql: &str,
+        repo_id: &str,
+        label: &str,
+    ) -> Result<Vec<T>, D1Error> {
+        let mut remaining_rows = AGENT_CAPTURE_MAX_ROWS_PER_TABLE;
+        self.collect_agent_capture_pages_with_budget(sql, repo_id, label, &mut remaining_rows)
+            .await
+    }
+
+    async fn collect_agent_capture_pages_with_budget<T: for<'de> Deserialize<'de>>(
+        &self,
+        sql: &str,
+        repo_id: &str,
+        label: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<T>, D1Error> {
+        let mut rows = Vec::new();
+        let mut offset = 0_usize;
+        loop {
+            // Ask for one row beyond the remaining aggregate allowance when
+            // possible, so an exhausted budget distinguishes an empty table
+            // from a remote snapshot that would cross the restore-wide cap.
+            let page_size = remaining_rows
+                .saturating_add(1)
+                .clamp(1, AGENT_CAPTURE_PAGE_SIZE);
+            let page: Vec<T> = self
+                .query(
+                    sql,
+                    Some(vec![
+                        serde_json::json!(repo_id),
+                        serde_json::json!(page_size),
+                        serde_json::json!(offset),
+                    ]),
+                )
+                .await?;
+            let page_len = page.len();
+            charge_agent_capture_restore_rows(remaining_rows, page_len, label)?;
+            rows.extend(page);
+            if page_len < page_size {
+                break;
+            }
+            offset = offset.saturating_add(page_len);
+        }
+        Ok(rows)
+    }
+
+    /// Read one coherent capture-catalog projection under a single aggregate
+    /// row budget. Cloud restore uses this instead of applying the safety cap
+    /// independently to each companion table.
+    pub async fn list_agent_capture_restore_catalog_rows(
+        &self,
+        repo_id: &str,
+        include_subagent_content: bool,
+        max_rows: usize,
+    ) -> Result<AgentCaptureRestoreCatalogRows, D1Error> {
+        let mut remaining_rows = max_rows;
+        let sessions = self
+            .list_agent_session_v2_rows_with_budget(repo_id, &mut remaining_rows)
+            .await?;
+        let checkpoints = self
+            .list_agent_checkpoint_v2_rows_with_budget(repo_id, &mut remaining_rows)
+            .await?;
+        let prune_tombstones = self
+            .list_agent_checkpoint_prune_tombstones_with_budget(repo_id, &mut remaining_rows)
+            .await?;
+        let (claims, revisions, links) = if include_subagent_content {
+            (
+                self.list_agent_subagent_content_claims_with_budget(repo_id, &mut remaining_rows)
+                    .await?,
+                self.list_agent_subagent_content_revisions_with_budget(
+                    repo_id,
+                    &mut remaining_rows,
+                )
+                .await?,
+                self.list_agent_subagent_links_with_budget(repo_id, &mut remaining_rows)
+                    .await?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        Ok(AgentCaptureRestoreCatalogRows {
+            sessions,
+            checkpoints,
+            prune_tombstones,
+            claims,
+            revisions,
+            links,
+            remaining_rows,
+        })
+    }
+
+    async fn remote_column_exists(&self, table: &str, column: &str) -> Result<bool, D1Error> {
+        if !table
+            .chars()
+            .chain(column.chars())
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(D1Error {
+                code: 2012,
+                message: "invalid D1 schema identifier".to_string(),
+            });
+        }
+        let rows: Vec<D1TableColumn> = self
+            .query(&format!("PRAGMA table_info({table})"), None)
+            .await?;
+        Ok(rows.iter().any(|row| row.name == column))
+    }
+
+    async fn remote_table_exists(&self, table: &str) -> Result<bool, D1Error> {
+        if !table
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(D1Error {
+                code: 2012,
+                message: "invalid D1 schema identifier".to_string(),
+            });
+        }
+        let rows: Vec<D1ExistenceProbe> = self
+            .query(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+                 ) AS present",
+                Some(vec![serde_json::json!(table)]),
+            )
+            .await?;
+        rows.first()
+            .map(|row| row.present == 1)
+            .ok_or_else(|| D1Error {
+                code: 2011,
+                message: "D1 schema probe returned no result row".to_string(),
+            })
+    }
+
+    /// Read-only probe used by restore. Unlike
+    /// [`Self::ensure_agent_capture_generation_table`], this never installs
+    /// legacy-writer barriers or adopts rows.
+    pub async fn agent_capture_generation_table_exists(&self) -> Result<bool, D1Error> {
+        self.remote_table_exists("agent_capture_generation").await
+    }
+
+    async fn agent_capture_v2_projection_is_ready(&self) -> Result<bool, D1Error> {
+        if !self
+            .remote_table_exists("agent_capture_schema_migration")
+            .await?
+        {
+            return Ok(false);
+        }
+        let rows: Vec<D1ExistenceProbe> = self
+            .query(
+                "SELECT EXISTS(
+                   SELECT 1 FROM agent_capture_schema_migration
+                   WHERE version = 2 AND state = 'complete'
+                 ) AS present",
+                None,
+            )
+            .await?;
+        rows.first()
+            .map(|row| row.present == 1)
+            .ok_or_else(|| D1Error {
+                code: 2011,
+                message: "agent-capture schema readiness probe returned no result row".to_string(),
+            })
+    }
+
+    /// Return whether any legacy or v2 capture catalog row exists for this
+    /// repository without creating or migrating remote schema.
+    pub async fn agent_capture_catalog_has_rows(&self, repo_id: &str) -> Result<bool, D1Error> {
+        for table in [
+            "agent_session",
+            "agent_checkpoint",
+            "agent_capture_session_v2",
+            "agent_capture_checkpoint_v2",
+        ] {
+            if !self.remote_table_exists(table).await? {
+                continue;
+            }
+            let sql = format!("SELECT 1 AS present FROM {table} WHERE repo_id = ?1 LIMIT 1");
+            let rows: Vec<D1ExistenceProbe> = self
+                .query(&sql, Some(vec![serde_json::json!(repo_id)]))
+                .await?;
+            if !rows.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Probe the three M5 companion tables as one schema unit. A partial
+    /// remote shape is corruption and must not be treated as an empty layer.
+    pub async fn agent_subagent_content_tables_exist(&self) -> Result<bool, D1Error> {
+        let mut present = 0_usize;
+        for table in [
+            "agent_subagent_content_claim",
+            "agent_subagent_content_revision",
+            "agent_subagent_link",
+        ] {
+            present += usize::from(self.remote_table_exists(table).await?);
+        }
+        match present {
+            0 => Ok(false),
+            3 => Ok(true),
+            _ => Err(D1Error {
+                code: 2011,
+                message: "remote subagent-content schema is incomplete".to_string(),
+            }),
+        }
+    }
+
+    async fn ensure_remote_column(
+        &self,
+        table: &str,
+        column: &str,
+        ddl: &str,
+    ) -> Result<(), D1Error> {
+        if self.remote_column_exists(table, column).await? {
+            return Ok(());
+        }
+        if let Err(error) = self.execute(ddl, None).await
+            && !self.remote_column_exists(table, column).await?
+        {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Upsert one `agent_checkpoint` row keyed by `(repo_id, checkpoint_id)`.
@@ -978,8 +2182,9 @@ impl D1Client {
         repo_id: &str,
         row: &AgentCheckpointRow,
     ) -> Result<(), D1Error> {
+        reject_unfenced_agent_capture_write("agent checkpoint")?;
         let sql = r#"
-            INSERT INTO agent_checkpoint (
+            INSERT INTO agent_capture_checkpoint_v2 (
                 checkpoint_id, repo_id, session_id, parent_checkpoint_id, scope,
                 parent_commit, tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
                 subagent_session_id, description, created_at, synced_at
@@ -988,18 +2193,18 @@ impl D1Client {
                 CAST(strftime('%s', 'now') AS INTEGER)
             )
             ON CONFLICT(repo_id, checkpoint_id) DO UPDATE SET
-                session_id = excluded.session_id,
-                parent_checkpoint_id = excluded.parent_checkpoint_id,
-                scope = excluded.scope,
-                parent_commit = excluded.parent_commit,
-                tree_oid = excluded.tree_oid,
-                metadata_blob_oid = excluded.metadata_blob_oid,
-                traces_commit = excluded.traces_commit,
-                tool_use_id = excluded.tool_use_id,
-                subagent_session_id = excluded.subagent_session_id,
-                description = excluded.description,
-                created_at = excluded.created_at,
                 synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE excluded.session_id IS agent_capture_checkpoint_v2.session_id
+              AND excluded.parent_checkpoint_id IS agent_capture_checkpoint_v2.parent_checkpoint_id
+              AND excluded.scope IS agent_capture_checkpoint_v2.scope
+              AND excluded.parent_commit IS agent_capture_checkpoint_v2.parent_commit
+              AND excluded.tree_oid IS agent_capture_checkpoint_v2.tree_oid
+              AND excluded.metadata_blob_oid IS agent_capture_checkpoint_v2.metadata_blob_oid
+              AND excluded.traces_commit IS agent_capture_checkpoint_v2.traces_commit
+              AND excluded.tool_use_id IS agent_capture_checkpoint_v2.tool_use_id
+              AND excluded.subagent_session_id IS agent_capture_checkpoint_v2.subagent_session_id
+              AND excluded.description IS agent_capture_checkpoint_v2.description
+              AND excluded.created_at IS agent_capture_checkpoint_v2.created_at
         "#;
         let params = vec![
             serde_json::json!(row.checkpoint_id),
@@ -1016,8 +2221,861 @@ impl D1Client {
             serde_json::json!(row.description),
             serde_json::json!(row.created_at),
         ];
-        self.execute(sql, Some(params)).await?;
+        let result = self.execute(sql, Some(params)).await?;
+        if result.meta.and_then(|meta| meta.changes) != Some(1) {
+            return Err(D1Error {
+                code: 3003,
+                message: "agent checkpoint conflicts with immutable remote state".to_string(),
+            });
+        }
         Ok(())
+    }
+
+    async fn execute_agent_capture_json_batch<T: Serialize>(
+        &self,
+        sql: &str,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[T],
+        label: &str,
+    ) -> Result<(), D1Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let statement =
+            Self::agent_capture_json_batch_statement(sql, repo_id, publish_token, rows, label)?;
+        let result = self.execute(&statement.sql, statement.params).await?;
+        let changes = result
+            .meta
+            .and_then(|meta| meta.changes)
+            .ok_or_else(|| D1Error {
+                code: 3002,
+                message: format!("D1 returned no change count for {label} batch"),
+            })?;
+        let expected = i64::try_from(rows.len()).map_err(|error| D1Error {
+            code: 2010,
+            message: format!("{label} batch size cannot be represented: {error}"),
+        })?;
+        if changes != expected {
+            return Err(D1Error {
+                code: 3003,
+                message: format!(
+                    "{label} batch was fenced by newer or conflicting remote state ({changes}/{expected} rows applied)"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn agent_capture_json_batch_statement<T: Serialize>(
+        sql: &str,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[T],
+        label: &str,
+    ) -> Result<D1Statement, D1Error> {
+        if rows.len() > AGENT_CAPTURE_PAGE_SIZE {
+            return Err(D1Error {
+                code: 2010,
+                message: format!(
+                    "{label} batch contains {} rows, exceeding the {}-row bound",
+                    rows.len(),
+                    AGENT_CAPTURE_PAGE_SIZE
+                ),
+            });
+        }
+        let payload = serde_json::to_string(rows).map_err(|error| D1Error {
+            code: 2004,
+            message: format!("Failed to encode {label} batch: {error}"),
+        })?;
+        Ok(D1Statement {
+            sql: sql.to_string(),
+            params: Some(vec![
+                serde_json::json!(repo_id),
+                serde_json::json!(payload),
+                serde_json::json!(publish_token),
+            ]),
+        })
+    }
+
+    /// Publish a bounded session batch. `sync_revision` is the generation:
+    /// an older clone cannot overwrite a newer remote row, and equal-generation
+    /// divergence is rejected rather than silently choosing a winner.
+    pub async fn sync_agent_sessions_batch(
+        &self,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[AgentSessionV2Row],
+    ) -> Result<(), D1Error> {
+        self.execute_agent_capture_json_batch(
+            r#"
+            WITH incoming(value) AS (SELECT value FROM json_each(?2))
+            INSERT INTO agent_capture_session_v2 (
+                session_id, repo_id, agent_kind, provider_session_id, state, working_dir,
+                worktree_id, parent_commit, parent_session_id, metadata_json,
+                redaction_report, started_at, last_event_at, stopped_at, schema_version,
+                sync_revision, synced_at
+            )
+            SELECT
+                json_extract(value, '$.session_id'), ?1,
+                json_extract(value, '$.agent_kind'),
+                json_extract(value, '$.provider_session_id'),
+                json_extract(value, '$.state'), json_extract(value, '$.working_dir'),
+                json_extract(value, '$.worktree_id'), json_extract(value, '$.parent_commit'),
+                json_extract(value, '$.parent_session_id'),
+                json_extract(value, '$.metadata_json'),
+                json_extract(value, '$.redaction_report'),
+                CAST(json_extract(value, '$.started_at') AS INTEGER),
+                CAST(json_extract(value, '$.last_event_at') AS INTEGER),
+                CAST(json_extract(value, '$.stopped_at') AS INTEGER),
+                CAST(json_extract(value, '$.schema_version') AS INTEGER),
+                CAST(json_extract(value, '$.sync_revision') AS INTEGER),
+                CAST(strftime('%s', 'now') AS INTEGER)
+            FROM incoming
+            WHERE EXISTS (
+                SELECT 1 FROM agent_capture_generation
+                WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+            )
+            ON CONFLICT(repo_id, session_id) DO UPDATE SET
+                agent_kind = excluded.agent_kind,
+                provider_session_id = excluded.provider_session_id,
+                state = excluded.state, working_dir = excluded.working_dir,
+                worktree_id = excluded.worktree_id, parent_commit = excluded.parent_commit,
+                parent_session_id = excluded.parent_session_id,
+                metadata_json = excluded.metadata_json,
+                redaction_report = excluded.redaction_report,
+                started_at = excluded.started_at, last_event_at = excluded.last_event_at,
+                stopped_at = excluded.stopped_at, schema_version = excluded.schema_version,
+                sync_revision = excluded.sync_revision,
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE excluded.sync_revision > agent_capture_session_v2.sync_revision
+               OR (excluded.sync_revision = agent_capture_session_v2.sync_revision
+                   AND excluded.agent_kind IS agent_capture_session_v2.agent_kind
+                   AND excluded.provider_session_id IS agent_capture_session_v2.provider_session_id
+                   AND excluded.state IS agent_capture_session_v2.state
+                   AND excluded.working_dir IS agent_capture_session_v2.working_dir
+                   AND excluded.worktree_id IS agent_capture_session_v2.worktree_id
+                   AND excluded.parent_commit IS agent_capture_session_v2.parent_commit
+                   AND excluded.parent_session_id IS agent_capture_session_v2.parent_session_id
+                   AND excluded.metadata_json IS agent_capture_session_v2.metadata_json
+                   AND excluded.redaction_report IS agent_capture_session_v2.redaction_report
+                   AND excluded.started_at IS agent_capture_session_v2.started_at
+                   AND excluded.last_event_at IS agent_capture_session_v2.last_event_at
+                   AND excluded.stopped_at IS agent_capture_session_v2.stopped_at
+                   AND excluded.schema_version IS agent_capture_session_v2.schema_version)
+            "#,
+            repo_id,
+            publish_token,
+            rows,
+            "agent session",
+        )
+        .await
+    }
+
+    /// Publish immutable checkpoint identities in one bounded request.
+    pub async fn sync_agent_checkpoints_batch(
+        &self,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[AgentCheckpointV2Row],
+    ) -> Result<(), D1Error> {
+        self.execute_agent_capture_json_batch(
+            r#"
+            WITH incoming(value) AS (SELECT value FROM json_each(?2))
+            INSERT INTO agent_capture_checkpoint_v2 (
+                checkpoint_id, repo_id, session_id, parent_checkpoint_id, scope,
+                parent_commit, tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
+                subagent_session_id, description, created_at, sync_revision, synced_at
+            )
+            SELECT json_extract(value, '$.checkpoint_id'), ?1,
+                json_extract(value, '$.session_id'),
+                json_extract(value, '$.parent_checkpoint_id'),
+                json_extract(value, '$.scope'), json_extract(value, '$.parent_commit'),
+                json_extract(value, '$.tree_oid'), json_extract(value, '$.metadata_blob_oid'),
+                json_extract(value, '$.traces_commit'), json_extract(value, '$.tool_use_id'),
+                json_extract(value, '$.subagent_session_id'), json_extract(value, '$.description'),
+                CAST(json_extract(value, '$.created_at') AS INTEGER),
+                CAST(json_extract(value, '$.sync_revision') AS INTEGER),
+                CAST(strftime('%s', 'now') AS INTEGER)
+            FROM incoming
+            WHERE EXISTS (
+                SELECT 1 FROM agent_capture_generation
+                WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM agent_checkpoint_prune_tombstone t
+                WHERE t.repo_id = ?1
+                  AND t.checkpoint_id = json_extract(value, '$.checkpoint_id')
+              )
+            ON CONFLICT(repo_id, checkpoint_id) DO UPDATE SET
+                tree_oid = excluded.tree_oid,
+                metadata_blob_oid = excluded.metadata_blob_oid,
+                traces_commit = excluded.traces_commit,
+                sync_revision = excluded.sync_revision,
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE (excluded.session_id IS agent_capture_checkpoint_v2.session_id
+              AND excluded.parent_checkpoint_id IS agent_capture_checkpoint_v2.parent_checkpoint_id
+              AND excluded.scope IS agent_capture_checkpoint_v2.scope
+              AND excluded.parent_commit IS agent_capture_checkpoint_v2.parent_commit
+              AND excluded.tool_use_id IS agent_capture_checkpoint_v2.tool_use_id
+              AND excluded.subagent_session_id IS agent_capture_checkpoint_v2.subagent_session_id
+              AND excluded.description IS agent_capture_checkpoint_v2.description
+              AND excluded.created_at IS agent_capture_checkpoint_v2.created_at
+              AND excluded.sync_revision > agent_capture_checkpoint_v2.sync_revision)
+               OR (excluded.sync_revision = agent_capture_checkpoint_v2.sync_revision
+              AND excluded.session_id IS agent_capture_checkpoint_v2.session_id
+              AND excluded.parent_checkpoint_id IS agent_capture_checkpoint_v2.parent_checkpoint_id
+              AND excluded.scope IS agent_capture_checkpoint_v2.scope
+              AND excluded.parent_commit IS agent_capture_checkpoint_v2.parent_commit
+              AND excluded.tree_oid IS agent_capture_checkpoint_v2.tree_oid
+              AND excluded.metadata_blob_oid IS agent_capture_checkpoint_v2.metadata_blob_oid
+              AND excluded.traces_commit IS agent_capture_checkpoint_v2.traces_commit
+              AND excluded.tool_use_id IS agent_capture_checkpoint_v2.tool_use_id
+              AND excluded.subagent_session_id IS agent_capture_checkpoint_v2.subagent_session_id
+              AND excluded.description IS agent_capture_checkpoint_v2.description
+              AND excluded.created_at IS agent_capture_checkpoint_v2.created_at)
+            "#,
+            repo_id,
+            publish_token,
+            rows,
+            "agent checkpoint",
+        )
+        .await
+    }
+
+    /// Publish durable ordinary-retention fences, then remove the fenced
+    /// checkpoint and its dependent immutable companion rows. Session erasure
+    /// never creates these rows, preserving the documented local-only erasure
+    /// boundary.
+    pub async fn sync_agent_checkpoint_prune_tombstones_batch(
+        &self,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[AgentCheckpointPruneTombstoneRow],
+    ) -> Result<(), D1Error> {
+        self.execute_agent_capture_json_batch(
+            r#"
+            WITH incoming(value) AS (SELECT value FROM json_each(?2))
+            INSERT INTO agent_checkpoint_prune_tombstone (
+                repo_id, checkpoint_id, session_id, pruned_at, synced_at
+            )
+            SELECT ?1, json_extract(value, '$.checkpoint_id'),
+                   json_extract(value, '$.session_id'),
+                   CAST(json_extract(value, '$.pruned_at') AS INTEGER),
+                   CAST(strftime('%s', 'now') AS INTEGER)
+            FROM incoming
+            WHERE EXISTS (
+                SELECT 1 FROM agent_capture_generation
+                WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+            )
+            ON CONFLICT(repo_id, checkpoint_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                pruned_at = MAX(agent_checkpoint_prune_tombstone.pruned_at, excluded.pruned_at),
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE excluded.session_id IS agent_checkpoint_prune_tombstone.session_id
+            "#,
+            repo_id,
+            publish_token,
+            rows,
+            "checkpoint prune tombstone",
+        )
+        .await?;
+
+        // Every statement boundary remains valid under Publishing-mode
+        // validation so an interrupted generation can be taken over. Remove
+        // the mutable claim first, then its immutable revision, association,
+        // and checkpoint. A later local claim batch recreates a rewound leaf;
+        // pruning the final leaf intentionally leaves the claim absent.
+        for sql in [
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_content_claim
+              WHERE repo_id = ?1
+                AND current_checkpoint_id IN (
+                    SELECT json_extract(value, '$.checkpoint_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_content_revision
+              WHERE repo_id = ?1
+                AND checkpoint_id IN (
+                    SELECT json_extract(value, '$.checkpoint_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_subagent_link
+              WHERE repo_id = ?1
+                AND content_checkpoint_id IN (
+                    SELECT json_extract(value, '$.checkpoint_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             DELETE FROM agent_capture_checkpoint_v2
+              WHERE repo_id = ?1
+                AND checkpoint_id IN (
+                    SELECT json_extract(value, '$.checkpoint_id') FROM incoming
+                )
+                AND EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                )",
+        ] {
+            let statement = Self::agent_capture_json_batch_statement(
+                sql,
+                repo_id,
+                publish_token,
+                rows,
+                "checkpoint prune cleanup",
+            )?;
+            self.execute(&statement.sql, statement.params).await?;
+        }
+        Ok(())
+    }
+
+    /// Create the durable M5 subagent-content companion tables in D1.
+    /// Transient reservation owner/lease/attempt fields are intentionally not
+    /// mirrored; restore always reconstructs an idle claim with the same
+    /// monotonic revision/fence high-water marks.
+    pub async fn ensure_agent_subagent_content_tables(&self) -> Result<(), D1Error> {
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_subagent_content_claim (
+                repo_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                content_schema_version INTEGER NOT NULL,
+                revision_cursor INTEGER NOT NULL,
+                sync_revision INTEGER NOT NULL DEFAULT 1,
+                current_revision INTEGER NOT NULL,
+                current_checkpoint_id TEXT,
+                current_digest TEXT,
+                fence_token INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (
+                    repo_id, parent_session_id, provider_kind, source_key,
+                    content_schema_version
+                )
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.ensure_remote_column(
+            "agent_subagent_content_claim",
+            "sync_revision",
+            "ALTER TABLE agent_subagent_content_claim ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
+        )
+        .await?;
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_subagent_content_revision (
+                repo_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                provider_kind TEXT NOT NULL,
+                source_key TEXT NOT NULL,
+                content_schema_version INTEGER NOT NULL,
+                revision INTEGER NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                source_channel TEXT NOT NULL,
+                partial INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (
+                    repo_id, parent_session_id, provider_kind, source_key,
+                    content_schema_version, revision
+                ),
+                UNIQUE(repo_id, checkpoint_id)
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.execute(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_subagent_link (
+                repo_id TEXT NOT NULL,
+                content_checkpoint_id TEXT NOT NULL,
+                parent_session_id TEXT NOT NULL,
+                link_state TEXT NOT NULL,
+                boundary_checkpoint_id TEXT,
+                stable_subagent_id TEXT,
+                sync_revision INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                synced_at INTEGER NOT NULL,
+                PRIMARY KEY (repo_id, content_checkpoint_id)
+            )
+            "#,
+            None,
+        )
+        .await?;
+        self.ensure_remote_column(
+            "agent_subagent_link",
+            "sync_revision",
+            "ALTER TABLE agent_subagent_link ADD COLUMN sync_revision INTEGER NOT NULL DEFAULT 1",
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn upsert_agent_subagent_content_claim(
+        &self,
+        repo_id: &str,
+        row: &AgentSubagentContentClaimRow,
+    ) -> Result<(), D1Error> {
+        reject_unfenced_agent_capture_write("subagent content claim")?;
+        let sql = r#"
+            INSERT INTO agent_subagent_content_claim (
+                repo_id, parent_session_id, provider_kind, source_key,
+                content_schema_version, revision_cursor, sync_revision, current_revision,
+                current_checkpoint_id, current_digest, fence_token, created_at,
+                updated_at, synced_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                      CAST(strftime('%s', 'now') AS INTEGER))
+            ON CONFLICT(repo_id, parent_session_id, provider_kind, source_key,
+                        content_schema_version) DO UPDATE SET
+                revision_cursor = excluded.revision_cursor,
+                sync_revision = excluded.sync_revision,
+                current_revision = excluded.current_revision,
+                current_checkpoint_id = excluded.current_checkpoint_id,
+                current_digest = excluded.current_digest,
+                fence_token = MAX(agent_subagent_content_claim.fence_token, excluded.fence_token),
+                created_at = excluded.created_at,
+                updated_at = MAX(agent_subagent_content_claim.updated_at, excluded.updated_at),
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE excluded.sync_revision > agent_subagent_content_claim.sync_revision
+               OR (excluded.sync_revision = agent_subagent_content_claim.sync_revision
+                   AND excluded.revision_cursor IS agent_subagent_content_claim.revision_cursor
+                   AND excluded.current_revision IS agent_subagent_content_claim.current_revision
+                   AND excluded.current_checkpoint_id IS agent_subagent_content_claim.current_checkpoint_id
+                   AND excluded.current_digest IS agent_subagent_content_claim.current_digest)
+        "#;
+        let result = self
+            .execute(
+                sql,
+                Some(vec![
+                    serde_json::json!(repo_id),
+                    serde_json::json!(row.parent_session_id),
+                    serde_json::json!(row.provider_kind),
+                    serde_json::json!(row.source_key),
+                    serde_json::json!(row.content_schema_version),
+                    serde_json::json!(row.revision_cursor),
+                    serde_json::json!(row.sync_revision),
+                    serde_json::json!(row.current_revision),
+                    serde_json::json!(row.current_checkpoint_id),
+                    serde_json::json!(row.current_digest),
+                    serde_json::json!(row.fence_token),
+                    serde_json::json!(row.created_at),
+                    serde_json::json!(row.updated_at),
+                ]),
+            )
+            .await?;
+        if result.meta.and_then(|meta| meta.changes) != Some(1) {
+            return Err(D1Error {
+                code: 3003,
+                message: "subagent claim was fenced by newer or conflicting remote state"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn upsert_agent_subagent_content_revision(
+        &self,
+        repo_id: &str,
+        row: &AgentSubagentContentRevisionRow,
+    ) -> Result<(), D1Error> {
+        reject_unfenced_agent_capture_write("subagent content revision")?;
+        let sql = r#"
+            INSERT INTO agent_subagent_content_revision (
+                repo_id, parent_session_id, provider_kind, source_key,
+                content_schema_version, revision, checkpoint_id, content_digest,
+                source_channel, partial, created_at, synced_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                      CAST(strftime('%s', 'now') AS INTEGER))
+            ON CONFLICT(repo_id, parent_session_id, provider_kind, source_key,
+                        content_schema_version, revision) DO UPDATE SET
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE excluded.checkpoint_id IS agent_subagent_content_revision.checkpoint_id
+              AND excluded.content_digest IS agent_subagent_content_revision.content_digest
+              AND excluded.source_channel IS agent_subagent_content_revision.source_channel
+              AND excluded.partial IS agent_subagent_content_revision.partial
+              AND excluded.created_at IS agent_subagent_content_revision.created_at
+        "#;
+        let result = self
+            .execute(
+                sql,
+                Some(vec![
+                    serde_json::json!(repo_id),
+                    serde_json::json!(row.parent_session_id),
+                    serde_json::json!(row.provider_kind),
+                    serde_json::json!(row.source_key),
+                    serde_json::json!(row.content_schema_version),
+                    serde_json::json!(row.revision),
+                    serde_json::json!(row.checkpoint_id),
+                    serde_json::json!(row.content_digest),
+                    serde_json::json!(row.source_channel),
+                    serde_json::json!(row.partial),
+                    serde_json::json!(row.created_at),
+                ]),
+            )
+            .await?;
+        if result.meta.and_then(|meta| meta.changes) != Some(1) {
+            return Err(D1Error {
+                code: 3003,
+                message: "subagent revision conflicts with immutable remote state".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn upsert_agent_subagent_link(
+        &self,
+        repo_id: &str,
+        row: &AgentSubagentLinkRow,
+    ) -> Result<(), D1Error> {
+        reject_unfenced_agent_capture_write("subagent link")?;
+        let sql = r#"
+            INSERT INTO agent_subagent_link (
+                repo_id, content_checkpoint_id, parent_session_id, link_state,
+                boundary_checkpoint_id, stable_subagent_id, sync_revision, created_at, updated_at,
+                synced_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                      CAST(strftime('%s', 'now') AS INTEGER))
+            ON CONFLICT(repo_id, content_checkpoint_id) DO UPDATE SET
+                parent_session_id = excluded.parent_session_id,
+                link_state = excluded.link_state,
+                boundary_checkpoint_id = excluded.boundary_checkpoint_id,
+                stable_subagent_id = excluded.stable_subagent_id,
+                sync_revision = excluded.sync_revision,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE excluded.sync_revision > agent_subagent_link.sync_revision
+               OR (excluded.sync_revision = agent_subagent_link.sync_revision
+                   AND excluded.parent_session_id IS agent_subagent_link.parent_session_id
+                   AND excluded.link_state IS agent_subagent_link.link_state
+                   AND excluded.boundary_checkpoint_id IS agent_subagent_link.boundary_checkpoint_id
+                   AND excluded.stable_subagent_id IS agent_subagent_link.stable_subagent_id
+                   AND excluded.created_at IS agent_subagent_link.created_at
+                   AND excluded.updated_at IS agent_subagent_link.updated_at)
+        "#;
+        let result = self
+            .execute(
+                sql,
+                Some(vec![
+                    serde_json::json!(repo_id),
+                    serde_json::json!(row.content_checkpoint_id),
+                    serde_json::json!(row.parent_session_id),
+                    serde_json::json!(row.link_state),
+                    serde_json::json!(row.boundary_checkpoint_id),
+                    serde_json::json!(row.stable_subagent_id),
+                    serde_json::json!(row.sync_revision),
+                    serde_json::json!(row.created_at),
+                    serde_json::json!(row.updated_at),
+                ]),
+            )
+            .await?;
+        if result.meta.and_then(|meta| meta.changes) != Some(1) {
+            return Err(D1Error {
+                code: 3003,
+                message: "subagent link was fenced by newer or conflicting remote state"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Append immutable source revisions. A same-key row may only be touched
+    /// when every immutable field matches, making concurrent divergent clones
+    /// fail closed.
+    pub async fn sync_agent_subagent_revisions_batch(
+        &self,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[AgentSubagentContentRevisionRow],
+    ) -> Result<(), D1Error> {
+        self.execute_agent_capture_json_batch(
+            r#"
+            WITH incoming(value) AS (SELECT value FROM json_each(?2))
+            INSERT INTO agent_subagent_content_revision (
+                repo_id, parent_session_id, provider_kind, source_key,
+                content_schema_version, revision, checkpoint_id, content_digest,
+                source_channel, partial, created_at, synced_at
+            )
+            SELECT ?1, json_extract(value, '$.parent_session_id'),
+                json_extract(value, '$.provider_kind'), json_extract(value, '$.source_key'),
+                CAST(json_extract(value, '$.content_schema_version') AS INTEGER),
+                CAST(json_extract(value, '$.revision') AS INTEGER),
+                json_extract(value, '$.checkpoint_id'), json_extract(value, '$.content_digest'),
+                json_extract(value, '$.source_channel'),
+                CAST(json_extract(value, '$.partial') AS INTEGER),
+                CAST(json_extract(value, '$.created_at') AS INTEGER),
+                CAST(strftime('%s', 'now') AS INTEGER)
+            FROM incoming
+            WHERE EXISTS (
+                SELECT 1 FROM agent_capture_generation
+                WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM agent_checkpoint_prune_tombstone t
+                WHERE t.repo_id = ?1
+                  AND t.checkpoint_id = json_extract(value, '$.checkpoint_id')
+              )
+            ON CONFLICT(repo_id, parent_session_id, provider_kind, source_key,
+                        content_schema_version, revision) DO UPDATE SET
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE excluded.checkpoint_id IS agent_subagent_content_revision.checkpoint_id
+              AND excluded.content_digest IS agent_subagent_content_revision.content_digest
+              AND excluded.source_channel IS agent_subagent_content_revision.source_channel
+              AND excluded.partial IS agent_subagent_content_revision.partial
+              AND excluded.created_at IS agent_subagent_content_revision.created_at
+            "#,
+            repo_id,
+            publish_token,
+            rows,
+            "subagent content revision",
+        )
+        .await
+    }
+
+    /// Publish association links by monotonic `sync_revision`; equal-generation
+    /// divergence is rejected and an older clone cannot undo a newer boundary
+    /// resolution/deletion observation.
+    pub async fn sync_agent_subagent_links_batch(
+        &self,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[AgentSubagentLinkRow],
+    ) -> Result<(), D1Error> {
+        self.execute_agent_capture_json_batch(
+            r#"
+            WITH incoming(value) AS (SELECT value FROM json_each(?2))
+            INSERT INTO agent_subagent_link (
+                repo_id, content_checkpoint_id, parent_session_id, link_state,
+                boundary_checkpoint_id, stable_subagent_id, sync_revision, created_at, updated_at,
+                synced_at
+            )
+            SELECT ?1, json_extract(value, '$.content_checkpoint_id'),
+                json_extract(value, '$.parent_session_id'), json_extract(value, '$.link_state'),
+                json_extract(value, '$.boundary_checkpoint_id'),
+                json_extract(value, '$.stable_subagent_id'),
+                CAST(json_extract(value, '$.sync_revision') AS INTEGER),
+                CAST(json_extract(value, '$.created_at') AS INTEGER),
+                CAST(json_extract(value, '$.updated_at') AS INTEGER),
+                CAST(strftime('%s', 'now') AS INTEGER)
+            FROM incoming
+            WHERE EXISTS (
+                SELECT 1 FROM agent_capture_generation
+                WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM agent_checkpoint_prune_tombstone t
+                WHERE t.repo_id = ?1
+                  AND t.checkpoint_id = json_extract(value, '$.content_checkpoint_id')
+              )
+            ON CONFLICT(repo_id, content_checkpoint_id) DO UPDATE SET
+                parent_session_id = excluded.parent_session_id,
+                link_state = excluded.link_state,
+                boundary_checkpoint_id = excluded.boundary_checkpoint_id,
+                stable_subagent_id = excluded.stable_subagent_id,
+                sync_revision = excluded.sync_revision,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE excluded.sync_revision > agent_subagent_link.sync_revision
+               OR (excluded.sync_revision = agent_subagent_link.sync_revision
+                   AND excluded.parent_session_id IS agent_subagent_link.parent_session_id
+                   AND excluded.link_state IS agent_subagent_link.link_state
+                   AND excluded.boundary_checkpoint_id IS agent_subagent_link.boundary_checkpoint_id
+                   AND excluded.stable_subagent_id IS agent_subagent_link.stable_subagent_id
+                   AND excluded.created_at IS agent_subagent_link.created_at
+                   AND excluded.updated_at IS agent_subagent_link.updated_at)
+            "#,
+            repo_id,
+            publish_token,
+            rows,
+            "subagent association link",
+        )
+        .await
+    }
+
+    /// Publish source claims last. The D1-side predicate verifies that the
+    /// advertised current revision, checkpoint, digest, and link already
+    /// exist, then advances only the monotonic revision cursor. Fence tokens
+    /// are merged by maximum for an otherwise identical generation.
+    pub async fn sync_agent_subagent_claims_batch(
+        &self,
+        repo_id: &str,
+        publish_token: &str,
+        rows: &[AgentSubagentContentClaimRow],
+    ) -> Result<(), D1Error> {
+        let sql = format!(
+            r#"
+            WITH incoming(value) AS (SELECT value FROM json_each(?2))
+            INSERT INTO agent_subagent_content_claim (
+                repo_id, parent_session_id, provider_kind, source_key,
+                content_schema_version, revision_cursor, sync_revision, current_revision,
+                current_checkpoint_id, current_digest, fence_token, created_at,
+                updated_at, synced_at
+            )
+            SELECT ?1, json_extract(value, '$.parent_session_id'),
+                json_extract(value, '$.provider_kind'), json_extract(value, '$.source_key'),
+                CAST(json_extract(value, '$.content_schema_version') AS INTEGER),
+                CAST(json_extract(value, '$.revision_cursor') AS INTEGER),
+                CAST(json_extract(value, '$.sync_revision') AS INTEGER),
+                CAST(json_extract(value, '$.current_revision') AS INTEGER),
+                json_extract(value, '$.current_checkpoint_id'),
+                json_extract(value, '$.current_digest'),
+                CAST(json_extract(value, '$.fence_token') AS INTEGER),
+                CAST(json_extract(value, '$.created_at') AS INTEGER),
+                CAST(json_extract(value, '$.updated_at') AS INTEGER),
+                CAST(strftime('%s', 'now') AS INTEGER)
+            FROM incoming
+            WHERE EXISTS (
+                    SELECT 1 FROM agent_capture_generation
+                    WHERE repo_id = ?1 AND state = 'publishing' AND writer_token = ?3
+                  )
+              AND (CAST(json_extract(value, '$.current_revision') AS INTEGER) = 0
+               OR (EXISTS (
+                    SELECT 1 FROM agent_subagent_content_revision r
+                    WHERE r.repo_id = ?1
+                      AND r.parent_session_id = json_extract(value, '$.parent_session_id')
+                      AND r.provider_kind = json_extract(value, '$.provider_kind')
+                      AND r.source_key = json_extract(value, '$.source_key')
+                      AND r.content_schema_version = CAST(json_extract(value, '$.content_schema_version') AS INTEGER)
+                      AND r.revision = CAST(json_extract(value, '$.current_revision') AS INTEGER)
+                      AND r.checkpoint_id = json_extract(value, '$.current_checkpoint_id')
+                      AND r.content_digest = json_extract(value, '$.current_digest')
+                  ) AND EXISTS (
+                    SELECT 1 FROM agent_capture_checkpoint_v2 c
+                    WHERE c.repo_id = ?1
+                      AND c.checkpoint_id = json_extract(value, '$.current_checkpoint_id')
+                  ) AND EXISTS (
+                    SELECT 1 FROM agent_subagent_link l
+                    WHERE l.repo_id = ?1
+                      AND l.content_checkpoint_id = json_extract(value, '$.current_checkpoint_id')
+                      AND l.parent_session_id = json_extract(value, '$.parent_session_id')
+                  )))
+            ON CONFLICT(repo_id, parent_session_id, provider_kind, source_key,
+                        content_schema_version) DO UPDATE SET
+                revision_cursor = excluded.revision_cursor,
+                sync_revision = excluded.sync_revision,
+                current_revision = excluded.current_revision,
+                current_checkpoint_id = excluded.current_checkpoint_id,
+                current_digest = excluded.current_digest,
+                fence_token = MAX(agent_subagent_content_claim.fence_token, excluded.fence_token),
+                created_at = excluded.created_at,
+                updated_at = MAX(agent_subagent_content_claim.updated_at, excluded.updated_at),
+                synced_at = CAST(strftime('%s', 'now') AS INTEGER)
+            WHERE {AGENT_SUBAGENT_CLAIM_UPDATE_GUARD}
+            "#
+        );
+        self.execute_agent_capture_json_batch(
+            &sql,
+            repo_id,
+            publish_token,
+            rows,
+            "subagent content claim",
+        )
+        .await
+    }
+
+    pub async fn list_agent_subagent_content_claims(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<AgentSubagentContentClaimRow>, D1Error> {
+        let mut remaining_rows = AGENT_CAPTURE_MAX_ROWS_PER_TABLE;
+        self.list_agent_subagent_content_claims_with_budget(repo_id, &mut remaining_rows)
+            .await
+    }
+
+    async fn list_agent_subagent_content_claims_with_budget(
+        &self,
+        repo_id: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<AgentSubagentContentClaimRow>, D1Error> {
+        self.collect_agent_capture_pages_with_budget(
+            "SELECT parent_session_id, provider_kind, source_key, content_schema_version,
+                    revision_cursor, sync_revision, current_revision, current_checkpoint_id,
+                    current_digest, fence_token, created_at, updated_at
+             FROM agent_subagent_content_claim WHERE repo_id = ?1
+             ORDER BY parent_session_id, provider_kind, source_key, content_schema_version
+             LIMIT ?2 OFFSET ?3",
+            repo_id,
+            "subagent content claim",
+            remaining_rows,
+        )
+        .await
+    }
+
+    pub async fn list_agent_subagent_content_revisions(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<AgentSubagentContentRevisionRow>, D1Error> {
+        let mut remaining_rows = AGENT_CAPTURE_MAX_ROWS_PER_TABLE;
+        self.list_agent_subagent_content_revisions_with_budget(repo_id, &mut remaining_rows)
+            .await
+    }
+
+    async fn list_agent_subagent_content_revisions_with_budget(
+        &self,
+        repo_id: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<AgentSubagentContentRevisionRow>, D1Error> {
+        self.collect_agent_capture_pages_with_budget(
+            "SELECT parent_session_id, provider_kind, source_key, content_schema_version,
+                    revision, checkpoint_id, content_digest, source_channel, partial,
+                    created_at
+             FROM agent_subagent_content_revision WHERE repo_id = ?1
+             ORDER BY parent_session_id, provider_kind, source_key,
+                      content_schema_version, revision
+             LIMIT ?2 OFFSET ?3",
+            repo_id,
+            "subagent content revision",
+            remaining_rows,
+        )
+        .await
+    }
+
+    pub async fn list_agent_subagent_links(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<AgentSubagentLinkRow>, D1Error> {
+        let mut remaining_rows = AGENT_CAPTURE_MAX_ROWS_PER_TABLE;
+        self.list_agent_subagent_links_with_budget(repo_id, &mut remaining_rows)
+            .await
+    }
+
+    async fn list_agent_subagent_links_with_budget(
+        &self,
+        repo_id: &str,
+        remaining_rows: &mut usize,
+    ) -> Result<Vec<AgentSubagentLinkRow>, D1Error> {
+        self.collect_agent_capture_pages_with_budget(
+            "SELECT content_checkpoint_id, parent_session_id, link_state,
+                    boundary_checkpoint_id, stable_subagent_id, sync_revision,
+                    created_at, updated_at
+             FROM agent_subagent_link WHERE repo_id = ?1
+             ORDER BY created_at, content_checkpoint_id
+             LIMIT ?2 OFFSET ?3",
+            repo_id,
+            "subagent association link",
+            remaining_rows,
+        )
+        .await
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -1859,12 +3917,10 @@ pub struct PublishSyncRunRow {
 
 /// Local view of an `agent_session` row prepared for D1 mirroring.
 ///
-/// Field set is the same as the local SQLite schema (see
-/// `sql/migrations/2026050303_agent_capture.sql`) minus the optional
-/// `id`/auto-increment surrogate columns. The cloud caller (`command::cloud`)
-/// builds these from a SELECT and hands them to
-/// [`D1Client::upsert_agent_session`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Source-compatible legacy session projection retained for embedders. The
+/// token-fenced cloud writer uses [`AgentSessionV2Row`] so adding the monotonic
+/// sync generation does not add a required field to this public struct.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionRow {
     pub session_id: String,
     pub agent_kind: String,
@@ -1882,8 +3938,29 @@ pub struct AgentSessionRow {
     pub schema_version: i64,
 }
 
+/// Versioned remote-capture projection with an explicit monotonic generation.
+/// The original [`AgentSessionRow`] remains source-compatible for embedders.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionV2Row {
+    pub session_id: String,
+    pub agent_kind: String,
+    pub provider_session_id: String,
+    pub state: String,
+    pub working_dir: String,
+    pub worktree_id: Option<String>,
+    pub parent_commit: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub metadata_json: String,
+    pub redaction_report: String,
+    pub started_at: i64,
+    pub last_event_at: i64,
+    pub stopped_at: Option<i64>,
+    pub schema_version: i64,
+    pub sync_revision: i64,
+}
+
 /// Local view of an `agent_checkpoint` row prepared for D1 mirroring.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AgentCheckpointRow {
     pub checkpoint_id: String,
     pub session_id: String,
@@ -1900,11 +3977,142 @@ pub struct AgentCheckpointRow {
     pub created_at: i64,
 }
 
+/// Versioned checkpoint projection used by fenced capture generations.
+///
+/// Keep [`AgentCheckpointRow`] unchanged for source compatibility with
+/// callers that construct the original public row type directly.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentCheckpointV2Row {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub parent_checkpoint_id: Option<String>,
+    pub scope: String,
+    pub parent_commit: Option<String>,
+    pub tree_oid: String,
+    pub metadata_blob_oid: String,
+    pub traces_commit: String,
+    pub tool_use_id: Option<String>,
+    pub subagent_session_id: Option<String>,
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub sync_revision: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentCheckpointPruneTombstoneRow {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub pruned_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentCheckpointIdRow {
+    checkpoint_id: String,
+}
+
+impl From<AgentCheckpointV2Row> for AgentCheckpointRow {
+    fn from(row: AgentCheckpointV2Row) -> Self {
+        Self {
+            checkpoint_id: row.checkpoint_id,
+            session_id: row.session_id,
+            parent_checkpoint_id: row.parent_checkpoint_id,
+            scope: row.scope,
+            parent_commit: row.parent_commit,
+            tree_oid: row.tree_oid,
+            metadata_blob_oid: row.metadata_blob_oid,
+            traces_commit: row.traces_commit,
+            tool_use_id: row.tool_use_id,
+            subagent_session_id: row.subagent_session_id,
+            description: row.description,
+            created_at: row.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSubagentContentClaimRow {
+    pub parent_session_id: String,
+    pub provider_kind: String,
+    pub source_key: String,
+    pub content_schema_version: i64,
+    pub revision_cursor: i64,
+    pub sync_revision: i64,
+    pub current_revision: i64,
+    pub current_checkpoint_id: Option<String>,
+    pub current_digest: Option<String>,
+    pub fence_token: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSubagentContentRevisionRow {
+    pub parent_session_id: String,
+    pub provider_kind: String,
+    pub source_key: String,
+    pub content_schema_version: i64,
+    pub revision: i64,
+    pub checkpoint_id: String,
+    pub content_digest: String,
+    pub source_channel: String,
+    pub partial: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentSubagentLinkRow {
+    pub content_checkpoint_id: String,
+    pub parent_session_id: String,
+    pub link_state: String,
+    pub boundary_checkpoint_id: Option<String>,
+    pub stable_subagent_id: Option<String>,
+    pub sync_revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct AgentCaptureRestoreCatalogRows {
+    pub sessions: Vec<AgentSessionV2Row>,
+    pub checkpoints: Vec<AgentCheckpointV2Row>,
+    pub prune_tombstones: Vec<AgentCheckpointPruneTombstoneRow>,
+    pub claims: Vec<AgentSubagentContentClaimRow>,
+    pub revisions: Vec<AgentSubagentContentRevisionRow>,
+    pub links: Vec<AgentSubagentLinkRow>,
+    /// Remaining capacity from the caller's aggregate restore budget. Object
+    /// indexes are charged by the cloud restore layer after this catalog read.
+    pub remaining_rows: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentCaptureGenerationRow {
+    pub repo_id: String,
+    pub generation: i64,
+    pub state: String,
+    pub writer_token: Option<String>,
+    pub object_index_digest: Option<String>,
+    pub object_index_count: Option<i64>,
+    pub object_index_scope: Option<String>,
+    pub object_index_generation: Option<i64>,
+    pub traces_head: Option<String>,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentCaptureGenerationManifest<'a> {
+    pub object_index_digest: &'a str,
+    pub object_index_count: i64,
+    pub object_index_scope: &'a str,
+    pub object_index_generation: i64,
+    pub traces_head: Option<&'a str>,
+}
+
 /// One row of the `object_index` table.
 ///
 /// Mirrors the on-disk SQLite columns one-to-one so that local and remote rows can
 /// be diffed without translation.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ObjectIndexRow {
     pub o_id: String,
     pub o_type: String,
@@ -1936,6 +4144,21 @@ mod tests {
         internal::config::ConfigKv,
         utils::test::{ChangeDirGuard, ScopedEnvVar, setup_with_new_libra_in},
     };
+
+    #[test]
+    fn agent_capture_restore_budget_is_shared_across_tables() {
+        let mut remaining = 5;
+        charge_agent_capture_restore_rows(&mut remaining, 3, "sessions")
+            .expect("first table fits aggregate budget");
+        charge_agent_capture_restore_rows(&mut remaining, 2, "checkpoints")
+            .expect("second table exactly consumes aggregate budget");
+        let error = charge_agent_capture_restore_rows(&mut remaining, 1, "subagent revisions")
+            .expect_err("third table must not receive a fresh per-table budget");
+        assert_eq!(remaining, 0);
+        assert_eq!(error.code, 2011);
+        assert!(error.message.contains("aggregate row safety bound"));
+        assert!(error.message.contains("subagent revisions"));
+    }
 
     /// RAII guard that removes an env var on construction and restores it on drop.
     /// Local copy of the helper used elsewhere — kept self-contained so the test
@@ -2031,6 +4254,805 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:8787/client/v4/accounts/account-123/d1/database/database-123/query"
+        );
+    }
+
+    #[test]
+    fn agent_capture_batch_wire_shape_scales_by_bounded_requests() {
+        let rows = (0..257)
+            .map(|revision| AgentSubagentContentRevisionRow {
+                parent_session_id: "parent".to_string(),
+                provider_kind: "claude_code".to_string(),
+                source_key: format!("source/sha256/{}", "a".repeat(64)),
+                content_schema_version: 1,
+                revision,
+                checkpoint_id: format!("checkpoint-{revision}"),
+                content_digest: format!("digest-{revision}"),
+                source_channel: "import".to_string(),
+                partial: 0,
+                created_at: revision,
+            })
+            .collect::<Vec<_>>();
+        let statements = rows
+            .chunks(128)
+            .map(|page| {
+                D1Client::agent_capture_json_batch_statement(
+                    "WITH incoming(value) AS (SELECT value FROM json_each(?2)) \
+                     SELECT value FROM incoming WHERE ?3 = ?3",
+                    "repo",
+                    "writer-token",
+                    page,
+                    "revision",
+                )
+                .expect("build bounded D1 statement")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 3);
+        let sizes =
+            statements
+                .iter()
+                .map(|statement| {
+                    let wire = serde_json::to_value(statement).expect("serialize D1 statement");
+                    assert_eq!(wire["params"][0], "repo");
+                    assert_eq!(wire["params"][2], "writer-token");
+                    assert!(wire["sql"].as_str().is_some_and(|sql| {
+                        sql.contains("json_each(?2)") && sql.contains("?3")
+                    }));
+                    let payload = wire["params"][1]
+                        .as_str()
+                        .expect("batch parameter is JSON text");
+                    serde_json::from_str::<Vec<AgentSubagentContentRevisionRow>>(payload)
+                        .expect("batch JSON text decodes")
+                        .len()
+                })
+                .collect::<Vec<_>>();
+        assert_eq!(sizes, [128, 128, 1]);
+    }
+
+    #[tokio::test]
+    async fn agent_capture_json_text_batch_executes_with_sqlite_json_each() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let rows = (1..=2)
+            .map(|revision| AgentSubagentContentRevisionRow {
+                parent_session_id: "parent".to_string(),
+                provider_kind: "claude_code".to_string(),
+                source_key: "source".to_string(),
+                content_schema_version: 1,
+                revision,
+                checkpoint_id: format!("checkpoint-{revision}"),
+                content_digest: format!("digest-{revision}"),
+                source_channel: "import".to_string(),
+                partial: 0,
+                created_at: revision,
+            })
+            .collect::<Vec<_>>();
+        let batch = D1Client::agent_capture_json_batch_statement(
+            "WITH incoming(value) AS (SELECT value FROM json_each(?2))
+             INSERT INTO batch_values(value)
+             SELECT CAST(json_extract(value, '$.revision') AS INTEGER)
+             FROM incoming WHERE ?1 = 'repo' AND ?3 = 'writer-token'",
+            "repo",
+            "writer-token",
+            &rows,
+            "revision",
+        )
+        .expect("build D1-compatible batch");
+        let params = batch.params.expect("batch params");
+        let payload = params[1].as_str().expect("JSON text parameter").to_string();
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open SQLite JSON fixture");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TABLE batch_values (value INTEGER NOT NULL)".to_string(),
+        ))
+        .await
+        .expect("create batch target");
+        conn.execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            batch.sql,
+            ["repo".into(), payload.into(), "writer-token".into()],
+        ))
+        .await
+        .expect("execute JSON-text batch through SQLite json_each");
+        let values = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT value FROM batch_values ORDER BY value".to_string(),
+            ))
+            .await
+            .expect("read batch values")
+            .into_iter()
+            .map(|row| row.try_get_by::<i64, _>("value").expect("batch value"))
+            .collect::<Vec<_>>();
+        assert_eq!(values, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn subagent_claim_batch_guard_rejects_revision_cursor_regression() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open claim high-water fixture");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TABLE agent_subagent_content_claim (
+                source_key TEXT PRIMARY KEY, revision_cursor INTEGER NOT NULL,
+                sync_revision INTEGER NOT NULL, current_revision INTEGER NOT NULL,
+                current_checkpoint_id TEXT, current_digest TEXT
+             )"
+            .to_string(),
+        ))
+        .await
+        .expect("create claim high-water fixture");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "INSERT INTO agent_subagent_content_claim VALUES
+             ('source', 9, 3, 9, 'checkpoint-9', 'digest-9')"
+                .to_string(),
+        ))
+        .await
+        .expect("seed claim high-water");
+        let sql = format!(
+            "INSERT INTO agent_subagent_content_claim VALUES
+             ('source', 8, 4, 8, 'checkpoint-8', 'digest-8')
+             ON CONFLICT(source_key) DO UPDATE SET
+                revision_cursor = excluded.revision_cursor,
+                sync_revision = excluded.sync_revision,
+                current_revision = excluded.current_revision,
+                current_checkpoint_id = excluded.current_checkpoint_id,
+                current_digest = excluded.current_digest
+             WHERE {AGENT_SUBAGENT_CLAIM_UPDATE_GUARD}"
+        );
+        let result = conn
+            .execute(Statement::from_string(conn.get_database_backend(), sql))
+            .await
+            .expect("apply guarded claim update");
+        assert_eq!(result.rows_affected(), 0);
+        let row = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT revision_cursor, sync_revision FROM agent_subagent_content_claim"
+                    .to_string(),
+            ))
+            .await
+            .expect("read guarded claim")
+            .expect("claim row");
+        assert_eq!(
+            row.try_get_by::<i64, _>("revision_cursor")
+                .expect("revision cursor"),
+            9
+        );
+        assert_eq!(
+            row.try_get_by::<i64, _>("sync_revision")
+                .expect("sync revision"),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn object_index_catalog_seed_accepts_existing_rows_and_preserves_generations() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open object-index seed fixture");
+        for sql in [
+            "CREATE TABLE object_index (repo_id TEXT NOT NULL)",
+            "CREATE TABLE object_index_catalog_generation (
+                repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL
+             )",
+            "INSERT INTO object_index VALUES ('existing'), ('existing'), ('new')",
+            "INSERT INTO object_index_catalog_generation VALUES ('existing', 7)",
+            OBJECT_INDEX_CATALOG_SEED_SQL,
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect("apply object-index generation seed SQL");
+        }
+        let generations = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT repo_id, generation FROM object_index_catalog_generation ORDER BY repo_id"
+                    .to_string(),
+            ))
+            .await
+            .expect("query seeded object-index generations")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.try_get_by::<String, _>("repo_id")
+                        .expect("seeded repository id"),
+                    row.try_get_by::<i64, _>("generation")
+                        .expect("seeded generation"),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generations,
+            [("existing".to_string(), 7), ("new".to_string(), 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn object_index_catalog_readiness_is_published_after_triggers() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open object-index readiness fixture");
+        for sql in [
+            "CREATE TABLE object_index (
+                id INTEGER PRIMARY KEY, o_id TEXT NOT NULL, o_type TEXT NOT NULL,
+                o_size INTEGER NOT NULL, repo_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+                is_synced INTEGER NOT NULL, UNIQUE(repo_id, o_id)
+             )",
+            "CREATE TABLE object_index_catalog_generation (
+                repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL
+             )",
+            OBJECT_INDEX_CATALOG_READY_TABLE_SQL,
+            OBJECT_INDEX_CATALOG_INVALIDATE_SQL,
+            OBJECT_INDEX_CATALOG_SEED_SQL,
+            "INSERT INTO object_index VALUES (1, 'before', 'blob', 1, 'repo', 1, 1)",
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect("prepare object-index readiness fixture");
+        }
+        let ready_before = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT EXISTS(
+                    SELECT 1 FROM object_index_catalog_generation_ready WHERE singleton = 1
+                 ) AS present"
+                    .to_string(),
+            ))
+            .await
+            .expect("probe readiness before trigger installation")
+            .expect("readiness probe row")
+            .try_get_by::<i64, _>("present")
+            .expect("readiness value");
+        assert_eq!(ready_before, 0);
+
+        for sql in OBJECT_INDEX_CATALOG_TRIGGERS
+            .into_iter()
+            .chain(std::iter::once(OBJECT_INDEX_CATALOG_PUBLISH_READY_SQL))
+        {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect("publish object-index readiness");
+        }
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "INSERT INTO object_index VALUES (2, 'after', 'blob', 1, 'repo', 1, 1)".to_string(),
+        ))
+        .await
+        .expect("mutate catalog after readiness");
+        let generation = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT generation FROM object_index_catalog_generation WHERE repo_id = 'repo'"
+                    .to_string(),
+            ))
+            .await
+            .expect("query ready generation")
+            .expect("generation row")
+            .try_get_by::<i64, _>("generation")
+            .expect("generation value");
+        assert_eq!(generation, 1);
+    }
+
+    #[tokio::test]
+    async fn object_index_catalog_generation_tracks_every_page_invalidating_mutation() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open object-index generation fixture");
+        for ddl in [
+            "CREATE TABLE object_index (
+                id INTEGER PRIMARY KEY, o_id TEXT NOT NULL, o_type TEXT NOT NULL,
+                o_size INTEGER NOT NULL, repo_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+                is_synced INTEGER NOT NULL, UNIQUE(repo_id, o_id)
+             )",
+            "CREATE TABLE object_index_catalog_generation (
+                repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL
+             )",
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                ddl.to_string(),
+            ))
+            .await
+            .expect("create object-index generation fixture");
+        }
+        for trigger in OBJECT_INDEX_CATALOG_TRIGGERS {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                trigger.to_string(),
+            ))
+            .await
+            .expect("install object-index generation trigger");
+        }
+        for mutation in [
+            "INSERT INTO object_index VALUES (1, 'b', 'blob', 1, 'repo', 1, 1)",
+            "UPDATE object_index SET o_size = 2 WHERE repo_id = 'repo' AND o_id = 'b'",
+            "INSERT INTO object_index VALUES (2, 'a', 'blob', 1, 'repo', 1, 1)",
+            "DELETE FROM object_index WHERE repo_id = 'repo' AND o_id = 'b'",
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                mutation.to_string(),
+            ))
+            .await
+            .expect("mutate object-index generation fixture");
+        }
+        let generation = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT generation FROM object_index_catalog_generation WHERE repo_id = 'repo'"
+                    .to_string(),
+            ))
+            .await
+            .expect("query object-index generation")
+            .expect("object-index generation row")
+            .try_get_by::<i64, _>("generation")
+            .expect("object-index generation value");
+        assert_eq!(generation, 4);
+    }
+
+    #[tokio::test]
+    async fn generation_start_excludes_active_writer_and_recovers_expired_writer() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open generation lease fixture");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "CREATE TABLE agent_capture_generation (
+                repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL,
+                state TEXT NOT NULL, writer_token TEXT,
+                object_index_digest TEXT, object_index_count INTEGER,
+                object_index_scope TEXT, object_index_generation INTEGER,
+                traces_head TEXT, started_at INTEGER NOT NULL, completed_at INTEGER
+             )"
+            .to_string(),
+        ))
+        .await
+        .expect("create generation lease fixture");
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "INSERT INTO agent_capture_generation VALUES (
+                'repo', 7, 'publishing', 'active', 'old', 1,
+                'checkpoint_projection', 1, NULL,
+                CAST(strftime('%s', 'now') AS INTEGER), NULL
+             )"
+            .to_string(),
+        ))
+        .await
+        .expect("seed active generation");
+        let params = || {
+            vec![
+                "repo".into(),
+                "next".into(),
+                "digest".into(),
+                2_i64.into(),
+                "checkpoint_projection".into(),
+                2_i64.into(),
+                Option::<String>::None.into(),
+                7_i64.into(),
+                AGENT_CAPTURE_GENERATION_LEASE_SECONDS.into(),
+            ]
+        };
+        let active = conn
+            .query_all(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                AGENT_CAPTURE_BEGIN_GENERATION_FROM_SQL,
+                params(),
+            ))
+            .await
+            .expect("probe active generation lease");
+        assert!(
+            active.is_empty(),
+            "an active publisher must retain its fence"
+        );
+
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "UPDATE agent_capture_generation SET started_at = 0 WHERE repo_id = 'repo'".to_string(),
+        ))
+        .await
+        .expect("expire generation lease");
+        let recovered = conn
+            .query_all(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                AGENT_CAPTURE_BEGIN_GENERATION_FROM_SQL,
+                params(),
+            ))
+            .await
+            .expect("recover expired generation");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0]
+                .try_get_by::<i64, _>("generation")
+                .expect("recovered generation"),
+            8
+        );
+        assert_eq!(
+            recovered[0]
+                .try_get_by::<String, _>("writer_token")
+                .expect("recovered writer"),
+            "next"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_completion_atomically_fences_object_index_generation() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open capture completion fixture");
+        for ddl in [
+            "CREATE TABLE object_index_catalog_generation (
+                repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL
+             )",
+            "CREATE TABLE agent_capture_generation (
+                repo_id TEXT PRIMARY KEY, generation INTEGER NOT NULL,
+                state TEXT NOT NULL, writer_token TEXT,
+                object_index_digest TEXT, object_index_count INTEGER,
+                object_index_scope TEXT, object_index_generation INTEGER,
+                traces_head TEXT, started_at INTEGER NOT NULL, completed_at INTEGER
+             )",
+            "INSERT INTO object_index_catalog_generation VALUES ('repo', 2)",
+            "INSERT INTO agent_capture_generation VALUES (
+                'repo', 1, 'publishing', 'writer', 'digest', 0,
+                'checkpoint_projection', 1, NULL, 1, NULL
+             )",
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                ddl.to_string(),
+            ))
+            .await
+            .expect("prepare capture completion fixture");
+        }
+
+        let stale = conn
+            .query_all(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                AGENT_CAPTURE_COMPLETE_GENERATION_SQL,
+                ["repo".into(), "writer".into(), 1_i64.into()],
+            ))
+            .await
+            .expect("run stale completion predicate");
+        assert!(
+            stale.is_empty(),
+            "an object-index mutation after manifest read must fence completion"
+        );
+
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            "UPDATE object_index_catalog_generation SET generation = 1 WHERE repo_id = 'repo'"
+                .to_string(),
+        ))
+        .await
+        .expect("restore matching object generation");
+        let complete = conn
+            .query_all(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                AGENT_CAPTURE_COMPLETE_GENERATION_SQL,
+                ["repo".into(), "writer".into(), 1_i64.into()],
+            ))
+            .await
+            .expect("run stable completion predicate");
+        assert_eq!(complete.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_capture_v2_barriers_reject_legacy_mixed_version_writers() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open SQLite compatibility fixture");
+        for ddl in [
+            "CREATE TABLE agent_session (session_id TEXT PRIMARY KEY)",
+            "CREATE TABLE agent_checkpoint (checkpoint_id TEXT PRIMARY KEY)",
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                ddl.to_string(),
+            ))
+            .await
+            .expect("create legacy capture table");
+        }
+        for ddl in AGENT_CAPTURE_LEGACY_WRITE_BARRIERS {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                ddl.to_string(),
+            ))
+            .await
+            .expect("install legacy writer barrier");
+        }
+
+        for sql in [
+            "INSERT INTO agent_session (session_id) VALUES ('legacy-session')",
+            "INSERT INTO agent_checkpoint (checkpoint_id) VALUES ('legacy-checkpoint')",
+        ] {
+            let error = conn
+                .execute(Statement::from_string(
+                    conn.get_database_backend(),
+                    sql.to_string(),
+                ))
+                .await
+                .expect_err("legacy writer must be rejected after v2 activation");
+            assert!(
+                error
+                    .to_string()
+                    .contains("legacy agent capture writer is fenced"),
+                "unexpected barrier error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn unfenced_single_row_agent_capture_writes_fail_closed() {
+        for label in [
+            "agent session",
+            "agent checkpoint",
+            "subagent content claim",
+            "subagent content revision",
+            "subagent link",
+        ] {
+            let error = reject_unfenced_agent_capture_write(label)
+                .expect_err("single-row v2 writes require a publication generation");
+            assert_eq!(error.code, 3003);
+            assert!(error.message.contains("active agent-capture generation"));
+        }
+    }
+
+    #[test]
+    fn legacy_agent_session_projection_keeps_its_original_struct_literal_shape() {
+        let row = AgentSessionRow {
+            session_id: "session".to_string(),
+            agent_kind: "claude_code".to_string(),
+            provider_session_id: "provider-session".to_string(),
+            state: "active".to_string(),
+            working_dir: "/repo".to_string(),
+            worktree_id: None,
+            parent_commit: None,
+            parent_session_id: None,
+            metadata_json: "{}".to_string(),
+            redaction_report: "{}".to_string(),
+            started_at: 1,
+            last_event_at: 2,
+            stopped_at: None,
+            schema_version: 1,
+        };
+        assert_eq!(row.session_id, "session");
+    }
+
+    #[test]
+    fn legacy_agent_checkpoint_projection_keeps_its_original_struct_literal_shape() {
+        let row = AgentCheckpointRow {
+            checkpoint_id: "checkpoint".to_string(),
+            session_id: "session".to_string(),
+            parent_checkpoint_id: None,
+            scope: "committed".to_string(),
+            parent_commit: None,
+            tree_oid: "tree".to_string(),
+            metadata_blob_oid: "metadata".to_string(),
+            traces_commit: "traces".to_string(),
+            tool_use_id: None,
+            subagent_session_id: None,
+            description: None,
+            created_at: 1,
+        };
+        assert_eq!(row.checkpoint_id, "checkpoint");
+    }
+
+    #[test]
+    fn compatibility_reads_wait_for_completed_v2_adoption() {
+        assert_eq!(agent_session_compatibility_table(false), "agent_session");
+        assert_eq!(
+            agent_checkpoint_compatibility_table(false),
+            "agent_checkpoint"
+        );
+        assert_eq!(
+            agent_session_compatibility_table(true),
+            "agent_capture_session_v2"
+        );
+        assert_eq!(
+            agent_checkpoint_compatibility_table(true),
+            "agent_capture_checkpoint_v2"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_capture_v2_adopts_legacy_sessions_once_at_generation_zero() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open SQLite adoption fixture");
+        for ddl in [
+            "CREATE TABLE agent_session (
+                session_id TEXT, repo_id TEXT, agent_kind TEXT, provider_session_id TEXT,
+                state TEXT, working_dir TEXT, worktree_id TEXT, parent_commit TEXT,
+                parent_session_id TEXT, metadata_json TEXT, redaction_report TEXT,
+                started_at INTEGER, last_event_at INTEGER, stopped_at INTEGER,
+                schema_version INTEGER, synced_at INTEGER
+             )",
+            "CREATE TABLE agent_capture_session_v2 (
+                session_id TEXT, repo_id TEXT, agent_kind TEXT, provider_session_id TEXT,
+                state TEXT, working_dir TEXT, worktree_id TEXT, parent_commit TEXT,
+                parent_session_id TEXT, metadata_json TEXT, redaction_report TEXT,
+                started_at INTEGER, last_event_at INTEGER, stopped_at INTEGER,
+                schema_version INTEGER, sync_revision INTEGER, synced_at INTEGER,
+                PRIMARY KEY (repo_id, session_id)
+             )",
+            "CREATE TABLE agent_capture_schema_migration (
+                version INTEGER PRIMARY KEY, state TEXT, completed_at INTEGER
+             )",
+            "INSERT INTO agent_capture_schema_migration VALUES (2, 'copying', NULL)",
+            "INSERT INTO agent_session VALUES (
+                'legacy-1', 'repo', 'claude_code', 'provider-1', 'active', '/repo',
+                NULL, NULL, NULL, '{}', '{}', 1, 2, NULL, 1, 3
+             )",
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                ddl.to_string(),
+            ))
+            .await
+            .expect("seed adoption fixture");
+        }
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            AGENT_CAPTURE_LEGACY_SESSION_ADOPTION_SQL.to_string(),
+        ))
+        .await
+        .expect("adopt legacy session");
+        let adopted = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT sync_revision FROM agent_capture_session_v2 WHERE session_id = 'legacy-1'"
+                    .to_string(),
+            ))
+            .await
+            .expect("query adopted session")
+            .expect("adopted row");
+        assert_eq!(
+            adopted
+                .try_get_by::<i64, _>("sync_revision")
+                .expect("adopted generation"),
+            0,
+            "a generation-1 current client must be able to supersede legacy state"
+        );
+
+        for sql in [
+            "UPDATE agent_capture_schema_migration SET state = 'complete' WHERE version = 2",
+            "INSERT INTO agent_session VALUES (
+                'legacy-2', 'repo', 'claude_code', 'provider-2', 'active', '/repo',
+                NULL, NULL, NULL, '{}', '{}', 1, 2, NULL, 1, 3
+             )",
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect("finish one-time adoption fixture");
+        }
+        conn.execute(Statement::from_string(
+            conn.get_database_backend(),
+            AGENT_CAPTURE_LEGACY_SESSION_ADOPTION_SQL.to_string(),
+        ))
+        .await
+        .expect("re-run adoption after completion");
+        let count = conn
+            .query_one(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT COUNT(*) AS n FROM agent_capture_session_v2".to_string(),
+            ))
+            .await
+            .expect("count adopted sessions")
+            .expect("count row")
+            .try_get_by::<i64, _>("n")
+            .expect("count value");
+        assert_eq!(
+            count, 1,
+            "later legacy writes must never enter the v2 snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_capture_v2_discards_unrestorable_legacy_checkpoint_orphans() {
+        use sea_orm::{ConnectionTrait, Database, Statement};
+
+        let conn = Database::connect("sqlite::memory:")
+            .await
+            .expect("open SQLite orphan adoption fixture");
+        for ddl in [
+            "CREATE TABLE agent_capture_schema_migration (
+                version INTEGER PRIMARY KEY, state TEXT, completed_at INTEGER
+             )",
+            "INSERT INTO agent_capture_schema_migration VALUES (2, 'copying', NULL)",
+            "CREATE TABLE agent_capture_session_v2 (
+                session_id TEXT, repo_id TEXT, PRIMARY KEY (repo_id, session_id)
+             )",
+            "INSERT INTO agent_capture_session_v2 VALUES ('present-session', 'repo')",
+            "CREATE TABLE agent_checkpoint (
+                checkpoint_id TEXT, repo_id TEXT, session_id TEXT,
+                parent_checkpoint_id TEXT, scope TEXT, parent_commit TEXT,
+                tree_oid TEXT, metadata_blob_oid TEXT, traces_commit TEXT,
+                tool_use_id TEXT, subagent_session_id TEXT, description TEXT,
+                created_at INTEGER, synced_at INTEGER
+             )",
+            "INSERT INTO agent_checkpoint VALUES
+                ('good', 'repo', 'present-session', NULL, 'committed', NULL,
+                 'tree-good', 'meta-good', 'commit-good', NULL, NULL, NULL, 1, 1),
+                ('orphan', 'repo', 'missing-session', NULL, 'committed', NULL,
+                 'tree-orphan', 'meta-orphan', 'commit-orphan', NULL, NULL, NULL, 2, 2)",
+            "CREATE TABLE agent_capture_checkpoint_v2 (
+                checkpoint_id TEXT, repo_id TEXT, session_id TEXT,
+                parent_checkpoint_id TEXT, scope TEXT, parent_commit TEXT,
+                tree_oid TEXT, metadata_blob_oid TEXT, traces_commit TEXT,
+                tool_use_id TEXT, subagent_session_id TEXT, description TEXT,
+                created_at INTEGER, sync_revision INTEGER, synced_at INTEGER,
+                PRIMARY KEY (repo_id, checkpoint_id)
+             )",
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                ddl.to_string(),
+            ))
+            .await
+            .expect("seed legacy orphan adoption fixture");
+        }
+        for sql in [
+            AGENT_CAPTURE_LEGACY_CHECKPOINT_ADOPTION_SQL,
+            AGENT_CAPTURE_LEGACY_ORPHAN_CLEANUP_SQL,
+        ] {
+            conn.execute(Statement::from_string(
+                conn.get_database_backend(),
+                sql.to_string(),
+            ))
+            .await
+            .expect("adopt and reconcile legacy checkpoints");
+        }
+        let rows = conn
+            .query_all(Statement::from_string(
+                conn.get_database_backend(),
+                "SELECT checkpoint_id, sync_revision FROM agent_capture_checkpoint_v2".to_string(),
+            ))
+            .await
+            .expect("query reconciled adopted checkpoints");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]
+                .try_get_by::<String, _>("checkpoint_id")
+                .expect("checkpoint id"),
+            "good"
+        );
+        assert_eq!(
+            rows[0]
+                .try_get_by::<i64, _>("sync_revision")
+                .expect("adopted checkpoint generation"),
+            0
         );
     }
 

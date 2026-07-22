@@ -126,6 +126,15 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026070701`  | `sparse_view` | `2026070701_sparse_view{,_down}.sql` (lore.md 2.2: read-only sparse view include patterns; owner `internal::sparse`) |
 | `2026070801`  | `worktree_isolation` | `2026070801_worktree_isolation{,_down}.sql` (lore.md 2.1: per-worktree HEAD/index/HEAD-reflog isolation — adds `worktree_id` to `reference` + `reflog`) |
 | `2026070802`  | `agent_checkpoint_paging` | `2026070802_agent_checkpoint_paging{,_down}.sql` (AG-20: `agent_checkpoint(traces_commit)` probe index — deliberately NON-unique so legacy DBs with duplicate rows cannot brick the auto-upgrade; writer idempotency lives in code (probe-first + `ON CONFLICT(checkpoint_id) DO NOTHING`) — plus keyset pagination indexes `agent_session(started_at DESC, session_id)` and `agent_checkpoint(created_at DESC, checkpoint_id)`) |
+| `2026070803`  | `agent_audit_log` | `2026070803_agent_audit_log{,_down}.sql` (AG-24a: append-only raw checkpoint access/export audit log; rollback freezes writes without dropping retained audit evidence) |
+| `2026071301`  | `agent_coverage_gate` | `2026071301_agent_coverage_gate{,_down}.sql` (M1: per-turn coverage claim and append-only revision gate) |
+| `2026071401`  | `agent_export_job` | `2026071401_agent_export_job{,_down}.sql` (M3: fenced OpenCode export-bridge job state) |
+| `2026071402`  | `agent_import_identity` | `2026071402_agent_import_identity{,_down}.sql` (M4: crash-recoverable import identity and progress) |
+| `2026071403`  | `agent_import_tombstone` | `2026071403_agent_import_tombstone{,_down}.sql` (M4: local anti-resurrection tombstone) |
+| `2026071404`  | `agent_tombstone_compat_barrier` | `2026071404_agent_tombstone_compat_barrier{,_down}.sql` (M4: old-writer compatibility triggers for already-released tombstones) |
+| `2026071405`  | `agent_coverage_conflict` | `2026071405_agent_coverage_conflict{,_down}.sql` (M4: bounded complete-coverage conflict evidence) |
+| `2026071406`  | `agent_subagent_content` | `2026071406_agent_subagent_content{,_down}.sql` (M5 immutable base: opaque child-source claims, append-only revisions, and boundary/content links; down refuses durable attribution or active reservations) |
+| `2026071407`  | `agent_subagent_replication` | `2026071407_agent_subagent_replication{,_down}.sql` (M5 compatibility: adds monotonic source/cloud generations, incarnation/cloud-base state, checkpoint-prune fences, and boundary-delete unlinking to repositories that already applied the immutable 1406 base schema) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no

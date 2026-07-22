@@ -278,6 +278,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claude_hook_forward_map_is_exactly_five_and_has_no_subagent_boundary() {
+        assert_eq!(
+            CLAUDE_HOOK_FORWARD_MAP,
+            [
+                ("SessionStart", "session-start"),
+                ("UserPromptSubmit", "prompt"),
+                ("PostToolUse", "tool-use"),
+                ("Stop", "stop"),
+                ("SessionEnd", "session-end"),
+            ]
+        );
+        assert!(
+            CLAUDE_HOOK_FORWARD_MAP
+                .iter()
+                .all(|(event, _)| !event.starts_with("Subagent"))
+        );
+    }
+
+    #[test]
     fn upsert_claude_hooks_is_idempotent() {
         let mut settings = ClaudeSettings::default();
         assert!(upsert_claude_hooks(&mut settings, "/tmp/libra", 10));

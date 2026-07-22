@@ -12,7 +12,12 @@
 //! All bounded constants below (`MAX_*`) protect the runtime from runaway providers
 //! that emit pathologically large or repetitive payloads.
 
-use std::{io::Read, path::Path, sync::Arc};
+use std::{
+    io::Read,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -727,9 +732,24 @@ pub async fn ingest_agent_traces_payload(
     let upsert_sql = "
         INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
-            metadata_json, redaction_report, started_at, last_event_at, stopped_at
+            metadata_json, redaction_report, started_at, last_event_at, stopped_at,
+            sync_revision
         )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        SELECT ?, ?, ?, ?, ?,
+               json_patch(
+                   ?,
+                   COALESCE((
+                       SELECT json_object('capture_incarnation', source_namespace)
+                       FROM agent_capture_incarnation
+                       WHERE agent_kind = ? AND provider_session_id = ?
+                   ), '{}')
+               ),
+               ?, ?, ?, ?,
+               COALESCE((
+                   SELECT next_session_sync_revision
+                   FROM agent_capture_incarnation
+                   WHERE agent_kind = ? AND provider_session_id = ?
+               ), 1)
         WHERE NOT EXISTS (
             SELECT 1 FROM agent_import_tombstone
             WHERE agent_kind = ? AND provider_session_id = ?
@@ -737,6 +757,7 @@ pub async fn ingest_agent_traces_payload(
         ON CONFLICT(agent_kind, provider_session_id) DO UPDATE SET
             state = excluded.state,
             last_event_at = excluded.last_event_at,
+            sync_revision = agent_session.sync_revision + 1,
             redaction_report = excluded.redaction_report,
             stopped_at = CASE WHEN excluded.state = 'stopped' THEN excluded.last_event_at
                               ELSE agent_session.stopped_at END,
@@ -759,10 +780,14 @@ pub async fn ingest_agent_traces_payload(
                 new_state.into(),
                 envelope.cwd.clone().into(),
                 metadata_json.into(),
+                agent_kind.into(),
+                envelope.session_id.clone().into(),
                 redaction_report_json.clone().into(),
                 now.into(),
                 now.into(),
                 stopped_at.into(),
+                agent_kind.into(),
+                envelope.session_id.clone().into(),
                 agent_kind.into(),
                 envelope.session_id.clone().into(),
             ],
@@ -850,6 +875,68 @@ pub async fn ingest_agent_traces_payload(
             )
             .await?;
         } else {
+            let subagent_deadline_ms = if cfg!(debug_assertions) {
+                std::env::var("LIBRA_TEST_SUBAGENT_DISCOVERY_DEADLINE_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(8_000)
+            } else {
+                8_000
+            };
+            let subagent_deadline = Some(
+                Instant::now()
+                    .checked_add(Duration::from_millis(subagent_deadline_ms))
+                    .context("compute bounded subagent hook deadline")?,
+            );
+            let subagent_discovery = if agent_kind == "claude_code" {
+                match crate::internal::ai::subagent_content::discover_claude_subagent_contents_bounded(
+                    std::path::Path::new(&envelope.cwd),
+                    &envelope.session_id,
+                    subagent_deadline.context("subagent hook deadline is unavailable")?,
+                    crate::internal::ai::observed_agents::TRANSCRIPT_READ_HARD_CAP_BYTES,
+                    crate::internal::ai::subagent_content::MAX_SUBAGENT_SOURCES_PER_CAPTURE,
+                )
+                .await
+                {
+                    Ok(discovery) => discovery,
+                    Err(_) => {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            reason = "bounded_subagent_discovery_failed",
+                            "Claude child discovery failed closed; preserving the parent checkpoint as partial"
+                        );
+                        crate::internal::ai::subagent_content::SubagentDiscovery {
+                            warning: Some(
+                                "bounded subagent content discovery failed; child attribution is incomplete"
+                                    .to_string(),
+                            ),
+                            ..crate::internal::ai::subagent_content::SubagentDiscovery::default()
+                        }
+                    }
+                }
+            } else {
+                crate::internal::ai::subagent_content::SubagentDiscovery::default()
+            };
+            // Child content must be durable before a parent advertises child-derived
+            // files/usage/source counts. A retry can safely no-op these source leaves
+            // if the subsequent parent append fails.
+            crate::internal::ai::subagent_content::capture_discovered_subagent_contents(
+                conn,
+                repo,
+                &session_id,
+                &subagent_discovery.sources,
+                "live",
+                subagent_deadline,
+            )
+            .await?;
+            if cfg!(debug_assertions)
+                && std::env::var_os(
+                    "LIBRA_TEST_FAIL_AFTER_SUBAGENT_CONTENT_BEFORE_PARENT_CHECKPOINT",
+                )
+                .is_some()
+            {
+                bail!("injected failure after subagent content before parent checkpoint");
+            }
             write_committed_checkpoint(
                 conn,
                 repo,
@@ -860,6 +947,8 @@ pub async fn ingest_agent_traces_payload(
                 &redaction_report_json,
                 &all_matches,
                 now,
+                &subagent_discovery.sources,
+                subagent_discovery.warning.as_deref(),
             )
             .await?;
         }
@@ -1034,6 +1123,8 @@ async fn write_committed_checkpoint(
     redaction_report_json: &str,
     redaction_matches: &[crate::internal::ai::observed_agents::RedactionMatch],
     now: i64,
+    subagent_sources: &[crate::internal::ai::subagent_content::DiscoveredSubagentContent],
+    subagent_discovery_warning: Option<&str>,
 ) -> Result<()> {
     use crate::internal::ai::{
         coverage_gate,
@@ -1424,8 +1515,16 @@ async fn write_committed_checkpoint(
     // accessors. Strictly fail-open — extraction problems mark the
     // metadata `partial` with redacted warnings and never block the
     // checkpoint write (redaction/path/write paths stay fail-closed).
-    let extraction_value =
-        build_extraction_metadata(agent_kind, transcript_raw_for_extraction.as_deref());
+    let subagent_raws = subagent_sources
+        .iter()
+        .map(crate::internal::ai::subagent_content::DiscoveredSubagentContent::bytes)
+        .collect::<Vec<_>>();
+    let extraction_value = build_extraction_metadata(
+        agent_kind,
+        transcript_raw_for_extraction.as_deref(),
+        &subagent_raws,
+        subagent_discovery_warning,
+    );
     let metadata = serde_json::json!({
         "schema_version": history::CHECKPOINT_METADATA_SCHEMA_VERSION,
         "checkpoint_id": null, // filled in below once we have the UUID
@@ -2311,8 +2410,9 @@ fn redact_extracted_json(value: serde_json::Value) -> serde_json::Value {
 /// raw transcript and shape the result for `metadata.json`'s additive
 /// `extraction` object. Fail-open by construction:
 ///
-/// - no adapter / no raw transcript → `{present:false, partial:true}` with
-///   an explanatory (non-sensitive) warning;
+/// - no adapter / no usable source bytes → `{present:false, partial:true}`
+///   with an explanatory (non-sensitive) warning; independently authorized
+///   child bytes remain extractable with an empty parent and `partial:true`;
 /// - individual extractor failure → warning + `partial:true`, remaining
 ///   dimensions still recorded;
 /// - warnings pass through the default `Redactor` before persistence so a
@@ -2322,11 +2422,20 @@ fn redact_extracted_json(value: serde_json::Value) -> serde_json::Value {
 /// The redacted transcript blob remains the sole persisted content
 /// carrier; extraction stores derived, low-sensitivity facts (usage
 /// numbers, model id, file paths, curated skill events).
-fn build_extraction_metadata(agent_kind: &str, raw: Option<&[u8]>) -> serde_json::Value {
+fn build_extraction_metadata(
+    agent_kind: &str,
+    raw: Option<&[u8]>,
+    subagent_raws: &[&[u8]],
+    subagent_discovery_warning: Option<&str>,
+) -> serde_json::Value {
     use crate::internal::ai::observed_agents::{AgentKind, agent_for};
 
     let mut partial = false;
     let mut warnings: Vec<String> = Vec::new();
+    if let Some(warning) = subagent_discovery_warning {
+        partial = true;
+        warnings.push(warning.to_string());
+    }
     let mut value = serde_json::json!({
         "schema_version": 1,
         "present": false,
@@ -2335,20 +2444,42 @@ fn build_extraction_metadata(agent_kind: &str, raw: Option<&[u8]>) -> serde_json
     });
 
     let adapter = AgentKind::from_db_str(agent_kind).map(agent_for);
-    let (Some(adapter), Some(raw)) = (adapter, raw) else {
+    let Some(adapter) = adapter else {
         partial = true;
-        warnings.push(if adapter.is_none() {
-            format!("unknown agent kind '{agent_kind}'; extraction skipped")
-        } else {
-            "no raw transcript available; extraction skipped".to_string()
-        });
+        warnings.push(format!(
+            "unknown agent kind '{agent_kind}'; extraction skipped"
+        ));
         finalize_extraction(&mut value, partial, warnings);
         return value;
     };
+    let raw = match raw {
+        Some(raw) => raw,
+        None if !subagent_raws.is_empty() && adapter.as_subagent_aware_extractor().is_some() => {
+            partial = true;
+            warnings.push(
+                "no raw parent transcript available; extraction derived from child sources only"
+                    .to_string(),
+            );
+            &[]
+        }
+        None => {
+            partial = true;
+            warnings.push("no raw transcript available; extraction skipped".to_string());
+            finalize_extraction(&mut value, partial, warnings);
+            return value;
+        }
+    };
 
-    let object = value
-        .as_object_mut()
-        .expect("extraction value is an object");
+    // INVARIANT: `value` is constructed by the object-form `json!` literal
+    // above and is never reassigned before this point.
+    let Some(object) = value.as_object_mut() else {
+        return serde_json::json!({
+            "schema_version": 1,
+            "present": false,
+            "partial": true,
+            "warnings": ["internal extraction metadata shape was not an object"],
+        });
+    };
     object.insert("present".into(), serde_json::Value::Bool(true));
 
     if let Some(calculator) = adapter.as_token_calculator() {
@@ -2392,20 +2523,44 @@ fn build_extraction_metadata(agent_kind: &str, raw: Option<&[u8]>) -> serde_json
         }
     }
     if let Some(extractor) = adapter.as_subagent_aware_extractor() {
-        match extractor.total_token_usage_including_subagents(raw) {
-            Ok(usage) => {
+        match extractor.extract_parent_and_subagents(raw, subagent_raws) {
+            Ok(aggregate) => {
                 object.insert(
-                    "subagent_token_usage".into(),
-                    serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+                    "aggregate_token_usage".into(),
+                    serde_json::to_value(&aggregate.aggregate_usage)
+                        .unwrap_or(serde_json::Value::Null),
                 );
+                object.insert(
+                    "subagent_source_count".into(),
+                    serde_json::json!(subagent_raws.len()),
+                );
+                if let Some(usage) = aggregate.subagent_usage {
+                    object.insert(
+                        "subagent_token_usage".into(),
+                        serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+                    );
+                }
+                let list: Vec<String> = aggregate
+                    .modified_files
+                    .iter()
+                    .map(|path| redact_extracted_string(&path.display().to_string()))
+                    .collect();
+                object.insert(
+                    "modified_files".into(),
+                    serde_json::to_value(list).unwrap_or(serde_json::Value::Null),
+                );
+                partial |= aggregate.partial;
+                warnings.extend(aggregate.warnings);
             }
             Err(err) => {
                 partial = true;
-                warnings.push(format!("subagent usage extraction failed: {err:#}"));
+                warnings.push(format!("subagent aggregate extraction failed: {err:#}"));
             }
         }
     }
-    if let Some(analyzer) = adapter.as_transcript_analyzer() {
+    if !object.contains_key("modified_files")
+        && let Some(analyzer) = adapter.as_transcript_analyzer()
+    {
         match analyzer.extract_modified_files_from_offset(raw, 0) {
             Ok(files) => {
                 // File paths are derived from untrusted tool_use input —
@@ -2940,7 +3095,7 @@ mod tests {
             r#"{"model":"gpt-5.3-codex","usage":{"input_tokens":10,"output_tokens":4,"api_call_count":5,"subagent_tokens":30}}"#,
             "\n",
         );
-        let value = build_extraction_metadata("codex", Some(transcript.as_bytes()));
+        let value = build_extraction_metadata("codex", Some(transcript.as_bytes()), &[], None);
         let extraction = value.as_object().expect("extraction object");
         assert_eq!(extraction["present"], serde_json::json!(true));
         assert_eq!(
@@ -2955,10 +3110,9 @@ mod tests {
             "generic-path subagent tokens persisted: {value}"
         );
 
-        // Claude uses the SubagentAwareExtractor accessor — its
-        // subagent_token_usage must be written by that block and NOT
-        // double-written by the generic fallback (value stays the
-        // accessor's, and the key exists exactly once in a JSON object).
+        // Claude uses the multi-source SubagentAwareExtractor accessor. A
+        // parent Task marker alone must not become attributed usage; only an
+        // independently supplied child transcript contributes that field.
         let claude_line = serde_json::json!({
             "type": "assistant",
             "message": {
@@ -2968,11 +3122,49 @@ mod tests {
                 "usage": {"input_tokens": 7, "output_tokens": 2}
             }
         });
-        let claude =
-            build_extraction_metadata("claude_code", Some(format!("{claude_line}\n").as_bytes()));
+        let parent = format!("{claude_line}\n");
+        let without_child =
+            build_extraction_metadata("claude_code", Some(parent.as_bytes()), &[], None);
+        assert!(
+            without_child.get("subagent_token_usage").is_none(),
+            "parent total is not subagent attribution: {without_child}"
+        );
+        let child = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":"child","usage":{"input_tokens":3,"output_tokens":1}}}"#,
+            "\n",
+        );
+        let claude = build_extraction_metadata(
+            "claude_code",
+            Some(parent.as_bytes()),
+            &[child.as_bytes()],
+            None,
+        );
         assert!(
             claude["subagent_token_usage"].is_object(),
-            "claude subagent usage present via accessor: {claude}"
+            "child transcript usage present via accessor: {claude}"
+        );
+        assert_eq!(claude["subagent_source_count"], serde_json::json!(1));
+
+        let child_only = build_extraction_metadata("claude_code", None, &[child.as_bytes()], None);
+        assert_eq!(child_only["present"], serde_json::json!(true));
+        assert_eq!(child_only["partial"], serde_json::json!(true));
+        assert_eq!(
+            child_only["subagent_source_count"],
+            serde_json::json!(1),
+            "durable child content remains attributable without parent bytes: {child_only}"
+        );
+        assert_eq!(
+            child_only["subagent_token_usage"]["input_tokens"],
+            serde_json::json!(3),
+            "child-only usage remains visible: {child_only}"
+        );
+        assert!(
+            child_only["warnings"]
+                .as_array()
+                .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("child sources only")))),
+            "child-only extraction records why the aggregate is partial: {child_only}"
         );
     }
 
@@ -3280,6 +3472,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_hook_session_consumes_saved_capture_incarnation() {
+        let (_dir, conn) = ingest_fresh_conn().await;
+        let backend = conn.get_database_backend();
+        let namespace = "0123456789abcdef0123456789abcdef";
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO agent_capture_incarnation (
+                agent_kind, provider_session_id, next_session_sync_revision,
+                source_namespace, updated_at
+             ) VALUES ('claude_code', ?, 7, ?, 1)",
+            ["S-restored-live".into(), namespace.into()],
+        ))
+        .await
+        .expect("seed erased-session replication incarnation");
+
+        ingest_agent_traces_payload(
+            &ingest_envelope("SessionStart", "S-restored-live", json!({})),
+            super::super::provider::ProviderHookCommand::SessionStart,
+            LifecycleEventKind::SessionStart,
+            claude_provider(),
+            &conn,
+            None,
+        )
+        .await
+        .expect("fresh live hook consumes the saved incarnation");
+
+        let row = conn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT sync_revision,
+                        json_extract(metadata_json, '$.capture_incarnation') AS incarnation
+                 FROM agent_session WHERE provider_session_id = ?",
+                ["S-restored-live".into()],
+            ))
+            .await
+            .expect("query restored live session")
+            .expect("restored live session row");
+        assert_eq!(row.try_get_by::<i64, _>("sync_revision").unwrap(), 7);
+        assert_eq!(
+            row.try_get_by::<String, _>("incarnation").unwrap(),
+            namespace
+        );
+    }
+
+    #[tokio::test]
     async fn ingest_session_end_marks_stopped_and_is_idempotent() {
         let (_dir, conn) = ingest_fresh_conn().await;
 
@@ -3311,7 +3548,8 @@ mod tests {
         let row = conn
             .query_one(Statement::from_sql_and_values(
                 backend,
-                "SELECT state, stopped_at FROM agent_session WHERE provider_session_id = ?",
+                "SELECT state, stopped_at, sync_revision FROM agent_session
+                 WHERE provider_session_id = ?",
                 ["S-002".into()],
             ))
             .await
@@ -3323,6 +3561,11 @@ mod tests {
             row.try_get_by::<Option<i64>, _>("stopped_at")
                 .unwrap()
                 .is_some()
+        );
+        assert_eq!(
+            row.try_get_by::<i64, _>("sync_revision").unwrap(),
+            2,
+            "same-second lifecycle changes use an explicit monotonic sync generation"
         );
 
         // Repeat-ingest is idempotent: still exactly one row for that session.

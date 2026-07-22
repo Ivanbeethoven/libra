@@ -51,6 +51,9 @@ pub fn exec(mut args: Vec<&str>) -> CliResult<()> {
 /// Boundary conditions:
 /// - Errors from any subcommand bubble up via `CliResult::Err`; the function does not
 ///   print them itself, leaving error rendering to the caller (typically `main.rs`).
+/// - Concurrent calls in one process are serialized because CLI dispatch mutates
+///   process-global CWD/hash/output state and drains one shared object-index queue.
+///   Callers may await concurrently, but commands execute one at a time.
 pub async fn exec_async(mut args: Vec<&str>) -> CliResult<()> {
     args.insert(0, env!("CARGO_PKG_NAME"));
     Box::pin(async move { cli::parse_async(Some(&args)).await }).await
@@ -58,10 +61,19 @@ pub async fn exec_async(mut args: Vec<&str>) -> CliResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
     use serial_test::serial;
     use tempfile::TempDir;
 
-    use crate::utils::test;
+    use crate::utils::test::{self, ScopedEnvVar};
 
     /// Smoke test: verifies that the [`ChangeDirGuard`](test::ChangeDirGuard) test
     /// helper can be acquired against a freshly-created temporary directory.
@@ -74,5 +86,47 @@ mod tests {
     fn test_libra_init() {
         let tmp_dir = TempDir::new().unwrap();
         let _guard = test::ChangeDirGuard::new(tmp_dir.path());
+    }
+
+    #[test]
+    #[serial]
+    fn exec_async_object_index_drain_yields_current_thread_executor() {
+        std::thread::Builder::new()
+            .name("exec-async-drain-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build current-thread test runtime")
+                    .block_on(async {
+                        let repo = TempDir::new().expect("create async exec repository");
+                        test::setup_with_new_libra_in(repo.path()).await;
+                        let _cwd = test::ChangeDirGuard::new(repo.path());
+                        let input = repo.path().join("payload.txt");
+                        fs::write(&input, b"async drain payload").expect("write hash-object input");
+                        let _delay =
+                            ScopedEnvVar::set("LIBRA_TEST_OBJECT_INDEX_UPDATE_DELAY_MS", "500");
+
+                        let timer_fired = Arc::new(AtomicBool::new(false));
+                        let timer_state = Arc::clone(&timer_fired);
+                        let timer = tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            timer_state.store(true, Ordering::SeqCst);
+                        });
+                        let input_arg = input.to_string_lossy().into_owned();
+                        super::exec_async(vec!["hash-object", "-w", input_arg.as_str()])
+                            .await
+                            .expect("embedded hash-object succeeds");
+                        assert!(
+                            timer_fired.load(Ordering::SeqCst),
+                            "object-index drain blocked the caller's current-thread Tokio executor"
+                        );
+                        timer.await.expect("join executor responsiveness timer");
+                    });
+            })
+            .expect("spawn large-stack async exec test")
+            .join()
+            .expect("join async exec test");
     }
 }

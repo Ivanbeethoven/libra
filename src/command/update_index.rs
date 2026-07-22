@@ -255,7 +255,11 @@ fn stage_working_tree_path(
         let target = fs::read_link(absolute)
             .map_err(|error| fatal(format!("cannot stage symlink '{path_str}': {error}")))?;
         let blob = Blob::from_content_bytes(symlink_target_blob_bytes(&target));
-        blob.save();
+        blob.try_save().map_err(|error| {
+            CliError::fatal(format!("failed to store object for '{path_str}': {error}"))
+                .with_exit_code(128)
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+        })?;
         let mut entry = IndexEntry::new_from_blob(path_str.to_string(), blob.id, 0);
         entry.mode = 0o120000;
         return Ok(entry);
@@ -277,7 +281,11 @@ fn stage_working_tree_path(
     } else {
         Blob::from_file(absolute)
     };
-    blob.save();
+    blob.try_save().map_err(|error| {
+        CliError::fatal(format!("failed to store object for '{path_str}': {error}"))
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
     IndexEntry::new_from_file(Path::new(path_str), blob.id, workdir).map_err(|error| {
         CliError::fatal(format!("failed to stage '{path_str}': {error}"))
             .with_exit_code(128)

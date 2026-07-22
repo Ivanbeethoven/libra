@@ -90,7 +90,7 @@ mod tests {
         let _env = ScopedEnvVar::set(LIBRA_HOME_ENV, "/custom/libra-home");
         let _db = ScopedEnvVar::set(LIBRA_CONFIG_GLOBAL_DB_ENV, "/isolated/config.db");
         assert_eq!(
-            resolve_libra_home().unwrap(),
+            resolve_libra_home().expect("test fixture operation should succeed"),
             PathBuf::from("/custom/libra-home")
         );
     }
@@ -102,7 +102,7 @@ mod tests {
         let _db = ScopedEnvVar::set(LIBRA_CONFIG_GLOBAL_DB_ENV, "/isolated/store/config.db");
         let _home = ScopedEnvVar::set("HOME", "/tmp/should-not-be-used");
         assert_eq!(
-            resolve_libra_home().unwrap(),
+            resolve_libra_home().expect("test fixture operation should succeed"),
             PathBuf::from("/isolated/store")
         );
     }
@@ -113,7 +113,10 @@ mod tests {
         let _env = ScopedEnvVar::unset(LIBRA_HOME_ENV);
         let _db = ScopedEnvVar::set(LIBRA_CONFIG_GLOBAL_DB_ENV, "config.db");
         let _home = ScopedEnvVar::set("HOME", "/tmp/should-not-be-used");
-        assert_eq!(resolve_libra_home().unwrap(), PathBuf::from("."));
+        assert_eq!(
+            resolve_libra_home().expect("test fixture operation should succeed"),
+            PathBuf::from(".")
+        );
     }
 
     #[test]
@@ -123,7 +126,7 @@ mod tests {
         let _db = ScopedEnvVar::unset(LIBRA_CONFIG_GLOBAL_DB_ENV);
         let _home = ScopedEnvVar::set("HOME", "/tmp/upgrade-home-test");
         assert_eq!(
-            resolve_libra_home().unwrap(),
+            resolve_libra_home().expect("test fixture operation should succeed"),
             PathBuf::from("/tmp/upgrade-home-test/.libra")
         );
     }
@@ -135,7 +138,7 @@ mod tests {
         let _db = ScopedEnvVar::unset(LIBRA_CONFIG_GLOBAL_DB_ENV);
         let _home = ScopedEnvVar::set("HOME", "/tmp/upgrade-home-test2");
         assert_eq!(
-            resolve_libra_home().unwrap(),
+            resolve_libra_home().expect("test fixture operation should succeed"),
             PathBuf::from("/tmp/upgrade-home-test2/.libra")
         );
     }

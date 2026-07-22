@@ -471,6 +471,84 @@ pub(crate) fn pinned_provider_directory_path(_directory: &std::fs::File) -> Path
     PathBuf::new()
 }
 
+/// Open a regular file beneath an already-pinned provider directory without
+/// following any descendant symlink.  Callers keep the directory descriptor
+/// alive across enumeration and pass the provider-relative entry back here,
+/// closing the usual `read_dir` check-to-open race.
+#[cfg(unix)]
+pub(crate) fn open_file_beneath_pinned_provider_directory(
+    directory: &std::fs::File,
+    relative: &Path,
+) -> Result<std::fs::File> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    // SAFETY: duplicating a live owned descriptor yields another owned
+    // descriptor referring to the same pinned directory object.
+    let duplicated = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicated < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("duplicate pinned provider directory descriptor");
+    }
+    // SAFETY: `duplicated` is a fresh descriptor returned by `dup`.
+    let mut current = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(duplicated) };
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty() {
+        anyhow::bail!("provider-relative source does not name a file");
+    }
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("provider-relative source contains a non-normal component");
+        };
+        let name = CString::new(name.as_bytes())
+            .context("provider-relative source component contains NUL")?;
+        let final_component = index + 1 == components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if final_component {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        // SAFETY: `current` owns a live directory fd and `name` is a valid
+        // NUL-terminated component. A successful fd is immediately owned.
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("securely open pinned provider descendant (no-follow)");
+        }
+        // SAFETY: `fd` is a fresh descriptor returned by `openat`.
+        let opened = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let metadata = opened
+            .metadata()
+            .context("inspect pinned provider descendant")?;
+        if final_component {
+            if !metadata.is_file() {
+                anyhow::bail!("provider descendant source is not a regular file");
+            }
+            return Ok(opened);
+        }
+        if !metadata.is_dir() {
+            anyhow::bail!("provider descendant component is not a directory");
+        }
+        current = opened;
+    }
+    anyhow::bail!("provider-relative source did not resolve to a file")
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_file_beneath_pinned_provider_directory(
+    _directory: &std::fs::File,
+    _relative: &Path,
+) -> Result<std::fs::File> {
+    anyhow::bail!(
+        "secure pinned provider descendant opening is unavailable on this platform; capture fails closed"
+    )
+}
+
 #[cfg(not(unix))]
 pub(crate) fn open_provider_directory_for_discovery(
     _adapter: &dyn ObservedAgent,

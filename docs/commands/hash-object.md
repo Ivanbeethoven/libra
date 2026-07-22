@@ -99,6 +99,32 @@ Structured output:
 }
 ```
 
+With `-w`, local object persistence and cloud-catalog indexing have separate
+durability boundaries. If the object is stored but the background
+`object_index` update reaches a terminal database error, the command keeps its
+normal success output (including exactly one `ok: true` JSON envelope), writes
+an actionable warning to stderr, and retains an atomic repair marker under the
+repository storage directory. The next schema-aware repository command retries
+that exact row automatically; `libra cloud sync` fails closed while any marker
+cannot be repaired. `--exit-code-on-warning` converts this otherwise successful
+local write to exit 9 / `LBR-WARN-001` without changing the persisted object.
+Queue drain is asynchronous and bounded to 60 seconds; if that budget expires,
+the command warns and leaves the marker for the next preflight rather than
+blocking an embedded Tokio executor. Failure to create the marker is returned
+before the command can report a completed indexed write, and failure to retire
+it after a successful row update is reported through the same warning contract.
+If a multi-input write stores an earlier object and a later input then fails,
+the original read/validation error and exit code remain primary, while stderr
+also reports any durable repair work left by the completed earlier write.
+Command-owned spawned persistence is registered before the task starts, and
+late failures remain attributed to the invocation that enqueued them. Repair
+uses bounded pages, so an oversized queue keeps progressing across subsequent
+commands; cloud and destructive agent cleanup remain fail-closed until it is
+empty. Replay and queued writers share a process-crash-safe ownership lock from
+a bounded 65,536-shard OID namespace through row update and marker retirement,
+so a delayed queued write cannot
+recreate a row after replay and destructive cleanup have consumed its marker.
+
 ## Compatibility
 
 | Feature | Libra | Git | Jujutsu |
@@ -121,3 +147,4 @@ Structured output:
 | Content is not a well-formed object of `-t <type>` (without `--literally`) | `LBR-CLI-002` | 129 | `pass --literally to hash malformed content without validation` |
 | Input file cannot be read | `LBR-IO-001` | 128 | Verify the path exists and is readable |
 | Object cannot be written | `LBR-IO-002` | 128 | Check object storage permissions and disk space |
+| Object stored but cloud index repair remains pending, with `--exit-code-on-warning` | `LBR-WARN-001` | 9 | Fix the reported repository database/marker error; the next repo command retries automatically |

@@ -307,12 +307,12 @@ pub fn extract_claude_code(data: &[u8]) -> ExtractionSummary {
         ));
     }
     if saw_task_tool {
-        // The Claude transcript does not attribute usage per subagent;
-        // expose the aggregate as the subagent-aware total and say so.
-        out.subagent_usage = out.usage.clone();
+        // The parent transcript does not attribute usage per child. DR-06's
+        // multi-source extractor adds usage only from independently opened
+        // `<session>/subagents/*.jsonl` files; never relabel the parent total.
         out.warnings.push(
-            "Task (subagent) calls present; per-subagent token split is not \
-             attributed in the transcript — subagent usage equals the session total"
+            "Task (subagent) calls present; the parent transcript alone does not attribute \
+             subagent usage"
                 .to_string(),
         );
         out.partial = true;
@@ -500,7 +500,10 @@ mod tests {
         assert_eq!(usage.cached_tokens, Some(6));
         assert_eq!(out.api_call_count, 1);
         assert_eq!(out.modified_files, ["src/main.rs"]);
-        assert!(out.subagent_usage.is_some(), "Task marks subagent usage");
+        assert_eq!(
+            out.subagent_usage, None,
+            "a Task marker alone must not relabel the parent session total"
+        );
         assert_eq!(out.skill_events.len(), 1);
         assert_eq!(out.skill_events[0].skill.name, "/review");
         assert!(out.partial, "undecodable line + Task approximation");

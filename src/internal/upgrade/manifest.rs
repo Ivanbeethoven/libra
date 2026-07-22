@@ -436,12 +436,17 @@ mod tests {
     // in tests to sign fixtures).
     fn test_keypair() -> ring::signature::Ed25519KeyPair {
         // INVARIANT: fixed seed is valid 32 bytes, generation cannot fail.
-        ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7u8; 32]).unwrap()
+        ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7u8; 32])
+            .expect("test fixture operation should succeed")
     }
 
     fn test_trust(generation: u32) -> Vec<TrustedKey> {
         use ring::signature::KeyPair;
-        let pk: [u8; 32] = test_keypair().public_key().as_ref().try_into().unwrap();
+        let pk: [u8; 32] = test_keypair()
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("test fixture operation should succeed");
         vec![TrustedKey {
             key_id: "test-key-1",
             ed25519_pubkey: pk,
@@ -480,7 +485,8 @@ mod tests {
     }
 
     fn envelope_for(payload: &serde_json::Value) -> Vec<u8> {
-        let payload_bytes = serde_json::to_vec(payload).unwrap();
+        let payload_bytes =
+            serde_json::to_vec(payload).expect("test fixture operation should succeed");
         let mut message = SIGNATURE_DOMAIN_PREFIX.to_vec();
         message.extend_from_slice(&payload_bytes);
         let sig = test_keypair().sign(&message);
@@ -492,13 +498,14 @@ mod tests {
                 "signature": base64::engine::general_purpose::STANDARD.encode(sig.as_ref()),
             }],
         }))
-        .unwrap()
+        .expect("test fixture operation should succeed")
     }
 
     #[test]
     fn valid_envelope_verifies_end_to_end() {
         let envelope = envelope_for(&payload_json("1.2.3"));
-        let manifest = verify_envelope_bytes(&envelope, &test_trust(1)).unwrap();
+        let manifest = verify_envelope_bytes(&envelope, &test_trust(1))
+            .expect("test fixture operation should succeed");
         assert_eq!(manifest.version, ReleaseVersion(1, 2, 3));
         assert_eq!(manifest.signer_key_id, "test-key-1");
         assert_eq!(manifest.control_revision, 5);
@@ -517,12 +524,14 @@ mod tests {
 
     #[test]
     fn tampered_payload_fails_signature() {
-        let payload_bytes = serde_json::to_vec(&payload_json("1.2.3")).unwrap();
+        let payload_bytes = serde_json::to_vec(&payload_json("1.2.3"))
+            .expect("test fixture operation should succeed");
         let mut message = SIGNATURE_DOMAIN_PREFIX.to_vec();
         message.extend_from_slice(&payload_bytes);
         let sig = test_keypair().sign(&message);
         // Sign 1.2.3 but ship 9.9.9 in the payload.
-        let tampered = serde_json::to_vec(&payload_json("9.9.9")).unwrap();
+        let tampered = serde_json::to_vec(&payload_json("9.9.9"))
+            .expect("test fixture operation should succeed");
         let envelope = serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
             "payload": base64::engine::general_purpose::STANDARD.encode(&tampered),
@@ -531,7 +540,7 @@ mod tests {
                 "signature": base64::engine::general_purpose::STANDARD.encode(sig.as_ref()),
             }],
         }))
-        .unwrap();
+        .expect("test fixture operation should succeed");
         assert!(matches!(
             verify_envelope_bytes(&envelope, &test_trust(1)),
             Err(ManifestError::NoTrustedSignature)
@@ -541,7 +550,8 @@ mod tests {
     #[test]
     fn duplicate_key_id_rejected_before_crypto() {
         let payload = payload_json("1.2.3");
-        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let payload_bytes =
+            serde_json::to_vec(&payload).expect("test fixture operation should succeed");
         let envelope = serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
             "payload": base64::engine::general_purpose::STANDARD.encode(&payload_bytes),
@@ -550,7 +560,7 @@ mod tests {
                 {"key_id": "test-key-1", "signature": "BBBB"},
             ],
         }))
-        .unwrap();
+        .expect("test fixture operation should succeed");
         assert!(matches!(
             verify_envelope_bytes(&envelope, &test_trust(1)),
             Err(ManifestError::DuplicateKeyId(_))
@@ -669,12 +679,18 @@ mod tests {
         assert!(verify_envelope_bytes(&envelope_for(&p), &test_trust(1)).is_err());
         // missing platform
         let mut p = payload_json("1.2.3");
-        p["artifacts"].as_array_mut().unwrap().pop();
+        p["artifacts"]
+            .as_array_mut()
+            .expect("test fixture operation should succeed")
+            .pop();
         assert!(verify_envelope_bytes(&envelope_for(&p), &test_trust(1)).is_err());
         // duplicate platform
         let mut p = payload_json("1.2.3");
         let dup = p["artifacts"][0].clone();
-        p["artifacts"].as_array_mut().unwrap().push(dup);
+        p["artifacts"]
+            .as_array_mut()
+            .expect("test fixture operation should succeed")
+            .push(dup);
         assert!(verify_envelope_bytes(&envelope_for(&p), &test_trust(1)).is_err());
         // zero size
         let mut p = payload_json("1.2.3");

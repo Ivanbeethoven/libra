@@ -421,7 +421,7 @@ fn persist_patchset_snapshot_and_evidence(
         }),
     };
 
-    tokio::spawn(async move {
+    ClientStorage::spawn_background_index_work(async move {
         store_to_mcp(&mcp_server, "patchset", &patchset_id, &patchset, debug_mode).await;
         history
             .event(
@@ -1815,7 +1815,7 @@ pub async fn start_code_ui_runtime(
     let pending_approvals_clone = pending_approvals.clone();
     let working_dir_clone = args.cwd.clone();
     let thread_id_clone = thread_id.clone();
-    tokio::spawn(async move {
+    ClientStorage::spawn_background_index_work(async move {
         let mut read = read;
         // When a streaming-delta event mutates in-memory state we deliberately
         // skip the publish_code_ui_snapshot broadcast so subscribers don't pay
@@ -1910,7 +1910,7 @@ pub async fn start_code_ui_runtime(
                         }
                         let history_recorder = history_recorder_clone.clone();
                         let thread_event_payload = params.clone();
-                        tokio::spawn(async move {
+                        ClientStorage::spawn_background_index_work(async move {
                             history_recorder
                                 .event(
                                     EventKind::ThreadStatus,
@@ -2813,7 +2813,7 @@ pub async fn execute(
     let personality_for_run = args.personality.clone();
     // commandExecution item 的默认工作目录（当 item 未提供 cwd 时使用）
     let default_command_cwd = args.cwd.clone();
-    let _reader_task = tokio::spawn(async move {
+    let _reader_task = ClientStorage::spawn_background_index_work(async move {
         let mut read = read;
         #[allow(clippy::while_let_loop)]
         loop {
@@ -2924,7 +2924,7 @@ pub async fn execute(
                                     }
 
                                     let mcp_server_for_thread = mcp_server_clone.clone();
-                                    tokio::spawn(async move {
+                                    ClientStorage::spawn_background_index_work(async move {
                                         store_to_mcp(
                                             &mcp_server_for_thread,
                                             "thread",
@@ -3065,7 +3065,7 @@ pub async fn execute(
                                     let snapshot_id = snapshot.id.clone();
                                     let snapshot_for_mcp = snapshot.clone();
                                     let mcp_server_for_snapshot = mcp_server_clone.clone();
-                                    tokio::spawn(async move {
+                                    ClientStorage::spawn_background_index_work(async move {
                                         store_to_mcp(
                                             &mcp_server_for_snapshot,
                                             "context_snapshot",
@@ -3170,7 +3170,7 @@ pub async fn execute(
                                     };
                                     let history_writer = history_writer_clone.clone();
                                     let run_id_for_write = turn_id.to_string();
-                                    tokio::spawn(async move {
+                                    ClientStorage::spawn_background_index_work(async move {
                                         history_writer
                                             .write("run_snapshot", &run_id_for_write, &run_snapshot)
                                             .await;
@@ -3198,7 +3198,7 @@ pub async fn execute(
 
                                     let mcp_server_for_run = mcp_server_clone.clone();
                                     let history = history_recorder_clone.clone();
-                                    tokio::spawn(async move {
+                                    ClientStorage::spawn_background_index_work(async move {
                                         store_to_mcp(
                                             &mcp_server_for_run,
                                             "run",
@@ -3274,41 +3274,47 @@ pub async fn execute(
                                             {
                                                 session.thread.current_turn_id = None;
                                             }
-                                            tokio::spawn(async move {
-                                                store_to_mcp(
-                                                    &mcp_server_for_run,
-                                                    "run",
-                                                    &run_id,
-                                                    &run,
-                                                    debug_mode,
-                                                )
-                                                .await;
-                                                history
-                                                    .event(
-                                                        history::EventKind::RunStatus,
+                                            ClientStorage::spawn_background_index_work(
+                                                async move {
+                                                    store_to_mcp(
+                                                        &mcp_server_for_run,
+                                                        "run",
                                                         &run_id,
-                                                        "completed",
-                                                        serde_json::json!({}),
+                                                        &run,
+                                                        debug_mode,
                                                     )
                                                     .await;
-                                                history_writer
-                                                    .write("run_event", &run_event.id, &run_event)
-                                                    .await;
-                                                let context_snapshot = ContextSnapshot {
-                                                    id: format!("context_rc_{}", run_id),
-                                                    thread_id: run.thread_id.clone(),
-                                                    run_id: Some(run_id.clone()),
-                                                    created_at: Utc::now(),
-                                                    data: serde_json::json!({ "release_candidate": true }),
-                                                };
-                                                history_writer
-                                                    .write(
-                                                        "context_snapshot",
-                                                        &context_snapshot.id,
-                                                        &context_snapshot,
-                                                    )
-                                                    .await;
-                                            });
+                                                    history
+                                                        .event(
+                                                            history::EventKind::RunStatus,
+                                                            &run_id,
+                                                            "completed",
+                                                            serde_json::json!({}),
+                                                        )
+                                                        .await;
+                                                    history_writer
+                                                        .write(
+                                                            "run_event",
+                                                            &run_event.id,
+                                                            &run_event,
+                                                        )
+                                                        .await;
+                                                    let context_snapshot = ContextSnapshot {
+                                                        id: format!("context_rc_{}", run_id),
+                                                        thread_id: run.thread_id.clone(),
+                                                        run_id: Some(run_id.clone()),
+                                                        created_at: Utc::now(),
+                                                        data: serde_json::json!({ "release_candidate": true }),
+                                                    };
+                                                    history_writer
+                                                        .write(
+                                                            "context_snapshot",
+                                                            &context_snapshot.id,
+                                                            &context_snapshot,
+                                                        )
+                                                        .await;
+                                                },
+                                            );
                                         }
                                     } else {
                                         println!("--- Turn completed ---");
@@ -3370,7 +3376,7 @@ pub async fn execute(
                                             p.turn_id.clone(),
                                             Utc::now().timestamp_millis()
                                         );
-                                        tokio::spawn(async move {
+                                        ClientStorage::spawn_background_index_work(async move {
                                             history_writer
                                                 .write("run_usage", &run_usage_id, &run_usage)
                                                 .await;
@@ -3645,7 +3651,7 @@ pub async fn execute(
                                             status: plan_status,
                                             created_at: plan_created_at,
                                         };
-                                        tokio::spawn(async move {
+                                        ClientStorage::spawn_background_index_work(async move {
                                             history_writer
                                                 .write(
                                                     "plan_snapshot",
@@ -3939,7 +3945,7 @@ pub async fn execute(
                                     };
                                     let history_writer = history_writer_clone.clone();
                                     let task_id_for_write = task_id.clone();
-                                    tokio::spawn(async move {
+                                    ClientStorage::spawn_background_index_work(async move {
                                         history_writer
                                             .write(
                                                 "task_snapshot",
@@ -3963,7 +3969,7 @@ pub async fn execute(
                                     // Store to MCP in background
                                     let mcp_server_for_task = mcp_server_clone.clone();
                                     let history = history_recorder_clone.clone();
-                                    tokio::spawn(async move {
+                                    ClientStorage::spawn_background_index_work(async move {
                                         store_to_mcp(
                                             &mcp_server_for_task,
                                             "task",
@@ -4050,7 +4056,7 @@ Task Completed"
                                         next_intent_id: None,
                                     };
                                     let history_writer = history_writer_clone.clone();
-                                    tokio::spawn(async move {
+                                    ClientStorage::spawn_background_index_work(async move {
                                         history_writer
                                             .write("task_event", &task_event.id, &task_event)
                                             .await;
@@ -4170,16 +4176,17 @@ Task Completed"
                                                         );
                                                     let mcp_server_for_tool =
                                                         mcp_server_clone.clone();
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_tool,
-                                                            "tool_invocation",
-                                                            &tool_id,
-                                                            &tool_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                        history
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_tool,
+                                                                "tool_invocation",
+                                                                &tool_id,
+                                                                &tool_for_mcp,
+                                                                debug_mode,
+                                                            )
+                                                            .await;
+                                                            history
                                                             .event(
                                                                 history::EventKind::ToolInvocationStatus,
                                                                 &tool_id,
@@ -4187,14 +4194,15 @@ Task Completed"
                                                                 serde_json::json!({"tool": tool, "server": server}),
                                                             )
                                                             .await;
-                                                        history_writer
-                                                            .write(
-                                                                "tool_invocation_event",
-                                                                &tool_event_object_id,
-                                                                &tool_event,
-                                                            )
-                                                            .await;
-                                                    });
+                                                            history_writer
+                                                                .write(
+                                                                    "tool_invocation_event",
+                                                                    &tool_event_object_id,
+                                                                    &tool_event,
+                                                                )
+                                                                .await;
+                                                        },
+                                                    );
                                                 }
                                                 "toolCall" => {
                                                     let tool = item
@@ -4240,16 +4248,17 @@ Task Completed"
                                                             &tool_id,
                                                             &tool_event.status,
                                                         );
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_tool,
-                                                            "tool_invocation",
-                                                            &tool_id,
-                                                            &tool_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                        history
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_tool,
+                                                                "tool_invocation",
+                                                                &tool_id,
+                                                                &tool_for_mcp,
+                                                                debug_mode,
+                                                            )
+                                                            .await;
+                                                            history
                                                             .event(
                                                                 history::EventKind::ToolInvocationStatus,
                                                                 &tool_id,
@@ -4257,14 +4266,15 @@ Task Completed"
                                                                 serde_json::json!({"tool": tool}),
                                                             )
                                                             .await;
-                                                        history_writer
-                                                            .write(
-                                                                "tool_invocation_event",
-                                                                &tool_event_object_id,
-                                                                &tool_event,
-                                                            )
-                                                            .await;
-                                                    });
+                                                            history_writer
+                                                                .write(
+                                                                    "tool_invocation_event",
+                                                                    &tool_event_object_id,
+                                                                    &tool_event,
+                                                                )
+                                                                .await;
+                                                        },
+                                                    );
                                                 }
                                                 "commandExecution" => {
                                                     let cmd = item
@@ -4334,16 +4344,17 @@ Task Completed"
                                                             &cmd_id,
                                                             &tool_event.status,
                                                         );
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_cmd,
-                                                            "tool_invocation",
-                                                            &cmd_id,
-                                                            &cmd_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                        history
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_cmd,
+                                                                "tool_invocation",
+                                                                &cmd_id,
+                                                                &cmd_for_mcp,
+                                                                debug_mode,
+                                                            )
+                                                            .await;
+                                                            history
                                                             .event(
                                                                 history::EventKind::ToolInvocationStatus,
                                                                 &cmd_id,
@@ -4351,14 +4362,15 @@ Task Completed"
                                                                 serde_json::json!({"command": cmd}),
                                                             )
                                                             .await;
-                                                        history_writer
-                                                            .write(
-                                                                "tool_invocation_event",
-                                                                &tool_event_object_id,
-                                                                &tool_event,
-                                                            )
-                                                            .await;
-                                                    });
+                                                            history_writer
+                                                                .write(
+                                                                    "tool_invocation_event",
+                                                                    &tool_event_object_id,
+                                                                    &tool_event,
+                                                                )
+                                                                .await;
+                                                        },
+                                                    );
                                                 }
                                                 "reasoning" => {
                                                     println!("  Thinking started");
@@ -4382,16 +4394,18 @@ Task Completed"
 
                                                     let mcp_server_for_reasoning =
                                                         mcp_server_clone.clone();
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_reasoning,
-                                                            "reasoning",
-                                                            &reasoning_id,
-                                                            &reasoning_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                    });
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_reasoning,
+                                                                "reasoning",
+                                                                &reasoning_id,
+                                                                &reasoning_for_mcp,
+                                                                debug_mode,
+                                                            )
+                                                            .await;
+                                                        },
+                                                    );
                                                 }
                                                 "plan" => {
                                                     let text = item
@@ -4425,16 +4439,18 @@ Task Completed"
 
                                                     let mcp_server_for_plan_2 =
                                                         mcp_server_clone.clone();
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_plan_2,
-                                                            "plan",
-                                                            &plan_id_2,
-                                                            &plan_for_mcp_2,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                    });
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_plan_2,
+                                                                "plan",
+                                                                &plan_id_2,
+                                                                &plan_for_mcp_2,
+                                                                debug_mode,
+                                                            )
+                                                            .await;
+                                                        },
+                                                    );
                                                 }
                                                 "fileChange" => {
                                                     println!("  ?? File Change started");
@@ -4458,16 +4474,18 @@ Task Completed"
 
                                                     let mcp_server_for_patchset =
                                                         mcp_server_clone.clone();
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_patchset,
-                                                            "patchset",
-                                                            &patchset_id,
-                                                            &patchset_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                    });
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_patchset,
+                                                                "patchset",
+                                                                &patchset_id,
+                                                                &patchset_for_mcp,
+                                                                debug_mode,
+                                                            )
+                                                            .await;
+                                                        },
+                                                    );
                                                 }
                                                 "dynamicToolCall" => {
                                                     let tool = item
@@ -4514,23 +4532,25 @@ Task Completed"
                                                             &dyn_tool_id,
                                                             &tool_event.status,
                                                         );
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_dyn,
-                                                            "tool_invocation",
-                                                            &dyn_tool_id,
-                                                            &dyn_tool_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                        history_writer
-                                                            .write(
-                                                                "tool_invocation_event",
-                                                                &tool_event_object_id,
-                                                                &tool_event,
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_dyn,
+                                                                "tool_invocation",
+                                                                &dyn_tool_id,
+                                                                &dyn_tool_for_mcp,
+                                                                debug_mode,
                                                             )
                                                             .await;
-                                                    });
+                                                            history_writer
+                                                                .write(
+                                                                    "tool_invocation_event",
+                                                                    &tool_event_object_id,
+                                                                    &tool_event,
+                                                                )
+                                                                .await;
+                                                        },
+                                                    );
                                                 }
                                                 "webSearch" => {
                                                     let query = item
@@ -4576,23 +4596,25 @@ Task Completed"
                                                             &ws_id,
                                                             &tool_event.status,
                                                         );
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_ws,
-                                                            "tool_invocation",
-                                                            &ws_id,
-                                                            &ws_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                        history_writer
-                                                            .write(
-                                                                "tool_invocation_event",
-                                                                &tool_event_object_id,
-                                                                &tool_event,
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_ws,
+                                                                "tool_invocation",
+                                                                &ws_id,
+                                                                &ws_for_mcp,
+                                                                debug_mode,
                                                             )
                                                             .await;
-                                                    });
+                                                            history_writer
+                                                                .write(
+                                                                    "tool_invocation_event",
+                                                                    &tool_event_object_id,
+                                                                    &tool_event,
+                                                                )
+                                                                .await;
+                                                        },
+                                                    );
                                                 }
                                                 "userMessage" => {
                                                     let content = item
@@ -4660,32 +4682,35 @@ Task Completed"
                                                     let history_writer =
                                                         history_writer_clone.clone();
                                                     let intent_id_for_write = item_id.clone();
-                                                    tokio::spawn(async move {
-                                                        history_writer
-                                                            .write(
-                                                                "intent_snapshot",
-                                                                &intent_id_for_write,
-                                                                &intent_snapshot,
-                                                            )
-                                                            .await;
-                                                        history_writer
-                                                            .write(
-                                                                "intent_event",
-                                                                &intent_event.id,
-                                                                &intent_event,
-                                                            )
-                                                            .await;
-                                                        if let Some(link_event) = parent_link_event
-                                                        {
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            history_writer
+                                                                .write(
+                                                                    "intent_snapshot",
+                                                                    &intent_id_for_write,
+                                                                    &intent_snapshot,
+                                                                )
+                                                                .await;
                                                             history_writer
                                                                 .write(
                                                                     "intent_event",
-                                                                    &link_event.id,
-                                                                    &link_event,
+                                                                    &intent_event.id,
+                                                                    &intent_event,
                                                                 )
                                                                 .await;
-                                                        }
-                                                    });
+                                                            if let Some(link_event) =
+                                                                parent_link_event
+                                                            {
+                                                                history_writer
+                                                                    .write(
+                                                                        "intent_event",
+                                                                        &link_event.id,
+                                                                        &link_event,
+                                                                    )
+                                                                    .await;
+                                                            }
+                                                        },
+                                                    );
                                                     let intent_id = item_id.clone();
                                                     let intent_for_mcp = intent.clone();
                                                     if let Some(mut session) = lock_or_warn(
@@ -4697,16 +4722,18 @@ Task Completed"
 
                                                     let mcp_server_for_intent =
                                                         mcp_server_clone.clone();
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_intent,
-                                                            "intent",
-                                                            &intent_id,
-                                                            &intent_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                    });
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_intent,
+                                                                "intent",
+                                                                &intent_id,
+                                                                &intent_for_mcp,
+                                                                debug_mode,
+                                                            )
+                                                            .await;
+                                                        },
+                                                    );
                                                 }
                                                 "agentMessage" => {
                                                     let content = item
@@ -4793,23 +4820,25 @@ Task Completed"
                                                             &inv_id,
                                                             &tool_event.status,
                                                         );
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_inv,
-                                                            "tool_invocation",
-                                                            &inv_id,
-                                                            &inv_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                        history_writer
-                                                            .write(
-                                                                "tool_invocation_event",
-                                                                &tool_event_object_id,
-                                                                &tool_event,
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_inv,
+                                                                "tool_invocation",
+                                                                &inv_id,
+                                                                &inv_for_mcp,
+                                                                debug_mode,
                                                             )
                                                             .await;
-                                                    });
+                                                            history_writer
+                                                                .write(
+                                                                    "tool_invocation_event",
+                                                                    &tool_event_object_id,
+                                                                    &tool_event,
+                                                                )
+                                                                .await;
+                                                        },
+                                                    );
                                                 }
                                                 "enteredReviewMode" => {
                                                     let review_id = item
@@ -4847,15 +4876,17 @@ Task Completed"
                                                     let history_writer =
                                                         history_writer_clone.clone();
                                                     let context_frame_id = context_frame.id.clone();
-                                                    tokio::spawn(async move {
-                                                        history_writer
-                                                            .write(
-                                                                "context_frame",
-                                                                &context_frame_id,
-                                                                &context_frame,
-                                                            )
-                                                            .await;
-                                                    });
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            history_writer
+                                                                .write(
+                                                                    "context_frame",
+                                                                    &context_frame_id,
+                                                                    &context_frame,
+                                                                )
+                                                                .await;
+                                                        },
+                                                    );
                                                     let snapshot = ContextSnapshot {
                                                         id: item_id.clone(),
                                                         thread_id: thread_id.clone(),
@@ -4867,16 +4898,18 @@ Task Completed"
                                                     let snapshot_for_mcp = snapshot.clone();
                                                     let mcp_server_for_snapshot =
                                                         mcp_server_clone.clone();
-                                                    tokio::spawn(async move {
-                                                        store_to_mcp(
-                                                            &mcp_server_for_snapshot,
-                                                            "context_snapshot",
-                                                            &snapshot_id,
-                                                            &snapshot_for_mcp,
-                                                            debug_mode,
-                                                        )
-                                                        .await;
-                                                    });
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            store_to_mcp(
+                                                                &mcp_server_for_snapshot,
+                                                                "context_snapshot",
+                                                                &snapshot_id,
+                                                                &snapshot_for_mcp,
+                                                                debug_mode,
+                                                            )
+                                                            .await;
+                                                        },
+                                                    );
                                                 }
                                                 _ => {
                                                     println!("  Task: {} started", item_type);
@@ -5011,16 +5044,17 @@ Task Completed"
                                                                 &inv_id,
                                                                 &tool_event.status,
                                                             );
-                                                        tokio::spawn(async move {
-                                                            store_to_mcp(
-                                                                &mcp_server_for_inv,
-                                                                "tool_invocation",
-                                                                &inv_id,
-                                                                &inv,
-                                                                debug_mode,
-                                                            )
-                                                            .await;
-                                                            history
+                                                        ClientStorage::spawn_background_index_work(
+                                                            async move {
+                                                                store_to_mcp(
+                                                                    &mcp_server_for_inv,
+                                                                    "tool_invocation",
+                                                                    &inv_id,
+                                                                    &inv,
+                                                                    debug_mode,
+                                                                )
+                                                                .await;
+                                                                history
                                                                 .event(
                                                                     history::EventKind::ToolInvocationStatus,
                                                                     &inv_id,
@@ -5033,14 +5067,15 @@ Task Completed"
                                                                     }),
                                                                 )
                                                                 .await;
-                                                            history_writer
-                                                                .write(
-                                                                    "tool_invocation_event",
-                                                                    &tool_event_object_id,
-                                                                    &tool_event,
-                                                                )
-                                                                .await;
-                                                        });
+                                                                history_writer
+                                                                    .write(
+                                                                        "tool_invocation_event",
+                                                                        &tool_event_object_id,
+                                                                        &tool_event,
+                                                                    )
+                                                                    .await;
+                                                            },
+                                                        );
                                                     }
                                                 }
                                                 "commandExecution" => {
@@ -5221,16 +5256,17 @@ Task Completed"
                                                                 None
                                                             },
                                                         };
-                                                        tokio::spawn(async move {
-                                                            store_to_mcp(
-                                                                &mcp_server_for_inv,
-                                                                "tool_invocation",
-                                                                &inv_id,
-                                                                &inv,
-                                                                debug_mode,
-                                                            )
-                                                            .await;
-                                                            history
+                                                        ClientStorage::spawn_background_index_work(
+                                                            async move {
+                                                                store_to_mcp(
+                                                                    &mcp_server_for_inv,
+                                                                    "tool_invocation",
+                                                                    &inv_id,
+                                                                    &inv,
+                                                                    debug_mode,
+                                                                )
+                                                                .await;
+                                                                history
                                                                 .event(
                                                                     history::EventKind::ToolInvocationStatus,
                                                                     &inv_id,
@@ -5238,30 +5274,32 @@ Task Completed"
                                                                     serde_json::json!({"command": cmd_name, "exit": exit_code}),
                                                                 )
                                                                 .await;
-                                                            history_writer
-                                                                .write(
-                                                                    "tool_invocation_event",
-                                                                    &tool_event_object_id,
-                                                                    &tool_event,
-                                                                )
-                                                                .await;
-                                                            history_writer
-                                                                .write(
-                                                                    "decision",
-                                                                    &decision.id,
-                                                                    &decision,
-                                                                )
-                                                                .await;
-                                                            if inv.status == ToolStatus::Failed {
                                                                 history_writer
                                                                     .write(
-                                                                        "run_event",
-                                                                        &run_event_failed.id,
-                                                                        &run_event_failed,
+                                                                        "tool_invocation_event",
+                                                                        &tool_event_object_id,
+                                                                        &tool_event,
                                                                     )
                                                                     .await;
-                                                            }
-                                                        });
+                                                                history_writer
+                                                                    .write(
+                                                                        "decision",
+                                                                        &decision.id,
+                                                                        &decision,
+                                                                    )
+                                                                    .await;
+                                                                if inv.status == ToolStatus::Failed
+                                                                {
+                                                                    history_writer
+                                                                        .write(
+                                                                            "run_event",
+                                                                            &run_event_failed.id,
+                                                                            &run_event_failed,
+                                                                        )
+                                                                        .await;
+                                                                }
+                                                            },
+                                                        );
 
                                                         if let Some(patchset) =
                                                             command_patchset.clone()
@@ -5563,23 +5601,25 @@ Task Completed"
                                                                 &inv_id,
                                                                 &tool_event.status,
                                                             );
-                                                        tokio::spawn(async move {
-                                                            store_to_mcp(
-                                                                &mcp_server_for_inv,
-                                                                "tool_invocation",
-                                                                &inv_id,
-                                                                &invocation,
-                                                                debug_mode,
-                                                            )
-                                                            .await;
-                                                            history_writer
-                                                                .write(
-                                                                    "tool_invocation_event",
-                                                                    &tool_event_object_id,
-                                                                    &tool_event,
+                                                        ClientStorage::spawn_background_index_work(
+                                                            async move {
+                                                                store_to_mcp(
+                                                                    &mcp_server_for_inv,
+                                                                    "tool_invocation",
+                                                                    &inv_id,
+                                                                    &invocation,
+                                                                    debug_mode,
                                                                 )
                                                                 .await;
-                                                        });
+                                                                history_writer
+                                                                    .write(
+                                                                        "tool_invocation_event",
+                                                                        &tool_event_object_id,
+                                                                        &tool_event,
+                                                                    )
+                                                                    .await;
+                                                            },
+                                                        );
                                                     }
                                                 }
                                                 "collabAgentToolCall" => {
@@ -5619,23 +5659,25 @@ Task Completed"
                                                                 &inv_id,
                                                                 &tool_event.status,
                                                             );
-                                                        tokio::spawn(async move {
-                                                            store_to_mcp(
-                                                                &mcp_server_for_inv,
-                                                                "tool_invocation",
-                                                                &inv_id,
-                                                                &invocation,
-                                                                debug_mode,
-                                                            )
-                                                            .await;
-                                                            history_writer
-                                                                .write(
-                                                                    "tool_invocation_event",
-                                                                    &tool_event_object_id,
-                                                                    &tool_event,
+                                                        ClientStorage::spawn_background_index_work(
+                                                            async move {
+                                                                store_to_mcp(
+                                                                    &mcp_server_for_inv,
+                                                                    "tool_invocation",
+                                                                    &inv_id,
+                                                                    &invocation,
+                                                                    debug_mode,
                                                                 )
                                                                 .await;
-                                                        });
+                                                                history_writer
+                                                                    .write(
+                                                                        "tool_invocation_event",
+                                                                        &tool_event_object_id,
+                                                                        &tool_event,
+                                                                    )
+                                                                    .await;
+                                                            },
+                                                        );
                                                     }
                                                 }
                                                 "webSearch" => {
@@ -5680,23 +5722,25 @@ Task Completed"
                                                                 &inv_id,
                                                                 &tool_event.status,
                                                             );
-                                                        tokio::spawn(async move {
-                                                            store_to_mcp(
-                                                                &mcp_server_for_inv,
-                                                                "tool_invocation",
-                                                                &inv_id,
-                                                                &invocation,
-                                                                debug_mode,
-                                                            )
-                                                            .await;
-                                                            history_writer
-                                                                .write(
-                                                                    "tool_invocation_event",
-                                                                    &tool_event_object_id,
-                                                                    &tool_event,
+                                                        ClientStorage::spawn_background_index_work(
+                                                            async move {
+                                                                store_to_mcp(
+                                                                    &mcp_server_for_inv,
+                                                                    "tool_invocation",
+                                                                    &inv_id,
+                                                                    &invocation,
+                                                                    debug_mode,
                                                                 )
                                                                 .await;
-                                                        });
+                                                                history_writer
+                                                                    .write(
+                                                                        "tool_invocation_event",
+                                                                        &tool_event_object_id,
+                                                                        &tool_event,
+                                                                    )
+                                                                    .await;
+                                                            },
+                                                        );
                                                     }
                                                 }
                                                 "contextCompaction" => {
@@ -5718,15 +5762,17 @@ Task Completed"
                                                     let history_writer =
                                                         history_writer_clone.clone();
                                                     let context_frame_id = context_frame.id.clone();
-                                                    tokio::spawn(async move {
-                                                        history_writer
-                                                            .write(
-                                                                "context_frame",
-                                                                &context_frame_id,
-                                                                &context_frame,
-                                                            )
-                                                            .await;
-                                                    });
+                                                    ClientStorage::spawn_background_index_work(
+                                                        async move {
+                                                            history_writer
+                                                                .write(
+                                                                    "context_frame",
+                                                                    &context_frame_id,
+                                                                    &context_frame,
+                                                                )
+                                                                .await;
+                                                        },
+                                                    );
                                                 }
                                                 "userMessage" => {
                                                     println!("  User message completed");
@@ -5906,7 +5952,7 @@ Task Completed"
 
                                     // Store to MCP in background
                                     let mcp_server_for_approval = mcp_server_clone.clone();
-                                    tokio::spawn(async move {
+                                    ClientStorage::spawn_background_index_work(async move {
                                         store_to_mcp(
                                             &mcp_server_for_approval,
                                             "approval_request",
@@ -5982,7 +6028,7 @@ Task Completed"
                                     if let Some(approval) = approval_to_store {
                                         let approval_id = approval.id.clone();
                                         let mcp_server_for_approval = mcp_server_clone.clone();
-                                        tokio::spawn(async move {
+                                        ClientStorage::spawn_background_index_work(async move {
                                             store_to_mcp(
                                                 &mcp_server_for_approval,
                                                 "approval_request",
@@ -6026,7 +6072,7 @@ Task Completed"
                                         };
                                         let history_writer = history_writer_clone.clone();
                                         let decision_id = decision.id.clone();
-                                        tokio::spawn(async move {
+                                        ClientStorage::spawn_background_index_work(async move {
                                             history_writer
                                                 .write("decision", &decision_id, &decision)
                                                 .await;

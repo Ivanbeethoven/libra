@@ -25,7 +25,10 @@ use libra::{
 };
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement, Value};
 
-use super::{assert_cli_success, init_repo_via_cli, parse_json_stdout, run_libra_command};
+use super::{
+    assert_cli_success, init_repo_via_cli, parse_json_stdout, run_libra_command,
+    run_libra_command_with_stdin_and_env,
+};
 
 async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
     let db_path = repo.join(".libra").join("libra.db");
@@ -175,7 +178,25 @@ async fn seed_checkpoint_commit(
     .await
     .expect("insert real agent_checkpoint");
 
-    written.commit_hash.to_string()
+    // This helper writes through HistoryManager outside a CLI invocation, so
+    // its index work intentionally uses the direct-library FIFO lane. Wait for
+    // this repository's durable markers to retire before a test invokes
+    // destructive cleanup; otherwise the test exercises preflight backlog
+    // refusal instead of the traces/catalog condition it was built to assert.
+    let marker_dir = repo_path.join("object-index-repair");
+    for _ in 0..400 {
+        let marker_count = std::fs::read_dir(&marker_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        if marker_count == 0 {
+            return written.commit_hash.to_string();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!(
+        "seeded checkpoint object-index markers did not retire within 10 seconds: {}",
+        marker_dir.display()
+    );
 }
 
 async fn checkpoint_exists(conn: &DatabaseConnection, checkpoint_id: &str) -> bool {
@@ -520,6 +541,16 @@ async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger(
         .await
         .expect("prune conflicted incumbent checkpoint");
     assert_eq!(outcome.removed_checkpoints, 1);
+    assert_eq!(
+        scalar_count(
+            &conn,
+            "SELECT COUNT(*) AS n FROM agent_checkpoint_prune_tombstone
+             WHERE checkpoint_id = 'cp-conflict-second'"
+        )
+        .await,
+        1,
+        "ordinary prune must leave a durable cloud anti-resurrection fence"
+    );
     let claim = conn
         .query_one(Statement::from_string(
             conn.get_database_backend(),
@@ -543,18 +574,26 @@ async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger(
         claim.try_get_by::<String, _>("coverage_digest").unwrap(),
         "digest-first"
     );
-    let retained_checkpoint = conn
+    let retained_checkpoint_row = conn
         .query_one(Statement::from_string(
             conn.get_database_backend(),
-            "SELECT traces_commit FROM agent_checkpoint
+            "SELECT traces_commit, sync_revision FROM agent_checkpoint
              WHERE checkpoint_id = 'cp-conflict-first'"
                 .to_string(),
         ))
         .await
         .expect("query retained checkpoint")
-        .expect("retained checkpoint row")
+        .expect("retained checkpoint row");
+    let retained_checkpoint = retained_checkpoint_row
         .try_get_by::<String, _>("traces_commit")
         .expect("decode retained checkpoint commit");
+    assert_eq!(
+        retained_checkpoint_row
+            .try_get_by::<i64, _>("sync_revision")
+            .expect("decode retained checkpoint cloud generation"),
+        2,
+        "a prune rewrite must advance the checkpoint replication generation"
+    );
     assert_eq!(
         claim.try_get_by::<String, _>("traces_commit").unwrap(),
         retained_checkpoint,
@@ -898,6 +937,80 @@ async fn agent_clean_drops_object_index_rows_only_for_removed_checkpoints() {
     let json = parse_json_stdout(&output);
     assert_eq!(json["data"]["window_guard"], "noop");
     assert_eq!(json["data"]["object_index_rows_dropped"], 0);
+}
+
+#[tokio::test]
+async fn agent_clean_fails_closed_until_pending_index_marker_can_retire() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let checkpoint_id = "cc110000-0000-4000-8000-000000000003";
+
+    let conn = connect_repo_db(repo.path()).await;
+    seed_session(&conn, "stopped-session", "stopped", 10, 20, 30).await;
+    seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        checkpoint_id,
+        "stopped-session",
+        CheckpointScope::Temporary,
+        602,
+    )
+    .await;
+    ClientStorage::wait_for_background_tasks();
+    conn.close().await.expect("close seed connection");
+
+    let indexed = run_libra_command_with_stdin_and_env(
+        &["hash-object", "--stdin", "-w"],
+        repo.path(),
+        "marker retirement must fence cleanup",
+        &[("LIBRA_TEST_OBJECT_INDEX_MARKER_RETIRE_FAIL", "1")],
+    );
+    assert_cli_success(
+        &indexed,
+        "local object write should complete with a repair warning",
+    );
+    assert!(
+        String::from_utf8_lossy(&indexed.stderr).contains("durable repair queue"),
+        "marker retirement failure should be reported: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let blocked = run_libra_command_with_stdin_and_env(
+        &["agent", "clean", "--all"],
+        repo.path(),
+        "",
+        &[("LIBRA_TEST_OBJECT_INDEX_MARKER_RETIRE_FAIL", "1")],
+    );
+    assert!(
+        !blocked.status.success(),
+        "destructive cleanup must not run while a repair marker cannot retire"
+    );
+    let blocked_stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        blocked_stderr.contains(
+            "cannot run this operation while durable local object-index repair is pending"
+        ) && blocked_stderr.contains("LBR-IO-002"),
+        "unexpected fail-closed error: {blocked_stderr}"
+    );
+    let conn = connect_repo_db(repo.path()).await;
+    assert!(
+        checkpoint_exists(&conn, checkpoint_id).await,
+        "preflight failure must occur before checkpoint and object-index deletion"
+    );
+    conn.close().await.expect("close blocked-state connection");
+
+    let repaired = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(
+        &repaired,
+        "ordinary command should retire the marker on retry",
+    );
+    let cleaned = run_libra_command(&["agent", "clean", "--all"], repo.path());
+    assert_cli_success(&cleaned, "cleanup should proceed after marker retirement");
+    let conn = connect_repo_db(repo.path()).await;
+    assert!(
+        !checkpoint_exists(&conn, checkpoint_id).await,
+        "checkpoint should be pruned only after repair ownership is retired"
+    );
 }
 
 #[tokio::test]

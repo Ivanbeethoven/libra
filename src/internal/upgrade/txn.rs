@@ -422,10 +422,14 @@ mod tests {
     use crate::internal::upgrade::marker::{OFFICIAL_INSTALL_SOURCE, official_marker_for_target};
 
     fn dir() -> (tempfile::TempDir, InstallDir) {
-        let guard = tempfile::tempdir().unwrap();
-        let path = guard.path().canonicalize().unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let d = InstallDir::open_validated(&path).unwrap();
+        let guard = tempfile::tempdir().expect("test fixture operation should succeed");
+        let path = guard
+            .path()
+            .canonicalize()
+            .expect("test fixture operation should succeed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("test fixture operation should succeed");
+        let d = InstallDir::open_validated(&path).expect("test fixture operation should succeed");
         (guard, d)
     }
 
@@ -456,7 +460,8 @@ mod tests {
     #[test]
     fn fresh_install_commits() {
         let (_g, d) = dir();
-        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755).unwrap();
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
         let out = run_install(
             &d,
             OldTarget::Absent,
@@ -466,17 +471,27 @@ mod tests {
             UpgradeState::default(),
             &pass(),
         )
-        .unwrap();
+        .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::Installed);
         assert_eq!(
-            d.read_file(TARGET_BINARY_NAME).unwrap().as_deref(),
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .as_deref(),
             Some(&b"NEW"[..])
         );
-        assert!(d.read_file(TXN_FILE_NAME).unwrap().is_none());
-        assert!(d.read_file(CANDIDATE_NAME).unwrap().is_none());
+        assert!(
+            d.read_file(TXN_FILE_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
+        assert!(
+            d.read_file(CANDIDATE_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
         assert!(
             official_marker_for_target(&d, "darwin-arm64")
-                .unwrap()
+                .expect("test fixture operation should succeed")
                 .is_some()
         );
     }
@@ -484,7 +499,8 @@ mod tests {
     #[test]
     fn fresh_install_probe_failure_aborts_and_leaves_nothing() {
         let (_g, d) = dir();
-        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755).unwrap();
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
         let out = run_install(
             &d,
             OldTarget::Absent,
@@ -494,18 +510,27 @@ mod tests {
             UpgradeState::default(),
             &fail(),
         )
-        .unwrap();
+        .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::AbortedAbsent);
-        assert!(d.read_file(TARGET_BINARY_NAME).unwrap().is_none());
-        assert!(d.read_file(TXN_FILE_NAME).unwrap().is_none());
+        assert!(
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
+        assert!(
+            d.read_file(TXN_FILE_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
     }
 
     #[test]
     fn upgrade_commits_and_replaces_target() {
         let (_g, d) = dir();
         d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
-            .unwrap();
-        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
         let out = run_install(
             &d,
             OldTarget::Present {
@@ -518,23 +543,30 @@ mod tests {
             UpgradeState::default(),
             &pass(),
         )
-        .unwrap();
+        .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::Installed);
         assert_eq!(
-            d.read_file(TARGET_BINARY_NAME).unwrap().as_deref(),
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .as_deref(),
             Some(&b"NEW"[..])
         );
-        assert!(d.read_file(BACKUP_NAME).unwrap().is_none());
+        assert!(
+            d.read_file(BACKUP_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
     }
 
     #[test]
     fn upgrade_probe_failure_rolls_back_to_old_and_restores_marker() {
         let (_g, d) = dir();
         d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
-            .unwrap();
-        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
         let old_marker = marker_for("1.0.0", b"OLD");
-        write_marker(&d, &old_marker).unwrap();
+        write_marker(&d, &old_marker).expect("test fixture operation should succeed");
         let out = run_install(
             &d,
             OldTarget::Present {
@@ -547,25 +579,31 @@ mod tests {
             UpgradeState::default(),
             &fail(),
         )
-        .unwrap();
+        .expect("test fixture operation should succeed");
         assert_eq!(out, TxnOutcome::RolledBack);
         assert_eq!(
-            d.read_file(TARGET_BINARY_NAME).unwrap().as_deref(),
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .as_deref(),
             Some(&b"OLD"[..])
         );
         // The restored marker still validates against the OLD binary.
         let m = official_marker_for_target(&d, "darwin-arm64")
-            .unwrap()
-            .unwrap();
+            .expect("test fixture operation should succeed")
+            .expect("test fixture operation should succeed");
         assert_eq!(m.version, "1.0.0");
-        assert!(d.read_file(TXN_FILE_NAME).unwrap().is_none());
+        assert!(
+            d.read_file(TXN_FILE_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
     }
 
     // ── §A.7 recovery decision table: construct each intermediate layout and
     //    assert the classified action drives to the right terminal state. ──
 
     fn journal(d: &InstallDir, txn: &Txn) {
-        store_txn(d, txn).unwrap();
+        store_txn(d, txn).expect("test fixture operation should succeed");
     }
 
     fn base_txn(state: TxnState, old: OldTarget) -> Txn {
@@ -583,11 +621,23 @@ mod tests {
     #[test]
     fn recover_prepared_absent_candidate_only_aborts() {
         let (_g, d) = dir();
-        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755).unwrap();
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
         journal(&d, &base_txn(TxnState::Prepared, OldTarget::Absent));
-        assert_eq!(recover(&d, &pass()).unwrap(), TxnOutcome::AbortedAbsent);
-        assert!(d.read_file(TARGET_BINARY_NAME).unwrap().is_none());
-        assert!(d.read_file(TXN_FILE_NAME).unwrap().is_none());
+        assert_eq!(
+            recover(&d, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::AbortedAbsent
+        );
+        assert!(
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
+        assert!(
+            d.read_file(TXN_FILE_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
     }
 
     #[test]
@@ -595,11 +645,16 @@ mod tests {
         let (_g, d) = dir();
         // rename landed (target=new, candidate gone) but state stayed Prepared.
         d.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
-            .unwrap();
+            .expect("test fixture operation should succeed");
         journal(&d, &base_txn(TxnState::Prepared, OldTarget::Absent));
-        assert_eq!(recover(&d, &pass()).unwrap(), TxnOutcome::Installed);
         assert_eq!(
-            d.read_file(TARGET_BINARY_NAME).unwrap().as_deref(),
+            recover(&d, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::Installed
+        );
+        assert_eq!(
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .as_deref(),
             Some(&b"NEW"[..])
         );
     }
@@ -608,8 +663,9 @@ mod tests {
     fn recover_prepared_present_no_backup_keeps_old() {
         let (_g, d) = dir();
         d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
-            .unwrap();
-        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
         journal(
             &d,
             &base_txn(
@@ -620,12 +676,21 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(recover(&d, &pass()).unwrap(), TxnOutcome::NoOp);
         assert_eq!(
-            d.read_file(TARGET_BINARY_NAME).unwrap().as_deref(),
+            recover(&d, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::NoOp
+        );
+        assert_eq!(
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .as_deref(),
             Some(&b"OLD"[..])
         );
-        assert!(d.read_file(TXN_FILE_NAME).unwrap().is_none());
+        assert!(
+            d.read_file(TXN_FILE_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
     }
 
     #[test]
@@ -633,9 +698,11 @@ mod tests {
         let (_g, d) = dir();
         // Backup already made (target=old, backup=old, candidate=new).
         d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
-            .unwrap();
-        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755).unwrap();
-        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
         journal(
             &d,
             &base_txn(
@@ -646,9 +713,14 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(recover(&d, &pass()).unwrap(), TxnOutcome::Installed);
         assert_eq!(
-            d.read_file(TARGET_BINARY_NAME).unwrap().as_deref(),
+            recover(&d, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::Installed
+        );
+        assert_eq!(
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .as_deref(),
             Some(&b"NEW"[..])
         );
     }
@@ -658,9 +730,11 @@ mod tests {
         // (a) target still old.
         let (_g, d) = dir();
         d.write_file_atomic(TARGET_BINARY_NAME, b"OLD", 0o755)
-            .unwrap();
-        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755).unwrap();
-        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(CANDIDATE_NAME, b"NEW", 0o755)
+            .expect("test fixture operation should succeed");
         journal(
             &d,
             &base_txn(
@@ -671,13 +745,17 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(recover(&d, &pass()).unwrap(), TxnOutcome::Installed);
+        assert_eq!(
+            recover(&d, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::Installed
+        );
 
         // (b) rename already applied (target=new, candidate gone).
         let (_g2, d2) = dir();
         d2.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
-            .unwrap();
-        d2.write_file_atomic(BACKUP_NAME, b"OLD", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d2.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
         journal(
             &d2,
             &base_txn(
@@ -688,7 +766,10 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(recover(&d2, &pass()).unwrap(), TxnOutcome::Installed);
+        assert_eq!(
+            recover(&d2, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::Installed
+        );
     }
 
     #[test]
@@ -696,8 +777,9 @@ mod tests {
         // Pass → commit.
         let (_g, d) = dir();
         d.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
-            .unwrap();
-        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
         journal(
             &d,
             &base_txn(
@@ -708,13 +790,17 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(recover(&d, &pass()).unwrap(), TxnOutcome::Installed);
+        assert_eq!(
+            recover(&d, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::Installed
+        );
 
         // Fail → rollback to old.
         let (_g2, d2) = dir();
         d2.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
-            .unwrap();
-        d2.write_file_atomic(BACKUP_NAME, b"OLD", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d2.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
         journal(
             &d2,
             &base_txn(
@@ -725,9 +811,14 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(recover(&d2, &fail()).unwrap(), TxnOutcome::RolledBack);
         assert_eq!(
-            d2.read_file(TARGET_BINARY_NAME).unwrap().as_deref(),
+            recover(&d2, &fail()).expect("test fixture operation should succeed"),
+            TxnOutcome::RolledBack
+        );
+        assert_eq!(
+            d2.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .as_deref(),
             Some(&b"OLD"[..])
         );
     }
@@ -737,12 +828,22 @@ mod tests {
         for state in [TxnState::PostProbePassed, TxnState::Committed] {
             let (_g, d) = dir();
             d.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
-                .unwrap();
+                .expect("test fixture operation should succeed");
             journal(&d, &base_txn(state, OldTarget::Absent));
-            assert_eq!(recover(&d, &fail()).unwrap(), TxnOutcome::Installed);
-            assert!(d.read_file(TXN_FILE_NAME).unwrap().is_none());
+            assert_eq!(
+                recover(&d, &fail()).expect("test fixture operation should succeed"),
+                TxnOutcome::Installed
+            );
+            assert!(
+                d.read_file(TXN_FILE_NAME)
+                    .expect("test fixture operation should succeed")
+                    .is_none()
+            );
             // Re-running recovery on the cleaned dir is a no-op.
-            assert_eq!(recover(&d, &fail()).unwrap(), TxnOutcome::NoOp);
+            assert_eq!(
+                recover(&d, &fail()).expect("test fixture operation should succeed"),
+                TxnOutcome::NoOp
+            );
         }
     }
 
@@ -751,8 +852,9 @@ mod tests {
         // RollbackIntent, target still new + backup=old.
         let (_g, d) = dir();
         d.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
-            .unwrap();
-        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755).unwrap();
+            .expect("test fixture operation should succeed");
+        d.write_file_atomic(BACKUP_NAME, b"OLD", 0o755)
+            .expect("test fixture operation should succeed");
         journal(
             &d,
             &base_txn(
@@ -763,22 +865,34 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(recover(&d, &pass()).unwrap(), TxnOutcome::RolledBack);
         assert_eq!(
-            d.read_file(TARGET_BINARY_NAME).unwrap().as_deref(),
+            recover(&d, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::RolledBack
+        );
+        assert_eq!(
+            d.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .as_deref(),
             Some(&b"OLD"[..])
         );
 
         // AbortAbsentIntent, target=new leftover.
         let (_g2, d2) = dir();
         d2.write_file_atomic(TARGET_BINARY_NAME, b"NEW", 0o755)
-            .unwrap();
+            .expect("test fixture operation should succeed");
         journal(
             &d2,
             &base_txn(TxnState::AbortAbsentIntent, OldTarget::Absent),
         );
-        assert_eq!(recover(&d2, &pass()).unwrap(), TxnOutcome::AbortedAbsent);
-        assert!(d2.read_file(TARGET_BINARY_NAME).unwrap().is_none());
+        assert_eq!(
+            recover(&d2, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::AbortedAbsent
+        );
+        assert!(
+            d2.read_file(TARGET_BINARY_NAME)
+                .expect("test fixture operation should succeed")
+                .is_none()
+        );
     }
 
     #[test]
@@ -795,6 +909,9 @@ mod tests {
     #[test]
     fn recover_without_txn_is_noop() {
         let (_g, d) = dir();
-        assert_eq!(recover(&d, &pass()).unwrap(), TxnOutcome::NoOp);
+        assert_eq!(
+            recover(&d, &pass()).expect("test fixture operation should succeed"),
+            TxnOutcome::NoOp
+        );
     }
 }

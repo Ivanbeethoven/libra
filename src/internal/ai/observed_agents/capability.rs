@@ -124,12 +124,68 @@ pub trait HookResponseWriter: ObservedAgent {
     fn write_hook_response(&self, message: &str) -> Result<()>;
 }
 
+/// Multi-source parent/subagent extraction result.  The parent aggregate and
+/// the attributed subagent-only usage stay distinct so a provider that only
+/// reports a parent total cannot accidentally label it as subagent usage.
+#[derive(Debug, Clone, Default)]
+pub struct SubagentExtraction {
+    pub modified_files: Vec<PathBuf>,
+    pub aggregate_usage: CompletionUsageSummary,
+    pub subagent_usage: Option<CompletionUsageSummary>,
+    pub partial: bool,
+    pub warnings: Vec<String>,
+}
+
 /// Optional capability: subagent-aware aggregate extraction (E1
-/// `subagent_aware_extractor`) — modified files and token totals that
-/// include nested subagent activity.
+/// `subagent_aware_extractor`).  DR-06 supplies independently discovered
+/// child transcript bytes; implementations union modified files and add only
+/// those child usage records to `subagent_usage`.
 pub trait SubagentAwareExtractor: ObservedAgent {
+    /// Original E1 capability surface.  Keep these methods required so
+    /// downstream implementations compiled against the pre-M5 trait remain
+    /// source-compatible.
     fn extract_all_modified_files(&self, data: &[u8]) -> Result<Vec<PathBuf>>;
+
     fn total_token_usage_including_subagents(&self, data: &[u8]) -> Result<CompletionUsageSummary>;
+
+    /// M5 multi-source extension.  The default composes the original methods
+    /// for the parent and each independently authorized child, so external
+    /// implementations gain correct conservative behavior without adding a
+    /// newly required method.
+    fn extract_parent_and_subagents(
+        &self,
+        parent: &[u8],
+        subagents: &[&[u8]],
+    ) -> Result<SubagentExtraction> {
+        let mut modified_files = self.extract_all_modified_files(parent)?;
+        let aggregate_usage = self.total_token_usage_including_subagents(parent)?;
+        let mut subagent_usage: Option<CompletionUsageSummary> = None;
+        for child in subagents {
+            for path in self.extract_all_modified_files(child)? {
+                if !modified_files.contains(&path) {
+                    modified_files.push(path);
+                }
+            }
+            let usage = self.total_token_usage_including_subagents(child)?;
+            match &mut subagent_usage {
+                Some(total) => total.merge(&usage),
+                None => subagent_usage = Some(usage),
+            }
+        }
+        Ok(SubagentExtraction {
+            modified_files,
+            aggregate_usage,
+            subagent_usage,
+            partial: !subagents.is_empty(),
+            warnings: (!subagents.is_empty())
+                .then(|| {
+                    "subagent attribution used the backward-compatible extractor adapter"
+                        .to_string()
+                })
+                .into_iter()
+                .collect(),
+        })
+    }
 }
 
 /// Optional capability: skill-event projection (E7). Deliberately NOT part
@@ -154,6 +210,75 @@ pub enum SkillEventSignal {
     InputSlashCommand,
     PromptSlashCommand,
     SkillToolUse,
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::internal::ai::observed_agents::{AgentKind, AgentStability};
+
+    struct LegacySubagentExtractor;
+
+    impl ObservedAgent for LegacySubagentExtractor {
+        fn provider_kind(&self) -> AgentKind {
+            AgentKind::ClaudeCode
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "legacy-test"
+        }
+
+        fn stability(&self) -> AgentStability {
+            AgentStability::Stable
+        }
+
+        fn read_transcript(&self, _session: &AgentSessionCtx) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn protected_dirs(&self) -> &'static [&'static str] {
+            &[]
+        }
+    }
+
+    // Compile/runtime pin: a pre-M5 implementation that defines only the two
+    // original required methods remains valid and receives the additive
+    // multi-source behavior through the trait default.
+    impl SubagentAwareExtractor for LegacySubagentExtractor {
+        fn extract_all_modified_files(&self, data: &[u8]) -> Result<Vec<PathBuf>> {
+            Ok(vec![PathBuf::from(String::from_utf8_lossy(data).as_ref())])
+        }
+
+        fn total_token_usage_including_subagents(
+            &self,
+            data: &[u8],
+        ) -> Result<CompletionUsageSummary> {
+            Ok(CompletionUsageSummary {
+                input_tokens: data.len() as u64,
+                ..CompletionUsageSummary::default()
+            })
+        }
+    }
+
+    #[test]
+    fn legacy_subagent_extractor_implementation_remains_source_compatible() {
+        let extraction = LegacySubagentExtractor
+            .extract_parent_and_subagents(b"parent", &[b"child"])
+            .expect("backward-compatible default");
+        assert_eq!(extraction.modified_files.len(), 2);
+        assert_eq!(
+            extraction.aggregate_usage.input_tokens, 6,
+            "legacy parent aggregate already promises subagent-inclusive usage"
+        );
+        assert_eq!(
+            extraction
+                .subagent_usage
+                .expect("child attribution")
+                .input_tokens,
+            5
+        );
+        assert!(extraction.partial);
+    }
 }
 
 /// The skill referenced by a [`SkillEvent`] (E7 `Skill{Name}`).

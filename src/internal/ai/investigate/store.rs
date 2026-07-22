@@ -641,7 +641,7 @@ impl InvestigateRunStore {
             &oid.to_string(),
             AGENT_FINDINGS_OTYPE,
             bytes.len() as i64,
-        );
+        )?;
         Ok(oid.to_string())
     }
 

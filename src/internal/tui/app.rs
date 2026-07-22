@@ -137,6 +137,7 @@ use crate::{
             CodeUiTranscriptEntryKind, snapshot_from_event,
         },
     },
+    utils::client_storage::ClientStorage,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -149,7 +150,7 @@ impl McpWriteTracker {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let handle = tokio::spawn(async move {
+        let handle = ClientStorage::spawn_background_index_work(async move {
             if timeout(MCP_WRITE_TIMEOUT, fut).await.is_err() {
                 tracing::warn!("MCP background write timed out");
             }
@@ -2856,7 +2857,7 @@ where
                     let working_dir = self.registry.working_dir().to_path_buf();
                     let plan_id = self.mcp_plan_id.clone();
                     let mcp_text = text.clone();
-                    tokio::spawn(async move {
+                    ClientStorage::spawn_background_index_work(async move {
                         match timeout(
                             MCP_TURN_TRACKING_TIMEOUT,
                             resolve_mcp_turn_tracking(mcp_server, plan_id, working_dir, mcp_text),
@@ -2942,7 +2943,7 @@ where
                 let working_dir = registry.working_dir().to_path_buf();
 
                 // Execute agent call in background task
-                let handle = tokio::spawn(async move {
+                let handle = ClientStorage::spawn_background_index_work(async move {
                     struct UiObserver {
                         tx: UnboundedSender<AppEvent>,
                         mcp_server: Option<Arc<LibraMcpServer>>,
@@ -4598,7 +4599,7 @@ where
         let mut events = runtime.subscribe();
         let tx = self.app_event_tx.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = ClientStorage::spawn_background_index_work(async move {
             if let Err(error) = adapter.submit_message(text).await {
                 let _ = tx.send(AppEvent::AgentEvent {
                     turn_id,
@@ -6111,7 +6112,7 @@ where
         let fallback_history = self.history.clone();
         let auto_repair_pending = self.pending_auto_plan_repair_execution.is_some();
 
-        let handle = tokio::spawn(async move {
+        let handle = ClientStorage::spawn_background_index_work(async move {
             struct ExecutionPlanObserver {
                 tx: UnboundedSender<AppEvent>,
                 turn_id: TurnId,
@@ -6672,7 +6673,7 @@ where
             NetworkPolicy::Allow
         );
 
-        let handle = tokio::spawn(async move {
+        let handle = ClientStorage::spawn_background_index_work(async move {
             struct UiOrchestratorObserver {
                 tx: UnboundedSender<AppEvent>,
                 turn_id: TurnId,
@@ -7083,7 +7084,7 @@ where
         let default_network_access = self.default_network_access;
         let classification_text = user_text.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = ClientStorage::spawn_background_index_work(async move {
             struct PlanObserver {
                 tx: UnboundedSender<AppEvent>,
                 turn_id: TurnId,

@@ -18,6 +18,17 @@ libra update-index --cacheinfo <mode>,<object>,<path>...
 - `--add <path>...` 从工作树（重新）暂存文件，允许尚未跟踪的路径。不带 `--add` 时，位置路径必须已被跟踪。若路径是符号链接，则暂存 mode `120000`，blob 内容为链接目标字节，并且不会跟随该链接。
 - `--remove <path>...` 从 index 删除指定路径。
 
+从工作树暂存时，若 blob 或其耐久云索引 marker 无法写入，命令会返回 `LBR-IO-002`，不会
+panic，也不会保存缺少修复 ownership 的 index 条目；正常重试会重新登记失败调用已经持久化的
+payload。
+
+本地 index 持久化与后续云目录更新具有独立的耐久边界。若 blob 与 index 已保存后，后台
+`object_index` 更新遇到终止错误，`update-index` 保留正常成功输出、向 stderr 发出可操作
+警告，并留下原子 repair marker，供下一条具备 schema 感知的仓库命令自动重试。修复仍待
+处理时，`cloud sync` 与破坏性 agent cleanup 会 fail closed。使用
+`--exit-code-on-warning` 时，已完成的本地更新返回退出码 9 / `LBR-WARN-001`；无需重跑
+`update-index`。
+
 ## 选项
 
 | 选项 | 说明 | 示例 |
@@ -32,7 +43,9 @@ libra update-index --cacheinfo <mode>,<object>,<path>...
 | 退出码 | 含义 |
 |--------|------|
 | `0` | index 已更新并保存。 |
+| `9` / `LBR-WARN-001` | 本地 index 已保存，但云索引修复仍待处理，且使用了 `--exit-code-on-warning`。 |
 | `128` | 不在仓库内、用法错误（`--cacheinfo` 非法、未跟踪路径且无 `--add`），或工作树文件缺失。 |
+| `128` / `LBR-IO-002` | 工作树 blob 或耐久云索引 marker 持久化失败；修复存储权限后重试。 |
 
 ## 示例
 

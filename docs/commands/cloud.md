@@ -290,12 +290,165 @@ agent-capture phases, for example:
 {"event":"cloud_sync.objects.total","total":42}
 {"event":"cloud_sync.objects.progress","synced":42,"total":42,"failed":0}
 {"event":"cloud_sync.metadata.synced","references":3}
-{"event":"cloud_sync.agent_capture.complete","sessions_synced":2,"sessions_failed":0,"checkpoints_synced":6,"checkpoints_failed":0}
+{"event":"cloud_sync.agent_capture.complete","sessions_synced":2,"sessions_failed":0,"checkpoints_synced":6,"checkpoints_failed":0,"subagent_rows_synced":3,"subagent_rows_failed":0}
 ```
+
+The completed counts report only rows actually sent by that incremental sync;
+the subagent companion count covers durable source claims, append-only source
+revisions, and boundary/content link rows. Agent catalog publication takes a
+short local SQLite snapshot, releases the rollback-journal read lock before the
+bounded object-store walk, and then requires an identical second catalog
+snapshot from the completed `object_index.is_synced` generation; a concurrent
+capture makes the phase retry instead of blocking hook/import commits or exposing
+catalog rows before their objects. On the ordinary path, the capture phase
+queries object-index rows only for checkpoint-reachable OIDs, so unrelated
+large repository history does not consume the 100,000-row capture safety bound.
+Remote rows are read in bounded pages and
+only missing/strictly newer generations are sent in bounded multi-row requests.
+Session, checkpoint, mutable claim, and link ordering uses explicit transactionally incremented sync
+revisions, not wall-clock timestamps. Because those counters are clone-local,
+Libra also records the exact completed remote generation from the last successful
+sync or restore; a changed existing row can advance only from that known ancestor,
+otherwise sync fails closed and asks the user to restore first. The transition to
+`publishing` uses a compare-and-swap on that same generation. An active writer
+retains its fence; if it crashes, the server-timestamped publication lease
+expires after five minutes and a later sync can atomically take over. Checkpoint generations advance when
+pruning rewrites a retained traces/tree identity or verified doctor repair
+corrects its tree/metadata/traces OIDs; immutable checkpoint fields
+must still match, so a stale clone cannot restore the pre-prune row. A remote generation manifest is marked
+`publishing` only after all remote conflict and object-durability preflight
+succeeds and before the first remote capture-catalog mutation; every batch is fenced by its unique
+writer token, and the manifest becomes `complete` only after the full companion
+graph is re-read and validated. The manifest binds the fenced traces head, the
+object-index catalog generation, and the canonical digest/count
+of the **checkpoint-reachable object-index projection**; unrelated large Git
+history is neither downloaded nor counted by the capture phase, while required
+OIDs are queried in bounded batches and their R2 payloads are content-hashed in
+fixed 32-object concurrency pages
+before completion; missing or corrupt payloads are replaced from validated
+local objects and read back before the manifest can complete. An interrupted run is therefore safely resumed
+or taken over by the next sync. Immutable revision conflicts and
+equal-generation checkpoint/claim/link divergence fail closed; revision and link
+dependencies publish before the monotonic claim high-water. Every D1 request
+has a 30-second timeout and the complete agent-capture phase has a 120-second
+deadline. Any agent-capture mirror failure makes `cloud sync` exit nonzero and
+machine output emits no preceding success envelope.
+
+Ordinary `agent clean` checkpoint retention records a durable prune tombstone in
+the same local transaction as the ref/catalog rewrite. Cloud sync publishes that
+fence before removing a current claim, its revision, link, and checkpoint in
+that resumable order; every interruption boundary remains a valid publishing
+state, and a rewound local claim is recreated by the later monotonic claim batch.
+D1 rejects later checkpoint writes for the tombstoned identity, so a stale clone
+cannot resurrect it. Session erasure deliberately does not create this ordinary
+prune fence. Restore checks local ordinary-prune tombstones against one stable
+completed remote generation **before downloading objects or applying generic
+refs metadata**; generic metadata defers the `traces` ref while capture
+ownership is being validated. A completed generation installs its fenced ref;
+when no generation or capture rows exist, restore applies the deferred legacy
+metadata ref so pre-manifest traces remain reachable. Unmanifested capture rows
+fail with a current-version sync instruction instead of selecting ambiguous
+ownership. If the last completed remote generation still contains one of those
+checkpoints, restore fails and asks the user to run cloud sync first instead of
+resurrecting its objects, ref, catalog row, or companion rows. If D1 instead
+retains an unmarked checkpoint absent locally because of session erasure,
+sync fails before starting a new capture generation and preserves the previous
+completed remote snapshot, matching the documented deferred cross-device erase
+semantics.
+
+Sync refuses to advertise a generation that restore could not read: one
+100,000-row aggregate safety budget covers sessions, checkpoints, prune
+tombstones, claims, revisions, links, and the fenced object-index projection.
+Restore applies the same aggregate bound to the rows it consumes;
+capture-scoped full object-index reads use keyset pagination and a
+trigger-maintained catalog generation. Ordinary full-repository object restore
+remains paginated but is not subject to the capture catalog's 100,000-row cap.
+Exceeding the shared capture bound fails with an actionable error instead
+of retaining unbounded remote input in memory. Any insert, update, or delete during paging invalidates the read and
+retries it up to three times, preventing duplicate or omitted page-boundary
+rows. During one-time v2 adoption, checkpoint rows left orphaned by the legacy
+best-effort mirror are discarded before strict dependency validation; a current
+local session/checkpoint pair can then publish coherently.
+
+Restore reads the same completed manifest before and after all bounded pages
+(retrying a changing generation up to three times), prevalidates the whole
+companion generation, and applies sessions,
+checkpoints, skeleton claims, revisions, links, and final claim advancement in
+one local SQLite transaction. A conflict or FK/write error leaves the previous
+local generation unchanged; newer local session/checkpoint/link generations are never
+regressed; a newer checkpoint generation may update only the
+traces/tree/metadata fields that pruning or verified doctor repair rewrites. An
+empty checkpoint catalog is valid only with an empty fenced traces head; restore
+rejects a crash-window head that has no matching catalog row.
+Legacy remote capture rows
+without a completed manifest must first be adopted by running `libra cloud sync`
+with the current Libra version. A legacy remote with no capture rows remains a
+valid Git-only backup and restore skips this optional layer. Restore only probes
+remote capture schema; it never installs writer barriers or adopts rows, so a
+failed/read-only restore cannot disable older writers. Current clients use versioned v2 remote
+session/checkpoint tables; D1 installs legacy write barriers before taking the
+one-time generation-0 adoption snapshot, so an old client cannot race a change
+between the copy and its completion marker. Unfenced single-row v2 writes also
+fail closed; current publication uses only writer-token-fenced batches. Restore also
+reads the object index through a generation-stable snapshot and rejects catalog
+state whose fenced projection no longer matches the manifest digest. Later
+unrelated object-index additions do not invalidate an otherwise unchanged
+checkpoint projection.
+It validates reachability from the manifest-bound traces head and restores that
+head atomically with the catalog rather than trusting separately uploaded generic
+reference metadata. Existing local objects are
+decoded and hash-checked; corrupt paths are re-downloaded atomically, and the
+complete traces chain plus every checkpoint tree/blob is validated before the
+catalog transaction starts. Local erase tombstones are still not propagated to
+D1/R2: a later restore can resurrect a remotely mirrored capture until
+cross-device deletion propagation is implemented. An explicit local
+`--restore-erased` import does preserve a new replication incarnation, so its
+session generation and child-source namespace cannot collide with the old rows
+that D1 still retains; it does not delete those retained rows.
 
 `cloud sync` default mode still uses the legacy human progress output.
 `cloud restore` and `cloud sync` failures continue through Libra's standard CLI
 error machinery.
+
+Before any cloud operation reads or changes the local `object_index`, CLI
+preflight replays the bounded,
+atomic repair markers retained by earlier object-writing commands whose
+background index update failed. A marker is removed only after its exact row is
+inserted or reconciled. Replay opens the repository database once and enumerates
+at most 100,000 raw repair-directory entries per invocation using bounded
+multi-row upserts. If more remain, that invocation makes durable progress but
+cloud commands fail closed; later repository commands continue with the next
+page. Replay and queued writers hold the same process-crash-safe ownership lock
+from a bounded 65,536-shard OID namespace through the row update and marker
+retirement. A delayed writer
+therefore skips a marker already retired by replay instead of recreating a row
+after destructive cleanup; a marker concurrently retired before replay opens it
+is treated as completed work. Canonical final marker filenames and contents are
+validated strictly. Current atomic writes use a sibling staging directory;
+bounded replay removes legacy `.tmp*` remnants from the marker directory so
+they cannot consume every page and permanently hide real repair work. Each
+bounded staging scan examines at most 1,024 entries and removes at most 256
+regular temp files older than 24 hours, preserving active writers while
+eventually reclaiming crash remnants. Marker OID length must match the
+repository's configured SHA-1 or SHA-256 object format. Because
+the marker is created only after a successful
+configured-backend object write, it remains sufficient provenance when a tiered
+backend has evicted the local cache copy and the payload exists only remotely;
+sync still reads and validates the payload before upload. The cloud operation
+fails closed with `LBR-IO-002` before credentials,
+uploads, progress success, or a JSON success envelope if a marker is malformed,
+another page remains, or its database update still fails; therefore `--force` is not a substitute for
+local catalog repair.
+
+Background queue accounting is invocation-local: a concurrent direct
+`ClientStorage` caller neither extends a CLI command's drain wait nor causes
+that command to emit a warning or exit 9. Invocation-owned and direct-library
+updates also use separate bounded FIFO lanes, so an older direct backlog cannot
+delay cloud preflight behind the command's finite drain budget. Marker
+publication is serialized with destructive cleanup by a repository-wide
+generation fence; cleanup holds the fence from exact candidate revalidation
+through its transaction commit. With `--sync-data`, marker retirement fsyncs
+the containing directory.
 
 ## Environment Variables
 
@@ -383,3 +536,4 @@ Note: Neither Git nor jj have a built-in cloud backup command. They rely on push
 | `LBR-IO-002` | Hash mismatch on restored object |
 | `LBR-IO-002` | Failed to save restored object to local storage |
 | `LBR-IO-002` | Metadata sync/restore failure |
+| `LBR-IO-002` | Durable local object-index repair marker could not be replayed before a cloud operation |

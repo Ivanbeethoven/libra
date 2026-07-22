@@ -694,6 +694,23 @@ async fn class1_stale_row_repaired_from_ref() {
         repaired, original,
         "repair must restore tree_oid/metadata_blob_oid/traces_commit from the ref"
     );
+    let conn = repo.db().await;
+    let generation = conn
+        .query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT sync_revision FROM agent_checkpoint WHERE checkpoint_id = ?",
+            [repaired.checkpoint_id.clone().into()],
+        ))
+        .await
+        .expect("query repaired checkpoint generation")
+        .expect("repaired checkpoint row")
+        .try_get_by::<i64, _>("sync_revision")
+        .expect("decode repaired checkpoint generation");
+    assert_eq!(
+        generation, 2,
+        "verified doctor repair must advance the cloud checkpoint generation"
+    );
+    drop(conn);
 
     assert_store_clean(&repo.doctor_json(false));
     assert_store_clean(&repo.doctor_json(true));
@@ -1529,9 +1546,10 @@ async fn class3_drifted_object_index_row_updated_in_place() {
     assert_eq!(before.len(), 1, "baseline transcript row: {before:?}");
     assert_eq!(before[0].1, "agent_transcript");
 
-    // Drift the row: wrong o_type and wrong size.
+    // Drift the row: wrong o_type/size and an already-synced flag that must
+    // be reset when repair changes the cloud-visible classification.
     repo.exec_sql(
-        "UPDATE object_index SET o_type = 'blob', o_size = 1 WHERE o_id = ?",
+        "UPDATE object_index SET o_type = 'blob', o_size = 1, is_synced = 1 WHERE o_id = ?",
         vec![transcript_oid.clone().into()],
     )
     .await;
@@ -1557,6 +1575,23 @@ async fn class3_drifted_object_index_row_updated_in_place() {
         repo.object_index_rows(&oids).await,
         before,
         "drifted row must be updated back to the writer baseline"
+    );
+    let synced: i64 = repo
+        .db()
+        .await
+        .query_one(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT is_synced FROM object_index WHERE o_id = ?",
+            [transcript_oid.clone().into()],
+        ))
+        .await
+        .expect("read repaired sync flag")
+        .expect("repaired row exists")
+        .try_get_by("is_synced")
+        .expect("decode repaired sync flag");
+    assert_eq!(
+        synced, 0,
+        "repaired row must be offered to cloud sync again"
     );
     assert_store_clean(&repo.doctor_json(false));
     assert_store_clean(&repo.doctor_json(true));

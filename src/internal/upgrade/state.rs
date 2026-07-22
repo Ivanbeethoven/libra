@@ -378,7 +378,7 @@ mod tests {
         VerifiedManifest {
             payload_digest: [digest_byte; 32],
             signer_key_id: "test-key-1".into(),
-            version: ReleaseVersion::parse(version).unwrap(),
+            version: ReleaseVersion::parse(version).expect("test fixture operation should succeed"),
             version_raw: version.to_string(),
             control_revision: control,
             published_at,
@@ -406,7 +406,8 @@ mod tests {
     fn fresh_state_accepts_and_advances_everything_in_one_step() {
         let state = UpgradeState::default();
         let m = manifest("1.2.3", 5, 7);
-        let accepted = evaluate_manifest(&state, &m, Some(GOOD_DATE), GOOD_DATE + 1).unwrap();
+        let accepted = evaluate_manifest(&state, &m, Some(GOOD_DATE), GOOD_DATE + 1)
+            .expect("test fixture operation should succeed");
         let s = &accepted.new_state;
         assert_eq!(s.max_seen.as_deref(), Some("1.2.3"));
         assert_eq!(s.max_control_revision, 5);
@@ -416,7 +417,9 @@ mod tests {
         );
         assert_eq!(s.trusted_time_floor, GOOD_DATE.max(m.published_at));
         assert_eq!(s.artifact_identity.len(), 4);
-        let cd = s.next_success_check_not_before.unwrap();
+        let cd = s
+            .next_success_check_not_before
+            .expect("test fixture operation should succeed");
         assert!(
             (GOOD_DATE + SUCCESS_COOLDOWN_SECONDS..GOOD_DATE + SUCCESS_COOLDOWN_SECONDS + 120)
                 .contains(&cd)
@@ -431,7 +434,7 @@ mod tests {
             Some(GOOD_DATE),
             GOOD_DATE,
         )
-        .unwrap()
+        .expect("test fixture operation should succeed")
         .new_state;
         // Replaying an older, still-unexpired control revision (e.g. the
         // pre-revocation envelope) is rejected (§A.7 test mandate).
@@ -463,7 +466,7 @@ mod tests {
             Some(GOOD_DATE),
             GOOD_DATE,
         )
-        .unwrap()
+        .expect("test fixture operation should succeed")
         .new_state;
         assert!(matches!(
             evaluate_manifest(&state, &manifest("1.2.2", 6, 8), Some(GOOD_DATE), GOOD_DATE),
@@ -537,10 +540,12 @@ mod tests {
     fn cooldown_window_rules() {
         let m = manifest("1.2.3", 5, 7);
         let state = evaluate_manifest(&UpgradeState::default(), &m, Some(GOOD_DATE), GOOD_DATE)
-            .unwrap()
+            .expect("test fixture operation should succeed")
             .new_state;
         let floor = state.trusted_time_floor;
-        let not_before = state.next_success_check_not_before.unwrap();
+        let not_before = state
+            .next_success_check_not_before
+            .expect("test fixture operation should succeed");
         // Within the cooldown and a sane clock → skip.
         assert!(cooldown_permits_skip(&state, not_before - 10));
         // Past the cooldown → check online.
@@ -592,29 +597,32 @@ mod tests {
 
     #[test]
     fn state_store_roundtrip_missing_and_corrupt() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test fixture operation should succeed");
         // Missing → default.
-        let state = read_state(dir.path()).unwrap();
+        let state = read_state(dir.path()).expect("test fixture operation should succeed");
         assert_eq!(state.max_control_revision, 0);
         // Roundtrip.
         let m = manifest("1.2.3", 5, 7);
-        let accepted = evaluate_manifest(&state, &m, Some(GOOD_DATE), GOOD_DATE).unwrap();
-        write_state(dir.path(), &accepted.new_state).unwrap();
-        let reread = read_state(dir.path()).unwrap();
+        let accepted = evaluate_manifest(&state, &m, Some(GOOD_DATE), GOOD_DATE)
+            .expect("test fixture operation should succeed");
+        write_state(dir.path(), &accepted.new_state)
+            .expect("test fixture operation should succeed");
+        let reread = read_state(dir.path()).expect("test fixture operation should succeed");
         assert_eq!(reread.max_control_revision, 5);
         assert_eq!(reread.max_seen.as_deref(), Some("1.2.3"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(dir.path().join(STATE_FILE_NAME))
-                .unwrap()
+                .expect("test fixture operation should succeed")
                 .permissions()
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
         // Corrupt → hard error, never a silent reset.
-        fs::write(dir.path().join(STATE_FILE_NAME), b"{ nope").unwrap();
+        fs::write(dir.path().join(STATE_FILE_NAME), b"{ nope")
+            .expect("test fixture operation should succeed");
         assert!(matches!(
             read_state(dir.path()),
             Err(StateStoreError::Corrupt { .. })

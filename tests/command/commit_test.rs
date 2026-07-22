@@ -1869,3 +1869,55 @@ fn test_commit_amend_no_edit_signed_parent_does_not_leak_gpgsig() {
         "amended message leaked a PGP signature block:\n{log}"
     );
 }
+
+#[test]
+fn commit_with_terminal_index_failure_is_repaired_without_recommitting() {
+    let repo = tempdir().expect("create temp repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("indexed.txt"), "content\n").expect("write fixture");
+    assert_cli_success(
+        &run_libra_command(&["add", "indexed.txt"], p),
+        "stage fixture",
+    );
+
+    let committed = run_libra_command_with_stdin_and_env(
+        &["commit", "-m", "durable index repair", "--no-verify"],
+        p,
+        "",
+        &[("LIBRA_TEST_OBJECT_INDEX_UPDATE_FAIL", "1")],
+    );
+    assert_cli_success(
+        &committed,
+        "the local commit should complete while cloud-index repair is durable",
+    );
+    assert!(
+        String::from_utf8_lossy(&committed.stderr).contains("durable repair queue"),
+        "terminal index failure should be visible: {}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&committed.stdout).contains("durable index repair"),
+        "the ref-advancing commit should have completed"
+    );
+
+    let marker_dir = p.join(".libra/object-index-repair");
+    let pending = std::fs::read_dir(&marker_dir)
+        .expect("repair marker directory should exist")
+        .count();
+    assert!(
+        pending >= 2,
+        "commit and tree updates should remain repairable"
+    );
+
+    let status = run_libra_command(&["status", "--short"], p);
+    assert_cli_success(&status, "the next command should repair pending index rows");
+    assert_eq!(
+        std::fs::read_dir(&marker_dir)
+            .expect("repair marker directory should remain readable")
+            .count(),
+        0,
+        "repair must not require creating a second commit"
+    );
+}

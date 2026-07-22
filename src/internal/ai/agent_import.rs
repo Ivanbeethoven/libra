@@ -185,11 +185,54 @@ pub struct ImportSummary {
     pub partial: bool,
 }
 
+/// Command-only extension of the stable embedding summary. Keeping the child
+/// count in this crate-private wrapper avoids changing the public struct-literal
+/// and exhaustive-destructure surface of [`ImportSummary`].
+#[derive(Debug, Clone)]
+pub(crate) struct DetailedImportSummary {
+    pub summary: ImportSummary,
+    pub subagent_checkpoints_written: usize,
+    /// Exact durable import identity/fence that produced this result. The
+    /// command-side object-index barrier uses both values so an older process
+    /// can never downgrade a newer successful writer.
+    pub import_identity_id: String,
+    pub import_fence_token: i64,
+}
+
+impl DetailedImportSummary {
+    fn new(
+        summary: ImportSummary,
+        subagent_checkpoints_written: usize,
+        lease: &ImportLease,
+    ) -> Self {
+        Self {
+            summary,
+            subagent_checkpoints_written,
+            import_identity_id: lease.identity_id.clone(),
+            import_fence_token: lease.fence_token,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 #[error("historical import failed after durable progress: {message}")]
 pub struct ImportProgressError {
     pub summary: ImportSummary,
+    pub(crate) subagent_checkpoints_written: usize,
+    import_identity_id: String,
+    import_fence_token: i64,
     message: String,
+}
+
+impl ImportProgressError {
+    pub(crate) fn detailed_summary(&self) -> DetailedImportSummary {
+        DetailedImportSummary {
+            summary: self.summary.clone(),
+            subagent_checkpoints_written: self.subagent_checkpoints_written,
+            import_identity_id: self.import_identity_id.clone(),
+            import_fence_token: self.import_fence_token,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -774,7 +817,7 @@ pub fn prepare_import_request(
     })
 }
 
-fn identity_id(request: &ImportRequest) -> String {
+pub(crate) fn identity_id(request: &ImportRequest) -> String {
     let mut digest = Sha256::new();
     for value in [
         request.agent_kind.as_db_str(),
@@ -804,8 +847,8 @@ fn existing_session_snapshot_fingerprint(snapshot: &ExistingSessionOwnershipSnap
     hex::encode(digest.finalize())
 }
 
-pub async fn load_existing_session_ownership(
-    conn: &DatabaseConnection,
+pub async fn load_existing_session_ownership<C: ConnectionTrait>(
+    conn: &C,
     kind: AgentKind,
     provider_session_id: &str,
 ) -> Result<Option<ExistingSessionOwnershipSnapshot>> {
@@ -899,8 +942,8 @@ pub fn validate_prepared_existing_session(
     Ok(())
 }
 
-async fn validate_existing_session_ownership(
-    conn: &DatabaseConnection,
+async fn validate_existing_session_ownership<C: ConnectionTrait>(
+    conn: &C,
     request: &ImportRequest,
 ) -> Result<()> {
     let observed =
@@ -964,20 +1007,44 @@ async fn ensure_session(conn: &impl ConnectionTrait, request: &ImportRequest) ->
     if request.existing_session_fingerprint.is_some() {
         return Err(ImportError::RepositoryConflict.into());
     }
-    let metadata = serde_json::json!({
+    let incarnation = conn
+        .query_one(Statement::from_sql_and_values(
+            backend,
+            "SELECT next_session_sync_revision, source_namespace
+             FROM agent_capture_incarnation
+             WHERE agent_kind = ? AND provider_session_id = ?",
+            [
+                request.agent_kind.as_db_str().into(),
+                request.provider_session_id.clone().into(),
+            ],
+        ))
+        .await
+        .context("read restored agent capture replication incarnation")?;
+    let (sync_revision, source_namespace) = if let Some(row) = incarnation {
+        (
+            row.try_get_by::<i64, _>("next_session_sync_revision")?,
+            Some(row.try_get_by::<String, _>("source_namespace")?),
+        )
+    } else {
+        (1, None)
+    };
+    let mut metadata = serde_json::json!({
         "import_provisional": true,
         "source_kind": request.source_kind,
         "source_id": request.source_id,
         "repository_identity": request.repository_identity,
         "source_fingerprint": request.source_fingerprint,
     });
+    if let Some(source_namespace) = source_namespace {
+        metadata["capture_incarnation"] = serde_json::Value::String(source_namespace);
+    }
     conn.execute(Statement::from_sql_and_values(
         backend,
         "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
             metadata_json, redaction_report, started_at, last_event_at,
-            stopped_at, schema_version
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            stopped_at, schema_version, sync_revision
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
         [
             request.session_id.clone().into(),
             request.agent_kind.as_db_str().into(),
@@ -991,6 +1058,7 @@ async fn ensure_session(conn: &impl ConnectionTrait, request: &ImportRequest) ->
             request.started_at.into(),
             request.started_at.into(),
             Value::from(None::<i64>),
+            sync_revision.into(),
         ],
     ))
     .await
@@ -1005,12 +1073,30 @@ async fn acquire_identity(
     now_ms: i64,
     deadline: Instant,
 ) -> Result<ImportLease> {
-    validate_existing_session_ownership(conn, request).await?;
     let identity_id = identity_id(request);
     let lease_expires_at = now_ms
         .checked_add(IMPORT_LEASE_MS)
         .context("import lease timestamp overflow")?;
     let txn = conn.begin().await.context("begin import identity lease")?;
+    // Acquire SQLite's writer slot before checking the tombstone and the
+    // prepared session fingerprint. Otherwise erasure can commit between a
+    // standalone ownership read and this transaction, turning a known erased
+    // identity into a misleading repository-conflict result.
+    txn.execute(Statement::from_sql_and_values(
+        txn.get_database_backend(),
+        // `working_dir` is deliberately outside the compatibility tombstone
+        // trigger's UPDATE OF list. Updating a guarded lifecycle column here
+        // would abort before the contextual tombstone check can return
+        // ImportError::Erased when erase has committed its first phase.
+        "UPDATE agent_session SET working_dir = working_dir
+         WHERE agent_kind = ? AND provider_session_id = ?",
+        [
+            request.agent_kind.as_db_str().into(),
+            request.provider_session_id.clone().into(),
+        ],
+    ))
+    .await
+    .context("serialize import identity acquisition with session erasure")?;
     let tombstone = txn
         .query_one(Statement::from_sql_and_values(
             txn.get_database_backend(),
@@ -1027,6 +1113,7 @@ async fn acquire_identity(
         txn.rollback().await.ok();
         return Err(ImportError::Erased.into());
     }
+    validate_existing_session_ownership(&txn, request).await?;
     // Keep the write barrier and session insert under the same SQLite writer
     // transaction. Otherwise erase can commit a tombstone between the check
     // and a standalone session insert, leaving a locally erased session
@@ -1620,6 +1707,61 @@ fn contiguous_next_ordinal(ordinals: &BTreeSet<usize>) -> Result<i64> {
     i64::try_from(next).context("turn ordinal exceeds import cursor range")
 }
 
+async fn capture_imported_subagent_content(
+    conn: &DatabaseConnection,
+    storage_root: &std::path::Path,
+    request: &ImportRequest,
+    discovery: &super::subagent_content::SubagentDiscovery,
+    deadline: Instant,
+) -> Result<super::subagent_content::SubagentCaptureSummary> {
+    if request.agent_kind != AgentKind::ClaudeCode {
+        return Ok(super::subagent_content::SubagentCaptureSummary::default());
+    }
+    if let Some(warning) = discovery.warning.as_deref() {
+        tracing::warn!(
+            session_id = %request.session_id,
+            warning,
+            "historical import subagent discovery is unavailable; parent import remains valid"
+        );
+    }
+    let summary = super::subagent_content::capture_discovered_subagent_contents(
+        conn,
+        storage_root,
+        &request.session_id,
+        &discovery.sources,
+        "import",
+        Some(deadline),
+    )
+    .await?;
+    tracing::info!(
+        session_id = %request.session_id,
+        discovered = summary.discovered,
+        checkpoints_written = summary.checkpoints_written,
+        skipped_unchanged = summary.skipped_unchanged,
+        skipped_inflight = summary.skipped_inflight,
+        partial_sources = summary.partial_sources,
+        "historical import subagent content attribution completed"
+    );
+    Ok(summary)
+}
+
+fn subagent_capture_progress(
+    error: &anyhow::Error,
+) -> super::subagent_content::SubagentCaptureSummary {
+    error
+        .downcast_ref::<super::subagent_content::SubagentCaptureProgressError>()
+        .map(|progress| progress.summary().clone())
+        .unwrap_or_default()
+}
+
+fn historical_import_is_partial(
+    skipped_inflight: usize,
+    conflicted: usize,
+    discovery: &super::subagent_content::SubagentDiscovery,
+) -> bool {
+    skipped_inflight > 0 || conflicted > 0 || discovery.partial_source_count() > 0
+}
+
 /// Persist one prepared source with per-turn checkpoints and the shared
 /// claim/ref/catalog/identity transaction.
 pub async fn import_prepared(
@@ -1628,6 +1770,43 @@ pub async fn import_prepared(
     request: ImportRequest,
     deadline: Instant,
 ) -> Result<ImportSummary> {
+    let discovery = if request.agent_kind == AgentKind::ClaudeCode {
+        let discovery_deadline =
+            super::subagent_content::discovery_deadline_preserving_parent(deadline)?;
+        match super::subagent_content::discover_claude_subagent_contents_bounded(
+            &request.working_dir,
+            &request.provider_session_id,
+            discovery_deadline,
+            super::observed_agents::TRANSCRIPT_READ_HARD_CAP_BYTES,
+            super::subagent_content::MAX_SUBAGENT_SOURCES_PER_CAPTURE,
+        )
+        .await
+        {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                match super::subagent_content::SubagentDiscovery::from_deadline_error(&error) {
+                    Some(discovery) => discovery,
+                    None => return Err(error),
+                }
+            }
+        }
+    } else {
+        super::subagent_content::SubagentDiscovery::default()
+    };
+    import_prepared_with_subagent_discovery(conn, storage_root, request, deadline, discovery)
+        .await
+        .map(|detailed| detailed.summary)
+}
+
+/// Command-path variant whose child discovery was already charged to the
+/// batch input budget before any persistence begins.
+pub(crate) async fn import_prepared_with_subagent_discovery(
+    conn: &DatabaseConnection,
+    storage_root: &std::path::Path,
+    request: ImportRequest,
+    deadline: Instant,
+    subagent_discovery: super::subagent_content::SubagentDiscovery,
+) -> Result<DetailedImportSummary> {
     ensure_before_deadline(deadline)?;
     let owner = format!("import:{}:{}", std::process::id(), uuid::Uuid::new_v4());
     let started_ms = Utc::now().timestamp_millis();
@@ -1673,9 +1852,71 @@ pub async fn import_prepared(
             abandon_import_attempt_after_error(conn, &request, &lease, None, "failed", error).await;
         return Err(error);
     }
-    let partial = outcome.skipped_inflight > 0 || outcome.conflicted > 0;
+    // A discovery warning (for example, secure child discovery being
+    // unavailable on this platform) does not prove that child evidence exists.
+    // Only observed incomplete sources or claim conflicts make the import
+    // partial; the parent transcript remains independently valid.
+    let partial = historical_import_is_partial(
+        outcome.skipped_inflight,
+        outcome.conflicted,
+        &subagent_discovery,
+    );
+    let defer_identity_for_subagents = !subagent_discovery.sources.is_empty();
     if outcome.reserved.is_empty() {
         let identity_state = if partial { "partial" } else { "committed" };
+        let capture = capture_imported_subagent_content(
+            conn,
+            storage_root,
+            &request,
+            &subagent_discovery,
+            deadline,
+        )
+        .await;
+        let capture_summary = match capture {
+            Ok(summary) => summary,
+            Err(error) => {
+                let child_progress = subagent_capture_progress(&error);
+                let error = abandon_import_attempt_after_error(
+                    conn,
+                    &request,
+                    &lease,
+                    None,
+                    "partial",
+                    error
+                        .context("capture subagent content for already-covered historical session"),
+                )
+                .await;
+                return Err(ImportProgressError {
+                    summary: ImportSummary {
+                        session_id: request.session_id.clone(),
+                        agent_kind: request.agent_kind.as_db_str().to_string(),
+                        turns_seen: request.turns.len(),
+                        checkpoints_written: 0,
+                        skipped_covered: outcome.skipped_covered,
+                        skipped_inflight: outcome.skipped_inflight,
+                        conflicted: outcome.conflicted,
+                        partial: true,
+                    },
+                    subagent_checkpoints_written: child_progress.checkpoints_written,
+                    import_identity_id: lease.identity_id.clone(),
+                    import_fence_token: lease.fence_token,
+                    message: format!("subagent content attribution failed: {error:#}"),
+                }
+                .into());
+            }
+        };
+        if capture_summary.partial_sources > 0 && !partial {
+            let error = abandon_import_attempt_after_error(
+                conn,
+                &request,
+                &lease,
+                None,
+                "partial",
+                anyhow!("subagent partial-source accounting changed during import finalization"),
+            )
+            .await;
+            return Err(error);
+        }
         if let Err(error) = finalize_noop_identity(
             conn,
             &request,
@@ -1698,16 +1939,20 @@ pub async fn import_prepared(
             .await;
             return Err(error);
         }
-        return Ok(ImportSummary {
-            session_id: request.session_id,
-            agent_kind: request.agent_kind.as_db_str().to_string(),
-            turns_seen: request.turns.len(),
-            checkpoints_written: 0,
-            skipped_covered: outcome.skipped_covered,
-            skipped_inflight: outcome.skipped_inflight,
-            conflicted: outcome.conflicted,
-            partial,
-        });
+        return Ok(DetailedImportSummary::new(
+            ImportSummary {
+                session_id: request.session_id,
+                agent_kind: request.agent_kind.as_db_str().to_string(),
+                turns_seen: request.turns.len(),
+                checkpoints_written: 0,
+                skipped_covered: outcome.skipped_covered,
+                skipped_inflight: outcome.skipped_inflight,
+                conflicted: outcome.conflicted,
+                partial,
+            },
+            capture_summary.checkpoints_written,
+            &lease,
+        ));
     }
 
     let objects_dir = storage_root.join("objects");
@@ -1845,7 +2090,12 @@ pub async fn import_prepared(
                 turn.completeness == Completeness::Incomplete,
             ))?;
             let report = redacted_json(&request.redaction_report)?;
-            let final_turn = claim_index + 1 == reserved.len() && !partial;
+            // Only imports with actual child sources defer identity completion.
+            // The established no-child path retains its atomic parent
+            // checkpoint+identity commit and post-commit deadline semantics.
+            let final_turn = claim_index + 1 == reserved.len()
+                && !partial
+                && !defer_identity_for_subagents;
             committed_ordinals.insert(turn.ordinal);
             let next_ordinal = contiguous_next_ordinal(&committed_ordinals)?;
             let plan = LiveClaimCommitPlan {
@@ -1967,18 +2217,86 @@ pub async fn import_prepared(
             };
             return Err(ImportProgressError {
                 summary,
+                subagent_checkpoints_written: 0,
+                import_identity_id: lease.identity_id.clone(),
+                import_fence_token: lease.fence_token,
                 message: format!("{error:#}"),
             }
             .into());
         }
     }
-    if partial
+    let capture = capture_imported_subagent_content(
+        conn,
+        storage_root,
+        &request,
+        &subagent_discovery,
+        deadline,
+    )
+    .await;
+    let capture_summary = match capture {
+        Ok(summary) => summary,
+        Err(error) => {
+            let child_progress = subagent_capture_progress(&error);
+            let error = abandon_import_attempt_after_error(
+                conn,
+                &request,
+                &lease,
+                None,
+                "partial",
+                error.context("capture imported subagent content"),
+            )
+            .await;
+            return Err(ImportProgressError {
+                summary: ImportSummary {
+                    session_id: request.session_id.clone(),
+                    agent_kind: request.agent_kind.as_db_str().to_string(),
+                    turns_seen: request.turns.len(),
+                    checkpoints_written: written,
+                    skipped_covered: outcome.skipped_covered,
+                    skipped_inflight: outcome.skipped_inflight,
+                    conflicted: outcome.conflicted,
+                    partial: true,
+                },
+                subagent_checkpoints_written: child_progress.checkpoints_written,
+                import_identity_id: lease.identity_id.clone(),
+                import_fence_token: lease.fence_token,
+                message: format!("subagent content attribution failed: {error:#}"),
+            }
+            .into());
+        }
+    };
+    if capture_summary.partial_sources > 0 && !partial {
+        let error =
+            anyhow!("subagent partial-source accounting changed during import finalization");
+        let error =
+            abandon_import_attempt_after_error(conn, &request, &lease, None, "partial", error)
+                .await;
+        return Err(ImportProgressError {
+            summary: ImportSummary {
+                session_id: request.session_id.clone(),
+                agent_kind: request.agent_kind.as_db_str().to_string(),
+                turns_seen: request.turns.len(),
+                checkpoints_written: written,
+                skipped_covered: outcome.skipped_covered,
+                skipped_inflight: outcome.skipped_inflight,
+                conflicted: outcome.conflicted,
+                partial: true,
+            },
+            subagent_checkpoints_written: capture_summary.checkpoints_written,
+            import_identity_id: lease.identity_id.clone(),
+            import_fence_token: lease.fence_token,
+            message: format!("{error:#}"),
+        }
+        .into());
+    }
+    let identity_state = if partial { "partial" } else { "committed" };
+    if (partial || defer_identity_for_subagents)
         && let Err(error) = finalize_noop_identity(
             conn,
             &request,
             &lease,
-            "partial",
-            Some("LBR-AGENT-018"),
+            identity_state,
+            partial.then_some("LBR-AGENT-018"),
             Utc::now().timestamp_millis(),
             deadline,
         )
@@ -1998,20 +2316,27 @@ pub async fn import_prepared(
                 conflicted: outcome.conflicted,
                 partial: true,
             },
+            subagent_checkpoints_written: capture_summary.checkpoints_written,
+            import_identity_id: lease.identity_id.clone(),
+            import_fence_token: lease.fence_token,
             message: format!("{error:#}"),
         }
         .into());
     }
-    Ok(ImportSummary {
-        session_id: request.session_id,
-        agent_kind: request.agent_kind.as_db_str().to_string(),
-        turns_seen: request.turns.len(),
-        checkpoints_written: written,
-        skipped_covered: outcome.skipped_covered,
-        skipped_inflight: outcome.skipped_inflight,
-        conflicted: outcome.conflicted,
-        partial,
-    })
+    Ok(DetailedImportSummary::new(
+        ImportSummary {
+            session_id: request.session_id,
+            agent_kind: request.agent_kind.as_db_str().to_string(),
+            turns_seen: request.turns.len(),
+            checkpoints_written: written,
+            skipped_covered: outcome.skipped_covered,
+            skipped_inflight: outcome.skipped_inflight,
+            conflicted: outcome.conflicted,
+            partial,
+        },
+        capture_summary.checkpoints_written,
+        &lease,
+    ))
 }
 
 /// Fast tombstone check used by the command before reading/exporting content.
@@ -2100,6 +2425,16 @@ pub async fn restore_tombstone(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_child_discovery_does_not_invalidate_parent_import() {
+        let discovery = super::super::subagent_content::SubagentDiscovery {
+            warning: Some("secure discovery unavailable".to_string()),
+            ..super::super::subagent_content::SubagentDiscovery::default()
+        };
+        assert!(!historical_import_is_partial(0, 0, &discovery));
+        assert!(historical_import_is_partial(1, 0, &discovery));
+    }
 
     #[tokio::test]
     async fn stale_finalizer_cannot_delete_new_takeover_session_or_marker() {
