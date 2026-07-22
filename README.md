@@ -10,11 +10,9 @@
 
 </div>
 
-Libra is an AI-native infrastructure that captures and structures the full lifecycle of software development, documenting every step from human intent and AI reasoning to validation and release.
+Libra is an AI-native version control system that extends traditional version control from tracking code changes to capturing the entire software creation process. It records development context, AI agent interactions, generated code, and validation history, transforming ephemeral coding sessions into reusable and traceable engineering knowledge. As a result, Libra enables developers and AI agents to understand the context behind code, replay previous workflows, and reuse proven solutions across projects. It improves reliability and collaboration for AI-assisted software development, especially in agentic coding, long-context workflows, and large-scale codebases.
 
-Our mission is to ensure that every software creation becomes lasting knowledge instead of discarded workflow data, empowering developers, teams, and AI systems to retrieve, reuse, and build upon the intelligence behind every piece of software.
-
-As AI becomes the primary producer of software, Libra provides the foundational infrastructure that preserves, compounds, and unlocks the long-term value of software creation.
+Libra is built to fit into existing developer workflows. It is Git-compatible and works with popular AI coding tools including Claude Code, Codex, and Gemini CLI, allowing developers to gradually adopt AI-native version control without changing their existing repositories or development environments.
 
 <div align="center">
 
