@@ -25,6 +25,7 @@ pub mod ai;
 pub mod alternates;
 pub mod auth;
 pub mod branch;
+pub mod brewfs_backend;
 pub mod config;
 pub mod db;
 pub mod deps;
