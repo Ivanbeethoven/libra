@@ -50,6 +50,9 @@ curl -fsSL https://download.libra.tools/install.sh | sh
 # Homebrew（macOS）
 brew install libra
 
+# Windows PowerShell
+irm https://download.libra.tools/install.ps1 | iex
+
 # 从源码编译（需要 Rust）
 git clone https://github.com/wingwangsz/libra.git
 cd libra
@@ -60,6 +63,8 @@ cargo build --release
 重复安装同一版本会修复缺失的 alias，不替换二进制。使用 `--no-alias` 或
 `LIBRA_NO_ALIAS=1` 可关闭；已存在的用户自有 `lba` 绝不会被覆盖。详见
 [安装器行为与选项](docs/installation.zh-CN.md)。
+Windows PowerShell 安装器会在 `libra.exe` 旁创建 `lba.cmd`，并将安装目录加入
+当前用户的 PATH。使用 `-NoAlias` 或 `LIBRA_NO_ALIAS=1` 可关闭该行为。
 
 ### 初始化你的第一个仓库
 
@@ -181,7 +186,7 @@ cargo +nightly fmt --all --check
 cargo +nightly fmt --all
 ```
 
-Windows 构建用户请查看 [Windows 构建指南](docs/installation/windows.md) 了解 OpenSSL 配置。
+Windows 安装与 alias 行为请查看[安装文档](docs/installation.zh-CN.md)。
 
 详细贡献指南请参见 [docs/development/contributing.md](docs/development/contributing.md)。
 

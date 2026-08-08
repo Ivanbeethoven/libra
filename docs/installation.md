@@ -34,6 +34,25 @@ whole Libra home directory is moved.
 The installer does not create a copy, hard link, shell function, or alias in a
 profile. `lba` is only the optional filesystem symlink beside `libra`.
 
+## Windows
+
+Run the PowerShell installer from PowerShell:
+
+```powershell
+irm https://download.libra.tools/install.ps1 | iex
+```
+
+It installs `libra.exe` in `%USERPROFILE%\.libra\bin`, adds that directory to
+the user PATH, and creates the optional `lba.cmd` shim. The shim resolves
+`libra.exe` beside itself, so moving the `.libra` directory keeps both commands
+working. Re-running the same version repairs a missing or Libra-managed shim
+without replacing the binary.
+
+Use `-NoAlias`, `LIBRA_NO_ALIAS=1`, or `-NoModifyPath` for opt-out behavior.
+`-Uninstall` removes only the Libra-managed binary, shim, marker, and PATH
+entry; existing user-owned `lba.*` files are preserved. The installer accepts
+`-Version <VERSION>`, `-Dir <PATH>`, and `-BaseUrl <URL>` for scripted installs.
+
 ## Opting out
 
 Use the flag for one invocation:

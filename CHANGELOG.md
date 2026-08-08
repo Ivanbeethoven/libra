@@ -13,6 +13,15 @@
   associations). Lease mutation stays internal to the agent runtime
   services.
 
+### Added (PD-10)
+
+- **Windows PowerShell installer and `lba.cmd` shim (plan-20260714 PD-10)**:
+  `install.ps1` installs the published `libra-windows-amd64.exe`, verifies a
+  published SHA-256 when available, updates the user PATH, and creates an
+  ownership-marked `lba.cmd`. Reinstalls repair only Libra-managed shims;
+  `-NoAlias`/`LIBRA_NO_ALIAS=1` preserve opt-out behavior, and `-Uninstall`
+  removes only files and PATH entries created by the installer.
+
 ### Fixed
 
 ### Added (PD-03)

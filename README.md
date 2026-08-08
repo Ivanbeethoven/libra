@@ -50,6 +50,9 @@ curl -fsSL https://download.libra.tools/install.sh | sh
 # Homebrew (macOS)
 brew install libra
 
+# Windows PowerShell
+irm https://download.libra.tools/install.ps1 | iex
+
 # From source (requires Rust)
 git clone https://github.com/wingwangsz/libra.git
 cd libra
@@ -61,6 +64,9 @@ The script installer also creates the optional shorthand
 repairs a missing alias without replacing the binary. Use `--no-alias` or
 `LIBRA_NO_ALIAS=1` to opt out; an existing user-owned `lba` is never
 overwritten. See [installer behavior and options](docs/installation.md).
+On Windows, the PowerShell installer creates `lba.cmd` beside `libra.exe` and
+adds the install directory to the user PATH. Use `-NoAlias` or
+`LIBRA_NO_ALIAS=1` to opt out.
 
 #### Auto-upgrade (opt-in)
 

@@ -31,6 +31,23 @@ curl -fsSL https://download.libra.tools/install.sh | sh
 安装器不会创建二进制副本、hard link、shell function 或 profile alias。`lba` 只是
 `libra` 旁的可选文件系统 symlink。
 
+## Windows
+
+在 PowerShell 中运行：
+
+```powershell
+irm https://download.libra.tools/install.ps1 | iex
+```
+
+安装器把 `libra.exe` 放到 `%USERPROFILE%\.libra\bin`，加入当前用户的 PATH，
+并创建可选的 `lba.cmd` shim。shim 总是调用自身旁边的 `libra.exe`，因此移动整个
+`.libra` 目录后两个命令仍然有效。重复安装同一版本时，会修复缺失或由 Libra
+管理的 shim，而不会替换二进制文件。
+
+可使用 `-NoAlias`、`LIBRA_NO_ALIAS=1` 或 `-NoModifyPath` 关闭对应行为。`-Uninstall`
+只删除 Libra 管理的二进制、shim、标记文件和 PATH 项；已有的用户 `lba.*` 文件会
+保留。脚本安装支持 `-Version <VERSION>`、`-Dir <PATH>` 和 `-BaseUrl <URL>`。
+
 ## 关闭 alias
 
 单次调用使用 flag：
