@@ -525,13 +525,44 @@ pub fn storage_path() -> PathBuf {
 /// regression), but worktree-state mutations must refuse and direct at
 /// `repair --migrate-layout` (committing here would silently move MAIN's
 /// HEAD).
+///
+/// NOT legacy: the ScorpioFS host-gitdir layout, where `.libra` is a symlink to a
+/// PER-WORKTREE directory under `<storage>/worktrees/<id>/` that carries its own
+/// `worktree_id` + `commondir` + `index`. That layout is isolated (mutating it
+/// cannot touch main's HEAD/index), so it is allowed to mutate. The discriminator
+/// is the presence of a `worktree_id` file in the symlink target: the legacy link
+/// points at the common storage, which has none.
 pub fn is_legacy_symlink_worktree() -> bool {
     let Ok((_, workdir, _gitdir)) = try_get_paths_full(None) else {
         return false;
     };
-    fs::symlink_metadata(workdir.join(ROOT_DIR))
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false)
+    let link = workdir.join(ROOT_DIR);
+    let Ok(meta) = fs::symlink_metadata(&link) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    !symlink_targets_isolated_gitdir(&link)
+}
+
+/// True when `link` is a symlink whose target directory is an isolated
+/// per-worktree gitdir: it contains both `worktree_id` and `commondir`. The
+/// target lives on the host filesystem (the ScorpioFS in-mount pointer links
+/// out of the projection), so this check never traverses FUSE.
+fn symlink_targets_isolated_gitdir(link: &Path) -> bool {
+    let Ok(target) = fs::read_link(link) else {
+        return false;
+    };
+    let abs = if target.is_absolute() {
+        target
+    } else {
+        match link.parent() {
+            Some(parent) => parent.join(target),
+            None => return false,
+        }
+    };
+    abs.join("worktree_id").is_file() && abs.join("commondir").is_file()
 }
 
 static MIGRATION_GATE_BYPASS: std::sync::atomic::AtomicBool =

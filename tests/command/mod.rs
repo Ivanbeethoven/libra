@@ -354,6 +354,7 @@ mod ls_remote_options_test;
 mod ls_remote_test;
 mod ls_tree_test;
 mod maintenance_test;
+mod mega_test;
 mod merge_base_test;
 mod merge_file_test;
 mod merge_test;

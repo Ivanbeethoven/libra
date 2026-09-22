@@ -34,6 +34,8 @@ EXAMPLES:
     libra worktree add --detach ../probe v1.2.0    Detached worktree at a commit-ish
     libra worktree add -b topic ../topic main      Create branch `topic` from `main` and
                                                    check it out
+    libra worktree add --backend scorpiofs -b topic ../topic
+                                                   Attach a ScorpioFS-backed worktree
     libra worktree list                            List every registered worktree
     libra worktree list --porcelain                Machine-readable worktree list
     libra worktree lock ../feature-x --reason wip  Lock a worktree to prevent prune/remove
@@ -91,6 +93,10 @@ pub enum WorktreeSubcommand {
         /// already exists (no -B/--force).
         #[clap(short = 'b', long = "create-branch", value_name = "NEW_BRANCH")]
         new_branch: Option<String>,
+        /// Worktree file backend. `scorpiofs` attaches a ScorpioFS FUSE mount
+        /// at the target path instead of materializing the tree on the host.
+        #[clap(long, value_name = "BACKEND")]
+        backend: Option<String>,
     },
     /// List all known worktrees and their state.
     List {
@@ -752,10 +758,19 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             target,
             detach,
             new_branch,
+            backend,
         } => {
-            let result = add_worktree(path, target, detach, new_branch)
-                .await
-                .map_err(WorktreeError::into_cli_error)?;
+            let result = if backend.as_deref() == Some("scorpiofs") {
+                add_scorpiofs_worktree(path, target, detach, new_branch).await
+            } else if backend.is_some() {
+                Err(WorktreeError::InvalidTarget(format!(
+                    "unsupported worktree backend '{}'; supported backends: scorpiofs",
+                    backend.unwrap_or_default()
+                )))
+            } else {
+                add_worktree(path, target, detach, new_branch, true).await
+            }
+            .map_err(WorktreeError::into_cli_error)?;
             render_add_worktree(&result, output)
         }
         WorktreeSubcommand::List { porcelain } => list_worktrees(output, porcelain).await,
@@ -1228,6 +1243,7 @@ async fn add_worktree(
     target_spec: Option<String>,
     detach: bool,
     new_branch: Option<String>,
+    populate_worktree: bool,
 ) -> WorktreeResult<WorktreeAddOutput> {
     // Registry mutation lock: the whole precheck → sweep → seed → registry
     // write sequence runs under it (a concurrent add's sweep must not
@@ -1646,11 +1662,9 @@ async fn add_worktree(
             conflict: None,
             pathspec: vec![util::working_dir_string()],
             source: Some("HEAD".to_string()),
-            worktree: true,
-            // lore.md 2.1: also restore the PRIVATE index to HEAD (a linked
-            // worktree no longer shares the main index, so a fresh worktree's
-            // index must be seeded to match HEAD or every file reads as a
-            // phantom change).
+            worktree: populate_worktree,
+            // A backend that mounts an external filesystem still needs a private
+            // index seeded from HEAD, but must not materialize the tree first.
             staged: true,
             pathspec_from_file: None,
             pathspec_file_nul: false,
@@ -1707,6 +1721,303 @@ async fn add_worktree(
         already_exists: false,
         reattached: false,
     })
+}
+
+/// Attach a registered Libra worktree to a ScorpioFS mount without materializing
+/// the committed tree into the host directory.
+async fn add_scorpiofs_worktree(
+    path: String,
+    target_spec: Option<String>,
+    detach: bool,
+    new_branch: Option<String>,
+) -> WorktreeResult<WorktreeAddOutput> {
+    let endpoint = std::env::var("LIBRA_SCORPIOFS_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:2725/antares".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let repo_path =
+        std::env::var("LIBRA_SCORPIOFS_REPO_PATH").unwrap_or_else(|_| "/project".to_string());
+
+    let result = add_worktree(path, target_spec, detach, new_branch, false).await?;
+    let target = resolve_path(&result.path, "worktree path")?;
+    let link_path = target.join(util::ROOT_DIR);
+    let storage = util::storage_path();
+    let worktree_id = util::worktree_instance_id(&target);
+
+    let base_revision = {
+        let _guard = DirGuard::change_to(&target).map_err(|e| {
+            WorktreeError::IoRead(format!(
+                "cannot enter ScorpioFS worktree '{}': {e}",
+                target.display()
+            ))
+        })?;
+        Head::current_commit_result()
+            .await
+            .map_err(|e| WorktreeError::IoRead(format!("cannot resolve worktree HEAD: {e}")))?
+            .ok_or_else(|| {
+                WorktreeError::OperationBlocked(
+                    "ScorpioFS worktrees require a committed HEAD".to_string(),
+                )
+            })?
+            .to_string()
+    };
+
+    let staging = target.with_file_name(format!(".libra-scorpiofs-{worktree_id}"));
+    fs::rename(&link_path, &staging).map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "failed to stage '{}' before mounting ScorpioFS: {e}",
+            link_path.display()
+        ))
+    })?;
+
+    let client = reqwest::Client::new();
+    // Worktree v2 attach: one call provisions the mount with its lower pinned from
+    // the first request (no tip-drift window before the base binding), and the
+    // daemon never touches VCS metadata — Libra writes `.libra` through the mount
+    // itself below.
+    //
+    // A unique job id per registration attempt: the daemon treats job ids
+    // idempotently, so a deterministic one would silently re-attach a STALE mount
+    // from an earlier registration of the same path (whose base binding and lower
+    // revision no longer match this worktree's HEAD). Orphaned mounts from crashed
+    // attempts are cleaned up by `worktree repair` / daemon GC instead.
+    let attach_nonce = uuid::Uuid::new_v4();
+    let attach_body = serde_json::json!({
+        "worktree_id": worktree_id,
+        "repo_path": repo_path,
+        "mountpoint": target.to_string_lossy(),
+        "base_revision": base_revision,
+        "job_id": format!("libra-scorpiofs-{worktree_id}-{attach_nonce}"),
+    });
+    let attached = match client
+        .post(format!("{endpoint}/worktrees"))
+        .json(&attach_body)
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            response.json::<serde_json::Value>().await.map_err(|e| {
+                WorktreeError::IoRead(format!("invalid ScorpioFS attach response: {e}"))
+            })?
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let _ = fs::rename(&staging, &link_path);
+            return Err(WorktreeError::IoWrite(format!(
+                "ScorpioFS attach failed ({status}): {body}"
+            )));
+        }
+        Err(e) => {
+            let _ = fs::rename(&staging, &link_path);
+            return Err(WorktreeError::IoRead(format!(
+                "cannot connect to ScorpioFS at {endpoint}: {e}"
+            )));
+        }
+    };
+
+    let mount_id = attached
+        .get("mount_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WorktreeError::IoRead("ScorpioFS attach response has no mount_id".into()))?;
+    let lower_revision = attached
+        .get("lower_revision")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    tracing::info!(
+        mount_id = %mount_id,
+        lower_revision = %lower_revision,
+        "scorpiofs worktree attached with pinned lower"
+    );
+
+    // Host-side per-worktree gitdir (spec §3.2): the mutable VCS state lives on
+    // the host, OUTSIDE the mount. The in-mount `.libra` becomes a single symlink
+    // to it — the kernel resolves the symlink before the FUSE lookup, so every
+    // Libra command inside the worktree reads host-side state directly, and the
+    // projection only ever holds one reconstructable pointer. This is what keeps
+    // ScorpioFS's on-demand projection and Libra's metadata from ever mixing.
+    let host_gitdir = storage.join("worktrees").join(&worktree_id);
+    fs::create_dir_all(&host_gitdir).map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "failed to create host-side worktree gitdir '{}': {e}",
+            host_gitdir.display()
+        ))
+    })?;
+    // The staged pointer (commondir/worktree_id/index) was seeded host-side during
+    // registration; move it into place. rename first (same-filesystem fast path),
+    // falling back to copy+delete across devices.
+    for name in ["commondir", "worktree_id", "index"] {
+        let from = staging.join(name);
+        if !from.exists() {
+            continue;
+        }
+        let to = host_gitdir.join(name);
+        if fs::rename(&from, &to).is_err() {
+            fs::copy(&from, &to).map_err(|e| {
+                WorktreeError::IoWrite(format!("failed to move '{}' host-side: {e}", name))
+            })?;
+            fs::remove_file(&from).map_err(|e| {
+                WorktreeError::IoWrite(format!("failed to clean '{}' after move: {e}", name))
+            })?;
+        }
+    }
+    fs::write(
+        host_gitdir.join("scorpiofs_mount_id"),
+        format!("{mount_id}\n"),
+    )
+    .map_err(|e| {
+        WorktreeError::IoWrite(format!("failed to persist the ScorpioFS mount id: {e}"))
+    })?;
+    fs::remove_dir_all(&staging).map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "failed to remove the staged pointer '{}': {e}",
+            staging.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&host_gitdir, &link_path).map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "failed to link in-mount '{}' to the host gitdir '{}': {e}",
+            link_path.display(),
+            host_gitdir.display()
+        ))
+    })?;
+    #[cfg(not(unix))]
+    {
+        let _ = (&host_gitdir, &link_path);
+        return Err(WorktreeError::OperationBlocked(
+            "ScorpioFS worktrees require a Unix host (FUSE + symlink pointer)".into(),
+        ));
+    }
+
+    Ok(result)
+}
+
+/// Fork the current ScorpioFS-backed worktree into a new linked worktree.
+///
+/// The new target is registered first (without restoring files), then ScorpioFS
+/// materializes the source upper into the target before the target FUSE session
+/// starts. This keeps the Libra registry/SQLite scope and the mounted filesystem
+/// transactionally aligned enough for a single-process CLI operation.
+pub(crate) async fn fork_scorpiofs_worktree(
+    target_path: String,
+    new_branch: Option<String>,
+) -> WorktreeResult<String> {
+    let source_mount_id = fs::read_to_string(
+        util::try_get_worktree_gitdir(None)
+            .map_err(|e| WorktreeError::IoRead(format!("cannot locate current .libra: {e}")))?
+            .join("scorpiofs_mount_id"),
+    )
+    .map_err(|e| WorktreeError::IoRead(format!("current worktree is not ScorpioFS-backed: {e}")))?
+    .trim()
+    .to_string();
+    if source_mount_id.is_empty() {
+        return Err(WorktreeError::InvalidTarget(
+            "current worktree has an empty ScorpioFS mount id".into(),
+        ));
+    }
+
+    let result = add_worktree(target_path, None, false, new_branch, false).await?;
+    let target = resolve_path(&result.path, "fork target")?;
+    let link_path = target.join(util::ROOT_DIR);
+    let worktree_id = util::worktree_instance_id(&target);
+    let staging = target.with_file_name(format!(".libra-scorpiofs-{worktree_id}"));
+    fs::rename(&link_path, &staging)
+        .map_err(|e| WorktreeError::IoWrite(format!("failed to stage fork target pointer: {e}")))?;
+
+    let endpoint = std::env::var("LIBRA_SCORPIOFS_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:2725/antares".to_string())
+        .trim_end_matches('/')
+        .to_string();
+    let client = reqwest::Client::new();
+    // Unique per attempt, same reasoning as the attach path: a deterministic id
+    // would idempotently re-attach a stale fork of the same target path.
+    let fork_nonce = uuid::Uuid::new_v4();
+    let body = serde_json::json!({
+        "job_id": format!("libra-scorpiofs-fork-{worktree_id}-{fork_nonce}"),
+        "mountpoint": target.to_string_lossy(),
+        "mode": "chain",
+    });
+    let response = client
+        .post(format!("{endpoint}/mounts/{source_mount_id}/fork"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| WorktreeError::IoRead(format!("cannot request ScorpioFS fork: {e}")))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        let _ = fs::rename(&staging, &link_path);
+        return Err(WorktreeError::IoWrite(format!(
+            "ScorpioFS fork failed ({status}): {text}"
+        )));
+    }
+    let fork = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| WorktreeError::IoRead(format!("invalid ScorpioFS fork response: {e}")))?;
+    let mount_id = fork
+        .get("mount_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| WorktreeError::IoRead("ScorpioFS fork response has no mount_id".into()))?;
+    // Validation, not state: the daemon pinned the child to the inherited lower and
+    // bound the inherited base itself. Its absence means the source was never a
+    // valid sync target, so the fork must not proceed.
+    let _base_revision = fork
+        .get("base_revision")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            WorktreeError::OperationBlocked("source ScorpioFS worktree has no base revision".into())
+        })?;
+
+    // The fork endpoint already pinned the child's lower to the inherited revision
+    // and bound the inherited base server-side. Libra only needs its own state:
+    // host-side gitdir + one in-mount symlink (spec §3.2), matching the attach path.
+    let host_gitdir = util::storage_path().join("worktrees").join(&worktree_id);
+    fs::create_dir_all(&host_gitdir).map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "failed to create the forked host-side gitdir '{}': {e}",
+            host_gitdir.display()
+        ))
+    })?;
+    for name in ["commondir", "worktree_id", "index"] {
+        let from = staging.join(name);
+        if !from.exists() {
+            continue;
+        }
+        let to = host_gitdir.join(name);
+        if fs::rename(&from, &to).is_err() {
+            fs::copy(&from, &to).map_err(|e| {
+                WorktreeError::IoWrite(format!("failed to move forked '{name}' host-side: {e}"))
+            })?;
+            fs::remove_file(&from)
+                .map_err(|e| WorktreeError::IoWrite(format!("failed to clean '{name}': {e}")))?;
+        }
+    }
+    fs::write(
+        host_gitdir.join("scorpiofs_mount_id"),
+        format!("{mount_id}\n"),
+    )
+    .map_err(|e| WorktreeError::IoWrite(format!("failed to persist the forked mount id: {e}")))?;
+    fs::remove_dir_all(&staging)
+        .map_err(|e| WorktreeError::IoWrite(format!("failed to remove fork staging: {e}")))?;
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&host_gitdir, &link_path).map_err(|e| {
+        WorktreeError::IoWrite(format!(
+            "failed to link the forked in-mount '{}' to '{}': {e}",
+            link_path.display(),
+            host_gitdir.display()
+        ))
+    })?;
+    #[cfg(not(unix))]
+    {
+        let _ = (&host_gitdir, &link_path);
+        return Err(WorktreeError::OperationBlocked(
+            "ScorpioFS worktrees require a Unix host (FUSE + symlink pointer)".into(),
+        ));
+    }
+
+    Ok(result.path)
 }
 
 /// Re-attach a detached worktree (W3-s1b, §C.7): verify the directory still
@@ -2240,7 +2551,15 @@ pub(crate) fn detect_entry_layout(path: &Path, is_main: bool) -> &'static str {
             if resolved.as_deref() == Some(canonical_storage.as_path()) {
                 "legacy-symlink"
             } else {
-                "corrupt"
+                // The ScorpioFS host-gitdir layout: `.libra` is a symlink to a
+                // PER-WORKTREE directory under `<storage>/worktrees/<id>/` that
+                // carries its own `worktree_id` + `commondir`. Functionally the
+                // isolated linked-v2 shape — the mutable state lives outside the
+                // projection, only the pointer is in the mount.
+                let isolated = resolved.as_deref().is_some_and(|resolved| {
+                    resolved.join("worktree_id").is_file() && resolved.join("commondir").is_file()
+                });
+                if isolated { "linked-v2" } else { "corrupt" }
             }
         }
         Ok(meta) if meta.is_dir() => {
