@@ -950,12 +950,24 @@ async fn collect_status_data(
         .await
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
-    let worktree = status_untracked::collect_status_worktree_changes(
+    // ScorpioFS heuristic fast path: on a mount, the daemon's upper-layer
+    // changed-path set replaces the whole-tree scan entirely. Falls back to
+    // the full scan whenever the mount/daemon/state is unavailable.
+    let worktree = match status_untracked::scorpiofs_worktree_changes(
         args.untracked_files.unwrap_or(UntrackedFiles::Normal),
         args.ignored,
         ignore_case,
     )
-    .map_err(CliError::from)?;
+    .await
+    {
+        Some(changes) => changes,
+        None => status_untracked::collect_status_worktree_changes(
+            args.untracked_files.unwrap_or(UntrackedFiles::Normal),
+            args.ignored,
+            ignore_case,
+        )
+        .map_err(CliError::from)?,
+    };
     let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
     let unmerged = unmerged::collect(&worktree.index)
         .into_iter()

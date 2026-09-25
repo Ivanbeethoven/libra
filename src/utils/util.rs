@@ -375,12 +375,40 @@ fn worktree_common_storage(gitdir: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// Process-level memo for repo-path resolution (common storage / workdir /
+/// gitdir), keyed by the absolute input path. Every DB/objects lookup goes
+/// through `try_get_paths_full`, and each miss walks the directory chain
+/// with a dozen stat calls (plus the worktree marker probes); `status` and
+/// friends hit this per file, so without the memo a 2k-file scan pays
+/// ~25k redundant stats. Resolution is stable for a given cwd within one
+/// process, which is the contract libra commands already assume.
+fn repo_paths_cache() -> &'static Mutex<HashMap<PathBuf, (PathBuf, PathBuf, PathBuf)>> {
+    static CACHE: Lazy<Mutex<HashMap<PathBuf, (PathBuf, PathBuf, PathBuf)>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    &CACHE
+}
+
 /// Resolve `(common_storage, workdir, worktree_gitdir)` for a path.
 /// - `worktree_gitdir`: the LOCAL `.libra` for this working tree (holds the
 ///   private `index` and `worktree_id`).
 /// - `common_storage`: the SHARED `.libra` (db / objects / hooks). Equals the
 ///   gitdir for the main worktree; the `commondir` target for a linked one.
 fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
+    let key = path.clone().unwrap_or_else(cur_dir);
+    if let Some(hit) = repo_paths_cache().lock().unwrap().get(&key) {
+        return Ok(hit.clone());
+    }
+    let resolved = try_get_paths_full_uncached(path)?;
+    repo_paths_cache()
+        .lock()
+        .unwrap()
+        .insert(key, resolved.clone());
+    Ok(resolved)
+}
+
+fn try_get_paths_full_uncached(
+    path: Option<PathBuf>,
+) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
     let mut path = path.clone().unwrap_or_else(cur_dir);
     let orig = path.clone();
 
@@ -1981,14 +2009,42 @@ struct IgnoreSource {
     base: PathBuf,
 }
 
+/// Process-level per-directory existence of the two ignore files, plus the
+/// workdir-level extra sources. `status` re-derives ignore sources for every
+/// scanned path; without this memo each target pays 2 stat calls per ancestor
+/// directory (almost all ENOENT), ~12k redundant stats on a 2k-file tree.
+/// A single libra command treats the worktree as immutable, which is the
+/// existing contract of `cached_ignore_file` as well.
+fn dir_ignore_exists_cache(
+) -> &'static Mutex<HashMap<PathBuf, (bool, bool)>> {
+    static CACHE: Lazy<Mutex<HashMap<PathBuf, (bool, bool)>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    &CACHE
+}
+
+fn dir_ignore_exists(dir: &Path) -> (bool, bool) {
+    let mut cache = dir_ignore_exists_cache().lock().unwrap();
+    if let Some(hit) = cache.get(dir) {
+        return *hit;
+    }
+    let hit = (dir.join(LIBRAIGNORE_FILE).exists(), dir.join(GITIGNORE_FILE).exists());
+    cache.insert(dir.to_path_buf(), hit);
+    hit
+}
+
 fn ignore_sources_for_target(work_dir: &Path, target_file: &Path) -> Vec<IgnoreSource> {
     let mut sources = Vec::new();
     let mut dir = target_file.to_path_buf();
     dir.pop();
 
     while dir.starts_with(work_dir) {
-        push_ignore_source(&mut sources, dir.join(LIBRAIGNORE_FILE), dir.clone());
-        push_ignore_source(&mut sources, dir.join(GITIGNORE_FILE), dir.clone());
+        let (has_libra, has_git) = dir_ignore_exists(&dir);
+        if has_libra {
+            sources.push(IgnoreSource { path: dir.join(LIBRAIGNORE_FILE), base: dir.clone() });
+        }
+        if has_git {
+            sources.push(IgnoreSource { path: dir.join(GITIGNORE_FILE), base: dir.clone() });
+        }
         dir.pop();
     }
 

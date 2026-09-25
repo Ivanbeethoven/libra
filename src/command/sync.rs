@@ -49,23 +49,23 @@ pub struct SyncArgs {
 
 /// Daemon-side view of a ScorpioFS worktree (`GET /worktrees/{mount}/state`).
 #[derive(Debug, Deserialize)]
-struct ScorpioState {
+pub(crate) struct ScorpioState {
     #[serde(default)]
-    base_revision: Option<String>,
-    generation: u64,
+    pub(crate) base_revision: Option<String>,
+    pub(crate) generation: u64,
     #[serde(default)]
-    dirty: bool,
+    pub(crate) dirty: bool,
     #[serde(default)]
-    changes: Vec<ScorpioChange>,
+    pub(crate) changes: Vec<ScorpioChange>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ScorpioChange {
-    path: String,
+pub(crate) struct ScorpioChange {
+    pub(crate) path: String,
     /// `added` | `modified` | `deleted` (Worktree v2), or v1 `modified`/`deleted`.
-    kind: String,
+    pub(crate) kind: String,
     #[serde(default)]
-    content_hash: Option<String>,
+    pub(crate) content_hash: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -93,7 +93,7 @@ struct FinalizeResponse {
     detail: Option<String>,
 }
 
-fn scorpio_endpoint() -> String {
+pub(crate) fn scorpio_endpoint() -> String {
     std::env::var("LIBRA_SCORPIOFS_ENDPOINT")
         .unwrap_or_else(|_| "http://127.0.0.1:2725/antares".to_string())
         .trim_end_matches('/')
@@ -101,7 +101,7 @@ fn scorpio_endpoint() -> String {
 }
 
 /// The ScorpioFS mount id backing this worktree, if any.
-fn current_mount_id() -> Option<String> {
+pub(crate) fn current_mount_id() -> Option<String> {
     util::try_get_worktree_gitdir(None)
         .ok()?
         .join("scorpiofs_mount_id")
@@ -121,7 +121,7 @@ impl ReadToStringIfExists for std::path::Path {
     }
 }
 
-fn http() -> reqwest::Client {
+pub(crate) fn http() -> reqwest::Client {
     reqwest::Client::new()
 }
 
