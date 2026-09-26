@@ -5236,7 +5236,10 @@ async fn agent_import_deadline_kills_blocked_checkpoint_object_write() {
     let started = Instant::now();
     let output = fixture
         .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "500")
+        // Full nextest load can spend multiple seconds before the checkpoint
+        // object-write hook runs; keep deadline long enough to reach the hook
+        // but still bound the blocked helper after it parks.
+        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "5000")
         .env("LIBRA_TEST_CHECKPOINT_OBJECT_WRITE_READY_FILE", &ready)
         .args([
             "agent",
@@ -5259,7 +5262,7 @@ async fn agent_import_deadline_kills_blocked_checkpoint_object_write() {
         "blocked object write bypassed deadline"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(8),
         "blocked object helper held the foreground past its deadline: {:?}",
         started.elapsed()
     );

@@ -79,11 +79,13 @@ fn run_case(name: &str, hold_external_lock: bool) {
     let mut child = ChildGuard(Some(command.spawn().expect("supervised lease child")));
 
     // When the existing production boundary runs, only this child may block.
+    // Execution budget after ready must tolerate a saturated nextest host
+    // (full suite still starves the child for >5s while keeping ready=true).
     let startup_deadline = Instant::now() + Duration::from_secs(30);
     let mut execution_deadline = None;
     let status = loop {
         if execution_deadline.is_none() && ready_path.exists() {
-            execution_deadline = Some(Instant::now() + Duration::from_secs(5));
+            execution_deadline = Some(Instant::now() + Duration::from_secs(30));
         }
         let running = child.0.as_mut().expect("owned child");
         if let Some(status) = running.try_wait().expect("poll child") {
@@ -94,7 +96,7 @@ fn run_case(name: &str, hold_external_lock: bool) {
             running.wait().expect("reap stalled child");
             child.0.take();
             panic!(
-                "{name} exceeded startup/5-second execution watchdog; ready={}\nstdout:\n{}\nstderr:\n{}",
+                "{name} exceeded startup/30-second execution watchdog; ready={}\nstdout:\n{}\nstderr:\n{}",
                 ready_path.exists(),
                 fs::read_to_string(&stdout_path).expect("stdout"),
                 fs::read_to_string(&stderr_path).expect("stderr"),

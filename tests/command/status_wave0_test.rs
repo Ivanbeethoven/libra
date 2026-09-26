@@ -6020,8 +6020,18 @@ fn ref_with_mismatched_hash_kind_fails_closed() {
     };
     assert_eq!(head_oid.len(), 40, "the fixture is a SHA-1 repository");
 
-    let flip = run_libra_command(&["config", "core.objectformat", "sha256"], repo.path());
-    assert_cli_success(&flip, "declare the repository sha256");
+    // B3-11: `config` refuses `core.objectformat` writes. Seed the mismatched
+    // declaration through ConfigKv (init/reinit path), preserving this test's
+    // read-boundary intent.
+    {
+        let _guard = libra::utils::test::ChangeDirGuard::new(repo.path());
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            libra::internal::config::ConfigKv::set("core.objectformat", "sha256", false)
+                .await
+                .expect("declare the repository sha256 via ConfigKv");
+        });
+    }
 
     // Every read path must now refuse the stored SHA-1 id.
     for flags in [

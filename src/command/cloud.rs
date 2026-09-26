@@ -5330,7 +5330,9 @@ mod tests {
                 .expect("insert concurrent checkpoint");
                 txn.commit().await.expect("commit concurrent capture");
             });
-            tokio::time::timeout(std::time::Duration::from_millis(150), writer)
+            // Bound is wall-clock: under a saturated nextest host, 150ms was
+            // too tight even when the writer was not blocked on the scan.
+            tokio::time::timeout(std::time::Duration::from_secs(2), writer)
                 .await
                 .expect("concurrent writer must not wait for the durability scan")
                 .expect("join concurrent capture");

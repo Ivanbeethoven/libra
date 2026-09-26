@@ -42,6 +42,20 @@ libra config --rename-section <old-name> <new-name>
 
 使用 `get` 读取值时，Libra 会按优先级 local → global → system 级联查找。第一个匹配项胜出；system 库不可读时会被跳过。
 
+### `core.objectformat` 在 init 时固定
+
+仓库创建后，本地 scope 写操作不能再改 `core.objectformat`（ADR-B3-01）。
+所有变更拼写一律以 `LBR-CLI-002`（exit 129）拒绝：`set`、裸位置赋值、
+`--add`、`--unset`、`--unset-all`、`--remove-section core`、涉及 `core` 的
+`--rename-section`，以及导入的 Git config 含该键时的 `import`（变量名大小写
+不敏感，例如 `core.ObjectFormat`）。`import` 的拒绝是原子的——该次导入的其他
+键也不会落地。
+
+要用不同格式请重建仓库：`libra init --object-format <sha1|sha256>`
+（`blake3` 稍后开门）。`init` / `reinit` 仍经数据库层写入该键；本护栏只卡住
+`config` 命令表面。**global** 或 **system** scope 下的 `core.objectformat` 行
+不被仓库命令消费，也不受本护栏影响。
+
 ### 裸读 `libra config <key>`
 
 只给一个位置参数、不给值时是**读取**，与 `git config <key>` 一致：把已存储的值写 stdout 并以 0 退出；多值 key 返回**最后一个**值；级联顺序与 `get` 完全相同（local → global → system）；加密值渲染为 `<REDACTED>`（要明文用 `config get --reveal`）。key 未设置时以 **exit 1** + `LBR-CLI-002` 失败。`-z`/`--null` 与 `get` 上的行为一致：值以 NUL 而非换行结尾。

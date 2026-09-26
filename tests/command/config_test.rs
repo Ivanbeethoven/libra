@@ -6521,3 +6521,223 @@ fn config_list_gpg_keys_history_count_is_deduplicated_and_hides_material() {
         "re-importing the same fingerprint must not add a history row: {second_out}"
     );
 }
+
+// ── B3-11: local-scope core.objectformat write refusal (ADR-B3-01) ─────────
+
+fn assert_core_objectformat_refused(output: &std::process::Output, context: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(129),
+        "{context}: expected exit 129, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("LBR-CLI-002") || stderr.contains("core.objectformat"),
+        "{context}: expected LBR-CLI-002 / objectformat refusal, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("core.objectformat"),
+        "{context}: diagnostic must name core.objectformat: {stderr}"
+    );
+}
+
+fn core_objectformat_value(repo: &std::path::Path) -> Option<String> {
+    let out = run_libra_command(&["config", "--local", "--get", "core.objectformat"], repo);
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[test]
+fn config_rejects_core_objectformat_set() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    let out = run_libra_command(
+        &["config", "set", "core.objectformat", "sha256"],
+        repo.path(),
+    );
+    assert_core_objectformat_refused(&out, "config set");
+    assert_eq!(core_objectformat_value(repo.path()), before);
+}
+
+#[test]
+fn config_rejects_core_objectformat_positional() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    let out = run_libra_command(&["config", "core.objectformat", "sha256"], repo.path());
+    assert_core_objectformat_refused(&out, "positional set");
+    assert_eq!(core_objectformat_value(repo.path()), before);
+}
+
+#[test]
+fn config_rejects_core_objectformat_add() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    let out = run_libra_command(
+        &["config", "--add", "core.objectformat", "sha256"],
+        repo.path(),
+    );
+    assert_core_objectformat_refused(&out, "config --add");
+    assert_eq!(core_objectformat_value(repo.path()), before);
+}
+
+#[test]
+fn config_rejects_core_objectformat_unset() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    let out = run_libra_command(&["config", "--unset", "core.objectformat"], repo.path());
+    assert_core_objectformat_refused(&out, "config --unset");
+    assert_eq!(core_objectformat_value(repo.path()), before);
+}
+
+#[test]
+fn config_rejects_core_objectformat_unset_all() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    let out = run_libra_command(&["config", "--unset-all", "core.objectformat"], repo.path());
+    assert_core_objectformat_refused(&out, "config --unset-all");
+    assert_eq!(core_objectformat_value(repo.path()), before);
+}
+
+#[test]
+fn config_rejects_core_objectformat_remove_section() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    let out = run_libra_command(&["config", "--remove-section", "core"], repo.path());
+    assert_core_objectformat_refused(&out, "config --remove-section");
+    assert_eq!(core_objectformat_value(repo.path()), before);
+}
+
+#[test]
+fn config_rejects_core_objectformat_rename_section() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    for args in [
+        vec!["config", "--rename-section", "core", "legacy"],
+        vec!["config", "--rename-section", "other", "core"],
+    ] {
+        // Seed a non-core section for the other→core case.
+        if args[3] == "other" {
+            let seed = run_libra_command(&["config", "set", "other.flag", "1"], repo.path());
+            assert_cli_success(&seed, "seed other.flag");
+        }
+        let out = run_libra_command(&args, repo.path());
+        assert_core_objectformat_refused(&out, &format!("{args:?}"));
+        assert_eq!(core_objectformat_value(repo.path()), before);
+    }
+}
+
+#[test]
+fn config_rejects_core_objectformat_case_variants() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    for key in [
+        "core.ObjectFormat",
+        "core.OBJECTFORMAT",
+        "core.objectFormat",
+    ] {
+        let out = run_libra_command(&["config", "set", key, "sha256"], repo.path());
+        assert_core_objectformat_refused(&out, key);
+        assert_eq!(core_objectformat_value(repo.path()), before);
+    }
+}
+
+#[test]
+fn config_rejects_core_objectformat_import() {
+    let repo = create_committed_repo_via_cli();
+    let before = core_objectformat_value(repo.path());
+    // Build a nested Git repo whose config carries core.objectformat, then
+    // import from that Git local config into the Libra local scope after
+    // pointing cwd at a Git worktree that shares no Libra DB... Simpler:
+    // write a temporary Git repo beside the Libra repo and import --local
+    // from inside it only when Git is available.
+    let git_probe = Command::new("git").arg("--version").output();
+    if !git_probe.map(|o| o.status.success()).unwrap_or(false) {
+        eprintln!("skipping import refusal: git unavailable");
+        return;
+    }
+    let git_dir = repo.path().join(".git-import-src");
+    std::fs::create_dir_all(&git_dir).unwrap();
+    let init = Command::new("git")
+        .args(["init"])
+        .current_dir(&git_dir)
+        .output()
+        .expect("git init");
+    assert!(
+        init.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let set = Command::new("git")
+        .args(["config", "--local", "core.objectformat", "sha256"])
+        .current_dir(&git_dir)
+        .output()
+        .expect("git config");
+    assert!(
+        set.status.success(),
+        "git config core.objectformat: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    // Import into Libra local scope while cwd is the Libra repo: Git --local
+    // reads .git under cwd, so we need the Libra repo to ALSO be a Git repo
+    // with the forbidden key, OR we import while standing in git_dir but
+    // targeting the Libra DB via LIBRA paths. Easiest reliable path: init
+    // Git inside the Libra worktree and set the key there, then import.
+    let nested = Command::new("git")
+        .args(["init"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git init in libra repo");
+    assert!(nested.status.success());
+    let plant = Command::new("git")
+        .args(["config", "--local", "core.objectformat", "sha256"])
+        .current_dir(repo.path())
+        .output()
+        .expect("plant git objectformat");
+    assert!(plant.status.success());
+    let user = Command::new("git")
+        .args(["config", "--local", "user.name", "importer"])
+        .current_dir(repo.path())
+        .output()
+        .expect("plant benign key");
+    assert!(user.status.success());
+
+    let out = run_libra_command(&["config", "import"], repo.path());
+    assert_core_objectformat_refused(&out, "config import");
+    assert_eq!(
+        core_objectformat_value(repo.path()),
+        before,
+        "import must be atomic: objectformat unchanged"
+    );
+    // Benign key must also not land when the batch is refused.
+    let user_get = run_libra_command(&["config", "--local", "--get", "user.name"], repo.path());
+    let user_val = String::from_utf8_lossy(&user_get.stdout);
+    assert!(
+        !user_get.status.success() || !user_val.contains("importer"),
+        "atomic refusal must not partially import user.name: {user_val}"
+    );
+}
+
+#[test]
+fn config_guard_does_not_block_sha256_init() {
+    let temp = tempdir().unwrap();
+    let p = temp.path();
+    let sha1 = run_libra_command(&["init"], p);
+    assert_cli_success(&sha1, "sha1 init");
+    let sha1_fmt = core_objectformat_value(p);
+    assert!(
+        matches!(sha1_fmt.as_deref(), Some("sha1") | None),
+        "sha1 init leaves sha1 or absent (reader default): {sha1_fmt:?}"
+    );
+    // Re-init is not always supported in-place; use a sibling dir for sha256.
+    let sha256_dir = tempdir().unwrap();
+    let sha256 = run_libra_command(&["init", "--object-format", "sha256"], sha256_dir.path());
+    assert_cli_success(&sha256, "sha256 init");
+    let fmt = core_objectformat_value(sha256_dir.path());
+    assert_eq!(
+        fmt.as_deref(),
+        Some("sha256"),
+        "sha256 init must write core.objectformat"
+    );
+}

@@ -252,6 +252,25 @@ ER-06a fail-closed).
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-09-27
+
+### Config: refuse local `core.objectformat` mutations (B3-11)
+
+- Local-scope `libra config` no longer changes `core.objectformat` after init
+  (`set`, positional assignment, `--add`, `--unset`, `--unset-all`,
+  `--remove-section core`, `--rename-section` involving `core`, and `import`
+  when the imported Git config carries the key). Refusal is `LBR-CLI-002`.
+- Init / reinit remain the only writers. Global/system rows for that key are
+  not consumed by repository commands.
+
+### C-gate hardening
+
+- Cloud pack writer timeout under saturated nextest hosts is 2s (was 150ms).
+- Supervised lease-test execution watchdog after ready is 30s (was 5s).
+- Concurrent DB migration fixtures use a 60s SQLite busy timeout.
+- Agent-import deadline fixtures tolerate full-suite load (5s helper delay /
+  8s wall budget).
+
 ## [0.23.68] — 2026-09-26
 
 ### Blake3 object-format baseline (B3-00)

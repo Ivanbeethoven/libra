@@ -272,6 +272,12 @@ impl ScopedConfig {
         value: &str,
         encrypted: bool,
     ) -> Result<(), String> {
+        if scope == ConfigScope::Local && is_core_objectformat_key(key) {
+            return Err(
+                "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
+                    .to_string(),
+            );
+        }
         let txn = Self::begin_mutation(scope).await?;
         ConfigKv::set_with_conn(&txn, key, value, encrypted)
             .await
@@ -287,6 +293,12 @@ impl ScopedConfig {
         value: &str,
         encrypted: bool,
     ) -> Result<(), String> {
+        if scope == ConfigScope::Local && is_core_objectformat_key(key) {
+            return Err(
+                "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
+                    .to_string(),
+            );
+        }
         let txn = Self::begin_mutation(scope).await?;
         ConfigKv::add_with_conn(&txn, key, value, encrypted)
             .await
@@ -297,6 +309,12 @@ impl ScopedConfig {
     }
 
     pub async fn unset(scope: ConfigScope, key: &str) -> Result<usize, String> {
+        if scope == ConfigScope::Local && is_core_objectformat_key(key) {
+            return Err(
+                "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
+                    .to_string(),
+            );
+        }
         let txn = Self::begin_mutation(scope).await?;
         let removed = ConfigKv::unset_with_conn(&txn, key)
             .await
@@ -308,6 +326,12 @@ impl ScopedConfig {
     }
 
     pub async fn unset_all(scope: ConfigScope, key: &str) -> Result<usize, String> {
+        if scope == ConfigScope::Local && is_core_objectformat_key(key) {
+            return Err(
+                "core.objectformat cannot be changed after init; the object format is fixed at fresh init"
+                    .to_string(),
+            );
+        }
         let txn = Self::begin_mutation(scope).await?;
         let removed = ConfigKv::unset_all_with_conn(&txn, key)
             .await
@@ -878,6 +902,47 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
 // ─────────────────────────────────────────────────────────────────────────────
 // Reserved `upgrade.*` namespace router (plan-20260714 §A.3)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Local-scope writes must not change `core.objectformat` (ADR-B3-01 决议 3 /
+/// B3-11). Section is exact `core`; the variable matches case-insensitively so
+/// `core.ObjectFormat` cannot bypass the guard. Init/reinit write through
+/// `ConfigKv` directly and are unaffected.
+fn is_core_objectformat_key(key: &str) -> bool {
+    let key = key.trim();
+    let Some((section, variable)) = key.split_once('.') else {
+        return false;
+    };
+    // Reject `core.foo.objectformat` style — only the two-component key.
+    if variable.contains('.') {
+        return false;
+    }
+    section == "core" && variable.eq_ignore_ascii_case("objectformat")
+}
+
+fn is_exact_core_section(name: &str) -> bool {
+    name.trim() == "core"
+}
+
+fn core_objectformat_mutation_error(operation: &str) -> CliError {
+    CliError::command_usage(format!(
+        "{operation} cannot change core.objectformat; the object format is fixed at fresh init"
+    ))
+    .with_stable_code(StableErrorCode::CliInvalidArguments)
+    .with_hint(
+        "recreate the repository with `libra init --object-format <sha1|sha256>` (blake3 opens in B3-01); config set/add/unset/import cannot change it",
+    )
+}
+
+fn refuse_local_core_objectformat_key(
+    scope: ConfigScope,
+    key: &str,
+    operation: &str,
+) -> CliResult<()> {
+    if scope == ConfigScope::Local && is_core_objectformat_key(key) {
+        return Err(core_objectformat_mutation_error(operation));
+    }
+    Ok(())
+}
 
 /// Whether `key` (a config key or a `--remove-section`/`--rename-section`
 /// section name) falls inside the reserved `upgrade.*` namespace.
@@ -1687,6 +1752,11 @@ async fn handle_set(
         ))
         .with_exit_code(1));
     }
+    refuse_local_core_objectformat_key(
+        scope,
+        key,
+        if add { "config --add" } else { "config set" },
+    )?;
 
     // `--encrypt` and `--plaintext` are mutually exclusive. config.md (line 77)
     // classifies this as a CLI usage error (exit 2 in fine mode, 129 in
@@ -1889,12 +1959,21 @@ async fn handle_set(
     if add {
         ScopedConfig::add(scope, key, &store_value, should_encrypt)
             .await
-            .map_err(CliError::from_legacy_string)?;
+            .map_err(|e| {
+                if e.contains("core.objectformat cannot be changed") {
+                    core_objectformat_mutation_error("config --add")
+                } else {
+                    CliError::from_legacy_string(e)
+                }
+            })?;
         emit_set_ack("add", scope, key, should_encrypt, output)?;
     } else {
         ScopedConfig::set(scope, key, &store_value, should_encrypt)
             .await
             .map_err(|e| {
+                if e.contains("core.objectformat cannot be changed") {
+                    return core_objectformat_mutation_error("config set");
+                }
                 let err = CliError::from_legacy_string(&e);
                 if e.contains("values exist") {
                     err.with_exit_code(5)
@@ -2755,6 +2834,15 @@ async fn handle_unset(
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    refuse_local_core_objectformat_key(
+        scope,
+        key,
+        if all {
+            "config --unset-all"
+        } else {
+            "config --unset"
+        },
+    )?;
     let count = if all {
         ScopedConfig::unset_all(scope, key)
             .await
@@ -2860,6 +2948,9 @@ async fn handle_remove_section(
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    if scope == ConfigScope::Local && is_exact_core_section(name) {
+        return Err(core_objectformat_mutation_error("config --remove-section"));
+    }
     // Lock before reading; the compatibility marker rolls back with deletes.
     let txn = ScopedConfig::begin_mutation(scope)
         .await
@@ -2912,6 +3003,9 @@ async fn handle_rename_section(
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    if scope == ConfigScope::Local && (is_exact_core_section(old) || is_exact_core_section(new)) {
+        return Err(core_objectformat_mutation_error("config --rename-section"));
+    }
     if old == new {
         return Err(CliError::from_legacy_string(format!(
             "error: source and destination sections are identical: {old}"
@@ -3023,9 +3117,13 @@ async fn handle_import(scope: ConfigScope, output: &OutputConfig) -> CliResult<(
         ));
     }
 
-    let summary = import_git_config(scope)
-        .await
-        .map_err(CliError::from_legacy_string)?;
+    let summary = import_git_config(scope).await.map_err(|e| {
+        if e.contains("core.objectformat cannot be changed") {
+            core_objectformat_mutation_error("config import")
+        } else {
+            CliError::from_legacy_string(e)
+        }
+    })?;
 
     if output.is_json() {
         emit_json_data(
@@ -3889,6 +3987,19 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
             continue;
         }
         all_entries.push((key_raw, value));
+    }
+
+    // B3-11: refuse the whole import when any entry would write core.objectformat
+    // (case-insensitive variable) into the local scope. Scan before any write.
+    if scope == ConfigScope::Local
+        && all_entries
+            .iter()
+            .any(|(key, _)| is_core_objectformat_key(key))
+    {
+        return Err(
+            "core.objectformat cannot be changed after init; refuse importing a Git config that sets it"
+                .to_string(),
+        );
     }
 
     // Process entries
