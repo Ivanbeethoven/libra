@@ -1011,28 +1011,36 @@ async fn collect_status_data(
     let mut unstaged_rename_details: RenameDetails = HashMap::new();
     let mut warnings: Vec<StatusWarning> = Vec::new();
     if let Some(threshold) = rename_threshold {
-        let head_blobs = head_oid
-            .as_ref()
-            .map(load_head_tree_blobs)
-            .unwrap_or_default();
-        let index_blobs = maybe_index
-            .as_ref()
-            .map(load_index_stage0_blobs)
-            .unwrap_or_default();
-        // Git 0..=60000 similarity scale (already engine-scale here).
+        // Git 0..=60000 similarity scale (already engine-scale here). Cheap to
+        // build, shared by the staged and unstaged detection passes below.
         let config = rename_detect::RenameDetectConfig {
             threshold,
             rename_limit: extras.rename_limit,
             comparison_budget: Some(rename_detect::STATUS_MAX_SIMILARITY_COMPARISONS),
         };
-        detect_renames_in_changes(
-            &mut staged,
-            &config,
-            RenameBlobSide::Known(&head_blobs),
-            RenameBlobSide::Known(&index_blobs),
-            &mut staged_rename_details,
-            &mut warnings,
-        );
+        // rename detection only has work when the staged snapshot actually has
+        // a deleted side or an added side — with neither, both blob universes
+        // would be loaded just to compare nothing. On large trees that
+        // eager load is the dominant cost of a clean `status` (measured ~190ms
+        // per run on a 2k-file mount), so skip it outright.
+        if !(staged.deleted.is_empty() && staged.new.is_empty()) {
+            let head_blobs = head_oid
+                .as_ref()
+                .map(load_head_tree_blobs)
+                .unwrap_or_default();
+            let index_blobs = maybe_index
+                .as_ref()
+                .map(load_index_stage0_blobs)
+                .unwrap_or_default();
+            detect_renames_in_changes(
+                &mut staged,
+                &config,
+                RenameBlobSide::Known(&head_blobs),
+                RenameBlobSide::Known(&index_blobs),
+                &mut staged_rename_details,
+                &mut warnings,
+            );
+        }
         // §B.3.1 Git default: unstaged "new" entries are untracked paths,
         // which may only be consumed as rename destinations under the
         // `status.renameUntracked` extension. Skipping detection keeps a
@@ -1106,7 +1114,12 @@ async fn collect_status_data(
             }
             // Detection runs on the probe's destination set (display base);
             // consumed destinations then collapse their display rows and
-            // `? dir/` markers (§B.3.5).
+            // `? dir/` markers (§B.3.5). The index blob universe is loaded
+            // only here — this branch already requires a deleted side.
+            let index_blobs = maybe_index
+                .as_ref()
+                .map(load_index_stage0_blobs)
+                .unwrap_or_default();
             let destinations_display: Vec<PathBuf> = outcome
                 .destinations
                 .iter()
