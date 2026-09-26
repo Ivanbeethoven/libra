@@ -52,6 +52,8 @@ Every Libra command accepts the following global flags:
 | `libra clean` | | Remove untracked files from the working tree (requires `-n` or `-f`) | [clean.md](clean.md) |
 | `libra stash` | | Save and restore temporary changes with push/pop/list/apply/drop subcommands | [stash.md](stash.md) |
 | `libra status` | `st` | Show the state of the working tree, staging area, and upstream tracking | [status.md](status.md) |
+| `libra sync` | | Stage, commit, and push the current worktree (Libra extension) | [sync.md](sync.md) |
+| `libra fork` | | Fork the current ScorpioFS-backed worktree | [fork.md](fork.md) |
 | `libra dirty` | | Advisory dirty-set marks for the status cache (Libra extension) | [dirty.md](dirty.md) |
 | `libra revision` | | Revision ordinal index over first-parent chains (Libra extension) | [revision.md](revision.md) |
 | `libra commit-tree` | `git commit-tree` | Create a commit object from a tree (plumbing) | [commit-tree.md](commit-tree.md) |
@@ -118,6 +120,7 @@ Every Libra command accepts the following global flags:
 | `libra push` | | Send local commits and objects to a remote with LFS integration | [push.md](push.md) |
 | `libra pull` | | Fetch and fast-forward merge into the current branch | [pull.md](pull.md) |
 | `libra open` | | Open the repository's remote URL in the system browser | [open.md](open.md) |
+| `libra mega` | | Work with Mega issues and change lists from the terminal | [mega.md](mega.md) |
 | `libra lfs` | | Manage Large File Storage: track, lock, unlock, list LFS files | [lfs.md](lfs.md) |
 | `libra credential` | | Vault-backed Git credential helper (fill/store/erase) | [credential.md](credential.md) |
 | `libra login` | | Authenticate to a Libra host (`/api/cli/*`) and store a host-scoped session token | [login.md](login.md) |

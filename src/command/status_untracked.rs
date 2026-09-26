@@ -89,6 +89,104 @@ pub(crate) fn collect_status_worktree_changes(
     })
 }
 
+/// ScorpioFS heuristic fast path: the mount's upper layer is the only writable
+/// surface, so the daemon's changed-path set IS the complete candidate set for
+/// unstaged changes — nothing outside it can differ from the index baseline.
+/// Querying it replaces the whole-tree walk and the per-file stat storm with a
+/// single bounded HTTP call plus hash comparisons (O(touch-set), not O(tree)).
+///
+/// Returns `None` (caller falls back to the full scan) when not on a ScorpioFS
+/// mount, when the daemon is unreachable or pre-Worktree-v2, and for
+/// `--untracked-files=all` (kept byte-identical with the full-scan semantics).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scorpiofs_worktree_changes(
+    untracked_mode: UntrackedFiles,
+    include_ignored: bool,
+    ignore_case: bool,
+) -> Option<StatusWorktreeChanges> {
+    use crate::command::sync::{ScorpioState, current_mount_id, http, scorpio_endpoint};
+    use std::time::Duration;
+
+    if matches!(untracked_mode, UntrackedFiles::All) {
+        return None;
+    }
+    let mount_id = current_mount_id()?;
+    let workdir = util::try_working_dir().ok()?;
+    let index_path = path::try_index().ok()?;
+    let index = Index::load(&index_path).ok()?;
+
+    let url = format!("{}/worktrees/{}/state", scorpio_endpoint(), mount_id);
+    // Bounded wait: status must stay fast even when the daemon is gone.
+    let response = http()
+        .get(&url)
+        .timeout(Duration::from_millis(800))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let state = response.json::<ScorpioState>().await.ok()?;
+
+    let tracked = TrackedPaths::from_index(&index, ignore_case);
+    let mut unstaged = Changes::default();
+    let mut ignored_files = Vec::new();
+    for change in &state.changes {
+        let p = change.path.trim_start_matches("./");
+        // The `.libra` pointer is VCS metadata living in the upper layer; it
+        // never participates in status.
+        if p.is_empty() || p == ".libra" || p.starts_with(".libra/") {
+            continue;
+        }
+        let rel = PathBuf::from(p);
+        let is_tracked = index.tracked(p, 0);
+        match change.kind.as_str() {
+            "deleted" => {
+                if is_tracked {
+                    unstaged.deleted.push(rel);
+                }
+            }
+            "added" | "modified" => {
+                if is_tracked {
+                    // Ignore rules never apply to tracked files (Git semantics):
+                    // an edited `app.log` stays `modified` even when `*.log` is
+                    // ignored. Test the hash first, so a matching ignore rule
+                    // cannot silently swallow a real edit.
+                    // The daemon hashes upper content in the same git-blob-OID
+                    // domain as the index; a touch or reverted write hashes
+                    // back to the index value, which means clean.
+                    let clean = match (&change.content_hash, index.get(p, 0)) {
+                        (Some(h), Some(entry)) => *h == entry.hash.to_string(),
+                        _ => false,
+                    };
+                    if !clean {
+                        unstaged.modified.push(rel);
+                    }
+                } else {
+                    let absolute = workdir.join(&rel);
+                    if util::check_gitignore(&workdir, &absolute) {
+                        if include_ignored {
+                            ignored_files.push(rel);
+                        }
+                    } else if !matches!(untracked_mode, UntrackedFiles::No) {
+                        unstaged.new.push(rel);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if matches!(untracked_mode, UntrackedFiles::Normal) {
+        unstaged.new = collapse_untracked_directories(unstaged.new, &tracked);
+    }
+    Some(StatusWorktreeChanges {
+        unstaged,
+        ignored_files,
+        index,
+        io_blocked: Vec::new(),
+    })
+}
+
 pub(crate) fn changes_to_current_directory(mut changes: Changes) -> Changes {
     changes.new = changes
         .new

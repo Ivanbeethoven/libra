@@ -135,6 +135,28 @@ pub struct AddArgs {
     pub ignore_missing: bool,
 }
 
+impl AddArgs {
+    /// Build the full-tree staging invocation used by higher-level workflows such
+    /// as `libra sync`.
+    pub(crate) fn all_worktree() -> Self {
+        Self {
+            pathspec: Vec::new(),
+            all: true,
+            update: false,
+            refresh: false,
+            verbose: false,
+            force: false,
+            dry_run: false,
+            ignore_errors: false,
+            pathspec_from_file: None,
+            pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
+        }
+    }
+}
+
 /// Domain error for `libra add`.
 ///
 /// Each variant maps to a specific failure mode of the staging pipeline and is

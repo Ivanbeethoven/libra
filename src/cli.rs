@@ -55,12 +55,12 @@ const ROOT_AFTER_HELP: &str = concat!(
     "\
 Command Groups:
   Repository Setup        init, clone, config, completions
-  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, layer, sparse-view, hydrate",
+  Working Tree            status, add, sync, fork, rm, mv, restore, clean, stash, dirty, layer, sparse-view, hydrate",
     media_group_entry!(),
     ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, am, rerere, metadata
-  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
+  Remote And Cloud        remote, fetch, pull, push, open, mega, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
@@ -345,6 +345,11 @@ enum Commands {
 
     #[command(about = "Show the working tree status", alias = "st")]
     Status(command::status::StatusArgs),
+    #[command(
+        about = "Stage, commit, and push the current worktree",
+        after_help = command::sync::SYNC_EXAMPLES
+    )]
+    Sync(command::sync::SyncArgs),
     #[command(about = "Add file contents to the index")]
     Add(command::add::AddArgs),
     #[command(
@@ -382,6 +387,11 @@ enum Commands {
         after_help = command::worktree::WORKTREE_EXAMPLES
     )]
     Worktree(command::worktree::WorktreeArgs),
+    #[command(
+        about = "Fork the current ScorpioFS-backed worktree",
+        after_help = command::fork::FORK_EXAMPLES
+    )]
+    Fork(command::fork::ForkArgs),
 
     #[command(about = "Show commit logs", alias = "hist", alias = "history")]
     Log(command::log::LogArgs),
@@ -698,6 +708,11 @@ enum Commands {
     Remote(command::remote::RemoteCmds),
     #[command(about = "Open the repository in the browser")]
     Open(command::open::OpenArgs),
+    #[command(
+        about = "Work with Mega issues and change lists",
+        after_help = command::mega::MEGA_EXAMPLES
+    )]
+    Mega(command::mega::MegaArgs),
     #[command(about = "Cloud backup and restore operations (D1/R2)")]
     Cloud(command::cloud::CloudArgs),
     #[command(about = "Manage read-only Cloudflare Worker publishing")]
@@ -1445,6 +1460,7 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         // `auth` manages host-global tokens in the GLOBAL store; it works
         // outside a repository and touches no objects.
         | Commands::Auth(_)
+        | Commands::Mega(_)
         | Commands::Login(_)
         | Commands::Whoami(_)
         | Commands::Logout(_)
@@ -2089,6 +2105,7 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
                 )
                 .await?
             }
+            Commands::Sync(cmd_args) => command::sync::execute_safe(cmd_args, &output).await?,
             Commands::Clean(cmd_args) => command::clean::execute_safe(cmd_args, &output).await?,
             Commands::Stash(cmd) => command::stash::execute_safe(cmd, &output).await?,
             Commands::Lfs(cmd) => command::lfs::execute_safe(cmd, &output).await?,
@@ -2259,6 +2276,7 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
             }
             Commands::Remote(cmd) => command::remote::execute_safe(cmd, &output).await?,
             Commands::Open(cmd_args) => command::open::execute_safe(cmd_args, &output).await?,
+            Commands::Mega(cmd_args) => command::mega::execute_safe(cmd_args, &output).await?,
             Commands::Pull(cmd_args) => command::pull::execute_safe(cmd_args, &output).await?,
             Commands::Config(cmd_args) => command::config::execute_safe(cmd_args, &output).await?,
             Commands::Checkout(cmd_args) => {
@@ -2269,6 +2287,7 @@ async fn parse_async_scoped(argv: Vec<String>) -> CliResult<()> {
             Commands::Worktree(cmd_args) => {
                 command::worktree::execute_safe(cmd_args, &output).await?
             }
+            Commands::Fork(cmd_args) => command::fork::execute_safe(cmd_args, &output).await?,
             Commands::Cloud(cmd_args) => command::cloud::execute_safe(cmd_args, &output).await?,
             Commands::Publish(cmd_args) => {
                 command::publish::execute_safe(cmd_args, &output).await?
