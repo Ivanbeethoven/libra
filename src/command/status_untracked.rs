@@ -147,14 +147,11 @@ pub(crate) async fn scorpiofs_worktree_changes(
                 }
             }
             "added" | "modified" => {
-                let absolute = workdir.join(&rel);
-                if util::check_gitignore(&workdir, &absolute) {
-                    if include_ignored && !is_tracked {
-                        ignored_files.push(rel);
-                    }
-                    continue;
-                }
                 if is_tracked {
+                    // Ignore rules never apply to tracked files (Git semantics):
+                    // an edited `app.log` stays `modified` even when `*.log` is
+                    // ignored. Test the hash first, so a matching ignore rule
+                    // cannot silently swallow a real edit.
                     // The daemon hashes upper content in the same git-blob-OID
                     // domain as the index; a touch or reverted write hashes
                     // back to the index value, which means clean.
@@ -165,8 +162,15 @@ pub(crate) async fn scorpiofs_worktree_changes(
                     if !clean {
                         unstaged.modified.push(rel);
                     }
-                } else if !matches!(untracked_mode, UntrackedFiles::No) {
-                    unstaged.new.push(rel);
+                } else {
+                    let absolute = workdir.join(&rel);
+                    if util::check_gitignore(&workdir, &absolute) {
+                        if include_ignored {
+                            ignored_files.push(rel);
+                        }
+                    } else if !matches!(untracked_mode, UntrackedFiles::No) {
+                        unstaged.new.push(rel);
+                    }
                 }
             }
             _ => {}
