@@ -388,6 +388,8 @@ for both fetch and push, matching Git's behavior.
 | Remote discovery / auth / network failure during prune | fetch-aligned network/auth codes | 128 | See `libra fetch` error table |
 | SSH public-key rejection during online `show`, `update`, `prune`, `set-head --auto`, or `add -f` discovery | `LBR-AUTH-002` | 128 | Check `libra config list --ssh-keys`, the SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
 
+Prune contacts the remote and fail-closes on object-format mismatch with `LBR-REPO-003` / exit 128. Wire kind comes from the `object-format` capability (not OID length). Covered by `protocol_object_format_mismatch_error_contract`.
+
 The SSH classification requires a zero-byte first-header EOF, direct exit status
 255, no stdout and a complete `Permission denied (<method-list>)` diagnostic with
 an exact `publickey` method. Host-key failures keep priority. The message and hint

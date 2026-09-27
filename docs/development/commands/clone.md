@@ -359,3 +359,8 @@ fetch-objects/send-pack 进程与其它坏帧继续走原协议分类。命令�
 该启发式可被 stderr 伪造，因此只表示远端拒绝认证或授权，不断言具体原因。
 迁移窗口从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚）；窗口内
 自动化应同时接受该失败的 `LBR-AUTH-002` 与旧 `LBR-NET-002`。
+
+
+## B3-07 capability-first wire kind
+
+See the user-facing command page for capability-first discovery, `object-format=blake3` negotiation, and mismatch stable codes. Named tests: `parse_discovery_does_not_infer_sha256_from_64_hex`, `blake3_*_round_trip`, `protocol_object_format_mismatch_error_contract`.

@@ -1059,8 +1059,17 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         fetch::FetchError::ConfigRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
-        fetch::FetchError::ObjectFormatMismatch { .. } => {
-            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
+        fetch::FetchError::ObjectFormatMismatch { remote, local } => {
+            let mut err = CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid);
+            if matches!(local, git_internal::hash::HashKind::Blake3)
+                || matches!(remote, git_internal::hash::HashKind::Blake3)
+            {
+                err = err.with_hint(
+                    "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                );
+            }
+            err
         }
         fetch::FetchError::IncompletePack { .. } => CliError::fatal(error.to_string())
             .with_stable_code(StableErrorCode::NetworkProtocol)

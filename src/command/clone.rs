@@ -738,9 +738,19 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
 /// Map a `FetchError` from the fetch phase into a `CliError`.
 fn map_fetch_error(source: fetch::FetchError) -> CliError {
     match &source {
-        fetch::FetchError::ObjectFormatMismatch { .. } => CliError::fatal(source.to_string())
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-            .with_hint("the remote and local repository use different object formats"),
+        fetch::FetchError::ObjectFormatMismatch { remote, local } => {
+            let mut err = CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("the remote and local repository use different object formats");
+            if matches!(local, git_internal::hash::HashKind::Blake3)
+                || matches!(remote, git_internal::hash::HashKind::Blake3)
+            {
+                err = err.with_hint(
+                    "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                );
+            }
+            err
+        }
         fetch::FetchError::FetchObjects { source: error, .. }
             if crate::internal::protocol::is_missing_shallow_capability(error) =>
         {
@@ -1507,11 +1517,8 @@ async fn clone_into_destination(
         source,
     })?;
 
-    let object_format = match discovery.hash_kind {
-        git_internal::hash::HashKind::Sha1 => "sha1".to_string(),
-        git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
-        git_internal::hash::HashKind::Blake3 => "blake3".to_string(),
-    };
+    let object_format =
+        crate::internal::object_format::as_str(discovery.hash_kind).to_string();
 
     // --- Step 4: Initialize repository ---
     if !output.quiet && !output.is_json() {
@@ -2182,6 +2189,22 @@ mod tests {
         assert_eq!(
             cli.hints()[0].as_str(),
             "retry after the remote repository stops changing"
+        );
+    }
+
+    #[test]
+    fn object_format_mismatch_maps_to_repo_state_invalid_with_blake3_hint() {
+        let cli = map_fetch_error(fetch::FetchError::ObjectFormatMismatch {
+            remote: git_internal::hash::HashKind::Sha1,
+            local: git_internal::hash::HashKind::Blake3,
+        });
+        assert_eq!(cli.stable_code(), StableErrorCode::RepoStateInvalid);
+        assert_eq!(cli.stable_code().as_str(), "LBR-REPO-003");
+        assert_eq!(cli.exit_code(), 128);
+        assert!(
+            cli.hints().iter().any(|hint| hint.as_str().contains("blake3")),
+            "clone map_fetch_error must surface blake3 extension hint: {:?}",
+            cli.hints()
         );
     }
 

@@ -376,6 +376,8 @@ Git LFS 需要单独的二进制（`git-lfs`）和 post-push hook 来上传大�
 | 跟踪 ref 更新失败 | `LBR-IO-002` | 128 | -- |
 | 仓库状态错误 | `LBR-REPO-002` | 128 | "try 'libra status' to verify" |
 
+非 sha1 线格式在首条 receive-pack 行广告 `object-format=sha256` 或 `object-format=blake3`；sha1 不广告。blake3↔blake3 本地 push 成功。HashKindMismatch 映射 `LBR-NET-002` / 退出码 128（任一侧为 blake3 时附带扩展提示）。覆盖测试：`blake3_push_round_trip`、`protocol_object_format_mismatch_error_contract`。
+
 ### 超时策略
 
 - Discovery / 连接：60s 连接超时

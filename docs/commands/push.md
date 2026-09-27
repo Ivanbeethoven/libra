@@ -513,6 +513,8 @@ trigger a fuzzy match suggestion via edit distance.
 | Tracking ref update failed | `LBR-IO-002` | 128 | -- |
 | Repository state error | `LBR-REPO-002` | 128 | "try 'libra status' to verify" |
 
+Non-sha1 wire kinds advertise `object-format=sha256` or `object-format=blake3` on the first receive-pack line; sha1 omits the capability. Blake3↔blake3 local push succeeds. HashKindMismatch maps to `LBR-NET-002` / exit 128 (blake3-extension hint when either side is blake3). Covered by `blake3_push_round_trip` and `protocol_object_format_mismatch_error_contract`.
+
 ### Timeout Policy
 
 - Discovery / connection: 60s connection timeout

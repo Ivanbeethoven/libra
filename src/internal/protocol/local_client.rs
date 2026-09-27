@@ -369,15 +369,12 @@ impl LocalClient {
             .map(|entry| entry.value)
             .unwrap_or_else(|| "sha1".to_string());
 
-        match object_format.as_str() {
-            "sha1" => Ok(HashKind::Sha1),
-            "sha256" => Ok(HashKind::Sha256),
-            "blake3" => Ok(HashKind::Blake3),
-            _ => Err(format!(
+        crate::internal::object_format::parse_config_value(&object_format).map_err(|_| {
+            format!(
                 "unsupported object format '{object_format}' in local repository '{}'",
                 db_path.display()
-            )),
-        }
+            )
+        })
     }
 
     pub async fn discovery_reference(
@@ -444,6 +441,15 @@ impl LocalClient {
                     for tag in tags {
                         tag_references.extend(tag_refs(tag).await?);
                     }
+                    // Advertise object-format for non-SHA-1 repos only (sha1
+                    // remains the protocol default and stays unadvertised).
+                    let mut capabilities = Vec::new();
+                    if !matches!(repo_hash_kind, HashKind::Sha1) {
+                        capabilities.push(format!(
+                            "object-format={}",
+                            crate::internal::object_format::as_str(repo_hash_kind)
+                        ));
+                    }
                     Ok(DiscoveryResult {
                         refs: local_branches
                             .into_iter()
@@ -455,7 +461,7 @@ impl LocalClient {
                                 _ref: reflog::HEAD.to_string(),
                             }))
                             .collect::<Vec<_>>(),
-                        capabilities: vec![],
+                        capabilities,
                         shallow_boundaries: Vec::new(),
                         hash_kind: repo_hash_kind,
                     })

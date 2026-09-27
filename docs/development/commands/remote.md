@@ -81,3 +81,8 @@ EOF、直接退出码255、无 stdout 与完整方法列表中的精确 `publick
 迁移窗口从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚）；窗口内
 自动化应接受 `LBR-AUTH-002`，并兼容各入口的旧代码：在线 `show` 与
 `set-head --auto` 为 `LBR-NET-001`，`update`、`prune` 与 `add -f` 为 `LBR-NET-002`。
+
+
+## B3-07 capability-first wire kind
+
+See the user-facing command page for capability-first discovery, `object-format=blake3` negotiation, and mismatch stable codes. Named tests: `parse_discovery_does_not_infer_sha256_from_64_hex`, `blake3_*_round_trip`, `protocol_object_format_mismatch_error_contract`.

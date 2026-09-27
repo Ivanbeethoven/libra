@@ -498,6 +498,8 @@ An unsupported object-format capability reports the fixed message
 Check that the URL points to a Git smart HTTP service and that a proxy has not
 truncated or replaced the response; then retry.
 
+Wire kind is capability-first (`object-format`, default sha1); OID length is never used to choose the algorithm. Blake3 remotes advertise `object-format=blake3` (Libra extension). Duplicate or conflicting `object-format` capabilities fail closed. Local blake3 vs remote sha1/sha256 fetch returns `LBR-REPO-003` / exit 128. Covered by `parse_discovery_does_not_infer_sha256_from_64_hex`, `blake3_fetch_round_trip`, and `protocol_object_format_mismatch_error_contract`.
+
 Fetch discovery reports `LBR-NET-002` for an empty advertisement or malformed
 pkt-line response, without echoing its header or payload bytes. Ordinary network
 failures retain `LBR-NET-001`; verify the Git service and any proxy response

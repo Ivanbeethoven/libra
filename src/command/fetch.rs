@@ -1033,8 +1033,16 @@ impl From<FetchError> for CliError {
                 ),
             FetchError::ConfigRead { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::IoReadFailed),
-            FetchError::ObjectFormatMismatch { .. } => CliError::fatal(error.to_string())
-                .with_stable_code(StableErrorCode::RepoStateInvalid),
+            FetchError::ObjectFormatMismatch { remote, local } => {
+                let mut err = CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::RepoStateInvalid);
+                if matches!(local, HashKind::Blake3) || matches!(remote, HashKind::Blake3) {
+                    err = err.with_hint(
+                        "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                    );
+                }
+                err
+            }
             FetchError::IncompletePack { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("the connection dropped mid-transfer — retry the fetch"),
@@ -6125,6 +6133,14 @@ mod tests {
             }
             .to_string(),
             "remote object format 'sha1' does not match local 'sha256'",
+        );
+        assert_eq!(
+            FetchError::ObjectFormatMismatch {
+                remote: git_internal::hash::HashKind::Sha1,
+                local: git_internal::hash::HashKind::Blake3
+            }
+            .to_string(),
+            "remote object format 'sha1' does not match local 'blake3'",
         );
         assert_eq!(
             FetchError::RemoteBranchNotFound {

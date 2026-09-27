@@ -473,8 +473,16 @@ impl From<PushError> for CliError {
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("pull and integrate remote changes first: 'libra pull'")
                 .with_hint("or use --force to overwrite (data loss risk)"),
-            PushError::HashKindMismatch { .. } => CliError::fatal(error.to_string())
-                .with_stable_code(StableErrorCode::NetworkProtocol),
+            PushError::HashKindMismatch { remote, local } => {
+                let mut err = CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::NetworkProtocol);
+                if remote == "blake3" || local == "blake3" {
+                    err = err.with_hint(
+                        "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                    );
+                }
+                err
+            }
             PushError::ObjectCollection(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::InternalInvariant)
                 .with_hint(format!("this is a bug; please report it at {ISSUE_URL}")),
@@ -1172,8 +1180,10 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
 
     let mut data = BytesMut::new();
     let mut capabilities = vec!["report-status"];
-    if get_wire_hash_kind() == HashKind::Sha256 {
-        capabilities.push("object-format=sha256");
+    match get_wire_hash_kind() {
+        HashKind::Sha1 => {}
+        HashKind::Sha256 => capabilities.push("object-format=sha256"),
+        HashKind::Blake3 => capabilities.push("object-format=blake3"),
     }
     if use_atomic {
         capabilities.push("atomic");
@@ -4762,6 +4772,14 @@ mod test {
             }
             .to_string(),
             "remote object format 'sha1' does not match local 'sha256'",
+        );
+        assert_eq!(
+            PushError::HashKindMismatch {
+                remote: "sha1".to_string(),
+                local: "blake3".to_string(),
+            }
+            .to_string(),
+            "remote object format 'sha1' does not match local 'blake3'",
         );
         assert_eq!(
             PushError::RemoteUnpackFailed.to_string(),

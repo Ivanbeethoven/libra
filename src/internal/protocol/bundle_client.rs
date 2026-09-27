@@ -125,12 +125,7 @@ fn hash_kind_from_heads(heads: &[(String, String)]) -> Result<HashKind, GitError
         ));
     };
     match crate::internal::object_format::parse_repo_oid(oid) {
-        Ok(_) if oid.len() == 40 => Ok(HashKind::Sha1),
-        Ok(_) if oid.len() == 64 => Ok(HashKind::Sha256),
-        Ok(_) => Err(GitError::NetworkError(format!(
-            "unsupported bundle object-id length {}",
-            oid.len()
-        ))),
+        Ok(hash) => Ok(hash.kind()),
         Err(error) => Err(GitError::NetworkError(format!(
             "bundle head has an invalid object id '{oid}': {error}"
         ))),

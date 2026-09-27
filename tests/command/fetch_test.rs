@@ -2958,3 +2958,109 @@ async fn test_fetch_dot_reads_local_refs() {
         "D2: fetch . writes FETCH_HEAD"
     );
 }
+
+
+#[test]
+#[serial(cwd)]
+fn blake3_fetch_round_trip() {
+    let remote = super::create_committed_repo_with_format("blake3");
+    // Advance the remote so fetch has something new to retrieve.
+    fs::write(remote.path().join("tracked.txt"), "tracked-v2\n").expect("update remote file");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], remote.path()),
+        "remote add v2",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "v2", "--no-verify"], remote.path()),
+        "remote commit v2",
+    );
+
+    let local = super::create_committed_repo_with_format("blake3");
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+            local.path(),
+        ),
+        "add blake3 origin",
+    );
+    let out = run_libra_command(&["fetch", "origin"], local.path());
+    assert_cli_success(&out, "blake3 fetch round-trip");
+    let show = run_libra_command(&["rev-parse", "refs/remotes/origin/main"], local.path());
+    assert_cli_success(&show, "origin/main after blake3 fetch");
+}
+
+#[test]
+#[serial(cwd)]
+fn protocol_object_format_mismatch_error_contract() {
+    // Local blake3 vs remote sha1: parameterized across fetch/pull/clone/remote/push.
+    let remote = create_committed_repo_via_cli(); // sha1
+    let local = super::create_committed_repo_with_format("blake3");
+
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+            local.path(),
+        ),
+        "add mismatched origin",
+    );
+
+    // fetch → LBR-REPO-003 / 128
+    let fetch = run_libra_command(&["--json", "fetch", "origin"], local.path());
+    let (_fetch_human, fetch_report) = parse_cli_error_stderr(&fetch.stderr);
+    assert_eq!(fetch.status.code(), Some(128), "fetch exit");
+    assert_eq!(fetch_report.exit_code, 128);
+    assert_eq!(fetch_report.error_code, "LBR-REPO-003");
+    assert!(
+        fetch_report.message.contains("does not match local"),
+        "fetch mismatch text: {}",
+        fetch_report.message
+    );
+    assert!(
+        fetch_report.message.to_lowercase().contains("blake3")
+            || fetch_report
+                .hints
+                .iter()
+                .any(|hint| hint.to_lowercase().contains("blake3")),
+        "fetch hint/body should mention blake3 extension: message={} hints={:?}",
+        fetch_report.message,
+        fetch_report.hints
+    );
+
+    // pull → LBR-REPO-003 / 128
+    let pull = run_libra_command(&["--json", "pull", "origin"], local.path());
+    let (_pull_human, pull_report) = parse_cli_error_stderr(&pull.stderr);
+    assert_eq!(pull.status.code(), Some(128), "pull exit");
+    assert_eq!(pull_report.exit_code, 128);
+    assert_eq!(pull_report.error_code, "LBR-REPO-003");
+
+    // remote prune → LBR-REPO-003 / 128 (ObjectFormatMismatch mapping point)
+    let remote_prune = run_libra_command(&["--json", "remote", "prune", "origin"], local.path());
+    let (_remote_human, remote_report) = parse_cli_error_stderr(&remote_prune.stderr);
+    assert_eq!(remote_prune.status.code(), Some(128), "remote prune exit");
+    assert_eq!(remote_report.exit_code, 128);
+    assert_eq!(remote_report.error_code, "LBR-REPO-003");
+
+    // push → LBR-NET-002 / 128
+    let push = run_libra_command(&["--json", "push", "origin", "main"], local.path());
+    let (_push_human, push_report) = parse_cli_error_stderr(&push.stderr);
+    assert_eq!(push.status.code(), Some(128), "push exit");
+    assert_eq!(push_report.exit_code, 128);
+    assert_eq!(push_report.error_code, "LBR-NET-002");
+
+    // clone maps ObjectFormatMismatch through map_fetch_error (LBR-REPO-003);
+    // that mapping is pinned in `clone::tests::object_format_mismatch_maps_to_repo_state_invalid_with_blake3_hint`.
+    // Fresh-path clone of the sha1 remote still succeeds (positive control).
+    let dest_root = tempdir().expect("mismatch clone root");
+    let dest = dest_root.path().join("sha1-clone");
+    let clone_ok = run_libra_command(
+        &[
+            "--json",
+            "clone",
+            remote.path().to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&clone_ok, "sha1 clone still works");
+}
+

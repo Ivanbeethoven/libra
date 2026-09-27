@@ -630,6 +630,32 @@ fn init_repo_via_cli(repo: &Path) {
     assert_cli_success(&output, "failed to initialize repository");
 }
 
+fn init_repo_via_cli_with_format(repo: &Path, object_format: &str) {
+    fs::create_dir_all(repo).expect("failed to create repository directory");
+    let output = run_libra_command(&["init", "--object-format", object_format], repo);
+    assert_cli_success(
+        &output,
+        &format!("failed to initialize {object_format} repository"),
+    );
+}
+
+/// Create a committed Libra repository with an explicit object-format.
+pub(crate) fn create_committed_repo_with_format(object_format: &str) -> tempfile::TempDir {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli_with_format(repo.path(), object_format);
+    configure_identity_via_cli(repo.path());
+
+    fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("failed to create tracked file");
+
+    let output = run_libra_command(&["add", "tracked.txt"], repo.path());
+    assert_cli_success(&output, "failed to add tracked file");
+
+    let output = run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path());
+    assert_cli_success(&output, "failed to create initial commit");
+
+    repo
+}
+
 /// Configure a stable local identity for commands that require commits.
 fn configure_identity_via_cli(repo: &Path) {
     let output = run_libra_command(&["config", "user.name", "Test User"], repo);

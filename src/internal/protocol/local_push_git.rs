@@ -21,7 +21,7 @@ use crate::{command::index_pack_v2, internal::pack_writer};
 /// Apply a local push update to a Git target repository at `target_path`.
 pub(crate) async fn apply_local_push_to_git(
     target_path: &Path,
-    _hash_kind: HashKind,
+    hash_kind: HashKind,
     updates: &[crate::command::push::PushRefUpdate],
     objs: &HashSet<Entry>,
     _dry_run: bool,
@@ -30,7 +30,7 @@ pub(crate) async fn apply_local_push_to_git(
     let git_dir = git_dir_for(target_path);
     let objects_dir = git_dir.join("objects");
     write_pack(&objects_dir, objs).await?;
-    apply_refs(&git_dir, updates)?;
+    apply_refs(&git_dir, updates, hash_kind)?;
     Ok(())
 }
 
@@ -91,6 +91,7 @@ async fn write_pack(objects_dir: &Path, objs: &HashSet<Entry>) -> Result<(), Str
 fn apply_refs(
     git_dir: &Path,
     updates: &[crate::command::push::PushRefUpdate],
+    hash_kind: HashKind,
 ) -> Result<(), String> {
     for update in updates {
         let ref_name = update.remote_ref.trim_start_matches("refs/");
@@ -98,7 +99,7 @@ fn apply_refs(
         match update.kind {
             crate::command::push::PushRefUpdateKind::Update => {
                 let oid = update.new_oid.as_str();
-                if !oid.chars().all(|c| c.is_ascii_hexdigit()) || oid.len() != 40 {
+                if ObjectHash::from_hex_for_kind(hash_kind, oid).is_err() {
                     return Err(format!("invalid object id '{oid}' for '{ref_name}'"));
                 }
                 if let Some(parent) = ref_path.parent() {

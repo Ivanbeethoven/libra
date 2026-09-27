@@ -2786,3 +2786,57 @@ fn test_clone_depth_status_not_gone_with_tag() {
         "P1b must not report gone: {text}"
     );
 }
+
+
+#[test]
+#[serial(cwd)]
+fn blake3_clone_round_trip() {
+    use crate::command::{assert_cli_success, create_committed_repo_with_format, run_libra_command};
+
+    let source = create_committed_repo_with_format("blake3");
+    let dest_root = tempdir().expect("clone dest root");
+    let dest = dest_root.path().join("blake3-clone");
+    let out = run_libra_command(
+        &[
+            "clone",
+            source.path().to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "blake3 clone round-trip");
+    let format = run_libra_command(&["config", "--get", "core.objectformat"], &dest);
+    assert_cli_success(&format, "read cloned objectformat");
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "blake3",
+        "clone must init from discovery blake3 kind"
+    );
+    let log = run_libra_command(&["log", "--oneline", "-1"], &dest);
+    assert_cli_success(&log, "blake3 clone log");
+}
+
+#[test]
+#[serial(cwd)]
+fn clone_sha256_libra_local_remote_succeeds() {
+    use crate::command::{assert_cli_success, create_committed_repo_with_format, run_libra_command};
+
+    let source = create_committed_repo_with_format("sha256");
+    let dest_root = tempdir().expect("sha256 clone dest root");
+    let dest = dest_root.path().join("sha256-clone");
+    let out = run_libra_command(
+        &[
+            "clone",
+            source.path().to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&out, "sha256 Libra local clone positive control");
+    let format = run_libra_command(&["config", "--get", "core.objectformat"], &dest);
+    assert_cli_success(&format, "read sha256 objectformat");
+    assert_eq!(
+        String::from_utf8_lossy(&format.stdout).trim(),
+        "sha256"
+    );
+}

@@ -391,10 +391,18 @@ impl From<RemoteError> for CliError {
                 "failed to prune remote-tracking branch '{name}': {detail}"
             ))
             .with_stable_code(StableErrorCode::IoWriteFailed),
-            RemoteError::ObjectFormatMismatch { remote, local } => CliError::fatal(format!(
-                "remote object format '{remote}' does not match local '{local}'"
-            ))
-            .with_stable_code(StableErrorCode::RepoStateInvalid),
+            RemoteError::ObjectFormatMismatch { remote, local } => {
+                let mut err = CliError::fatal(format!(
+                    "remote object format '{remote}' does not match local '{local}'"
+                ))
+                .with_stable_code(StableErrorCode::RepoStateInvalid);
+                if remote == "blake3" || local == "blake3" {
+                    err = err.with_hint(
+                        "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                    );
+                }
+                err
+            }
             RemoteError::RemoteTrackingBranchNotFound { remote, branch } => {
                 CliError::fatal(format!("no such remote-tracking branch '{remote}/{branch}'"))
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
@@ -2242,6 +2250,14 @@ mod tests {
             }
             .to_string(),
             "remote object format 'sha1' does not match local 'sha256'",
+        );
+        assert_eq!(
+            RemoteError::ObjectFormatMismatch {
+                remote: "sha1".to_string(),
+                local: "blake3".to_string(),
+            }
+            .to_string(),
+            "remote object format 'sha1' does not match local 'blake3'",
         );
         assert_eq!(
             RemoteError::RemoteTrackingBranchNotFound {

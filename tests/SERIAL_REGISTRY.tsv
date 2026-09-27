@@ -878,3 +878,8 @@ test_remote_add_mirror_fetch_track_allowed	lane:cwd	changes the process working 
 test_remote_rename_global_push_default_warns_and_is_unchanged	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_remote_rename_push_targets_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_t5505_add_another_remote	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+blake3_clone_round_trip	lane:cwd	B3-07 Libra↔Libra blake3 clone round-trip; serial(cwd) while spawning CLI subprocesses
+blake3_fetch_round_trip	lane:cwd	B3-07 Libra↔Libra blake3 fetch round-trip; serial(cwd) while spawning CLI subprocesses
+blake3_push_round_trip	lane:cwd	B3-07 Libra↔Libra blake3 push round-trip; serial(cwd) while spawning CLI subprocesses
+clone_sha256_libra_local_remote_succeeds	lane:cwd	B3-07 sha256 Libra local clone positive control; serial(cwd) while spawning CLI subprocesses
+protocol_object_format_mismatch_error_contract	lane:cwd	B3-07 object-format mismatch stable-code contract across fetch/pull/remote/push; serial(cwd) while spawning CLI subprocesses

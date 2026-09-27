@@ -604,6 +604,8 @@ Every `CloneError` variant maps to an explicit `StableErrorCode` -- no message s
 | Checkout LFS download failure | `LBR-NET-001` | 128 | "LFS content transfer failed" |
 | Internal invariant | `LBR-INTERNAL-001` | 128 | Issues URL |
 
+Wire kind is capability-first: discovery reads `object-format` (default `sha1`) before validating OID width, so a 64-hex advertisement without the capability fails closed instead of inferring sha256. Libra↔Libra blake3 clones advertise/negotiate `object-format=blake3` and initialize the destination from the discovery kind. Format mismatch maps to `LBR-REPO-003` (exit 128) with a blake3-extension hint when either side is blake3. Covered by `blake3_clone_round_trip`, `clone_sha256_libra_local_remote_succeeds`, and `protocol_object_format_mismatch_error_contract`.
+
 Init errors are transparently forwarded through `InitError -> CliError`.
 
 ### Cleanup Failure Visibility

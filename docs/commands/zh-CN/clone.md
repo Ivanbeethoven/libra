@@ -398,6 +398,8 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | 检出 LFS 下载失败 | `LBR-NET-001` | 128 | "LFS content transfer failed" |
 | 内部不变量 | `LBR-INTERNAL-001` | 128 | Issues URL |
 
+线格式为 capability-first：discovery 先读 `object-format`（缺省 `sha1`）再校验 OID 宽度；无 capability 的 64-hex 广告 fail-closed，不再按长度推断 sha256。Libra↔Libra blake3 clone 协商 `object-format=blake3`，并以 discovery kind 初始化目标仓。格式不匹配映射 `LBR-REPO-003`（退出码 128），任一侧为 blake3 时附带扩展提示。覆盖测试：`blake3_clone_round_trip`、`clone_sha256_libra_local_remote_succeeds`、`protocol_object_format_mismatch_error_contract`。
+
 Init 错误会通过 `InitError -> CliError` 透明转发。
 
 ### 清理失败可见性

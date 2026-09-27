@@ -185,7 +185,7 @@ with the retired Web implementation (RC-23).
 |---|---|---|---|
 | `network_remotes_test` | 3 | Real-network smoke tests against GitHub | `src/internal/protocol/`, `src/git_protocol.rs` |
 | `protocol_timeout_recovery` | 3 | git:// connect/idle timeout recovery via a local hung/refused listener (self-contained) | `src/internal/protocol/git_client.rs` |
-| `protocol_capability_negotiation` | 3 | Fetch capability and shallow advertisement parsing, plus Git-daemon shallow-source clone and fetch regressions | `src/internal/protocol/mod.rs`, `src/command/fetch.rs` |
+| `protocol_capability_negotiation` | 3 | Fetch capability and shallow advertisement parsing, plus Git-daemon shallow-source clone and fetch regressions  (feature `test-network`; CI network job currently runs only `network_remotes_test`, so this target is not executed in CI)| `src/internal/protocol/mod.rs`, `src/command/fetch.rs` |
 
 ## Wave 1F — Feature-gated deterministic (compile-time feature, no secrets)
 

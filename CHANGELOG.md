@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.26.0] — 2026-09-27
+
+B3-07: protocol capability-first wire kind + Libra↔Libra blake3 negotiation.
+
+### Protocol discovery (capability-first)
+
+- Reference advertisement wire kind comes only from the `object-format` capability
+  (default `sha1`); OID width is never used to infer sha256/blake3.
+- Advertises `object-format=blake3` (and still `object-format=sha256`) when the
+  local/request kind is non-sha1; sha1 omits the capability.
+- Duplicate or conflicting `object-format` capabilities fail closed; tagged wire
+  IDs are rejected.
+- Libra↔Libra blake3 clone/fetch/push round-trips succeed; mismatch maps to
+  `LBR-REPO-003` (fetch/pull/clone/remote) or `LBR-NET-002` (push) with a
+  blake3-extension hint.
+
 ## [0.25.0] — 2026-09-27
 
 REL-B3-01 family release: blake3 repository object-format open (Libra extension) with

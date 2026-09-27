@@ -2967,3 +2967,34 @@ async fn test_push_dot_updates_local_nondestructive_ref() {
         String::from_utf8_lossy(&ls.stdout)
     );
 }
+
+
+#[test]
+#[serial(cwd)]
+fn blake3_push_round_trip() {
+    let remote_dir = tempfile::tempdir().expect("blake3 bare remote");
+    let remote_path = remote_dir.path();
+    let init_remote = run_libra_command(
+        &["init", "--bare", "--object-format", "blake3"],
+        remote_path,
+    );
+    assert_cli_success(&init_remote, "init blake3 bare remote");
+
+    let local = super::create_committed_repo_with_format("blake3");
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", remote_path.to_str().unwrap()],
+            local.path(),
+        ),
+        "add blake3 bare origin",
+    );
+    let out = run_libra_command(&["push", "origin", "main"], local.path());
+    assert_cli_success(&out, "blake3 push round-trip");
+    let ls = run_libra_command(&["ls-remote", remote_path.to_str().unwrap()], local.path());
+    assert_cli_success(&ls, "ls-remote after blake3 push");
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).contains("refs/heads/main"),
+        "blake3 push must update remote main: {}",
+        String::from_utf8_lossy(&ls.stdout)
+    );
+}

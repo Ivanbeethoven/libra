@@ -13,7 +13,7 @@ use crate::{
     git_protocol::{
         PKT_LINE_PROTOCOL_ERROR_PREFIX, ServiceType, add_pkt_line_string, read_pkt_line,
     },
-    internal::branch::Branch,
+    internal::{branch::Branch, object_format},
 };
 
 pub mod bundle_client;
@@ -136,6 +136,54 @@ pub struct DiscoveryResult {
     pub hash_kind: HashKind,
 }
 
+/// Resolve wire `HashKind` from discovery capabilities (capability-first).
+///
+/// Missing `object-format` defaults to SHA-1. Every `object-format=` entry is
+/// read; duplicates or conflicting values fail closed.
+fn wire_kind_from_capabilities(capabilities: &[String]) -> Result<HashKind, GitError> {
+    let mut formats = Vec::new();
+    for cap in capabilities {
+        let Some(raw) = cap.strip_prefix("object-format=") else {
+            continue;
+        };
+        let kind = object_format::parse_config_value(raw).map_err(|_| {
+            GitError::NetworkError("Unsupported object format capability".to_string())
+        })?;
+        formats.push(kind);
+    }
+    match formats.as_slice() {
+        [] => Ok(HashKind::Sha1),
+        [kind] => Ok(*kind),
+        [first, rest @ ..] => {
+            if rest.iter().all(|kind| kind == first) {
+                // Duplicate identical object-format entries still fail closed.
+                return Err(GitError::NetworkError(
+                    "Conflicting object-format capabilities".to_string(),
+                ));
+            }
+            Err(GitError::NetworkError(
+                "Conflicting object-format capabilities".to_string(),
+            ))
+        }
+    }
+}
+
+fn validate_discovery_oid(hash_kind: HashKind, hash: &str) -> Result<String, GitError> {
+    if hash.contains(':') {
+        return Err(GitError::NetworkError(format!(
+            "Tagged object id '{hash}' is not allowed on the pkt-line wire"
+        )));
+    }
+    ObjectHash::from_hex_for_kind(hash_kind, hash)
+        .map(|oid| oid.to_string())
+        .map_err(|_| {
+            GitError::NetworkError(format!(
+                "Invalid object id '{hash}' for advertised object-format {}",
+                object_format::as_str(hash_kind)
+            ))
+        })
+}
+
 /// Parse discovered references from Git protocol advertisement response.
 pub fn parse_discovered_references(
     mut response_content: Bytes,
@@ -152,15 +200,6 @@ pub fn parse_discovered_references(
     let mut saw_header = false; // header seen or not
     let mut processed_first_ref = false;
     let mut hash_kind = HashKind::Sha1;
-    // Closure to parse hash kind based on length
-    let parse_hash_kind = |hash: &str| match hash.len() {
-        40 => Ok(HashKind::Sha1),
-        64 => Ok(HashKind::Sha256),
-        _ => Err(GitError::NetworkError(format!(
-            "Invalid hash length {}, expected 40 or 64",
-            hash.len()
-        ))),
-    };
 
     loop {
         let (bytes_take, pkt_line) = read_pkt_line(&mut response_content)
@@ -192,20 +231,11 @@ pub fn parse_discovered_references(
                     "Unexpected shallow boundary in reference advertisement".to_string(),
                 ));
             }
-            if oid.len() != hash_kind.size() * 2
-                || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(GitError::NetworkError(format!(
+            let canonical_oid = validate_discovery_oid(hash_kind, oid).map_err(|_| {
+                GitError::NetworkError(format!(
                     "Invalid shallow boundary object id '{oid}' in reference advertisement"
-                )));
-            }
-            let canonical_oid = ObjectHash::from_hex_for_kind(hash_kind, oid)
-                .map_err(|_| {
-                    GitError::NetworkError(format!(
-                        "Invalid shallow boundary object id '{oid}' in reference advertisement"
-                    ))
-                })?
-                .to_string();
+                ))
+            })?;
             shallow_boundaries.insert(canonical_oid);
             if shallow_boundaries.len() > MAX_ADVERTISED_SHALLOW_BOUNDARIES {
                 return Err(GitError::NetworkError(format!(
@@ -217,16 +247,6 @@ pub fn parse_discovered_references(
         let (hash, rest) = pkt_line.split_once(' ').ok_or_else(|| {
             GitError::NetworkError("Invalid reference format, missing object id".to_string())
         })?;
-        let detected_kind = parse_hash_kind(hash)?;
-        if !processed_first_ref {
-            hash_kind = detected_kind;
-        } else if detected_kind != hash_kind {
-            return Err(GitError::NetworkError(format!(
-                "Hash kind mismatch: expected {hash_kind}, got length {}",
-                hash.len()
-            )));
-        }
-
         let rest = rest.trim();
 
         if !processed_first_ref {
@@ -240,31 +260,17 @@ pub fn parse_discovered_references(
                     .filter(|cap| !cap.is_empty())
                     .map(|cap| cap.to_string())
                     .collect();
-                if let Some(format_cap) = capabilities
-                    .iter()
-                    .find(|cap| cap.starts_with("object-format="))
-                {
-                    let format_kind = match format_cap.as_str() {
-                        "object-format=sha1" => HashKind::Sha1,
-                        "object-format=sha256" => HashKind::Sha256,
-                        "object-format=blake3" => HashKind::Blake3,
-                        _ => {
-                            return Err(GitError::NetworkError(
-                                "Unsupported object format capability".to_string(),
-                            ));
-                        }
-                    };
-                    if format_kind != detected_kind {
-                        return Err(GitError::NetworkError(format!(
-                            "Object format mismatch: advertised {format_kind}, got hash length {}",
-                            hash.len()
-                        )));
-                    }
-                    hash_kind = format_kind;
-                }
+            }
+            // Capability-first: wire kind comes only from object-format (default sha1).
+            hash_kind = wire_kind_from_capabilities(&capabilities)?;
+            let canonical_hash = validate_discovery_oid(hash_kind, hash)?;
+
+            if !caps.is_empty() {
+                let caps = caps.split(' ').collect::<Vec<&str>>();
+                tracing::debug!("capability declarations: {:?}", caps);
             }
 
-            if hash == ObjectHash::zero_str(hash_kind) {
+            if canonical_hash == ObjectHash::zero_str(hash_kind) {
                 tracing::debug!(
                     "discovery for {:?} returned zero hash, treating as empty repository",
                     service
@@ -279,18 +285,15 @@ pub fn parse_discovered_references(
 
             if reference != "capabilities^{}" {
                 ref_list.push(DiscoveredReference {
-                    _hash: hash.to_string(),
+                    _hash: canonical_hash,
                     _ref: reference.to_string(),
                 });
             }
-            if !caps.is_empty() {
-                let caps = caps.split(' ').collect::<Vec<&str>>();
-                tracing::debug!("capability declarations: {:?}", caps);
-            }
             processed_first_ref = true;
         } else {
+            let canonical_hash = validate_discovery_oid(hash_kind, hash)?;
             ref_list.push(DiscoveredReference {
-                _hash: hash.to_string(),
+                _hash: canonical_hash,
                 _ref: rest.to_string(),
             });
         }
@@ -375,8 +378,10 @@ fn generate_upload_pack_content_inner(
     if supports_shallow {
         requested_caps.push("shallow");
     }
-    if get_wire_hash_kind() == HashKind::Sha256 {
-        requested_caps.push("object-format=sha256");
+    match get_wire_hash_kind() {
+        HashKind::Sha1 => {}
+        HashKind::Sha256 => requested_caps.push("object-format=sha256"),
+        HashKind::Blake3 => requested_caps.push("object-format=blake3"),
     }
     let requested_caps = requested_caps.join(" ");
     for w in want {
@@ -545,6 +550,7 @@ mod test {
         for (kind, width, cap) in [
             (HashKind::Sha1, 40, "object-format=sha1"),
             (HashKind::Sha256, 64, "object-format=sha256"),
+            (HashKind::Blake3, 64, "object-format=blake3"),
         ] {
             for service in [ServiceType::UploadPack, ServiceType::ReceivePack] {
                 let hash = "1".repeat(width);
@@ -565,6 +571,71 @@ mod test {
                 assert!(empty.refs.is_empty());
                 assert_eq!(empty.hash_kind, kind);
             }
+        }
+    }
+
+    #[test]
+    fn parse_discovery_does_not_infer_sha256_from_64_hex() {
+        // Capability-first: missing object-format ⇒ sha1; a 64-hex OID must not
+        // be inferred as sha256 (or blake3) from width alone.
+        let hash = "1".repeat(64);
+        let err = discovery_error(&advertisement(&hash, "multi_ack"));
+        assert!(
+            err.contains("Invalid object id") && err.contains("sha1"),
+            "expected sha1 width rejection, got {err}"
+        );
+        // Explicit sha256 capability still accepts 64-hex.
+        let ok = parse_discovered_references(
+            advertisement(&hash, "object-format=sha256"),
+            ServiceType::UploadPack,
+        )
+        .expect("sha256 capability accepts 64-hex");
+        assert_eq!(ok.hash_kind, HashKind::Sha256);
+        // Blake3 capability also accepts 64-hex (not inferred from length).
+        let blake3 = parse_discovered_references(
+            advertisement(&hash, "object-format=blake3"),
+            ServiceType::UploadPack,
+        )
+        .expect("blake3 capability accepts 64-hex");
+        assert_eq!(blake3.hash_kind, HashKind::Blake3);
+        // No capability + 40-hex remains sha1.
+        let sha1 = parse_discovered_references(
+            advertisement(&"a".repeat(40), "multi_ack"),
+            ServiceType::UploadPack,
+        )
+        .expect("default sha1");
+        assert_eq!(sha1.hash_kind, HashKind::Sha1);
+    }
+
+    #[test]
+    fn protocol_rejects_tagged_id() {
+        for tagged in [
+            format!("sha256:{}", "1".repeat(64)),
+            format!("blake3:{}", "1".repeat(64)),
+            format!("sha1:{}", "1".repeat(40)),
+        ] {
+            let err = discovery_error(&advertisement(&tagged, "object-format=sha256"));
+            assert!(
+                err.contains("Tagged object id"),
+                "tagged wire id must fail closed: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_rejects_conflicting_object_format() {
+        let hash = "1".repeat(64);
+        for caps in [
+            "object-format=sha256 object-format=blake3",
+            "object-format=blake3 object-format=sha256",
+            "object-format=sha256 object-format=sha256",
+            "multi_ack object-format=sha1 object-format=sha256",
+        ] {
+            let err = discovery_error(&advertisement(&hash, caps));
+            assert_eq!(
+                err, "Conflicting object-format capabilities",
+                "caps={caps:?}"
+            );
         }
     }
 
@@ -694,6 +765,38 @@ mod test {
             !text.contains("thin-pack"),
             "thin-pack must not be advertised: {text}"
         );
+        // sha1 default: do not advertise object-format.
+        assert!(
+            !text.contains("object-format="),
+            "sha1 want line must omit object-format: {text}"
+        );
+
+        set_wire_hash_kind(HashKind::Sha256);
+        let sha256_body =
+            generate_upload_pack_content(&[], &["1".repeat(64)], &[], None);
+        let sha256_text = String::from_utf8_lossy(&sha256_body);
+        assert!(
+            sha256_text.contains("object-format=sha256"),
+            "sha256 want line must advertise object-format=sha256: {sha256_text}"
+        );
+        assert!(
+            !sha256_text.contains("object-format=blake3"),
+            "sha256 want must not advertise blake3: {sha256_text}"
+        );
+
+        set_wire_hash_kind(HashKind::Blake3);
+        let blake3_body =
+            generate_upload_pack_content(&[], &["1".repeat(64)], &[], None);
+        let blake3_text = String::from_utf8_lossy(&blake3_body);
+        assert!(
+            blake3_text.contains("object-format=blake3"),
+            "blake3 want line must advertise object-format=blake3: {blake3_text}"
+        );
+        assert!(
+            !blake3_text.contains("object-format=sha256"),
+            "blake3 want must not advertise sha256: {blake3_text}"
+        );
+        set_wire_hash_kind(HashKind::Sha1);
     }
 
     #[test]
