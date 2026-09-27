@@ -1,8 +1,26 @@
 # Changelog
 
-## [Unreleased]
+## [0.27.2] — 2026-09-28
 
-### Cloud object-format metadata (B3-09 / B3-14; ships with REL-B3-02 / B3-17)
+### Commit the deletion of the last tracked file (issue #497)
+
+- `libra commit` / `commit -a` no longer misreport `nothing to commit
+  (create/copy files and use 'libra add' to track)` when the LAST tracked file
+  is removed. A staged deletion that empties the index is still a real change
+  relative to `HEAD`, so `commit -a` and `libra add -A && libra commit` now
+  produce a deletion commit (matching Git's `git rm <last-file> && git commit`).
+- The empty-index refusal is now gated on there being nothing to commit relative
+  to `HEAD` (`tracked_entries.is_empty() && staged_changes.is_empty()` in
+  `src/command/commit.rs`, ADR-CD-01): a genuinely empty repository (no commit
+  and no staged changes) still reports `nothing to commit (create/copy files and
+  use 'libra add' to track)`, and a clean worktree still reports
+  `nothing to commit, working tree clean`.
+- Regression coverage: `tests/command/commit_test.rs` (delete-last-file via
+  `commit -a` and via `add -A && commit`) and
+  `tests/compat/commit_delete_last_tracked_file_test.rs` (Git upstream comparison
+  plus clean-repo refusal).
+
+### Cloud object-format metadata (B3-09 / B3-14)
 
 - D1 `repositories` / `object_index` carry nullable `object_format`; backup
   writes the repository kind; restore refuses OID-width inference.
@@ -10,7 +28,7 @@
   `LBR-REPO-002` (exit 128) and a re-backup hint. Legacy all-40-hex catalogs
   without metadata remain sha1.
 - **Minimum compatible client:** a Libra binary that includes B3-14 cloud
-  metadata consumption (REL-B3-02 / B3-17 and newer). Older clients must not
+  metadata consumption (this release, v0.27.2, and newer). Older clients must not
   restore new metadata-bearing snapshots via width guessing.
 
 ## [0.27.1] — 2026-09-27
