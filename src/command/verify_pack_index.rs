@@ -1,7 +1,7 @@
 use git_internal::hash::{HashKind, ObjectHash};
 use sha1::{Digest, Sha1};
 
-pub(crate) use super::verify_pack_index_v2::infer_idx_v2_hash_kind;
+pub(crate) use super::verify_pack_index_v2::idx_v2_matches_hash_kind;
 use super::{
     verify_pack_index_common::{
         FANOUT_LEN, IDX_MAGIC, parse_fanout, validate_fanout_matches_entries,

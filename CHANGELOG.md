@@ -39,6 +39,16 @@
 - Empty packs use a BLAKE3 32-byte trailer; cross-kind `bundle unbundle` fails closed
   with no residual pack/index writes.
 
+### verify-pack explicit hash kind (B3-06)
+
+- `verify-pack` uses the repository `core.objectformat` and never guesses sha1/sha256/blake3
+  from idx v2 layout (sha256 and blake3 share OID width).
+- Outside a repository, `--hash-kind <sha1|sha256|blake3>` is required; omitting it fails
+  with `LBR-CLI-002`.
+- blake3 repositories verify idx v2 with BLAKE3 digests.
+
+
+
 
 
 
