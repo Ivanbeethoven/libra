@@ -513,7 +513,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn synthetic_legacy_predecessor_is_deterministic_and_format_separated() {
+        use git_internal::hash::{HashKind, set_hash_kind_for_test};
+
+        // Helper parses under the process-wide hash kind (same as repo OID
+        // context at rewrite time). Switch kinds explicitly to prove
+        // format-separated synthetic identities.
+        let _sha1 = set_hash_kind_for_test(HashKind::Sha1);
         let sha1_oid = "0123456789abcdef0123456789abcdef01234567";
         let first = synthetic_change_id_for_legacy_predecessor_for_kind(
             git_internal::hash::HashKind::Sha1,
@@ -526,8 +533,10 @@ mod tests {
         )
         .expect("synthetic id");
         assert_eq!(first, second);
-        // A 64-hex oid is a SHA-256 commit and must not alias the SHA-1
-        // synthetic identity for the same bytes.
+        assert!(synthetic_change_id_for_legacy_predecessor("not-hex").is_none());
+        drop(_sha1);
+
+        let _sha256 = set_hash_kind_for_test(HashKind::Sha256);
         let sha256_oid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let sha256 = synthetic_change_id_for_legacy_predecessor_for_kind(
             git_internal::hash::HashKind::Sha256,
