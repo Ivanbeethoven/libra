@@ -10,7 +10,7 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub id: i64,
-    /// Object hash (SHA-1 or SHA-256)
+    /// Object hash (algorithm-agnostic hex; kind comes from `core.objectformat`)
     // Removed unique constraint to allow same object in different repos
     pub o_id: String,
     /// Object type: blob, tree, commit, tag

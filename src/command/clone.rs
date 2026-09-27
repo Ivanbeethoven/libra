@@ -498,7 +498,7 @@ pub struct CloneOutput {
     pub remote_name: String,
     /// Actual checked-out branch; `None` for empty remotes.
     pub branch: Option<String>,
-    /// `sha1` or `sha256` (from `InitOutput.object_format`).
+    /// `sha1` / `sha256` / `blake3` (from `InitOutput.object_format`).
     pub object_format: String,
     /// From `InitOutput.repo_id`.
     pub repo_id: String,
@@ -533,6 +533,9 @@ pub struct CloudCloneSiteOutput {
     pub site_id: String,
     pub slug: String,
     pub repo_id: String,
+    /// Authoritative repository object-format from D1 backup metadata when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_format: Option<String>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub ref_name: Option<String>,
     pub revision: String,

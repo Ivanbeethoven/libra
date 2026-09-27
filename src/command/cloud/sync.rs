@@ -75,9 +75,14 @@ pub(crate) async fn run_cloud_sync(
         ))
     })?;
 
+    // Persist the repository object-format alongside the backup catalog so
+    // restore can read an authoritative kind (B3-09 storage axis; B3-14
+    // consumes it fail-closed).
+    let object_format = crate::internal::object_format::as_str(git_internal::hash::get_hash_kind());
+
     // Upsert repository info.
     let repo_row = d1_client
-        .upsert_repository(&repo_id, &project_name)
+        .upsert_repository_with_format(&repo_id, &project_name, Some(object_format))
         .await
         .map_err(|e| {
             if e.message.contains("UNIQUE constraint failed: repositories.name") {
@@ -294,14 +299,18 @@ async fn sync_single_object(
             .map_err(|e| CloudError::R2(format!("R2 upload failed: {}", e)))?;
     }
 
-    // Phase 2: Upsert to D1 (idempotent - will update if exists)
+    // Phase 2: Upsert to D1 (idempotent - will update if exists). Tag the
+    // row with the repository object-format so consumers never infer kind
+    // from `o_id` width (B3-09 storage; B3-14 semantics).
+    let object_format = crate::internal::object_format::as_str(git_internal::hash::get_hash_kind());
     d1_client
-        .upsert_object_index(
+        .upsert_object_index_with_format(
             &obj.o_id,
             &obj.o_type,
             obj.o_size,
             &obj.repo_id,
             obj.created_at,
+            Some(object_format),
         )
         .await
         .map_err(|e| CloudError::D1(format!("D1 write failed: {}", e.message)))?;

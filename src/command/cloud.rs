@@ -237,6 +237,10 @@ struct CloudAgentCaptureSyncOutput {
 #[derive(Debug, Clone, Serialize)]
 struct CloudRestoreOutput {
     repo_id: String,
+    /// Authoritative repository object-format from D1 `repositories`
+    /// (`sha1` / `sha256` / `blake3`) when the backup wrote one (B3-09).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object_format: Option<String>,
     metadata_only: bool,
     total_objects: usize,
     indexes_restored: usize,
@@ -1020,6 +1024,21 @@ async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRestoreOutput>
             .ok_or_else(|| CloudError::NameNotFound("repo_id is required".to_string()))?
     };
 
+    // Converge repositories schema and read the authoritative object-format
+    // written by backup (B3-09 restore plan field). Missing/NULL stays None
+    // for B3-14 fail-closed consumers.
+    d1_client.ensure_repositories_table().await.map_err(|e| {
+        CloudError::D1(format!(
+            "Failed to ensure repositories table: {}",
+            e.message
+        ))
+    })?;
+    let object_format = d1_client
+        .find_repository(&repo_id)
+        .await
+        .map_err(|e| CloudError::D1(format!("Failed to load repository metadata: {}", e.message)))?
+        .and_then(|row| row.object_format);
+
     let indexes = d1_client
         .get_object_indexes(&repo_id)
         .await
@@ -1065,6 +1084,7 @@ async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRestoreOutput>
     if args.metadata_only {
         return Ok(CloudRestoreOutput {
             repo_id,
+            object_format,
             metadata_only: true,
             total_objects: indexes.len(),
             indexes_restored: indexes.len(),
@@ -1140,6 +1160,7 @@ async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRestoreOutput>
 
     Ok(CloudRestoreOutput {
         repo_id,
+        object_format,
         metadata_only: false,
         total_objects: indexes.len(),
         indexes_restored: indexes.len(),
@@ -3404,6 +3425,7 @@ mod tests {
             repo_id: "test-repo".to_string(),
             created_at: 0,
             is_synced: 1,
+            object_format: None,
         }
     }
 
@@ -5060,6 +5082,7 @@ mod tests {
                 repo_id: "repo".to_string(),
                 created_at: 1,
                 is_synced: 1,
+                object_format: None,
             },
             ObjectIndexRow {
                 o_id: "tree".to_string(),
@@ -5068,6 +5091,7 @@ mod tests {
                 repo_id: "repo".to_string(),
                 created_at: 1,
                 is_synced: 1,
+                object_format: None,
             },
         ];
         let mut retained = remote_only;
@@ -5108,6 +5132,7 @@ mod tests {
             repo_id: "repo".to_string(),
             created_at: 200,
             is_synced: 1,
+            object_format: None,
         };
         let second = ObjectIndexRow {
             o_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -5116,6 +5141,7 @@ mod tests {
             repo_id: "repo".to_string(),
             created_at: 100,
             is_synced: 1,
+            object_format: None,
         };
         let left = agent_capture_object_index_digest(&[first.clone(), second.clone()])
             .expect("digest indexes");
