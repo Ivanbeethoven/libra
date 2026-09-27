@@ -47,6 +47,14 @@
   with `LBR-CLI-002`.
 - blake3 repositories verify idx v2 with BLAKE3 digests.
 
+### maintenance blake3 skips commit-graph (B3-13)
+
+- blake3 repositories skip the `maintenance` `commit-graph` task (Git CGPH has no
+  blake3 `hash_version`): warn on stderr / JSON task message, leave existing
+  `objects/info/commit-graph*` untouched, and rely on object-walk `log` / `rev-list`.
+
+
+
 
 
 

@@ -1418,6 +1418,108 @@ fn gc_refuses_a_manifest_that_is_not_a_json_object() {
     );
 }
 
+/// B3-13: blake3 repositories must never create/update a Git-compatible CGPH.
+#[test]
+fn maintenance_blake3_skips_commit_graph() {
+    let repo = tempfile::tempdir().expect("blake3 repo");
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--vault", "false", "--object-format", "blake3"],
+            repo.path(),
+        ),
+        "init blake3",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "Test User"], repo.path()),
+        "user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "test@example.com"], repo.path()),
+        "user.email",
+    );
+    fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("write tracked");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit",
+    );
+
+    let info_dir = repo.path().join(".libra/objects/info");
+    let cgph = info_dir.join("commit-graph");
+    // Stale CGPH left from a previous kind / mistaken write must be ignored.
+    fs::create_dir_all(&info_dir).expect("objects/info");
+    fs::write(&cgph, b"CGPH-stale-fixture").expect("seed stale cgph");
+    let before_meta = fs::metadata(&cgph).expect("stale meta");
+    let before_mtime = before_meta.modified().ok();
+    let before_len = before_meta.len();
+
+    let output = run_libra_command(
+        &["maintenance", "run", "--task", "commit-graph", "--json"],
+        repo.path(),
+    );
+    assert!(
+        output.status.success(),
+        "blake3 commit-graph skip must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning:") && stderr.contains("blake3"),
+        "must warn on stderr: {stderr}"
+    );
+    let json = parse_json_stdout(&output);
+    let tasks = json["data"]["tasks"].as_array().expect("tasks array");
+    let cg = tasks
+        .iter()
+        .find(|t| t["task"].as_str() == Some("commit-graph"))
+        .expect("commit-graph task result");
+    assert_eq!(cg["success"], true);
+    let msg = cg["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("blake3") && msg.contains("skipped"),
+        "JSON message must record blake3 skip: {msg}"
+    );
+
+    let after_meta = fs::metadata(&cgph).expect("cgph still present");
+    assert_eq!(
+        after_meta.len(),
+        before_len,
+        "stale CGPH must not be rewritten"
+    );
+    if let (Some(before), Ok(after)) = (before_mtime, after_meta.modified()) {
+        assert_eq!(before, after, "stale CGPH mtime must not change");
+    }
+    // No additional commit-graph* artifacts.
+    for entry in fs::read_dir(&info_dir).expect("read info") {
+        let name = entry.expect("dirent").file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("commit-graph") {
+            assert_eq!(
+                name.as_ref(),
+                "commit-graph",
+                "unexpected commit-graph artifact: {name}"
+            );
+        }
+    }
+
+    // History walks fall back to object traversal.
+    let log = run_libra_command(&["log", "--oneline", "-n", "1"], repo.path());
+    assert_cli_success(&log, "blake3 log without CGPH");
+    assert!(
+        !String::from_utf8_lossy(&log.stdout).trim().is_empty(),
+        "log must print at least one commit"
+    );
+    let rev_list = run_libra_command(&["rev-list", "HEAD"], repo.path());
+    assert_cli_success(&rev_list, "blake3 rev-list without CGPH");
+    assert!(
+        !String::from_utf8_lossy(&rev_list.stdout).trim().is_empty(),
+        "rev-list must list HEAD"
+    );
+}
+
 /// B3-08: `parse_object_hash` must honour the repository hash kind (blake3),
 /// not infer SHA-256 from a 32-byte width.
 #[tokio::test]
