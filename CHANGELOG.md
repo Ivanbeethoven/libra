@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.27.1] — 2026-09-27
+
+### AI task-run tagged commit column (B3-16)
+
+- Local SQLite migration adds nullable `ai_index_task_run.base_commit_ref`
+  (`TEXT`) for tagged `repo-commit:<kind>:<hex>` values (substrate for B3-10).
+- Forward apply is claim-first / `ADD COLUMN` idempotent; down is protected and
+  refuses when any non-NULL tagged value exists.
+- Projection rebuild snapshots `base_commit_ref` before delete and backfills by
+  `(task_id, run_id)` (GC-08).
+- **Minimum compatible client:** a Libra binary that includes this migration
+  (this release and newer). Older binaries open a post-migration repository DB
+  as `UnsupportedFuture` and refuse before SeaORM SELECT.
+
 ## [0.27.0] — 2026-09-27
 
 ### Local Git sha256 source reject gate (B3-12)

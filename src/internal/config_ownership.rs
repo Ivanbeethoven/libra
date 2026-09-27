@@ -291,6 +291,9 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
     ("ai_index_run_event", ConfigOwner::Repository),
     ("ai_index_run_patchset", ConfigOwner::Repository),
     ("ai_index_task_run", ConfigOwner::Repository),
+    // B3-16 protected-down rebuild staging (created and dropped in the same
+    // migration; never durable).
+    ("ai_index_task_run__rebuild", ConfigOwner::Repository),
     ("ai_live_context_window", ConfigOwner::Repository),
     ("ai_decision_proposal", ConfigOwner::Repository),
     ("ai_final_decision", ConfigOwner::Repository),

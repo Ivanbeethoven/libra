@@ -60,6 +60,8 @@ pub mod investigate;
 pub mod sandbox;
 // Source security + config resolver (SourcePool deleted in RC-23).
 pub mod sources;
+// Task↔run reverse-index projection (B3-16 base_commit_ref substrate).
+pub mod projection;
 // Per-session persistent state.
 pub mod session;
 // Misc utilities used across the AI module.

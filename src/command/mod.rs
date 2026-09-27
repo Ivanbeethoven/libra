@@ -50,6 +50,7 @@ pub mod file;
 pub mod for_each_ref;
 pub mod format_patch;
 pub mod fsck;
+pub mod graph;
 pub mod grep;
 pub mod hash_object;
 pub(crate) mod history_config;
