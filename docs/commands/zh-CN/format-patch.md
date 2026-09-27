@@ -135,3 +135,7 @@ unified diff
 | 输出目录创建失败 | `LBR-IO-002` |
 | 配置读取失败 | `LBR-IO-001` |
 | 无效 `format.signOff` / 配置的输出目录为空 | `LBR-CLI-003` |
+
+## Blake3 仓库
+
+当 `core.objectformat` 为 `blake3` 时，`--base` 的 prerequisite-patch-id 使用 BLAKE3 摘要（64 位十六进制），而不是 SHA-1 仓所用的 Git stable patch-id 组合器。

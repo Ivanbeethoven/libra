@@ -10,6 +10,15 @@
 - Reinit refuses a different `--object-format` with `LBR-CLI-002` (and unknown stored formats
   with `LBR-REPO-002`) via a read-only, no-migration inspect before top-up.
 
+### hash-object / commit / format-patch blake3 local write (B3-02)
+
+- Blake3 repositories hash blobs/trees/commits with the repository kind; `hash-object -w`,
+  `commit`, and `log` round-trip 64-hex Blake3 OIDs.
+- `format-patch --base` prerequisite patch-ids use a BLAKE3 digest in blake3 repositories
+  (not the SHA-1 Git-stable combiner).
+- Worktree I/O helper `apply_hash_kind` accepts `blake3` (no longer silently folds to SHA-1).
+
+
 ## [0.23.67] — 2026-09-26
 
 ### remote / fetch / pull / push / credential / rerere Git alignment (issues/480)

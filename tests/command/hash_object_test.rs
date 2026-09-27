@@ -560,3 +560,35 @@ async fn hash_object_stdin_paths_hashes_each_path_in_order() {
         String::from_utf8_lossy(&bad.stdout)
     );
 }
+
+#[tokio::test]
+async fn hash_object_blake3_roundtrip() {
+    let repo = tempfile::tempdir().expect("create temp repo");
+    let init = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "blake3"],
+        repo.path(),
+    );
+    assert_cli_success(&init, "failed to initialize blake3 repository");
+    fs::write(repo.path().join("hello.txt"), b"hello world\n").expect("write fixture");
+
+    let output = run_libra_command(&["hash-object", "-w", "hello.txt"], repo.path());
+    assert_cli_success(&output, "hash-object -w blake3");
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(oid.len(), 64, "blake3 blob OID must be 64 hex: {oid}");
+    assert!(
+        oid.chars().all(|c| c.is_ascii_hexdigit()),
+        "blake3 OID must be hex: {oid}"
+    );
+
+    let typed = run_libra_command(&["cat-file", "-t", &oid], repo.path());
+    assert_cli_success(&typed, "cat-file -t");
+    assert_eq!(String::from_utf8_lossy(&typed.stdout).trim(), "blob");
+
+    let printed = run_libra_command(&["cat-file", "-p", &oid], repo.path());
+    assert_cli_success(&printed, "cat-file -p");
+    assert_eq!(printed.stdout, b"hello world\n");
+
+    let hashed = run_libra_command(&["hash-object", "hello.txt"], repo.path());
+    assert_cli_success(&hashed, "hash-object read-only");
+    assert_eq!(String::from_utf8_lossy(&hashed.stdout).trim(), oid);
+}

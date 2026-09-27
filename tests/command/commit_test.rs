@@ -2538,3 +2538,77 @@ fn test_commit_all_updates_mode_only_change() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[tokio::test]
+async fn commit_blake3_object_readback() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path();
+    let init = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "blake3"],
+        repo,
+    );
+    assert_cli_success(&init, "blake3 init");
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.name", "Blake3 User"], repo),
+        "user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "user.email", "blake3@example.com"],
+            repo,
+        ),
+        "user.email",
+    );
+    std::fs::write(repo.join("a.txt"), b"hello blake3\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], repo), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "blake3 tip", "--no-verify"], repo),
+        "commit",
+    );
+
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(head.len(), 64, "commit OID width: {head}");
+    let tree =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD^{tree}"], repo).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(tree.len(), 64, "tree OID width: {tree}");
+
+    let blob =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD:a.txt"], repo).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(blob.len(), 64, "blob OID width: {blob}");
+
+    // Load objects under the repository kind to assert Blake3.
+    let _guard = ChangeDirGuard::new(repo);
+    let _hash = git_internal::hash::set_hash_kind_for_test(git_internal::hash::HashKind::Blake3);
+    let head_oid = git_internal::hash::ObjectHash::from_hex_for_kind(
+        git_internal::hash::HashKind::Blake3,
+        &head,
+    )
+    .expect("parse head");
+    assert_eq!(head_oid.kind(), git_internal::hash::HashKind::Blake3);
+    let tree_oid = git_internal::hash::ObjectHash::from_hex_for_kind(
+        git_internal::hash::HashKind::Blake3,
+        &tree,
+    )
+    .expect("parse tree");
+    assert_eq!(tree_oid.kind(), git_internal::hash::HashKind::Blake3);
+    let blob_oid = git_internal::hash::ObjectHash::from_hex_for_kind(
+        git_internal::hash::HashKind::Blake3,
+        &blob,
+    )
+    .expect("parse blob");
+    assert_eq!(blob_oid.kind(), git_internal::hash::HashKind::Blake3);
+
+    let log = run_libra_command(&["log", "--oneline"], repo);
+    assert_cli_success(&log, "log --oneline");
+    let log_text = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        log_text.contains("blake3 tip"),
+        "log should show commit: {log_text}"
+    );
+}

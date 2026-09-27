@@ -1619,3 +1619,77 @@ fn base_with_cover_letter_lands_on_cover() {
         "only the cover letter carries the base trailer"
     );
 }
+
+#[test]
+fn format_patch_blake3_patch_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let p = temp.path();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--vault", "false", "--object-format", "blake3"],
+            p,
+        ),
+        "blake3 init",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "user.name", "Blake3 User"], p),
+        "user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "user.email", "blake3@example.com"],
+            p,
+        ),
+        "user.email",
+    );
+    fs::write(p.join("f1"), "a\n").unwrap();
+    fs::write(p.join("f2"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f1", "f2"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    fs::write(p.join("f1"), "A\n").unwrap();
+    fs::write(p.join("f2"), "B\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f1", "f2"], p), "add multi");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "multi", "--no-verify"], p),
+        "commit multi",
+    );
+    fs::write(p.join("f3"), "c\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f3"], p), "add tip");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tip", "--no-verify"], p),
+        "commit tip",
+    );
+
+    let out = run_libra_command(
+        &["format-patch", "--base=HEAD~2", "--stdout", "HEAD~1..HEAD"],
+        p,
+    );
+    assert_cli_success(&out, "format-patch --base blake3");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("prerequisite-patch-id: "),
+        "blake3 format-patch must emit prerequisite-patch-id: {text}"
+    );
+    // Extract the first prerequisite-patch-id value and assert 64-hex (BLAKE3 digest).
+    let mut found = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("prerequisite-patch-id: ") {
+            found = Some(rest.trim().to_string());
+            break;
+        }
+    }
+    let pid = found.expect("prerequisite-patch-id line");
+    assert_eq!(pid.len(), 64, "blake3 patch-id must be 64 hex: {pid}");
+    assert!(
+        pid.chars().all(|c| c.is_ascii_hexdigit()),
+        "blake3 patch-id must be hex: {pid}"
+    );
+    // Must NOT match the SHA-1 git-stable patch-id for the same content.
+    assert_ne!(
+        pid, "41738f97b408e386f1d209bee7dc2096eeafa713",
+        "blake3 combiner must not emit the sha1 patch-id"
+    );
+}

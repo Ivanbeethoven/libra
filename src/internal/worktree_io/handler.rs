@@ -568,10 +568,11 @@ fn hash_lfs_file_handle(file: &std::fs::File, length: u64) -> io::Result<(String
 }
 
 fn apply_hash_kind(kind: &str) {
-    match kind {
-        "sha256" => git_internal::hash::set_hash_kind(git_internal::hash::HashKind::Sha256),
-        _ => git_internal::hash::set_hash_kind(git_internal::hash::HashKind::Sha1),
-    }
+    // Route through `object_format::parse_config_value` so blake3 is not
+    // silently folded into Sha1 (B3-02 unblock; B3-04 may tighten unknown).
+    let parsed = crate::internal::object_format::parse_config_value(kind)
+        .unwrap_or(git_internal::hash::HashKind::Sha1);
+    git_internal::hash::set_hash_kind(parsed);
 }
 
 fn maybe_test_kill_after_checkpoint(seq: u64) {
