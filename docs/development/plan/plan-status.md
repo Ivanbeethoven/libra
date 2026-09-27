@@ -21,7 +21,7 @@
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
 | [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | ACF-01..09 全部 `pending`；Entire `main@9c06bfb13` 對標已完成；Claude R8 字面 `VERDICT: PASS`（P0/P1/P2=0）；是 0902/0904/0905/0911 production、0916 CAP-07 與 0923 DM-05 session consumer contract 的前置 |
-| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿；2026-09-28 最终本地门 8228/8228 passed，本轮不 bump 版本） |
+| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿；2026-09-28 最终本地门 8241/8241 passed，本轮不 bump 版本） |
 | [`plan-20260923.md`](plan-20260923.md) | Cross-cutting (implemented CLI completion) | 已排期 | English static-first rewrite; CP-00..20 pending; CP-00 inventory precedes implementation approval; CP-06 static acceptance blocks all dynamic work; no implementation/release claimed |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
@@ -293,7 +293,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿；2026-09-28 本地最终门 8228/8228 passed，本轮不 bump 版本）。
+- **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿；2026-09-28 本地最终门 8241/8241 passed，本轮不 bump 版本）。
 - **本会话已收口：** `issues/577` SA-02/SA-01 已 `done`/`complete`；PR #578、v0.24.1、8/8 release jobs、网站 `cf` 与生产页 D 证据均完成，Issue #577 CLOSED。
 - **SCAP-01 与 B3-00：** SCAP-01 已收口，`runtime.rs` 写集互斥结束；B3-00 继续在 `main` 上推进。
 - **下一步：** `issues/474` 已收口（DEP-CL-07 完成，#474 CLOSED）。B3-00 另轨。
