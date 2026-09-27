@@ -11,7 +11,7 @@ use std::{
 };
 
 use clap::{Parser, ValueEnum};
-use git_internal::hash::{HashKind, set_hash_kind};
+use git_internal::hash::set_hash_kind;
 use sea_orm::{ActiveModelTrait, DbConn, DbErr, Set, TransactionTrait};
 use serde::Serialize;
 
@@ -42,7 +42,8 @@ const EXAMPLES: &str = r#"EXAMPLES:
     libra init -b develop                      Use 'develop' as initial branch
     libra init --from-git-repository ../old    Convert from existing Git repo
     libra init --vault false                   Skip vault / GPG setup
-    libra init --object-format sha256          Use SHA-256 hashing"#;
+    libra init --object-format sha256          Use SHA-256 hashing
+    libra init --object-format blake3          Use BLAKE3 hashing"#;
 
 // NOTE: `src/command/init.rs` lines 3-20 are a protected merge-conflict block in this workspace.
 // The imports inside that block must stay as-is. To avoid `unused_imports` warnings without
@@ -103,6 +104,17 @@ pub enum InitError {
         stage: &'static str,
         message: String,
     },
+
+    /// Convert/object-format combination that must fail closed before any write.
+    #[error("{message}")]
+    ConvertObjectFormatForbidden {
+        message: String,
+        hint: Option<String>,
+    },
+
+    /// Stored or source `core.objectformat` / Git extensions.objectformat is unknown.
+    #[error("{message}")]
+    UnknownObjectFormat { message: String },
 
     #[error("vault initialization failed: {message}")]
     VaultInitializationFailed { message: String },
@@ -183,6 +195,16 @@ impl From<InitError> for CliError {
                 ))
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
             }
+            InitError::ConvertObjectFormatForbidden { message, hint } => {
+                let mut cli = CliError::command_usage(message)
+                    .with_stable_code(StableErrorCode::CliInvalidArguments);
+                if let Some(hint) = hint {
+                    cli = cli.with_hint(hint);
+                }
+                cli
+            }
+            InitError::UnknownObjectFormat { message } => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::RepoCorrupt),
             InitError::VaultInitializationFailed { message } => {
                 // Intent: vault setup runs after repository metadata exists;
                 // failure here means an internal initialization invariant broke
@@ -278,7 +300,7 @@ pub struct InitArgs {
     #[clap(long, required = false, value_name = "MODE")]
     pub shared: Option<String>,
 
-    /// Object hash algorithm: `sha1` (default) or `sha256`
+    /// Object hash algorithm: `sha1` (default), `sha256`, or `blake3`
     #[clap(long = "object-format", name = "format", required = false)]
     pub object_format: Option<String>,
 
@@ -592,6 +614,14 @@ async fn run_init_internal(
     }
     let is_git_conversion = from_git.is_some();
     let object_format = resolve_object_format(args.object_format.as_deref())?;
+    // ADR-B3-01: Convert is SHA-1→SHA-1 only. Refuse sha256/blake3 targets (and
+    // sha256 Git sources) before create_dir_all / layout / DB.
+    if is_git_conversion {
+        refuse_convert_object_format_combination(
+            from_git.as_deref().expect("is_git_conversion"),
+            &object_format,
+        )?;
+    }
     let ref_format = args.ref_format.clone().unwrap_or(RefFormat::Strict);
     let initial_branch_name = if is_git_conversion {
         // Git conversion selects HEAD from the source repository's branch layout;
@@ -700,12 +730,13 @@ async fn run_init_internal(
         set_vault_signing_value(&database_path, false).await?;
     }
 
-    set_hash_kind(match object_format.as_str() {
-        "sha1" => HashKind::Sha1,
-        "sha256" => HashKind::Sha256,
-        "blake3" => HashKind::Blake3,
-        _ => HashKind::Sha1,
-    });
+    set_hash_kind(
+        crate::internal::object_format::parse_config_value(&object_format).map_err(|_| {
+            InitError::UnknownObjectFormat {
+                message: format!("unsupported object format '{object_format}'"),
+            }
+        })?,
+    );
 
     let path = root_dir
         .canonicalize()
@@ -759,12 +790,43 @@ async fn reinitialize_existing(
         let requested_ref_format = args.ref_format.clone().unwrap_or(RefFormat::Strict);
         validate_branch_name(requested, &requested_ref_format)?;
     }
-    // Normalize/validate the requested object format once; reused for the warning.
     let requested_object_format = args
         .object_format
         .as_deref()
         .map(|format| resolve_object_format(Some(format)))
         .transpose()?;
+
+    // ADR-B3-01: compare stored objectformat via a read-only, no-migration
+    // connection BEFORE layout/DB upgrade side effects.
+    let database_path = root_dir.join(DATABASE);
+    let inspect_conn = crate::internal::db::open_database_without_migrations(&database_path)
+        .await
+        .map_err(InitError::Io)?;
+    let stored_object_format = read_config_string(&inspect_conn, "core.objectformat")
+        .await?
+        .unwrap_or_else(|| "sha1".to_string());
+    // Drop the inspect connection before opening the migrating one.
+    let _ = inspect_conn.close().await;
+
+    if crate::internal::object_format::parse_config_value(&stored_object_format).is_err() {
+        return Err(InitError::UnknownObjectFormat {
+            message: format!("repository has unknown core.objectformat '{stored_object_format}'"),
+        });
+    }
+    if let Some(requested) = &requested_object_format
+        && requested != &stored_object_format
+    {
+        return Err(InitError::ConvertObjectFormatForbidden {
+            message: format!(
+                "cannot change object format from '{stored_object_format}' to '{requested}' on re-initialization"
+            ),
+            hint: Some(
+                "object format is fixed at fresh init; create a new repository with \
+                 `libra init --object-format <format>` instead"
+                    .to_string(),
+            ),
+        });
+    }
 
     progress.emit("Reinitializing existing repository ...");
     fs::create_dir_all(root_dir)?;
@@ -776,7 +838,6 @@ async fn reinitialize_existing(
         apply_shared(root_dir, shared_mode)?;
     }
 
-    let database_path = root_dir.join(DATABASE);
     // Connect to the EXISTING database (schema auto-upgrades on open); never recreate
     // it — `create_database_connection` would reject an existing file.
     let conn = get_db_conn_instance_for_path(&database_path)
@@ -786,9 +847,7 @@ async fn reinitialize_existing(
         persist_shared_repository(&conn, shared_mode).await?;
     }
 
-    let object_format = read_config_string(&conn, "core.objectformat")
-        .await?
-        .unwrap_or_else(|| "sha1".to_string());
+    let object_format = stored_object_format;
     let ref_format = read_config_string(&conn, "core.initrefformat")
         .await?
         .unwrap_or_else(|| RefFormat::Strict.as_str().to_string());
@@ -816,10 +875,13 @@ async fn reinitialize_existing(
         Head::Detached(_) => "HEAD".to_string(),
     };
 
-    set_hash_kind(match object_format.as_str() {
-        "sha256" => HashKind::Sha256,
-        _ => HashKind::Sha1,
-    });
+    set_hash_kind(
+        crate::internal::object_format::parse_config_value(&object_format).map_err(|_| {
+            InitError::UnknownObjectFormat {
+                message: format!("repository has unknown core.objectformat '{object_format}'"),
+            }
+        })?,
+    );
 
     // Flags that cannot change an existing repository were validated above; here they
     // are accepted-but-ignored with a warning when they differ from the stored value
@@ -830,13 +892,6 @@ async fn reinitialize_existing(
     {
         warnings.push(format!(
             "ignoring --initial-branch '{requested}' on re-initialization; keeping '{initial_branch}'"
-        ));
-    }
-    if let Some(requested) = &requested_object_format
-        && requested != &object_format
-    {
-        warnings.push(format!(
-            "ignoring --object-format '{requested}' on re-initialization; keeping '{object_format}'"
         ));
     }
 
@@ -862,7 +917,10 @@ async fn reinitialize_existing(
 
 /// Read a single config value from the repository database, mapping store errors to
 /// [`InitError::Database`]. Returns `None` when the key is unset.
-async fn read_config_string(conn: &DbConn, key: &str) -> Result<Option<String>, InitError> {
+async fn read_config_string<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    key: &str,
+) -> Result<Option<String>, InitError> {
     ConfigKv::get_with_conn(conn, key)
         .await
         .map(|entry| entry.map(|entry| entry.value))
@@ -927,18 +985,81 @@ fn resolve_object_format(raw: Option<&str>) -> Result<String, InitError> {
     let object_format = raw
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or_else(|| "sha1".to_string());
-    match object_format.as_str() {
-        "sha1" | "sha256" => Ok(object_format),
-        _ => Err(invalid_argument(
-            format!("unsupported object format '{object_format}'"),
-            suggest_object_format(&object_format)
-                .map(|suggestion| format!("did you mean '{suggestion}'?")),
-        )),
-    }
+    crate::internal::object_format::parse_config_value(&object_format)
+        .map(|kind| crate::internal::object_format::as_str(kind).to_string())
+        .map_err(|_| {
+            invalid_argument(
+                format!("unsupported object format '{object_format}'"),
+                suggest_object_format(&object_format)
+                    .map(|suggestion| format!("did you mean '{suggestion}'?")),
+            )
+        })
 }
 
 fn suggest_object_format(value: &str) -> Option<&'static str> {
-    (value == "sha265").then_some("sha256")
+    match value {
+        "sha265" | "sha-256" => Some("sha256"),
+        "blake" | "blake2" | "blak3" => Some("blake3"),
+        _ => None,
+    }
+}
+
+/// ADR-B3-01 Convert gate: only SHA-1 Git → SHA-1 Libra is allowed, and the
+/// check must run before any target layout/DB write.
+fn refuse_convert_object_format_combination(
+    source: &Path,
+    target_format: &str,
+) -> Result<(), InitError> {
+    let fresh_init_hint = Some(
+        "SHA-256/BLAKE3 Libra repositories can only be created with a fresh \
+         `libra init --object-format <format>` (Convert from Git is SHA-1 only)"
+            .to_string(),
+    );
+    if target_format != "sha1" {
+        return Err(InitError::ConvertObjectFormatForbidden {
+            message: format!(
+                "cannot convert a Git repository into a Libra repository with \
+                 --object-format {target_format}"
+            ),
+            hint: fresh_init_hint.clone(),
+        });
+    }
+
+    // Resolve worktree → `.git` (or bare root) before reading `config`.
+    let git_dir = convert::resolve_git_source_dir(source)?;
+    let source_kind = crate::internal::protocol::local_client::read_git_source_objectformat(
+        &git_dir,
+    )
+    .map_err(|error| match error {
+        crate::internal::protocol::local_client::GitSourceObjectFormatError::Unreadable(
+            message,
+        ) => InitError::Io(io::Error::other(message)),
+        crate::internal::protocol::local_client::GitSourceObjectFormatError::UnknownValue(
+            value,
+        ) => InitError::UnknownObjectFormat {
+            message: format!(
+                "source Git repository has unsupported extensions.objectformat '{value}'"
+            ),
+        },
+        crate::internal::protocol::local_client::GitSourceObjectFormatError::ExtensionWithoutV1 => {
+            InitError::UnknownObjectFormat {
+                message: "source Git repository sets extensions.objectformat without \
+                              core.repositoryformatversion=1"
+                    .to_string(),
+            }
+        }
+        crate::internal::protocol::local_client::GitSourceObjectFormatError::Corrupt(message) => {
+            InitError::UnknownObjectFormat { message }
+        }
+    })?;
+
+    if matches!(source_kind, git_internal::hash::HashKind::Sha256) {
+        return Err(InitError::ConvertObjectFormatForbidden {
+            message: "cannot convert a SHA-256 Git repository into Libra".to_string(),
+            hint: fresh_init_hint,
+        });
+    }
+    Ok(())
 }
 
 fn is_reinit(target_dir: &Path, bare: bool) -> bool {

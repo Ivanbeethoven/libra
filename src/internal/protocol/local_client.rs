@@ -627,6 +627,10 @@ impl LocalClient {
 
 /// Read `objectformat` from a foreign Git repository's `config`, defaulting to
 /// SHA-1 (the overwhelmingly common case for local Git remotes).
+///
+/// **Fail-open** on unknown/unreadable config — intentional pre-B3-12 behaviour
+/// consumed by clone/fetch/pull. Convert preflight must use
+/// [`parse_git_source_objectformat`] instead (B3-01 / ADR-B3-01).
 pub(crate) fn git_repo_hash_kind(repo_path: &Path) -> HashKind {
     if let Ok(text) = fs::read_to_string(repo_path.join("config")) {
         for line in text.lines() {
@@ -637,6 +641,94 @@ pub(crate) fn git_repo_hash_kind(repo_path: &Path) -> HashKind {
         }
     }
     HashKind::Sha1
+}
+
+/// Fail-closed Convert preflight errors for a foreign Git `config` text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitSourceObjectFormatError {
+    /// `[extensions] objectformat` present but `repositoryformatversion` is not 1.
+    ExtensionWithoutV1,
+    /// Value is not an exact lowercase `sha1` / `sha256` (Git has no blake3).
+    UnknownValue(String),
+    /// Config text could not be interpreted as Git config for this key.
+    Corrupt(String),
+    /// The Git `config` file could not be read.
+    Unreadable(String),
+}
+
+/// Strictly parse a foreign Git `config` blob for Convert object-format preflight.
+///
+/// Rules (ADR-B3-01 / B3-01; aligned with git `read_repository_format`):
+/// - does **not** follow `include` / `includeIf`;
+/// - `[extensions] objectformat` is only meaningful when
+///   `core.repositoryformatversion = 1`; if the key is present otherwise → error;
+/// - unknown values fail closed (never default to Sha1);
+/// - missing `objectformat` → [`HashKind::Sha1`].
+pub fn parse_git_source_objectformat(
+    config_text: &str,
+) -> Result<HashKind, GitSourceObjectFormatError> {
+    let mut section = String::new();
+    let mut repo_format_version: Option<String> = None;
+    let mut object_format: Option<String> = None;
+
+    for raw in config_text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let inner = &line[1..line.len() - 1];
+            // Strip subsection quotes: [extensions "foo"] → extensions
+            section = inner
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().trim_matches('"').to_string();
+        match (section.as_str(), key.as_str()) {
+            ("core", "repositoryformatversion") => {
+                repo_format_version = Some(value);
+            }
+            ("extensions", "objectformat") => {
+                // Last value wins (Git).
+                object_format = Some(value.to_ascii_lowercase());
+            }
+            _ => {}
+        }
+    }
+
+    let Some(format) = object_format else {
+        return Ok(HashKind::Sha1);
+    };
+
+    let version = repo_format_version.as_deref().unwrap_or("");
+    if version != "1" {
+        return Err(GitSourceObjectFormatError::ExtensionWithoutV1);
+    }
+
+    match format.as_str() {
+        "sha1" => Ok(HashKind::Sha1),
+        "sha256" => Ok(HashKind::Sha256),
+        other => Err(GitSourceObjectFormatError::UnknownValue(other.to_string())),
+    }
+}
+
+/// Read + strictly parse a foreign Git repository's object format for Convert.
+pub(crate) fn read_git_source_objectformat(
+    repo_path: &Path,
+) -> Result<HashKind, GitSourceObjectFormatError> {
+    let path = repo_path.join("config");
+    let text = fs::read_to_string(&path).map_err(|error| {
+        GitSourceObjectFormatError::Unreadable(format!("cannot read '{}': {error}", path.display()))
+    })?;
+    parse_git_source_objectformat(&text)
 }
 
 /// Read every ref a foreign Git repository advertises: loose `refs/**`,

@@ -29,6 +29,10 @@ libra config get core.objectformat
 cd "$RUN_DIR"
 libra init --object-format sha256 object-sha256
 cd object-sha256
+# ...
+cd ..
+libra init --object-format blake3 object-blake3
+cd object-blake3
 libra config get core.objectformat
 
 cd "$RUN_DIR"
@@ -51,7 +55,7 @@ cd "$RUN_DIR"
 ! libra init -b "bad branch" bad-branch-name
 ```
 
-断言：短/长 initial branch 参数都能通过 `branch` 或等价公开命令观察到初始分支；`core.objectformat` 分别为 `sha1` / `sha256`；`core.initrefformat` 分别为 `strict` / `filesystem`；非法 object/ref format 或非法分支名必须非 0 退出，并给出可理解的参数错误或修复提示。
+断言：短/长 initial branch 参数都能通过 `branch` 或等价公开命令观察到初始分支；`core.objectformat` 分别为 `sha1` / `sha256` / `blake3`；`core.initrefformat` 分别为 `strict` / `filesystem`；非法 object/ref format 或非法分支名必须非 0 退出，并给出可理解的参数错误或修复提示。
 
 补充可执行断言（对象格式与 ref 格式关键）：
 - `libra --json config get core.objectformat` 在 sha256 仓库中验证值为 "sha256"。
@@ -59,3 +63,6 @@ cd "$RUN_DIR"
 - 非法 `--object-format sha265` 的错误必须非 0，且包含 "unsupported object format" 或 LBR- 相关标识（捕获 stderr 验证）。
 - 所有 init 后立即 `libra fsck --connectivity-only` 通过。
 
+
+
+B3-01 补充：`libra init --from-git-repository <git> --object-format sha256|blake3` 以及源 Git `extensions.objectformat=sha256` 必须在写盘前以 `LBR-CLI-002` 拒绝；已有仓 `libra init --object-format <不同值>` 同样 `LBR-CLI-002`；未知已存格式为 `LBR-REPO-002`。

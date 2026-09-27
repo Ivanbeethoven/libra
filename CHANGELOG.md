@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### init / Convert / reinit object-format gates (B3-01)
+
+- Fresh `libra init --object-format blake3` is accepted and persists `core.objectformat=blake3`.
+- Convert (`--from-git-repository`) is SHA-1 Git → SHA-1 Libra only: sha256/blake3 targets and
+  sha256 Git sources fail closed with `LBR-CLI-002` before any target layout/DB write.
+- Reinit refuses a different `--object-format` with `LBR-CLI-002` (and unknown stored formats
+  with `LBR-REPO-002`) via a read-only, no-migration inspect before top-up.
+
 ## [0.23.67] — 2026-09-26
 
 ### remote / fetch / pull / push / credential / rerere Git alignment (issues/480)
@@ -251,6 +261,15 @@ Website pages were not updated (`../libra-backend` is a `.libra` checkout;
 ER-06a fail-closed).
 
 ## [Unreleased]
+
+### init / Convert / reinit object-format gates (B3-01)
+
+- Fresh `libra init --object-format blake3` is accepted and persists `core.objectformat=blake3`.
+- Convert (`--from-git-repository`) is SHA-1 Git → SHA-1 Libra only: sha256/blake3 targets and
+  sha256 Git sources fail closed with `LBR-CLI-002` before any target layout/DB write.
+- Reinit refuses a different `--object-format` with `LBR-CLI-002` (and unknown stored formats
+  with `LBR-REPO-002`) via a read-only, no-migration inspect before top-up.
+
 
 ## [0.24.0] — 2026-09-27
 

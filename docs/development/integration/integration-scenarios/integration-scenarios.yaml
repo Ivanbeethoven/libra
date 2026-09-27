@@ -281,7 +281,7 @@ scenarios:
   - id: cli.init-branch-and-format-options
     wave: 1
     group: init
-    purpose: "Cover -b/--initial-branch, --object-format (sha1/sha256), --ref-format (strict/filesystem) and negatives."
+    purpose: "Cover -b/--initial-branch, --object-format (sha1/sha256/blake3), --ref-format (strict/filesystem), Convert/reinit refuse gates, and negatives."
     gh_required: false
     requires_git: false
     key_assertion_categories: [json_envelope, fsck, negative_exit]

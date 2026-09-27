@@ -33,9 +33,10 @@ directories) and re-applying `--shared`, while preserving existing repository da
 configuration, `HEAD`, refs, objects, vault, and repository id are otherwise untouched.
 Opening the database can still apply schema migrations; preserving data does not
 mean preserving the old database schema.
-`--initial-branch` and `--object-format` are ignored (with a warning) when they
-differ from the existing repository, and `--from-git-repository` is rejected on an
-already-initialized repository.
+`--initial-branch` that differs from the existing HEAD is ignored (with a warning).
+A different `--object-format` is refused with `LBR-CLI-002` before any layout or
+database side effect. `--from-git-repository` is rejected on an already-initialized
+repository.
 
 Initializing a repository whose storage root is the Libra home itself (`$LIBRA_HOME`,
 default `~/.libra`), or a path inside the global configuration directory
@@ -129,11 +130,19 @@ libra init --initial-branch trunk
 
 ### `--object-format <FORMAT>`
 
-Set the object hash algorithm. Accepted values are `sha1` (default) and `sha256`.
+Set the object hash algorithm for a **fresh** repository. Accepted values are
+`sha1` (default), `sha256`, and `blake3` (Libra extension; not a Git object format).
 
 ```bash
 libra init --object-format sha256
+libra init --object-format blake3
 ```
+
+Convert (`--from-git-repository`) is SHA-1 Git → SHA-1 Libra only. Passing
+`--object-format sha256` or `blake3` with Convert, or converting a SHA-256 Git
+source, fails closed with `LBR-CLI-002` before any target write. Re-running
+`init` on an existing repository refuses a different `--object-format` the same
+way; create a new repository instead.
 
 ### `--from-git-repository <PATH>`
 

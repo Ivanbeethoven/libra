@@ -1,6 +1,8 @@
 //! Utilities for converting existing Git repositories into Libra repositories by reusing fetch and clone logic.
 //!
-//! `libra init --from-git-repository <path>` calls into this module after the empty
+//! `libra init --from-git-repository <path>` validates the source HEAD and
+//! object format (SHA-1→SHA-1 only; see ADR-B3-01 / `refuse_convert_object_format_combination`)
+//! before any target layout/DB write, then calls into this module after the empty
 //! Libra database has been bootstrapped. The conversion path treats the source Git
 //! repository as a remote named `origin`, runs a normal `fetch` and `setup_repository`
 //! against it, and then translates `.gitignore` files into `.libraignore` siblings so

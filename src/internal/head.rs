@@ -68,23 +68,39 @@ fn parse_ref_commit_for_kind(
     what: &str,
     repo_kind: HashKind,
 ) -> Result<ObjectHash, BranchStoreError> {
-    let commit = crate::internal::object_format::parse_repo_oid(raw).map_err(|error| {
-        BranchStoreError::Corrupt {
-            name: ref_name.to_string(),
-            detail: format!("invalid {what}: {error}"),
+    // Parse under the repository's explicit kind. Wrong-length hex is then
+    // re-parsed under the legacy length→kind map (40→sha1, 64→sha256) solely
+    // so the diagnostic can say "is X but this repository uses Y" — matching
+    // the pre-B3-08 FromStr contract without calling the banned production
+    // FromStr path (blake3 is never inferred from length).
+    match crate::internal::object_format::parse_hex_for_kind(repo_kind, raw) {
+        Ok(commit) => Ok(commit),
+        Err(primary) => {
+            let inferred = match raw.len() {
+                40 => crate::internal::object_format::parse_hex_for_kind(HashKind::Sha1, raw).ok(),
+                64 => {
+                    crate::internal::object_format::parse_hex_for_kind(HashKind::Sha256, raw).ok()
+                }
+                _ => None,
+            };
+            if let Some(commit) = inferred
+                && commit.kind() != repo_kind
+            {
+                return Err(BranchStoreError::Corrupt {
+                    name: ref_name.to_string(),
+                    detail: format!(
+                        "{what} is {:?} but this repository uses {:?}",
+                        commit.kind(),
+                        repo_kind
+                    ),
+                });
+            }
+            Err(BranchStoreError::Corrupt {
+                name: ref_name.to_string(),
+                detail: format!("invalid {what}: {primary}"),
+            })
         }
-    })?;
-    if commit.kind() != repo_kind {
-        return Err(BranchStoreError::Corrupt {
-            name: ref_name.to_string(),
-            detail: format!(
-                "{what} is {:?} but this repository uses {:?}",
-                commit.kind(),
-                repo_kind
-            ),
-        });
     }
-    Ok(commit)
 }
 
 fn decode_local_head(
@@ -118,21 +134,18 @@ async fn repository_hash_kind_with_conn<C: ConnectionTrait>(
                 "failed to read core.objectformat for HEAD: {error:#}"
             ))
         })?;
-    // Match CLI preflight exactly; HashKind::from_str also accepts noncanonical uppercase.
-    match entry
+    let value = entry
         .as_ref()
         .map(|entry| entry.value.as_str())
-        .unwrap_or("sha1")
-    {
-        "sha1" => Ok(HashKind::Sha1),
-        "sha256" => Ok(HashKind::Sha256),
-        value => Err(BranchStoreError::Corrupt {
+        .unwrap_or("sha1");
+    crate::internal::object_format::parse_config_value(value).map_err(|_| {
+        BranchStoreError::Corrupt {
             name: "core.objectformat".to_string(),
             detail: format!(
-                "unsupported repository object format '{value}'; expected 'sha1' or 'sha256'"
+                "unsupported repository object format '{value}'; expected 'sha1', 'sha256', or 'blake3'"
             ),
-        }),
-    }
+        }
+    })
 }
 
 impl Head {

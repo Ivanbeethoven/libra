@@ -216,23 +216,8 @@ async fn read_schema_free_object_format(
 }
 
 fn set_hash_kind_from_object_format(object_format: String) -> CliResult<()> {
-    let hash_kind = match object_format.as_str() {
-        "sha1" => HashKind::Sha1,
-        "sha256" => HashKind::Sha256,
-        // Explicit reject until B3-01 opens `init --object-format blake3`.
-        // Keeping a dedicated arm closes the preflight bypass window that a
-        // wildcard `_` would leave if a later edit added a soft fallback.
-        "blake3" => {
-            return Err(CliError::fatal(
-                "unsupported object format: 'blake3'".to_string(),
-            ));
-        }
-        _ => {
-            return Err(CliError::fatal(format!(
-                "unsupported object format: '{object_format}'"
-            )));
-        }
-    };
+    let hash_kind = crate::internal::object_format::parse_config_value(&object_format)
+        .map_err(|_| CliError::fatal(format!("unsupported object format: '{object_format}'")))?;
     set_hash_kind(hash_kind);
     Ok(())
 }

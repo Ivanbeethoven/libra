@@ -83,7 +83,7 @@ async fn scoped_head_rejects_unknown_or_noncanonical_object_format() {
         assert_eq!(
             error.to_string(),
             format!(
-                "stored branch reference 'core.objectformat' is corrupt: unsupported repository object format '{format}'; expected 'sha1' or 'sha256'"
+                "stored branch reference 'core.objectformat' is corrupt: unsupported repository object format '{format}'; expected 'sha1', 'sha256', or 'blake3'"
             )
         );
     }
