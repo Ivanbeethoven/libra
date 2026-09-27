@@ -289,6 +289,8 @@ pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度�
 合法的 `0000` flush 与未收到响应有明确区别；合法的空仓库广告仍受支持。
 不支持的 object-format capability 使用固定错误消息
 `Unsupported object format capability`，不回显远端提供的值。
+
+**本地 Git sha256 拒绝门（B3-12）：** 本地路径 Git 上游若 `objectformat=sha256`，在 fetch 阶段拒绝（`LBR-CLI-002`，退出码 129），不进入 merge/rebase。未知/损坏 → `LBR-REPO-002`；不可读 → `LBR-IO-001`。网络 Git sha256 暂缓（DEFER-B3-10）。覆盖：`pull_rejects_sha256_git_source`。
 请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。
 
 ## pkt-line 错误归类

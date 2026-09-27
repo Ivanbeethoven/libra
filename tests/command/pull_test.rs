@@ -1928,3 +1928,60 @@ async fn test_pull_repository_dot_merges() {
     let out = run_libra_command(&["pull", ".", cur.as_str()], p);
     assert_cli_success(&out, "pull . <branch>");
 }
+
+/// B3-12: rewrite a local Git repo's config to advertise `objectformat`.
+fn force_git_source_objectformat(repo: &Path, value: &str) {
+    let git_config = repo.join(".git").join("config");
+    let mut text = fs::read_to_string(&git_config).expect("read git config");
+    if text.contains("repositoryformatversion = 0") {
+        text = text.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    } else if !text.contains("repositoryformatversion = 1") {
+        text.push_str("\n[core]\n\trepositoryformatversion = 1\n");
+    }
+    text.push_str(&format!("\n[extensions]\n\tobjectformat = {value}\n"));
+    fs::write(&git_config, text).expect("write git config");
+}
+
+#[test]
+#[serial(cwd)]
+fn pull_rejects_sha256_git_source() {
+    use super::{create_committed_repo_via_cli, create_linear_git_repo, parse_cli_error_stderr};
+
+    let (git_src, _) = create_linear_git_repo(1);
+    force_git_source_objectformat(git_src.path(), "sha256");
+
+    let repo = create_committed_repo_via_cli();
+    configure_pull_tracking(repo.path(), git_src.path(), "main");
+
+    let head_before = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_cli_success(&head_before, "rev-parse before pull");
+    let head_oid = String::from_utf8_lossy(&head_before.stdout)
+        .trim()
+        .to_string();
+
+    let out = run_libra_command(&["--json", "pull"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "{report:?}");
+    assert!(
+        report.hints.iter().any(|h| h.contains("fresh")
+            || h.contains("libra init --object-format")
+            || h.contains("SHA-256/BLAKE3")),
+        "hint must point at fresh init: {:?}",
+        report.hints
+    );
+
+    let head_after = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_cli_success(&head_after, "rev-parse after pull");
+    assert_eq!(
+        String::from_utf8_lossy(&head_after.stdout).trim(),
+        head_oid,
+        "pull reject must leave HEAD unchanged"
+    );
+}

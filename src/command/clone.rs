@@ -348,12 +348,15 @@ fn uses_local_clone_semantics(args: &CloneArgs, remote_client: &fetch::RemoteCli
 }
 
 fn git_source_is_shallow(repo_path: &Path) -> bool {
-    ShallowSet::load_at_for_kind(
-        &repo_path.join("shallow"),
-        crate::internal::protocol::local_client::git_repo_hash_kind(repo_path),
-    )
-    .map(|set| !set.oids().is_empty())
-    .unwrap_or(true)
+    let Ok(hash_kind) = crate::internal::protocol::local_client::git_repo_hash_kind(repo_path)
+    else {
+        // Unknown/unreadable source config is rejected at discovery; treat as
+        // shallow here so local-clone shortcuts stay disabled.
+        return true;
+    };
+    ShallowSet::load_at_for_kind(&repo_path.join("shallow"), hash_kind)
+        .map(|set| !set.oids().is_empty())
+        .unwrap_or(true)
 }
 
 fn inspect_local_git_shallow(
@@ -361,10 +364,14 @@ fn inspect_local_git_shallow(
 ) -> Result<ShallowSet, ShallowError> {
     match remote_client {
         fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
-            ShallowSet::load_at_for_kind(
-                &client.repo_path().join("shallow"),
-                crate::internal::protocol::local_client::git_repo_hash_kind(client.repo_path()),
-            )
+            let config_path = client.repo_path().join("config");
+            let hash_kind =
+                crate::internal::protocol::local_client::git_repo_hash_kind(client.repo_path())
+                    .map_err(|error| ShallowError::Read {
+                        path: config_path.clone(),
+                        source: std::io::Error::other(error.to_string()),
+                    })?;
+            ShallowSet::load_at_for_kind(&client.repo_path().join("shallow"), hash_kind)
         }
         _ => Ok(ShallowSet::empty()),
     }
@@ -674,9 +681,18 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
                     )
             }
         },
+        fetch::FetchError::UnsupportedLocalGitSha256 => fetch::map_unsupported_local_git_sha256(),
+        fetch::FetchError::GitSourceConfig(error) => fetch::map_git_source_config_error(error),
         fetch::FetchError::Discovery {
             source: git_error, ..
         } => match git_error {
+            GitError::IOError(io_error)
+                if let Some(config_error) = io_error.get_ref().and_then(|inner| {
+                    inner.downcast_ref::<crate::internal::protocol::local_client::GitSourceConfigError>()
+                }) =>
+            {
+                fetch::map_git_source_config_error(config_error)
+            }
             GitError::UnAuthorized(_) => {
                 CliError::fatal(format!("remote discovery failed: {source}"))
                     .with_stable_code(StableErrorCode::AuthPermissionDenied)
@@ -804,6 +820,8 @@ fn map_fetch_error(source: fetch::FetchError) -> CliError {
                      shallow boundaries",
                 )
         }
+        fetch::FetchError::UnsupportedLocalGitSha256 => fetch::map_unsupported_local_git_sha256(),
+        fetch::FetchError::GitSourceConfig(error) => fetch::map_git_source_config_error(error),
         fetch::FetchError::RemoteBranchNotFound { .. } => CliError::fatal(source.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("the specified branch does not exist on the remote"),
@@ -1517,8 +1535,7 @@ async fn clone_into_destination(
         source,
     })?;
 
-    let object_format =
-        crate::internal::object_format::as_str(discovery.hash_kind).to_string();
+    let object_format = crate::internal::object_format::as_str(discovery.hash_kind).to_string();
 
     // --- Step 4: Initialize repository ---
     if !output.quiet && !output.is_json() {
@@ -2202,7 +2219,9 @@ mod tests {
         assert_eq!(cli.stable_code().as_str(), "LBR-REPO-003");
         assert_eq!(cli.exit_code(), 128);
         assert!(
-            cli.hints().iter().any(|hint| hint.as_str().contains("blake3")),
+            cli.hints()
+                .iter()
+                .any(|hint| hint.as_str().contains("blake3")),
             "clone map_fetch_error must surface blake3 extension hint: {:?}",
             cli.hints()
         );

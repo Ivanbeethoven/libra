@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.27.0] — 2026-09-27
+
+### Local Git sha256 source reject gate (B3-12)
+
+- `libra clone` / `fetch` / `pull` refuse **local-path Git** sources with
+  `extensions.objectformat=sha256` (`LBR-CLI-002`, exit 129) before any write;
+  hint points at fresh `libra init --object-format`.
+- Unknown/corrupt local Git `objectformat` → `LBR-REPO-002` (128); unreadable
+  config → `LBR-IO-001` (128). Shared `git_repo_hash_kind` is now fail-closed
+  (no silent Sha1 default).
+- Network Git sha256 sources remain deferred (DEFER-B3-10). Libra↔Libra sha256/
+  blake3 remotes are unaffected.
+
 ## [0.26.0] — 2026-09-27
 
 B3-07: protocol capability-first wire kind + Libra↔Libra blake3 negotiation.

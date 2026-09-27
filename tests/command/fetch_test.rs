@@ -2959,7 +2959,6 @@ async fn test_fetch_dot_reads_local_refs() {
     );
 }
 
-
 #[test]
 #[serial(cwd)]
 fn blake3_fetch_round_trip() {
@@ -3064,3 +3063,70 @@ fn protocol_object_format_mismatch_error_contract() {
     assert_cli_success(&clone_ok, "sha1 clone still works");
 }
 
+/// B3-12: rewrite a local Git repo's config to advertise `objectformat`.
+fn force_git_source_objectformat(repo: &Path, value: &str) {
+    let git_config = repo.join(".git").join("config");
+    let mut text = fs::read_to_string(&git_config).expect("read git config");
+    if text.contains("repositoryformatversion = 0") {
+        text = text.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    } else if !text.contains("repositoryformatversion = 1") {
+        text.push_str("\n[core]\n\trepositoryformatversion = 1\n");
+    }
+    text.push_str(&format!("\n[extensions]\n\tobjectformat = {value}\n"));
+    fs::write(&git_config, text).expect("write git config");
+}
+
+#[test]
+#[serial(cwd)]
+fn fetch_rejects_sha256_git_source() {
+    use super::{
+        assert_cli_success, create_linear_git_repo, init_repo_via_cli, parse_cli_error_stderr,
+        run_libra_command,
+    };
+
+    let (git_src, _) = create_linear_git_repo(1);
+    force_git_source_objectformat(git_src.path(), "sha256");
+
+    let dest = tempdir().expect("fetch reject dest");
+    init_repo_via_cli(dest.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", git_src.path().to_str().unwrap()],
+            dest.path(),
+        ),
+        "remote add",
+    );
+
+    let before_refs = dest.path().join(".libra").join("refs").join("remotes");
+    let before_exists = before_refs.exists();
+
+    let out = run_libra_command(&["--json", "fetch", "origin"], dest.path());
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "{report:?}");
+    assert!(
+        report.hints.iter().any(|h| h.contains("fresh")
+            || h.contains("libra init --object-format")
+            || h.contains("SHA-256/BLAKE3")),
+        "hint must point at fresh init: {:?}",
+        report.hints
+    );
+    assert_eq!(
+        before_refs.exists(),
+        before_exists,
+        "fetch must not write remote-tracking refs"
+    );
+    if before_refs.exists() {
+        assert!(
+            fs::read_dir(&before_refs).map(|d| d.count()).unwrap_or(0) == 0
+                || !before_refs.join("origin").exists(),
+            "no origin tracking refs after reject"
+        );
+    }
+}

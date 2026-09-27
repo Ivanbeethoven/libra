@@ -606,6 +606,8 @@ Every `CloneError` variant maps to an explicit `StableErrorCode` -- no message s
 
 Wire kind is capability-first: discovery reads `object-format` (default `sha1`) before validating OID width, so a 64-hex advertisement without the capability fails closed instead of inferring sha256. Libra↔Libra blake3 clones advertise/negotiate `object-format=blake3` and initialize the destination from the discovery kind. Format mismatch maps to `LBR-REPO-003` (exit 128) with a blake3-extension hint when either side is blake3. Covered by `blake3_clone_round_trip`, `clone_sha256_libra_local_remote_succeeds`, and `protocol_object_format_mismatch_error_contract`.
 
+**Local Git sha256 reject (B3-12):** a local-path Git source with `extensions.objectformat=sha256` is refused before any destination write (`LBR-CLI-002`, exit 129); create SHA-256/BLAKE3 Libra repositories with a fresh `libra init --object-format` instead. Unknown/corrupt source `objectformat` → `LBR-REPO-002`; unreadable config → `LBR-IO-001`. Network Git sha256 sources remain deferred (DEFER-B3-10). Covered by `clone_rejects_sha256_git_source` and `clone_rejects_unknown_git_source_format`.
+
 Init errors are transparently forwarded through `InitError -> CliError`.
 
 ### Cleanup Failure Visibility

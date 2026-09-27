@@ -334,6 +334,8 @@ lengths below four, and truncated payloads. A valid `0000` flush remains distinc
 from an absent response; a valid empty-repository advertisement is supported.
 An unsupported object-format capability reports the fixed message
 `Unsupported object format capability` without echoing its remote value.
+
+**Local Git sha256 reject (B3-12):** a local-path Git upstream with `objectformat=sha256` is refused in the fetch phase (`LBR-CLI-002`, exit 129) before merge/rebase. Unknown/corrupt → `LBR-REPO-002`; unreadable → `LBR-IO-001`. Network Git sha256 deferred (DEFER-B3-10). Covered by `pull_rejects_sha256_git_source`.
 Check that the URL points to a Git smart HTTP service and that a proxy has not
 truncated or replaced the response; then retry.
 

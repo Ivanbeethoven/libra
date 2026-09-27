@@ -52,7 +52,7 @@ use crate::{
             git_client::GitClient,
             https_client::HttpsClient,
             is_missing_shallow_capability, is_shallow_advertisement_changed,
-            local_client::LocalClient,
+            local_client::{GitSourceConfigError, LocalClient, git_repo_hash_kind},
             repository_arg, set_wire_hash_kind,
             ssh_client::{SshClient, is_ssh_spec},
         },
@@ -961,6 +961,12 @@ pub enum FetchError {
     UnsupportedShallowLocalLibra,
     #[error("failed to inspect local repository state: {message}")]
     LocalState { message: String },
+    /// Local-path Git source advertises `objectformat=sha256` (ADR-B3-01 / B3-12).
+    #[error("local Git repositories with objectformat=sha256 are not supported")]
+    UnsupportedLocalGitSha256,
+    /// Local-path Git `config` objectformat unknown/corrupt or unreadable (B3-12).
+    #[error("{0}")]
+    GitSourceConfig(GitSourceConfigError),
 }
 
 impl From<FetchError> for CliError {
@@ -1073,7 +1079,34 @@ impl From<FetchError> for CliError {
             FetchError::LocalState { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
             }
+            FetchError::UnsupportedLocalGitSha256 => map_unsupported_local_git_sha256(),
+            FetchError::GitSourceConfig(source) => map_git_source_config_error(source),
         }
+    }
+}
+
+/// Shared hint for ADR-B3-01 local Git sha256 reject (clone/fetch/pull).
+pub(crate) const LOCAL_GIT_SHA256_FRESH_INIT_HINT: &str = "SHA-256/BLAKE3 Libra repositories can only be created with a fresh \
+     `libra init --object-format <format>` (local Git sha256 sources cannot be \
+     cloned, fetched, or pulled)";
+
+pub(crate) fn map_unsupported_local_git_sha256() -> CliError {
+    CliError::command_usage("local Git repositories with objectformat=sha256 are not supported")
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint(LOCAL_GIT_SHA256_FRESH_INIT_HINT)
+}
+
+pub(crate) fn map_git_source_config_error(error: &GitSourceConfigError) -> CliError {
+    match error {
+        // Align with Convert's UnknownObjectFormat → LBR-REPO-002 (RepoCorrupt).
+        GitSourceConfigError::UnknownOrCorrupt { detail } => CliError::fatal(detail.clone())
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint(
+                "fix the source Git repository's config objectformat, or use a SHA-1 Git source",
+            ),
+        GitSourceConfigError::Unreadable { detail } => CliError::fatal(detail.clone())
+            .with_stable_code(StableErrorCode::IoReadFailed)
+            .with_hint("check filesystem permissions on the source Git repository config"),
     }
 }
 
@@ -1093,6 +1126,13 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
             CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::AuthPermissionDenied)
                 .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
+        }
+        GitError::IOError(error)
+            if let Some(config_error) = error.get_ref().and_then(|inner| {
+                inner.downcast_ref::<GitSourceConfigError>()
+            }) =>
+        {
+            map_git_source_config_error(config_error)
         }
         GitError::NetworkError(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::NetworkUnavailable)
@@ -1658,6 +1698,17 @@ pub(crate) async fn discover_remote_with_name(
             reason,
         }
     })?;
+    // B3-12: reject local-path Git sha256 / unknown / unreadable config before
+    // discovery mutates anything. Network Git sha256 remains DEFER-B3-10.
+    if let RemoteClient::Local(client) = &remote_client
+        && !client.is_libra_source()
+    {
+        match git_repo_hash_kind(client.repo_path()) {
+            Ok(HashKind::Sha256) => return Err(FetchError::UnsupportedLocalGitSha256),
+            Ok(_) => {}
+            Err(error) => return Err(FetchError::GitSourceConfig(error)),
+        }
+    }
     let discovery = remote_client
         .discovery_reference(UploadPack)
         .await

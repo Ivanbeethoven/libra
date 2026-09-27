@@ -342,6 +342,8 @@ pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度�
 
 线格式为 capability-first（`object-format`，缺省 sha1）；OID 长度不决定算法。blake3 远端广告 `object-format=blake3`（Libra 扩展）。重复/冲突的 `object-format` capability fail-closed。本地 blake3 对远端 sha1/sha256 的 fetch 返回 `LBR-REPO-003` / 退出码 128。覆盖测试：`parse_discovery_does_not_infer_sha256_from_64_hex`、`blake3_fetch_round_trip`、`protocol_object_format_mismatch_error_contract`。
 
+**本地 Git sha256 拒绝门（B3-12）：** 本地路径 Git 远端若 `objectformat=sha256`，在任何 fetch 写入前拒绝（`LBR-CLI-002`，退出码 129）。未知/损坏 → `LBR-REPO-002`；不可读 → `LBR-IO-001`。网络 Git sha256 暂缓（DEFER-B3-10）。覆盖：`fetch_rejects_sha256_git_source`。
+
 fetch discovery 对空广告或畸形 pkt-line 响应返回 `LBR-NET-002`，不回显标头或
 payload 字节。普通网络故障仍返回 `LBR-NET-001`；遇到协议错误时，请先检查 Git
 服务及代理返回的响应，再重试。

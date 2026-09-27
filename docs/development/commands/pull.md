@@ -342,3 +342,7 @@ Pull 复用 fetch 的 SSH discovery 分类：首个 pkt-line 标头零字节 EOF
 启发式可被 stderr 伪造，不断言拒绝访问的具体原因。
 迁移窗口从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚）；窗口内
 自动化应同时接受该失败的 `LBR-AUTH-002` 与旧 `LBR-NET-002`。
+
+## B3-12 local Git sha256 reject
+
+See the user-facing `pull` page for the local-path Git `objectformat=sha256` reject (`LBR-CLI-002`), unknown/corrupt (`LBR-REPO-002`), and unreadable (`LBR-IO-001`) mappings. Network Git sha256 remains DEFER-B3-10. Named tests: `pull_rejects_sha256_git_source`.

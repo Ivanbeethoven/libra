@@ -883,3 +883,7 @@ blake3_fetch_round_trip	lane:cwd	B3-07 Libra↔Libra blake3 fetch round-trip; se
 blake3_push_round_trip	lane:cwd	B3-07 Libra↔Libra blake3 push round-trip; serial(cwd) while spawning CLI subprocesses
 clone_sha256_libra_local_remote_succeeds	lane:cwd	B3-07 sha256 Libra local clone positive control; serial(cwd) while spawning CLI subprocesses
 protocol_object_format_mismatch_error_contract	lane:cwd	B3-07 object-format mismatch stable-code contract across fetch/pull/remote/push; serial(cwd) while spawning CLI subprocesses
+clone_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 clone reject; serial(cwd) while spawning CLI subprocesses
+clone_rejects_unknown_git_source_format	lane:cwd	B3-12 local Git unknown/unreadable objectformat reject; serial(cwd) while spawning CLI subprocesses
+fetch_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 fetch reject; serial(cwd) while spawning CLI subprocesses
+pull_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 pull reject; serial(cwd) while spawning CLI subprocesses

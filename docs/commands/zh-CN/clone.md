@@ -400,6 +400,8 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 
 线格式为 capability-first：discovery 先读 `object-format`（缺省 `sha1`）再校验 OID 宽度；无 capability 的 64-hex 广告 fail-closed，不再按长度推断 sha256。Libra↔Libra blake3 clone 协商 `object-format=blake3`，并以 discovery kind 初始化目标仓。格式不匹配映射 `LBR-REPO-003`（退出码 128），任一侧为 blake3 时附带扩展提示。覆盖测试：`blake3_clone_round_trip`、`clone_sha256_libra_local_remote_succeeds`、`protocol_object_format_mismatch_error_contract`。
 
+**本地 Git sha256 拒绝门（B3-12）：** 本地路径 Git 源若 `extensions.objectformat=sha256`，在任何目标写入前拒绝（`LBR-CLI-002`，退出码 129）；SHA-256/BLAKE3 Libra 仓请用 `libra init --object-format` 新建。未知/损坏 `objectformat` → `LBR-REPO-002`；不可读 config → `LBR-IO-001`。网络 Git sha256 暂缓（DEFER-B3-10）。覆盖：`clone_rejects_sha256_git_source`、`clone_rejects_unknown_git_source_format`。
+
 Init 错误会通过 `InitError -> CliError` 透明转发。
 
 ### 清理失败可见性

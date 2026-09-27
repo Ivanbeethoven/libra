@@ -1099,6 +1099,8 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         fetch::FetchError::LocalState { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
         }
+        fetch::FetchError::UnsupportedLocalGitSha256 => fetch::map_unsupported_local_git_sha256(),
+        fetch::FetchError::GitSourceConfig(error) => fetch::map_git_source_config_error(error),
     }
 }
 
@@ -1118,6 +1120,13 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
             CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::AuthPermissionDenied)
                 .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
+        }
+        GitError::IOError(error)
+            if let Some(config_error) = error.get_ref().and_then(|inner| {
+                inner.downcast_ref::<crate::internal::protocol::local_client::GitSourceConfigError>()
+            }) =>
+        {
+            fetch::map_git_source_config_error(config_error)
         }
         GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
             CliError::fatal(message)

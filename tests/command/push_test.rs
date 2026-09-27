@@ -2968,7 +2968,6 @@ async fn test_push_dot_updates_local_nondestructive_ref() {
     );
 }
 
-
 #[test]
 #[serial(cwd)]
 fn blake3_push_round_trip() {

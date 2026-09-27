@@ -772,8 +772,7 @@ mod test {
         );
 
         set_wire_hash_kind(HashKind::Sha256);
-        let sha256_body =
-            generate_upload_pack_content(&[], &["1".repeat(64)], &[], None);
+        let sha256_body = generate_upload_pack_content(&[], &["1".repeat(64)], &[], None);
         let sha256_text = String::from_utf8_lossy(&sha256_body);
         assert!(
             sha256_text.contains("object-format=sha256"),
@@ -785,8 +784,7 @@ mod test {
         );
 
         set_wire_hash_kind(HashKind::Blake3);
-        let blake3_body =
-            generate_upload_pack_content(&[], &["1".repeat(64)], &[], None);
+        let blake3_body = generate_upload_pack_content(&[], &["1".repeat(64)], &[], None);
         let blake3_text = String::from_utf8_lossy(&blake3_body);
         assert!(
             blake3_text.contains("object-format=blake3"),

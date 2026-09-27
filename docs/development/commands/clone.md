@@ -364,3 +364,7 @@ fetch-objects/send-pack 进程与其它坏帧继续走原协议分类。命令�
 ## B3-07 capability-first wire kind
 
 See the user-facing command page for capability-first discovery, `object-format=blake3` negotiation, and mismatch stable codes. Named tests: `parse_discovery_does_not_infer_sha256_from_64_hex`, `blake3_*_round_trip`, `protocol_object_format_mismatch_error_contract`.
+
+## B3-12 local Git sha256 reject
+
+See the user-facing `clone` page for the local-path Git `objectformat=sha256` reject (`LBR-CLI-002`), unknown/corrupt (`LBR-REPO-002`), and unreadable (`LBR-IO-001`) mappings. Network Git sha256 remains DEFER-B3-10. Named tests: `clone_rejects_sha256_git_source`, `clone_rejects_unknown_git_source_format`.

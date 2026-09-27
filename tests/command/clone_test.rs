@@ -2787,11 +2787,12 @@ fn test_clone_depth_status_not_gone_with_tag() {
     );
 }
 
-
 #[test]
 #[serial(cwd)]
 fn blake3_clone_round_trip() {
-    use crate::command::{assert_cli_success, create_committed_repo_with_format, run_libra_command};
+    use crate::command::{
+        assert_cli_success, create_committed_repo_with_format, run_libra_command,
+    };
 
     let source = create_committed_repo_with_format("blake3");
     let dest_root = tempdir().expect("clone dest root");
@@ -2819,7 +2820,9 @@ fn blake3_clone_round_trip() {
 #[test]
 #[serial(cwd)]
 fn clone_sha256_libra_local_remote_succeeds() {
-    use crate::command::{assert_cli_success, create_committed_repo_with_format, run_libra_command};
+    use crate::command::{
+        assert_cli_success, create_committed_repo_with_format, run_libra_command,
+    };
 
     let source = create_committed_repo_with_format("sha256");
     let dest_root = tempdir().expect("sha256 clone dest root");
@@ -2835,8 +2838,127 @@ fn clone_sha256_libra_local_remote_succeeds() {
     assert_cli_success(&out, "sha256 Libra local clone positive control");
     let format = run_libra_command(&["config", "--get", "core.objectformat"], &dest);
     assert_cli_success(&format, "read sha256 objectformat");
-    assert_eq!(
-        String::from_utf8_lossy(&format.stdout).trim(),
-        "sha256"
+    assert_eq!(String::from_utf8_lossy(&format.stdout).trim(), "sha256");
+}
+
+/// B3-12: rewrite a local Git repo's config to advertise `objectformat`.
+fn force_git_source_objectformat(repo: &std::path::Path, value: &str) {
+    let git_config = repo.join(".git").join("config");
+    let mut text = fs::read_to_string(&git_config).expect("read git config");
+    if text.contains("repositoryformatversion = 0") {
+        text = text.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    } else if !text.contains("repositoryformatversion = 1") {
+        text.push_str("\n[core]\n\trepositoryformatversion = 1\n");
+    }
+    text.push_str(&format!("\n[extensions]\n\tobjectformat = {value}\n"));
+    fs::write(&git_config, text).expect("write git config");
+}
+
+#[test]
+#[serial(cwd)]
+fn clone_rejects_sha256_git_source() {
+    use crate::command::{
+        assert_cli_success, create_linear_git_repo, parse_cli_error_stderr, run_libra_command,
+    };
+
+    // Positive control: unmodified SHA-1 Git source still clones (AC10).
+    let (sha1_src, _) = create_linear_git_repo(1);
+    let sha1_dest_root = tempdir().expect("sha1 clone dest root");
+    let sha1_dest = sha1_dest_root.path().join("sha1-ok");
+    let ok = run_libra_command(
+        &[
+            "clone",
+            sha1_src.path().to_str().unwrap(),
+            sha1_dest.to_str().unwrap(),
+        ],
+        sha1_dest_root.path(),
     );
+    assert_cli_success(&ok, "SHA-1 local Git clone positive control");
+    assert!(
+        sha1_dest.join(".libra").exists(),
+        "sha1 clone writes .libra"
+    );
+
+    let (git_src, _) = create_linear_git_repo(1);
+    force_git_source_objectformat(git_src.path(), "sha256");
+
+    let dest_root = tempdir().expect("sha256 reject dest root");
+    let dest = dest_root.path().join("sha256-reject");
+    let out = run_libra_command(
+        &[
+            "--json",
+            "clone",
+            git_src.path().to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "{report:?}");
+    assert!(
+        report.hints.iter().any(|h| h.contains("fresh")
+            || h.contains("libra init --object-format")
+            || h.contains("SHA-256/BLAKE3")),
+        "hint must point at fresh init: {:?}",
+        report.hints
+    );
+    assert!(!dest.join(".libra").exists(), "zero-write: no .libra");
+    assert!(!dest.exists() || fs::read_dir(&dest).map(|d| d.count()).unwrap_or(0) == 0);
+}
+
+#[test]
+#[serial(cwd)]
+fn clone_rejects_unknown_git_source_format() {
+    use crate::command::{create_linear_git_repo, parse_cli_error_stderr, run_libra_command};
+
+    // Unknown objectformat → LBR-REPO-002 / 128, zero write.
+    {
+        let (git_src, _) = create_linear_git_repo(1);
+        force_git_source_objectformat(git_src.path(), "not-a-hash");
+        let dest_root = tempdir().expect("unknown format dest root");
+        let dest = dest_root.path().join("unknown-reject");
+        let out = run_libra_command(
+            &[
+                "--json",
+                "clone",
+                git_src.path().to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ],
+            dest_root.path(),
+        );
+        assert_eq!(out.status.code(), Some(128), "{:?}", out);
+        let (_human, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-REPO-002", "{report:?}");
+        assert!(!dest.join(".libra").exists(), "zero-write: no .libra");
+    }
+
+    // Unreadable config → LBR-IO-001 / 128, zero write.
+    {
+        let (git_src, _) = create_linear_git_repo(1);
+        let git_config = git_src.path().join(".git").join("config");
+        fs::remove_file(&git_config).expect("remove config");
+        fs::create_dir(&git_config).expect("directory-as-config");
+        let dest_root = tempdir().expect("unreadable config dest root");
+        let dest = dest_root.path().join("unreadable-reject");
+        let out = run_libra_command(
+            &[
+                "--json",
+                "clone",
+                git_src.path().to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ],
+            dest_root.path(),
+        );
+        assert_eq!(out.status.code(), Some(128), "{:?}", out);
+        let (_human, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-IO-001", "{report:?}");
+        assert!(!dest.join(".libra").exists(), "zero-write: no .libra");
+    }
 }
