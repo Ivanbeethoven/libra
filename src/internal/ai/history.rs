@@ -471,17 +471,20 @@ fn parse_cleanup_index_roots(
         .with_context(|| format!("{what} entry count exceeds this platform"))?;
     let checksum_start = bytes.len() - hash_bytes;
     let expected_checksum = &bytes[checksum_start..];
-    let checksum_matches = match hash_bytes {
-        20 => {
-            use sha1::Digest as _;
-            sha1::Sha1::digest(&bytes[..checksum_start]).as_slice() == expected_checksum
-        }
+    let kind = match hash_bytes {
+        20 => git_internal::hash::HashKind::Sha1,
         32 => {
-            use sha2::Digest as _;
-            sha2::Sha256::digest(&bytes[..checksum_start]).as_slice() == expected_checksum
+            // 32-byte tails are shared by sha256 and blake3; prefer the process
+            // hash kind when it matches the width, else sha256 (legacy AI cleanup).
+            match git_internal::hash::get_hash_kind() {
+                git_internal::hash::HashKind::Blake3 => git_internal::hash::HashKind::Blake3,
+                _ => git_internal::hash::HashKind::Sha256,
+            }
         }
-        _ => false,
+        _ => bail!("{what} uses unsupported {hash_bytes}-byte object ids"),
     };
+    let computed = crate::internal::object_format::digest(kind, &bytes[..checksum_start]);
+    let checksum_matches = computed.as_ref() == expected_checksum;
     if !checksum_matches {
         bail!("{what} checksum does not match the held file bytes");
     }
@@ -7177,6 +7180,40 @@ mod tests {
         assert!(
             super::parse_cleanup_index_roots(&patched, 20, "held index").is_err(),
             "unknown extended bits must fail closed"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hash_kind)]
+    fn history_cleanup_index_roots_blake3_checksum() {
+        use git_internal::{
+            hash::{HashKind, ObjectHash, set_hash_kind_for_test},
+            internal::index::{Index as GitIndex, IndexEntry},
+        };
+
+        let _guard = set_hash_kind_for_test(HashKind::Blake3);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("held-index-blake3");
+        let mut index = GitIndex::new();
+        let oid = ObjectHash::from_bytes_for_kind(HashKind::Blake3, &[0x42u8; 32]).unwrap();
+        let entry = IndexEntry::new_from_blob("blake3.txt".to_string(), oid, 3);
+        index.update(entry);
+        index.to_file(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let roots = super::parse_cleanup_index_roots(&bytes, 32, "held blake3 index")
+            .expect("blake3 index checksum must validate via helper digest");
+        let expected: std::collections::HashSet<String> =
+            std::iter::once(oid.to_string()).collect();
+        assert_eq!(roots, expected);
+
+        // Flip a checksum byte → fail closed.
+        let mut patched = bytes.clone();
+        let last = patched.len() - 1;
+        patched[last] ^= 0xff;
+        assert!(
+            super::parse_cleanup_index_roots(&patched, 32, "held blake3 index").is_err(),
+            "corrupt blake3 index checksum must fail"
         );
     }
 }

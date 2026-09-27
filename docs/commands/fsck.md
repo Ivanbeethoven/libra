@@ -343,3 +343,7 @@ Libra supports both SHA1 and SHA256 hash algorithms, determined by repository co
 
 By default, objects mentioned in reflogs are considered reachable and not reported as dangling.
 Use `--no-reflogs` to exclude reflog entries from reachability analysis.
+
+## Blake3 repositories
+
+`fsck` verifies loose-object and pack trailers with the repository object hash algorithm, including BLAKE3 when `core.objectformat=blake3`.

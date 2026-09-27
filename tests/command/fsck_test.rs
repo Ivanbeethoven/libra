@@ -1464,3 +1464,83 @@ fn test_fsck_reports_broken_links_matrix_corrupt_shallow() {
         "must mention corrupt shallow metadata: {combined}"
     );
 }
+
+#[test]
+fn fsck_blake3_clean_repo() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--vault", "false", "--object-format", "blake3"],
+            repo.path(),
+        ),
+        "blake3 init",
+    );
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("file.txt"), "blake3 fsck\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file.txt"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tip", "--no-verify"], repo.path()),
+        "commit",
+    );
+
+    let full = run_libra_command(&["fsck"], repo.path());
+    assert_cli_success(&full, "fsck clean blake3");
+    let conn = run_libra_command(&["fsck", "--connectivity-only"], repo.path());
+    assert_cli_success(&conn, "fsck --connectivity-only blake3");
+}
+
+#[test]
+fn fsck_blake3_hash_mismatch() {
+    let repo = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--vault", "false", "--object-format", "blake3"],
+            repo.path(),
+        ),
+        "blake3 init",
+    );
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("a.txt"), "content-a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], repo.path()), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tip", "--no-verify"], repo.path()),
+        "commit",
+    );
+
+    let blob_a = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "HEAD:a.txt"], repo.path()).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(blob_a.len(), 64);
+
+    // Write a different blob and transplant its loose bytes onto blob_a's path.
+    fs::write(repo.path().join("b.txt"), "content-b-different\n").unwrap();
+    let blob_b = String::from_utf8_lossy(
+        &run_libra_command(&["hash-object", "-w", "b.txt"], repo.path()).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_ne!(blob_a, blob_b);
+
+    let objects = repo.path().join(".libra").join("objects");
+    let path_a = objects.join(&blob_a[0..2]).join(&blob_a[2..]);
+    let path_b = objects.join(&blob_b[0..2]).join(&blob_b[2..]);
+    assert!(path_a.exists() && path_b.exists());
+    fs::copy(&path_b, &path_a).unwrap();
+
+    let output = run_libra_command(&["fsck"], repo.path());
+    assert!(
+        !output.status.success(),
+        "fsck must fail on blake3 hash mismatch"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("hash mismatch") || combined.contains("HashMismatch"),
+        "must report hash mismatch (BLAKE3 digest), got: {combined}"
+    );
+}

@@ -18,6 +18,14 @@
   (not the SHA-1 Git-stable combiner).
 - Worktree I/O helper `apply_hash_kind` accepts `blake3` (no longer silently folds to SHA-1).
 
+### fsck / index fingerprint blake3 (B3-03)
+
+- `fsck` verifies object hashes via `object_format::digest` for sha1/sha256/blake3
+  (removed ring `_ => SHA1` wildcard).
+- AI history cleanup index checksum validation uses the helper digest for 32-byte tails
+  under blake3 process kind.
+
+
 
 ## [0.23.67] — 2026-09-26
 
