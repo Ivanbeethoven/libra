@@ -261,7 +261,7 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
             maybe_test_slow_object_read(&oid);
-            apply_hash_kind(&hash_kind);
+            apply_hash_kind(&hash_kind)?;
             let outcome = match object_store_capability.as_ref() {
                 Some(capability) => read_object_blob_request(&oid, capability, byte_limit),
                 None => Err(ObjectBlobStatus::Unavailable),
@@ -473,7 +473,7 @@ fn hash_file_blob_beneath_with_session(
     hash_kind: &str,
     root_session: Option<u64>,
 ) -> io::Result<git_internal::hash::ObjectHash> {
-    apply_hash_kind(hash_kind);
+    apply_hash_kind(hash_kind)?;
     let stat = crate::utils::beneath::lstat_beneath(root, relative)?;
     if stat.is_symlink {
         let target = crate::utils::beneath::read_symlink_beneath(root, relative)?;
@@ -567,12 +567,15 @@ fn hash_lfs_file_handle(file: &std::fs::File, length: u64) -> io::Result<(String
     Ok((hex::encode(hasher.finish().as_ref()), total))
 }
 
-fn apply_hash_kind(kind: &str) {
-    // Route through `object_format::parse_config_value` so blake3 is not
-    // silently folded into Sha1 (B3-02 unblock; B3-04 may tighten unknown).
-    let parsed = crate::internal::object_format::parse_config_value(kind)
-        .unwrap_or(git_internal::hash::HashKind::Sha1);
+fn apply_hash_kind(kind: &str) -> io::Result<()> {
+    let parsed = crate::internal::object_format::parse_config_value(kind).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported hash_kind '{kind}' (expected sha1|sha256|blake3)"),
+        )
+    })?;
     git_internal::hash::set_hash_kind(parsed);
+    Ok(())
 }
 
 fn maybe_test_kill_after_checkpoint(seq: u64) {
@@ -710,4 +713,23 @@ pub(crate) fn write_object_blob_outcome(
 
 fn write_raw_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     crate::internal::worktree_io::protocol::write_raw_frame(writer, payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_hash_kind;
+
+    #[test]
+    fn worktree_io_unknown_format_errors() {
+        let err = apply_hash_kind("not-a-hash").expect_err("unknown must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unsupported hash_kind"),
+            "got: {err}"
+        );
+        // Valid tags still apply.
+        apply_hash_kind("blake3").expect("blake3 ok");
+        apply_hash_kind("sha256").expect("sha256 ok");
+        apply_hash_kind("sha1").expect("sha1 ok");
+    }
 }

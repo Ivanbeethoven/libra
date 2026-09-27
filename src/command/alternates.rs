@@ -105,11 +105,7 @@ fn resolve_objects_dir(input: &str) -> CliResult<PathBuf> {
 }
 
 fn this_object_format() -> String {
-    match git_internal::hash::get_hash_kind() {
-        git_internal::hash::HashKind::Sha1 => "sha1".to_string(),
-        git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
-        git_internal::hash::HashKind::Blake3 => "blake3".to_string(),
-    }
+    crate::internal::object_format::as_str(git_internal::hash::get_hash_kind()).to_string()
 }
 
 /// The foreign repo's `libra.db` path (`<repo>/.libra/libra.db`), or None if
@@ -137,27 +133,29 @@ async fn read_foreign_config(objects_dir: &Path) -> Result<Option<(String, bool)
     let conn = sea_orm::Database::connect(options)
         .await
         .map_err(|e| format!("cannot open the base repo's config database: {e}"))?;
-    // objectformat (config table; default sha1).
+    // Prefer `config_kv` (same store as CLI preflight / init). Empty or unknown
+    // values fail closed — never default to sha1 for a Libra DB that has a row.
     let fmt_row = conn
         .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT value FROM config WHERE name = 'objectformat' AND configuration = 'core' \
-             LIMIT 1"
-                .to_string(),
+            "SELECT value FROM config_kv WHERE key = 'core.objectformat' LIMIT 1".to_string(),
         ))
         .await
         .map_err(|e| format!("cannot read the base repo's objectformat: {e}"))?;
     let objectformat = match fmt_row {
-        Some(row) => row
-            .try_get_by_index::<String>(0)
-            .map(|v| {
-                if v.trim().is_empty() {
-                    "sha1".into()
-                } else {
-                    v
-                }
-            })
-            .unwrap_or_else(|_| "sha1".to_string()),
+        Some(row) => {
+            let value = row
+                .try_get_by_index::<String>(0)
+                .map_err(|e| format!("cannot decode the base repo's objectformat: {e}"))?;
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err("base repo has an empty core.objectformat".to_string());
+            }
+            crate::internal::object_format::parse_config_value(trimmed)
+                .map(|kind| crate::internal::object_format::as_str(kind).to_string())
+                .map_err(|_| format!("base repo has unsupported core.objectformat '{trimmed}'"))?
+        }
+        // Missing key on a Libra DB → treat as legacy sha1 default (preflight does the same).
         None => "sha1".to_string(),
     };
     // tiered? (config_kv LIBRA_STORAGE_TYPE = s3/r2).

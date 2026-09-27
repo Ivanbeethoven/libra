@@ -25,6 +25,13 @@
 - AI history cleanup index checksum validation uses the helper digest for 32-byte tails
   under blake3 process kind.
 
+### worker / alternates / obliteration kind strings (B3-04)
+
+- Worktree I/O `apply_hash_kind` fails closed on unknown kind strings (no silent SHA-1 fallback).
+- Alternates read the base repo's `config_kv` `core.objectformat` and refuse cross-kind /
+  unknown-format borrows.
+
+
 
 
 ## [0.23.67] — 2026-09-26

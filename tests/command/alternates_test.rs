@@ -590,3 +590,66 @@ fn a_positional_prune_does_not_retire_a_borrower_through_an_alias() {
         String::from_utf8_lossy(&gc.stdout)
     );
 }
+
+#[test]
+fn alternates_rejects_cross_kind_blake3() {
+    let (base, _oid) = committed_repo("sha1-base");
+    let borrower = tempfile::tempdir().expect("borrower");
+    let bp = borrower.path();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--vault", "false", "--object-format", "blake3"],
+            bp,
+        ),
+        "init blake3 borrower",
+    );
+    let out = run_libra_command(&["alternates", "add", &objects_dir(base.path())], bp);
+    assert_ne!(out.status.code(), Some(0), "cross-kind borrow must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("objectformat") || stderr.contains("blake3"),
+        "must mention format mismatch: {stderr}"
+    );
+}
+
+#[test]
+fn alternates_rejects_unknown_base_format() {
+    use sea_orm::{ConnectionTrait, Database};
+
+    let (base, _oid) = committed_repo("poison-base");
+    let db_path = base.path().join(".libra/libra.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let db = Database::connect(&url).await.expect("connect");
+        db.execute_unprepared(
+            "UPDATE config_kv SET value='not-a-real-format' WHERE key='core.objectformat'",
+        )
+        .await
+        .expect("poison");
+        db.close().await.ok();
+    });
+
+    let borrower = tempfile::tempdir().expect("borrower");
+    let bp = borrower.path();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], bp),
+        "init",
+    );
+    let out = run_libra_command(&["alternates", "add", &objects_dir(base.path())], bp);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "unknown base format must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported")
+            || stderr.contains("objectformat")
+            || stderr.contains("refusing"),
+        "must refuse unknown base format: {stderr}"
+    );
+}

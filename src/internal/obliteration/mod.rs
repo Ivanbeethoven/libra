@@ -225,11 +225,7 @@ pub fn is_tombstoned_cached(hash: &ObjectHash) -> bool {
 }
 
 fn hash_kind_str() -> &'static str {
-    match git_internal::hash::get_hash_kind() {
-        git_internal::hash::HashKind::Sha1 => "sha1",
-        git_internal::hash::HashKind::Sha256 => "sha256",
-        git_internal::hash::HashKind::Blake3 => "blake3",
-    }
+    crate::internal::object_format::as_str(git_internal::hash::get_hash_kind())
 }
 
 /// Loose-object payload path for `hash` (`.libra/objects/ab/cdef…`).
