@@ -6,7 +6,7 @@ use std::{
 
 use git_internal::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::types::ObjectType,
@@ -122,7 +122,7 @@ fn build_index_v2_inner(
     let err = Arc::new(Mutex::new(None));
     let err_c = err.clone();
     let commit_edges = collect_edges
-        .then(|| PackCommitEdges::new(parent, get_hash_kind()))
+        .then(|| PackCommitEdges::new(parent, git_internal::hash::get_hash_kind()))
         .transpose()?
         .map(|spool| Arc::new(Mutex::new(spool)));
     let commit_edges_c = commit_edges.clone();

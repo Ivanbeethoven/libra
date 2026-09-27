@@ -35,7 +35,6 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    str::FromStr,
     sync::{Arc, OnceLock, mpsc},
     time::{Duration, Instant},
 };
@@ -44,7 +43,7 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(test)]
 use git_internal::internal::object::types::ObjectType;
 use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::object::{
         ObjectTrait,
         commit::Commit,
@@ -742,7 +741,7 @@ pub fn run_checkpoint_object_io_helper(input: &[u8]) -> Result<Vec<u8>> {
                         message: format!("unsupported checkpoint read type '{expected_type}'"),
                     }
                 } else {
-                    match ObjectHash::from_str(&oid) {
+                    match crate::internal::object_format::parse_repo_oid(&oid) {
                         Err(error) => CheckpointObjectIoHelperResponse::Error {
                             message: format!("invalid checkpoint object id '{oid}': {error}"),
                         },
@@ -837,7 +836,7 @@ pub fn run_checkpoint_object_io_helper(input: &[u8]) -> Result<Vec<u8>> {
                     .collect::<Vec<_>>();
                 match parse_cataloged_traces_commits(&cataloged_commits).and_then(
                     |cataloged_commits| {
-                        let head = ObjectHash::from_str(&head)
+                        let head = crate::internal::object_format::parse_repo_oid(&head)
                             .map_err(|error| anyhow!("invalid traces snapshot head: {error}"))?;
                         checkpoint_snapshot_durable_oids_from_head(
                             &repo_path,
@@ -1364,7 +1363,7 @@ impl HistoryManager {
 
         match ref_model {
             Some(model) => match model.commit {
-                Some(commit_hash) => ObjectHash::from_str(&commit_hash)
+                Some(commit_hash) => crate::internal::object_format::parse_repo_oid(&commit_hash)
                     .map(Some)
                     .map_err(|e| anyhow!("Invalid commit hash in DB: {}", e)),
                 None => Ok(None),
@@ -1390,7 +1389,7 @@ impl HistoryManager {
         let content = String::from_utf8_lossy(&data);
         for line in content.lines() {
             if let Some(hash_str) = line.strip_prefix("tree ") {
-                let tree_hash = ObjectHash::from_str(hash_str)
+                let tree_hash = crate::internal::object_format::parse_repo_oid(hash_str)
                     .map_err(|e| anyhow!("Invalid tree hash in commit: {}", e))?;
                 return self.load_tree(&tree_hash);
             }
@@ -1776,7 +1775,7 @@ impl HistoryManager {
             .with_context(|| format!("failed to write checkpoint {what} {object_type}"))?;
             match response {
                 CheckpointObjectIoHelperResponse::Written { oid, was_created } => (
-                    ObjectHash::from_str(&oid).map_err(|error| {
+                    crate::internal::object_format::parse_repo_oid(&oid).map_err(|error| {
                         anyhow!("helper returned invalid checkpoint oid '{oid}': {error}")
                     })?,
                     was_created,
@@ -1880,7 +1879,7 @@ impl HistoryManager {
         let content = String::from_utf8_lossy(&data);
         for line in content.lines() {
             if let Some(hash_str) = line.strip_prefix("tree ") {
-                let tree_hash = ObjectHash::from_str(hash_str)
+                let tree_hash = crate::internal::object_format::parse_repo_oid(hash_str)
                     .map_err(|error| anyhow!("Invalid tree hash in commit: {error}"))?;
                 return self.load_tree_for_attempt(&tree_hash, deadline).await;
             }
@@ -2752,7 +2751,7 @@ impl HistoryManager {
         for row in root_rows {
             let value: String = row.try_get_by("oid")?;
             if !value.is_empty() && !value.bytes().all(|byte| byte == b'0') {
-                ObjectHash::from_str(&value).map_err(|error| {
+                crate::internal::object_format::parse_repo_oid(&value).map_err(|error| {
                     anyhow!("repository cleanup root {value} is invalid: {error}")
                 })?;
                 graph_roots.push(value);
@@ -2803,7 +2802,7 @@ impl HistoryManager {
         }
         let request = serde_json::to_vec(&RejectedCleanupIndexHelperRequest {
             repo_path: self.repo_path.clone(),
-            hash_bytes: get_hash_kind().size(),
+            hash_bytes: git_internal::hash::get_hash_kind().size(),
         })
         .context("encode rejected-cleanup index helper request")?;
         let current_exe = std::env::current_exe()
@@ -3015,9 +3014,11 @@ impl HistoryManager {
                         .ok_or_else(|| {
                             anyhow!("ref-reachable annotated tag {oid} has no object target")
                         })?;
-                    stack.push(ObjectHash::from_str(target).map_err(|error| {
-                        anyhow!("parse annotated tag {oid} target {target}: {error}")
-                    })?);
+                    stack.push(
+                        crate::internal::object_format::parse_repo_oid(target).map_err(
+                            |error| anyhow!("parse annotated tag {oid} target {target}: {error}"),
+                        )?,
+                    );
                 }
                 ObjectType::Blob => {}
                 other => {
@@ -4834,7 +4835,7 @@ pub(crate) async fn checkpoint_rows_snapshot_durable_oids_from_head(
     checkpoints: &[CheckpointDurabilitySpec<'_>],
     deadline: Option<Instant>,
 ) -> Result<HashSet<String>> {
-    let parsed_head = ObjectHash::from_str(head)
+    let parsed_head = crate::internal::object_format::parse_repo_oid(head)
         .map_err(|error| anyhow!("invalid fenced refs/libra/traces head: {error}"))?;
 
     #[cfg(not(test))]
@@ -4898,9 +4899,9 @@ fn checkpoint_snapshot_durable_oids_from_head(
 
     let mut expected = HashMap::new();
     for checkpoint in checkpoints {
-        let commit = ObjectHash::from_str(checkpoint.traces_commit)
+        let commit = crate::internal::object_format::parse_repo_oid(checkpoint.traces_commit)
             .map_err(|error| anyhow!("invalid checkpoint traces commit: {error}"))?;
-        let tree = ObjectHash::from_str(checkpoint.tree_oid)
+        let tree = crate::internal::object_format::parse_repo_oid(checkpoint.tree_oid)
             .map_err(|error| anyhow!("invalid checkpoint root tree: {error}"))?;
         if expected.insert(commit, tree).is_some() {
             bail!("multiple checkpoints share one traces commit");
@@ -4956,10 +4957,11 @@ fn checkpoint_snapshot_durable_oids_from_head(
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             bail!("checkpoint snapshot durability verification exceeded its deadline");
         }
-        let expected_tree = ObjectHash::from_str(checkpoint.tree_oid)
+        let expected_tree = crate::internal::object_format::parse_repo_oid(checkpoint.tree_oid)
             .map_err(|error| anyhow!("invalid checkpoint root tree: {error}"))?;
-        let expected_metadata = ObjectHash::from_str(checkpoint.metadata_blob_oid)
-            .map_err(|error| anyhow!("invalid checkpoint metadata blob: {error}"))?;
+        let expected_metadata =
+            crate::internal::object_format::parse_repo_oid(checkpoint.metadata_blob_oid)
+                .map_err(|error| anyhow!("invalid checkpoint metadata blob: {error}"))?;
         let mut leaf_oids = checkpoint_leaf_tree_durable_oids(
             repo_path,
             checkpoint.checkpoint_id,
@@ -5623,7 +5625,10 @@ mod tests {
         let manager = HistoryManager::new(storage.clone(), repo_path.clone(), db_conn.clone());
 
         // 1. Append first object
-        let blob_hash = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap();
+        let blob_hash = crate::internal::object_format::parse_repo_oid(
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
         manager.append("task", "task-1", blob_hash).await.unwrap();
 
         // Verify ref exists in DB
@@ -5636,7 +5641,7 @@ mod tests {
             .expect("Reference should exist");
 
         let commit_hash_str = ref_model.commit.expect("Commit hash should exist");
-        let commit_hash = ObjectHash::from_str(&commit_hash_str).unwrap();
+        let commit_hash = crate::internal::object_format::parse_repo_oid(&commit_hash_str).unwrap();
 
         // Verify we can load commit
         let data = read_git_object(&repo_path, &commit_hash).unwrap();
@@ -5645,7 +5650,10 @@ mod tests {
         assert!(content.contains("Update task/task-1"));
 
         // 2. Append second object (same type)
-        let blob_hash_2 = ObjectHash::from_str("f4e6d0434b8b29ae775ad8c2e48c5391e69de29b").unwrap();
+        let blob_hash_2 = crate::internal::object_format::parse_repo_oid(
+            "f4e6d0434b8b29ae775ad8c2e48c5391e69de29b",
+        )
+        .unwrap();
         manager.append("task", "task-2", blob_hash_2).await.unwrap();
 
         // 3. Append third object (different type)
@@ -5672,8 +5680,14 @@ mod tests {
         let db_conn = Arc::new(setup_test_db().await);
         let manager = HistoryManager::new(storage.clone(), repo_path.clone(), db_conn.clone());
 
-        let blob_hash = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap();
-        let other_hash = ObjectHash::from_str("f4e6d0434b8b29ae775ad8c2e48c5391e69de29b").unwrap();
+        let blob_hash = crate::internal::object_format::parse_repo_oid(
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        let other_hash = crate::internal::object_format::parse_repo_oid(
+            "f4e6d0434b8b29ae775ad8c2e48c5391e69de29b",
+        )
+        .unwrap();
 
         manager
             .append("patchset", "shared-id", blob_hash)
@@ -5701,7 +5715,10 @@ mod tests {
         let db_conn = Arc::new(setup_test_db().await);
         let manager = HistoryManager::new(storage.clone(), repo_path.clone(), db_conn.clone());
 
-        let blob_hash = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap();
+        let blob_hash = crate::internal::object_format::parse_repo_oid(
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
         manager
             .append("run_event", "run-event-1", blob_hash)
             .await
@@ -5756,7 +5773,10 @@ mod tests {
             })
         };
 
-        let hash = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap();
+        let hash = crate::internal::object_format::parse_repo_oid(
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
         manager
             .update_ref(AI_REF, hash)
             .await
@@ -6082,9 +6102,18 @@ mod tests {
         let db_conn = Arc::new(setup_test_db().await);
         let manager = HistoryManager::new(storage, repo_path, db_conn);
 
-        let task_hash = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391").unwrap();
-        let plan_hash = ObjectHash::from_str("f4e6d0434b8b29ae775ad8c2e48c5391e69de29b").unwrap();
-        let frame_hash = ObjectHash::from_str("a4e6d0434b8b29ae775ad8c2e48c5391e69de29b").unwrap();
+        let task_hash = crate::internal::object_format::parse_repo_oid(
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        let plan_hash = crate::internal::object_format::parse_repo_oid(
+            "f4e6d0434b8b29ae775ad8c2e48c5391e69de29b",
+        )
+        .unwrap();
+        let frame_hash = crate::internal::object_format::parse_repo_oid(
+            "a4e6d0434b8b29ae775ad8c2e48c5391e69de29b",
+        )
+        .unwrap();
 
         manager.append("task", "task-1", task_hash).await.unwrap();
         let stale_head = manager.resolve_history_head().await.unwrap();
@@ -6865,8 +6894,10 @@ mod tests {
             db_conn,
             crate::internal::branch::TRACES_BRANCH,
         );
-        let root = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
-            .expect("valid test oid");
+        let root = crate::internal::object_format::parse_repo_oid(
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("valid test oid");
         let started = Instant::now();
         let error = manager
             .reachable_rejected_objects_with_limits(
@@ -6898,8 +6929,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo_path = dir.path().join(".libra");
         let objects_dir = repo_path.join("objects");
-        let root = ObjectHash::from_str("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391")
-            .expect("valid FIFO object id");
+        let root = crate::internal::object_format::parse_repo_oid(
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("valid FIFO object id");
         let root_text = root.to_string();
         let shard = objects_dir.join(&root_text[..2]);
         std::fs::create_dir_all(&shard).expect("create FIFO object shard");
@@ -7113,7 +7146,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("held-index");
         let mut index = GitIndex::new();
-        let oid = ObjectHash::from_bytes(&[0x31u8; 20]).unwrap();
+        let oid =
+            ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &[0x31u8; 20])
+                .unwrap();
         let mut entry = IndexEntry::new_from_blob("skip.txt".to_string(), oid, 3);
         entry.flags.skip_worktree = true;
         index.update(entry);

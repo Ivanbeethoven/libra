@@ -31,15 +31,18 @@ pub(super) fn build_rev_list_children(commits: &[Commit]) -> RevListChildren {
 #[cfg(test)]
 mod tests {
     use git_internal::{
-        hash::{ObjectHash, get_hash_kind},
+        hash::ObjectHash,
         internal::object::signature::{Signature, SignatureType},
     };
 
     use super::*;
 
     fn test_hash(byte: u8) -> ObjectHash {
-        ObjectHash::from_bytes(&vec![byte; get_hash_kind().size()])
-            .expect("test hash bytes should match active hash kind")
+        ObjectHash::from_bytes_for_kind(
+            git_internal::hash::get_hash_kind(),
+            &vec![byte; git_internal::hash::get_hash_kind().size()],
+        )
+        .expect("test hash bytes should match active hash kind")
     }
 
     fn test_signature() -> Signature {

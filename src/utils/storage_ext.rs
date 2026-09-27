@@ -262,7 +262,7 @@ impl<S: Storage + Send + Sync + ?Sized> StorageExt for S {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, sync::Arc};
+    use std::sync::Arc;
 
     use git_internal::internal::object::{
         task::{GoalType, Task},
@@ -296,7 +296,7 @@ mod tests {
         assert!(!artifact.key().is_empty());
 
         // Verify retrieval using standard storage get (simulating Artifact resolution)
-        let key_hash = ObjectHash::from_str(artifact.key()).unwrap();
+        let key_hash = crate::internal::object_format::parse_repo_oid(artifact.key()).unwrap();
         let (data, _) = storage.get(&key_hash).await.unwrap();
         assert_eq!(data, content);
     }

@@ -1,6 +1,6 @@
 //! Implements `for-each-ref` to enumerate refs with filtering and formatting.
 
-use std::{collections::HashMap, io::IsTerminal, str::FromStr};
+use std::{collections::HashMap, io::IsTerminal};
 
 use clap::Parser;
 use git_internal::{
@@ -663,7 +663,7 @@ async fn resolve_points_at_target(object_ref: &str) -> CliResult<String> {
             CliError::fatal(format!("tag '{object_ref}' is missing target object"))
                 .with_stable_code(StableErrorCode::RepoCorrupt)
         })?;
-        ObjectHash::from_str(&target).map_err(|source| {
+        crate::internal::object_format::parse_repo_oid(&target).map_err(|source| {
             CliError::fatal(format!(
                 "tag '{object_ref}' has invalid target object '{target}': {source}"
             ))
@@ -675,7 +675,7 @@ async fn resolve_points_at_target(object_ref: &str) -> CliResult<String> {
     if let Ok(hash) = util::get_commit_base(object_ref).await {
         return Ok(hash.to_string());
     }
-    if let Ok(hash) = ObjectHash::from_str(object_ref) {
+    if let Ok(hash) = crate::internal::object_format::parse_repo_oid(object_ref) {
         return Ok(hash.to_string());
     }
 
@@ -738,13 +738,14 @@ fn parse_objectsize_sort_key(sort: &str) -> Option<bool> {
 /// the size Git reports. A missing/unreadable object is a real corruption and is
 /// surfaced as an error (rather than silently reported as size 0).
 fn ref_object_size(entry: &RefEntry) -> CliResult<i64> {
-    let hash = ObjectHash::from_str(&entry.objectname).map_err(|source| {
-        CliError::fatal(format!(
-            "ref '{}' has an invalid object id '{}': {source}",
-            entry.refname, entry.objectname
-        ))
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?;
+    let hash =
+        crate::internal::object_format::parse_repo_oid(&entry.objectname).map_err(|source| {
+            CliError::fatal(format!(
+                "ref '{}' has an invalid object id '{}': {source}",
+                entry.refname, entry.objectname
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
     let data = util::objects_storage().get(&hash).map_err(|source| {
         CliError::fatal(format!(
             "failed to read object {} for ref '{}': {source}",
@@ -766,13 +767,14 @@ fn ref_object_size(entry: &RefEntry) -> CliResult<i64> {
 /// rejected. Commit and (annotated) tag objects, the only objects a branch/tag
 /// ref normally names, are text.
 fn ref_raw_content(entry: &RefEntry) -> CliResult<String> {
-    let hash = ObjectHash::from_str(&entry.objectname).map_err(|source| {
-        CliError::fatal(format!(
-            "ref '{}' has an invalid object id '{}': {source}",
-            entry.refname, entry.objectname
-        ))
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?;
+    let hash =
+        crate::internal::object_format::parse_repo_oid(&entry.objectname).map_err(|source| {
+            CliError::fatal(format!(
+                "ref '{}' has an invalid object id '{}': {source}",
+                entry.refname, entry.objectname
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
     let data = util::objects_storage().get(&hash).map_err(|source| {
         CliError::fatal(format!(
             "failed to read object {} for ref '{}': {source}",
@@ -922,7 +924,7 @@ fn ref_sort_timestamp(entry: &RefEntry, key: DateSortKey) -> i64 {
     // commit's). `entry.objecttype` is the object's actual type, determined when
     // the ref was listed, so loading it as a tag here is sound.
     if matches!(key, DateSortKey::Creator) && entry.objecttype == "tag" {
-        return ObjectHash::from_str(&entry.objectname)
+        return crate::internal::object_format::parse_repo_oid(&entry.objectname)
             .ok()
             .and_then(|hash| load_object::<GitTag>(&hash).ok())
             .map(|tag| tag.tagger.timestamp as i64)
@@ -947,7 +949,7 @@ pub const MAX_TAG_PEEL_DEPTH: usize = 16;
 /// (tag → tag → … → commit). Returns `None` when the chain resolves to a
 /// tree/blob or cannot be loaded.
 fn ref_commit(entry: &RefEntry) -> Option<Commit> {
-    let hash = ObjectHash::from_str(&entry.objectname).ok()?;
+    let hash = crate::internal::object_format::parse_repo_oid(&entry.objectname).ok()?;
     peel_to_commit(hash)
 }
 
@@ -1025,13 +1027,14 @@ fn ref_deref_target(entry: &RefEntry) -> CliResult<Option<(ObjectHash, ObjectTyp
     if entry.objecttype != "tag" {
         return Ok(None);
     }
-    let start = ObjectHash::from_str(&entry.objectname).map_err(|source| {
-        CliError::fatal(format!(
-            "ref '{}' has an invalid object id '{}': {source}",
-            entry.refname, entry.objectname
-        ))
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?;
+    let start =
+        crate::internal::object_format::parse_repo_oid(&entry.objectname).map_err(|source| {
+            CliError::fatal(format!(
+                "ref '{}' has an invalid object id '{}': {source}",
+                entry.refname, entry.objectname
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
     Ok(Some(peel_tag_to_target(start, &entry.refname)?))
 }
 
@@ -2021,7 +2024,7 @@ struct CommitFields {
 
 /// Load the ref's object (once) and extract its commit-field atom values.
 fn commit_fields_for(entry: &RefEntry) -> CommitFields {
-    let Ok(hash) = ObjectHash::from_str(&entry.objectname) else {
+    let Ok(hash) = crate::internal::object_format::parse_repo_oid(&entry.objectname) else {
         return CommitFields::default();
     };
     match entry.objecttype.as_str() {

@@ -6,7 +6,7 @@ use std::{
 };
 
 use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::{
         metadata::{EntryMeta, MetaAttached},
         pack::{Pack, entry::Entry, pack_index::IndexEntry},
@@ -118,7 +118,7 @@ pub(crate) fn pack_entry_sizes(
     pack_len: u64,
 ) -> CliResult<BTreeMap<ObjectHash, u64>> {
     let trailer_start = pack_len
-        .checked_sub(get_hash_kind().size() as u64)
+        .checked_sub(git_internal::hash::get_hash_kind().size() as u64)
         .ok_or_else(|| {
             CliError::fatal("pack file is shorter than its trailing checksum")
                 .with_stable_code(StableErrorCode::RepoCorrupt)
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn insert_decoded_pack_entry_rejects_duplicate_hashes() {
         let _hash_guard = set_hash_kind_for_test(HashKind::Sha1);
-        let hash = ObjectHash::new(b"duplicate");
+        let hash = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), b"duplicate");
         let mut entries = BTreeMap::new();
 
         insert_decoded_pack_entry(&mut entries, decoded_entry(hash)).expect("first insert");

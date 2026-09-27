@@ -11,7 +11,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::{self, Write},
-    str::FromStr,
 };
 
 use clap::Parser;
@@ -387,7 +386,7 @@ async fn load_export_tags() -> CliResult<Vec<ExportTag>> {
             .with_exit_code(128)
             .with_stable_code(StableErrorCode::RepoCorrupt)
         })?;
-        let raw_target = ObjectHash::from_str(&raw).map_err(|error| {
+        let raw_target = crate::internal::object_format::parse_repo_oid(&raw).map_err(|error| {
             CliError::fatal(format!(
                 "fast-export: tag '{ref_name}' has invalid target '{raw}': {error}"
             ))
@@ -477,14 +476,14 @@ async fn load_export_notes() -> CliResult<Vec<ExportNote>> {
         })?;
         notes.push(ExportNote {
             notes_ref,
-            object: ObjectHash::from_str(&object).map_err(|error| {
+            object: crate::internal::object_format::parse_repo_oid(&object).map_err(|error| {
                 CliError::fatal(format!(
                     "fast-export: invalid noted object '{object}': {error}"
                 ))
                 .with_exit_code(128)
                 .with_stable_code(StableErrorCode::RepoCorrupt)
             })?,
-            blob: ObjectHash::from_str(&blob).map_err(|error| {
+            blob: crate::internal::object_format::parse_repo_oid(&blob).map_err(|error| {
                 CliError::fatal(format!("fast-export: invalid note blob '{blob}': {error}"))
                     .with_exit_code(128)
                     .with_stable_code(StableErrorCode::RepoCorrupt)

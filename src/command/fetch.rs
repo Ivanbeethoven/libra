@@ -9,7 +9,6 @@ use std::{
     fs,
     io::{self, Error as IoError, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -18,7 +17,7 @@ use clap::Parser;
 use futures_util::FutureExt;
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
+    hash::{HashKind, ObjectHash, set_hash_kind},
     internal::object::commit::Commit,
 };
 use indicatif::ProgressBar;
@@ -975,8 +974,7 @@ impl From<FetchError> for CliError {
                 | RemoteSpecErrorKind::MalformedUrl
                 | RemoteSpecErrorKind::UnsupportedScheme => CliError::command_usage(reason.clone())
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
-                    .with_hint("check the remote URL with 'libra remote get-url <name>'"),
-            },
+                    .with_hint("check the remote URL with 'libra remote get-url <name>'")},
             FetchError::Discovery { source, .. } => {
                 map_fetch_discovery_error(error.to_string(), source)
             }
@@ -1088,8 +1086,7 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
             map_fetch_io_error(message, error, StableErrorCode::NetworkUnavailable)
                 .with_hint("check network connectivity and retry")
         }
-        _ => CliError::fatal(message).with_stable_code(StableErrorCode::NetworkProtocol),
-    }
+        _ => CliError::fatal(message).with_stable_code(StableErrorCode::NetworkProtocol)}
 }
 
 // Keep existing command callers on the shared bounded protocol classifier.
@@ -1223,10 +1220,9 @@ fn format_fetch_porcelain(result: &FetchOutput) -> String {
         // back to the hash-kind-correct zero id (40 hex for SHA-1, 64 for
         // SHA-256); the new-oid zero always matches the old-oid width.
         for entry in &remote.pruned {
-            let old_oid = entry
-                .old_oid
-                .clone()
-                .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
+            let old_oid = entry.old_oid.clone().unwrap_or_else(|| {
+                ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()
+            });
             let zero = "0".repeat(old_oid.len());
             lines.push(format!("- {old_oid} {zero} {}", entry.remote_ref));
         }
@@ -1775,8 +1771,7 @@ fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), Fe
     } else {
         Err(FetchError::InvalidRefspec {
             refspec: refspec.to_string(),
-            reason: "destination must be under refs/heads/* or refs/remotes/<remote>/* and must not be a reserved HEAD ref".to_string(),
-        })
+            reason: "destination must be under refs/heads/* or refs/remotes/<remote>/* and must not be a reserved HEAD ref".to_string()})
     }
 }
 
@@ -2257,7 +2252,7 @@ async fn fetch_repository_with_result_reusing(
     {
         return Err(FetchError::UnsupportedShallowLocalLibra);
     }
-    let local_kind = get_hash_kind();
+    let local_kind = git_internal::hash::get_hash_kind();
     if discovery.hash_kind != local_kind {
         return Err(FetchError::ObjectFormatMismatch {
             remote: discovery.hash_kind,
@@ -2609,8 +2604,7 @@ async fn fetch_repository_with_result_reusing(
                 .ok_or_else(|| FetchError::LocalState {
                     message: format!(
                         "missing presence result for parent '{parent}' of advertised shallow commit '{boundary}'"
-                    ),
-                })?;
+                    )})?;
             missing_parent |= !present;
         }
         if missing_parent {
@@ -2664,7 +2658,7 @@ async fn fetch_repository_with_result_reusing(
             discovered_tags
                 .into_iter()
                 .filter(|tag| {
-                    ObjectHash::from_str(&tag._hash)
+                    crate::internal::object_format::parse_repo_oid(&tag._hash)
                         .map(|oid| storage.exist(&oid))
                         .unwrap_or(false)
                 })
@@ -3217,7 +3211,13 @@ async fn read_fetch_stream(
     output: &OutputConfig,
     task: &str,
 ) -> Result<FetchStreamData, FetchError> {
-    read_fetch_stream_for_kind(result_stream, output, task, get_hash_kind()).await
+    read_fetch_stream_for_kind(
+        result_stream,
+        output,
+        task,
+        git_internal::hash::get_hash_kind(),
+    )
+    .await
 }
 
 /// Strip a leading `ERR ` / `FATAL ` marker from a side-band channel-3 message so
@@ -4276,8 +4276,7 @@ fn fetch_destination_storage(
     }
     Err(FetchError::InvalidRefspec {
         refspec: destination.to_string(),
-        reason: "destination must be under refs/heads/*, refs/remotes/<remote>/*, or another refs/* name".to_string(),
-    })
+        reason: "destination must be under refs/heads/*, refs/remotes/<remote>/*, or another refs/* name".to_string()})
 }
 
 fn fetch_head_path() -> Result<PathBuf, FetchError> {
@@ -4460,7 +4459,7 @@ async fn prune_stale_remote_refs(
         .map_err(|message| FetchError::LocalState { message })?;
     let remote_owned = remote_name.to_string();
     let to_delete = pruned.clone();
-    let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
     // Reads the refs it is about to move/delete before writing them, so the
     // write lock is taken up front (`db::begin_write_transaction`).
     crate::internal::db::write_transaction(&db, |txn| {
@@ -4569,7 +4568,7 @@ async fn prune_stale_mirror_refs(
         .await
         .map_err(|message| FetchError::LocalState { message })?;
     let to_delete = pruned.clone();
-    let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
     crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             for entry in &to_delete {
@@ -4650,8 +4649,7 @@ async fn update_references(
                     message: format!(
                         "failed to inspect fetch destination '{}': {error}",
                         plan.destination
-                    ),
-                })?
+                    )})?
                 .map(|branch| branch.commit.to_string());
 
                 reject_checked_out_destination(
@@ -4671,8 +4669,7 @@ async fn update_references(
                         message: format!(
                             "non-fast-forward update to '{}' requires '+' in the refspec or --force",
                             plan.destination
-                        ),
-                    });
+                        )});
                 }
 
                 Branch::update_branch_with_conn(
@@ -4686,30 +4683,26 @@ async fn update_references(
                     message: format!(
                         "failed to persist fetch destination '{}': {source}",
                         plan.destination
-                    ),
-                })?;
+                    )})?;
 
                 let context = ReflogContext {
                     old_oid: old_oid
                         .clone()
-                        .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string()),
+                        .unwrap_or_else(|| ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()),
                     new_oid: plan.reference._hash.clone(),
-                    action: ReflogAction::Fetch,
-                };
+                    action: ReflogAction::Fetch};
                 Reflog::insert_single_entry(txn, &context, &plan.destination)
                     .await
                     .map_err(|source| FetchError::UpdateRefs {
                         message: format!(
                             "failed to record reflog for fetch destination '{}': {source}",
                             plan.destination
-                        ),
-                    })?;
+                        )})?;
                 updates.push(FetchRefUpdate {
                     remote_ref: plan.destination.clone(),
                     forced,
                     old_oid,
-                    new_oid: plan.reference._hash.clone(),
-                });
+                    new_oid: plan.reference._hash.clone()});
             }
 
             // Update the cached remote HEAD to the branch it points at, resolved
@@ -4739,8 +4732,7 @@ async fn update_references(
                     message: format!(
                         "failed to update refs/remotes/{}/HEAD: {error}",
                         remote_config.name
-                    ),
-                })?;
+                    )})?;
             } else if branch.is_none() {
                 ref_model::Entity::delete_many()
                     .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
@@ -4751,8 +4743,7 @@ async fn update_references(
                         message: format!(
                             "failed to remove stale refs/remotes/{}/HEAD: {error}",
                             remote_config.name
-                        ),
-                    })?;
+                        )})?;
             }
             if remote_default_branch.is_none() && branch.is_none() && remote_head.is_some() {
                 tracing::debug!("remote HEAD does not point to a branch ref");
@@ -4764,10 +4755,8 @@ async fn update_references(
     .await
     .map_err(|source| match source {
         TransactionError::Connection(error) => FetchError::UpdateRefs {
-            message: error.to_string(),
-        },
-        TransactionError::Transaction(error) => error,
-    })
+            message: error.to_string()},
+        TransactionError::Transaction(error) => error})
 }
 
 /// Whether `new_oid` updating `old_oid` is a forced (non-fast-forward) change.
@@ -4785,7 +4774,10 @@ fn fetch_update_force_status(old_oid: Option<&str>, new_oid: &str) -> Option<boo
     let Some(old_str) = old_oid else {
         return Some(false);
     };
-    let (Ok(old), Ok(new)) = (ObjectHash::from_str(old_str), ObjectHash::from_str(new_oid)) else {
+    let (Ok(old), Ok(new)) = (
+        crate::internal::object_format::parse_repo_oid(old_str),
+        crate::internal::object_format::parse_repo_oid(new_oid),
+    ) else {
         return None;
     };
     if old == new {
@@ -4986,8 +4978,7 @@ async fn persist_fetched_tags(
                     .one(txn)
                     .await
                     .map_err(|error| FetchError::UpdateRefs {
-                        message: format!("failed to inspect existing tag '{}': {error}", tag._ref),
-                    })?;
+                        message: format!("failed to inspect existing tag '{}': {error}", tag._ref)})?;
                 match existing {
                     Some(row) if row.commit.as_deref() == Some(tag._hash.as_str()) => {
                         // Already up to date — nothing to report.
@@ -5003,14 +4994,12 @@ async fn persist_fetched_tags(
                                 message: format!(
                                     "failed to force-update tag '{}': {source}",
                                     tag._ref
-                                ),
-                            })?;
+                                )})?;
                         updates.push(FetchRefUpdate {
                             remote_ref: tag._ref.clone(),
                             old_oid: old,
                             new_oid: tag._hash.clone(),
-                            forced: true,
-                        });
+                            forced: true});
                     }
                     Some(_) => {
                         tracing::warn!(
@@ -5029,14 +5018,12 @@ async fn persist_fetched_tags(
                             .insert(txn)
                             .await
                             .map_err(|source| FetchError::UpdateRefs {
-                                message: format!("failed to persist tag '{}': {source}", tag._ref),
-                            })?;
+                                message: format!("failed to persist tag '{}': {source}", tag._ref)})?;
                         updates.push(FetchRefUpdate {
                             remote_ref: tag._ref.clone(),
                             old_oid: None,
                             new_oid: tag._hash.clone(),
-                            forced: false,
-                        });
+                            forced: false});
                     }
                 }
             }
@@ -5047,9 +5034,7 @@ async fn persist_fetched_tags(
     .map_err(|source| FetchError::UpdateRefs {
         message: match source {
             TransactionError::Connection(error) => error.to_string(),
-            TransactionError::Transaction(error) => error.to_string(),
-        },
-    })
+            TransactionError::Transaction(error) => error.to_string()}})
 }
 
 /// Soft cap on the number of commits we walk back from each branch tip when
@@ -5110,7 +5095,7 @@ async fn resolve_negotiation_tip(
     _hash_kind: HashKind,
 ) -> Result<ObjectHash, FetchError> {
     // Try as a full object id first.
-    if let Ok(oid) = ObjectHash::from_str(tip) {
+    if let Ok(oid) = crate::internal::object_format::parse_repo_oid(tip) {
         return Ok(oid);
     }
     // Try as a ref (full or branch short name).
@@ -6121,7 +6106,7 @@ mod tests {
             FetchError::InvalidRemoteSpec {
                 spec: "/missing/repo".to_string(),
                 kind: RemoteSpecErrorKind::MissingLocalRepo,
-                reason: "local path does not exist".to_string(),
+                reason: "local path does not exist".to_string()
             }
             .to_string(),
             "local path does not exist",
@@ -6129,7 +6114,7 @@ mod tests {
         assert_eq!(
             FetchError::ObjectFormatMismatch {
                 remote: git_internal::hash::HashKind::Sha1,
-                local: git_internal::hash::HashKind::Sha256,
+                local: git_internal::hash::HashKind::Sha256
             }
             .to_string(),
             "remote object format 'sha1' does not match local 'sha256'",
@@ -6137,7 +6122,7 @@ mod tests {
         assert_eq!(
             FetchError::RemoteBranchNotFound {
                 branch: "feature".to_string(),
-                remote: "origin".to_string(),
+                remote: "origin".to_string()
             }
             .to_string(),
             "couldn't find remote ref feature",
@@ -6145,7 +6130,7 @@ mod tests {
         assert_eq!(
             FetchError::InvalidRefspec {
                 refspec: "refs/heads/main:HEAD".to_string(),
-                reason: "unsupported destination".to_string(),
+                reason: "unsupported destination".to_string()
             }
             .to_string(),
             "invalid fetch refspec 'refs/heads/main:HEAD': unsupported destination",
@@ -6153,7 +6138,7 @@ mod tests {
         assert_eq!(
             FetchError::ConfigRead {
                 key: "remote.origin.fetch".to_string(),
-                message: "database is locked".to_string(),
+                message: "database is locked".to_string()
             }
             .to_string(),
             "failed to read fetch configuration 'remote.origin.fetch': database is locked",
@@ -6203,14 +6188,14 @@ mod tests {
         );
         assert_eq!(
             FetchError::InvalidPktHeader {
-                header: "zzzz".to_string(),
+                header: "zzzz".to_string()
             }
             .to_string(),
             "invalid packet line header 'zzzz'",
         );
         assert_eq!(
             FetchError::RemoteSideband {
-                message: "access denied".to_string(),
+                message: "access denied".to_string()
             }
             .to_string(),
             "remote reported an error: access denied",
@@ -6221,21 +6206,21 @@ mod tests {
         );
         assert_eq!(
             FetchError::UpdateRefs {
-                message: "ref database is read-only".to_string(),
+                message: "ref database is read-only".to_string()
             }
             .to_string(),
             "failed to update references after fetch: ref database is read-only",
         );
         assert_eq!(
             FetchError::RefUpdateRejected {
-                message: "destination is checked out".to_string(),
+                message: "destination is checked out".to_string()
             }
             .to_string(),
             "fetch destination update rejected: destination is checked out",
         );
         assert_eq!(
             FetchError::LocalState {
-                message: "missing object directory".to_string(),
+                message: "missing object directory".to_string()
             }
             .to_string(),
             "failed to inspect local repository state: missing object directory",
@@ -6301,7 +6286,7 @@ mod tests {
         pack.extend_from_slice(b"PACK");
         pack.extend_from_slice(&2_u32.to_be_bytes());
         pack.extend_from_slice(&0_u32.to_be_bytes());
-        let checksum = ObjectHash::new(&pack);
+        let checksum = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &pack);
         pack.extend_from_slice(checksum.as_ref());
         pack
     }
@@ -7502,7 +7487,7 @@ mod tests {
                 "failed to inspect existing remote-tracking ref 'refs/remotes/origin/main': {}",
                 crate::internal::branch::BranchStoreError::Corrupt {
                     name: "refs/remotes/origin/main".to_string(),
-                    detail: "invalid object id".to_string(),
+                    detail: "invalid object id".to_string()
                 }
             ),
         };

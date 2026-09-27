@@ -5,7 +5,7 @@
 //! still owns the object-store CAS implementation and `pub use`s these items
 //! until remaining Code-side callers are deleted.
 
-use std::{str::FromStr, time::Instant};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use git_internal::hash::ObjectHash;
@@ -504,8 +504,7 @@ pub(crate) fn manifest_entry(
         "media_type": media_type,
         "compression": "none",
         "redaction": redaction,
-        "schema_version": schema_version,
-    })
+        "schema_version": schema_version})
 }
 
 /// Serialise `manifest.json` for one E4-libra checkpoint: logical role →
@@ -535,8 +534,7 @@ pub(crate) fn build_checkpoint_manifest_json(
         "media_type": "application/x-ndjson",
         "compression": "none",
         "redaction": "redacted",
-        "schema_version": 1,
-    });
+        "schema_version": 1});
     // INVARIANT: transcript_entry is constructed as a JSON object above.
     let transcript_obj = transcript_entry
         .as_object_mut()
@@ -557,8 +555,7 @@ pub(crate) fn build_checkpoint_manifest_json(
                         serde_json::json!({
                             "path": format!("transcript/{}", part.name),
                             "oid": part.oid.to_string(),
-                            "byte_len": part.byte_len,
-                        })
+                            "byte_len": part.byte_len})
                     })
                     .collect::<Vec<_>>()
             ),
@@ -566,48 +563,45 @@ pub(crate) fn build_checkpoint_manifest_json(
     }
 
     let manifest = serde_json::json!({
-        "schema_version": CHECKPOINT_MANIFEST_SCHEMA_VERSION,
-        "checkpoint_id": checkpoint_id,
-        "content_hash": {
-            "algorithm": "sha256",
-            "path": "content_hash.txt",
-            // Self-describing hash definition: sha256 over the
-            // concatenation of these roles' bytes in THIS order (the
-            // transcript contributes its logical, reassembled stream).
-            "coverage": CHECKPOINT_CONTENT_HASH_COVERAGE,
-        },
-        "entries": {
-            "metadata": manifest_entry(
-                "metadata.json",
-                metadata,
-                "application/json",
-                "redacted",
-                CHECKPOINT_METADATA_SCHEMA_VERSION,
-            ),
-            "lifecycle_events": manifest_entry(
-                "events/lifecycle.jsonl",
-                lifecycle_events,
-                "application/x-ndjson",
-                "redacted",
-                1,
-            ),
-            "transcript": transcript_entry,
-            "redaction_report": manifest_entry(
-                "redaction_report.json",
-                redaction_report,
-                "application/json",
-                "report",
-                1,
-            ),
-            "content_hash": manifest_entry(
-                "content_hash.txt",
-                content_hash,
-                "text/plain",
-                "none",
-                1,
-            ),
-        },
-    });
+    "schema_version": CHECKPOINT_MANIFEST_SCHEMA_VERSION,
+    "checkpoint_id": checkpoint_id,
+    "content_hash": {
+        "algorithm": "sha256",
+        "path": "content_hash.txt",
+        // Self-describing hash definition: sha256 over the
+        // concatenation of these roles' bytes in THIS order (the
+        // transcript contributes its logical, reassembled stream).
+        "coverage": CHECKPOINT_CONTENT_HASH_COVERAGE},
+    "entries": {
+        "metadata": manifest_entry(
+            "metadata.json",
+            metadata,
+            "application/json",
+            "redacted",
+            CHECKPOINT_METADATA_SCHEMA_VERSION,
+        ),
+        "lifecycle_events": manifest_entry(
+            "events/lifecycle.jsonl",
+            lifecycle_events,
+            "application/x-ndjson",
+            "redacted",
+            1,
+        ),
+        "transcript": transcript_entry,
+        "redaction_report": manifest_entry(
+            "redaction_report.json",
+            redaction_report,
+            "application/json",
+            "report",
+            1,
+        ),
+        "content_hash": manifest_entry(
+            "content_hash.txt",
+            content_hash,
+            "text/plain",
+            "none",
+            1,
+        )}});
     serde_json::to_vec_pretty(&manifest).context("failed to serialize checkpoint manifest.json")
 }
 
@@ -762,21 +756,21 @@ fn validate_traces_inflight_marker(
         })?;
     }
     for oid in &marker.oids {
-        ObjectHash::from_str(oid).map_err(|error| {
+        crate::internal::object_format::parse_repo_oid(oid).map_err(|error| {
             anyhow!(
                 "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid object id '{oid}': {error}; inspect it with `libra agent doctor` before retrying"
             )
         })?;
     }
     for oid in &marker.created_oids {
-        ObjectHash::from_str(oid).map_err(|error| {
+        crate::internal::object_format::parse_repo_oid(oid).map_err(|error| {
             anyhow!(
                 "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid created object id '{oid}': {error}; inspect it with `libra agent doctor` before retrying"
             )
         })?;
     }
     if let Some(commit) = marker.commit.as_deref() {
-        ObjectHash::from_str(commit).map_err(|error| {
+        crate::internal::object_format::parse_repo_oid(commit).map_err(|error| {
             anyhow!(
                 "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid commit id '{commit}': {error}; inspect it with `libra agent doctor` before retrying"
             )

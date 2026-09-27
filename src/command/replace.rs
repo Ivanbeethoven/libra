@@ -15,7 +15,6 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use clap::Parser;
@@ -235,7 +234,7 @@ fn resolve_via(map: &ReplaceMap, hash: ObjectHash) -> ObjectHash {
 /// skipped, matching the loader's robustness-over-strictness stance).
 fn read_one_replace_ref(dir: &Path, hash: &ObjectHash) -> Option<ObjectHash> {
     let content = fs::read_to_string(dir.join(hash.to_string())).ok()?;
-    ObjectHash::from_str(content.trim()).ok()
+    crate::internal::object_format::parse_repo_oid(content.trim()).ok()
 }
 
 /// Scan `.libra/refs/replace/` into a map. Best-effort: a malformed entry is
@@ -249,13 +248,13 @@ fn load_replace_map(dir: &Path) -> HashMap<ObjectHash, ObjectHash> {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(src) = ObjectHash::from_str(name) else {
+        let Ok(src) = crate::internal::object_format::parse_repo_oid(name) else {
             continue;
         };
         let Ok(content) = fs::read_to_string(entry.path()) else {
             continue;
         };
-        let Ok(dst) = ObjectHash::from_str(content.trim()) else {
+        let Ok(dst) = crate::internal::object_format::parse_repo_oid(content.trim()) else {
             continue;
         };
         map.insert(src, dst);
@@ -380,7 +379,7 @@ fn list(pattern: Option<&str>) -> CliResult<()> {
     for entry in entries {
         let entry = entry.map_err(read_err)?;
         if let Some(name) = entry.file_name().to_str()
-            && ObjectHash::from_str(name).is_ok()
+            && crate::internal::object_format::parse_repo_oid(name).is_ok()
             && pattern.is_none_or(|p| name.contains(p))
         {
             names.push(name.to_string());
@@ -396,7 +395,7 @@ fn list(pattern: Option<&str>) -> CliResult<()> {
 /// Resolve an argument to an object id: a full object-hash string of any type
 /// that exists, otherwise a commit-ish / ref via `get_commit_base`.
 async fn resolve_any(spec: &str) -> CliResult<ObjectHash> {
-    if let Ok(hash) = ObjectHash::from_str(spec)
+    if let Ok(hash) = crate::internal::object_format::parse_repo_oid(spec)
         && util::objects_storage().get(&hash).is_ok()
     {
         return Ok(hash);
@@ -436,7 +435,8 @@ mod tests {
     use crate::internal::worktree_scope::WorktreeScope;
 
     fn oid(byte: u8) -> ObjectHash {
-        ObjectHash::from_str(&format!("{byte:02x}").repeat(20)).expect("valid test oid")
+        crate::internal::object_format::parse_repo_oid(&format!("{byte:02x}").repeat(20))
+            .expect("valid test oid")
     }
 
     fn repo_fixture() -> tempfile::TempDir {

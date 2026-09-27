@@ -7,7 +7,6 @@ use std::{
     fs, io,
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -17,7 +16,7 @@ use byteorder::{BigEndian, ReadBytesExt};
 use flate2::{Compression, write::ZlibEncoder};
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
+    hash::{HashKind, ObjectHash, set_hash_kind},
     internal::{
         object::types::ObjectType,
         pack::{Pack, cache_object::CacheObject},
@@ -539,14 +538,16 @@ impl LocalStorage {
                 Self::object_type_at_pack_offset(pack, base, depth + 1, state, storage, index)
             }
             7 => {
-                let base = ObjectHash::from_stream_for_kind(get_hash_kind(), &mut file).map_err(
-                    |error| {
-                        GitError::InvalidObjectInfo(format!(
-                            "cannot read REF_DELTA base at offset {offset} in '{}': {error}",
-                            pack.display()
-                        ))
-                    },
-                )?;
+                let base = ObjectHash::from_stream_for_kind(
+                    git_internal::hash::get_hash_kind(),
+                    &mut file,
+                )
+                .map_err(|error| {
+                    GitError::InvalidObjectInfo(format!(
+                        "cannot read REF_DELTA base at offset {offset} in '{}': {error}",
+                        pack.display()
+                    ))
+                })?;
                 if let Some(kind) = state.resolved_hashes.get(&base) {
                     return Ok(*kind);
                 }
@@ -938,7 +939,7 @@ impl LocalStorage {
         });
         Self {
             base_path,
-            hash_kind: Some(get_hash_kind()),
+            hash_kind: Some(git_internal::hash::get_hash_kind()),
             alternates: Vec::new(),
         }
     }
@@ -950,7 +951,7 @@ impl LocalStorage {
     pub(crate) fn open_no_create(base_path: PathBuf) -> Self {
         Self {
             base_path,
-            hash_kind: Some(get_hash_kind()),
+            hash_kind: Some(git_internal::hash::get_hash_kind()),
             alternates: Vec::new(),
         }
     }
@@ -1067,7 +1068,7 @@ impl LocalStorage {
             for entry in entries.flatten() {
                 let rest = entry.file_name().to_string_lossy().into_owned();
                 let oid_hex = format!("{shard_name}{rest}");
-                let Ok(hash) = ObjectHash::from_str(&oid_hex) else {
+                let Ok(hash) = crate::internal::object_format::parse_repo_oid(&oid_hex) else {
                     continue;
                 };
                 let Ok(meta) = entry.metadata() else {
@@ -1186,7 +1187,7 @@ impl LocalStorage {
         let mut idxs = Vec::new();
         for pack in packs {
             let idx = pack.with_extension("idx");
-            let want_v2 = get_hash_kind() == HashKind::Sha256;
+            let want_v2 = git_internal::hash::get_hash_kind() == HashKind::Sha256;
             let needs_rebuild = if idx.exists() {
                 if want_v2 {
                     !matches!(Self::read_idx_version_path(&idx), Ok(IdxVersion::V2))
@@ -1294,7 +1295,7 @@ impl LocalStorage {
         };
         let end = fanout[first_byte as usize] as usize;
         let object_count = fanout[255] as u64;
-        let hash_size = get_hash_kind().size() as u64;
+        let hash_size = git_internal::hash::get_hash_kind().size() as u64;
 
         match version {
             IdxVersion::V1 => {
@@ -1364,7 +1365,7 @@ impl LocalStorage {
         };
         let mut high = u64::from(fanout[first_byte]);
         let object_count = u64::from(fanout[255]);
-        let hash_size = get_hash_kind().size() as u64;
+        let hash_size = git_internal::hash::get_hash_kind().size() as u64;
         if version == IdxVersion::V1 && hash_size != 20 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2120,7 +2121,8 @@ impl Storage for LocalStorage {
                             };
                             let full_hash = format!("{parent_name}{file_name}");
                             if full_hash.starts_with(&prefix)
-                                && let Ok(hash) = ObjectHash::from_str(&full_hash)
+                                && let Ok(hash) =
+                                    crate::internal::object_format::parse_repo_oid(&full_hash)
                             {
                                 objects.push(hash);
                             }
@@ -2153,7 +2155,7 @@ impl LocalStorage {
         let (version, fanout) = Self::read_idx_fanout(idx_file)?;
         let mut idx_file = fs::File::open(idx_file)?;
         let object_count = fanout[255] as u64;
-        let hash_size = get_hash_kind().size() as u64;
+        let hash_size = git_internal::hash::get_hash_kind().size() as u64;
 
         let names_offset = match version {
             IdxVersion::V1 => FANOUT,
@@ -2376,8 +2378,10 @@ mod tests {
         )
         .expect("index OFS delta fixture");
         let storage = LocalStorage::new(dir.path().to_path_buf());
-        let ofs_delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse fixture delta hash");
+        let ofs_delta = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse fixture delta hash");
         assert_eq!(
             storage
                 .object_type_bounded_probe(&ofs_delta)
@@ -2439,8 +2443,10 @@ mod tests {
         )
         .expect("copy unindexed unrelated pack");
         let storage = LocalStorage::new(dir.path().to_path_buf());
-        let base = ObjectHash::from_str("b1a36d7748643b07e2bd006211e9e6a492f6bb8b")
-            .expect("parse packed base OID");
+        let base = crate::internal::object_format::parse_repo_oid(
+            "b1a36d7748643b07e2bd006211e9e6a492f6bb8b",
+        )
+        .expect("parse packed base OID");
         let ref_pack = dir.path().join("reference.pack");
         let mut bytes = vec![0; 12];
         bytes.push(0x70);
@@ -2509,10 +2515,14 @@ mod tests {
             .put(&loose, b"small tree", ObjectType::Tree)
             .await
             .expect("store loose tree");
-        let packed_delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse packed delta hash");
-        let packed_base = ObjectHash::from_str("b1a36d7748643b07e2bd006211e9e6a492f6bb8b")
-            .expect("parse packed base hash");
+        let packed_delta = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse packed delta hash");
+        let packed_base = crate::internal::object_format::parse_repo_oid(
+            "b1a36d7748643b07e2bd006211e9e6a492f6bb8b",
+        )
+        .expect("parse packed base hash");
         let missing = ObjectHash::Sha1([0xf4; 20]);
         let found = <LocalStorage as Storage>::object_types_bounded_probe(
             &storage,
@@ -2552,8 +2562,10 @@ mod tests {
         )
         .expect("copy orphan pack");
         let storage = LocalStorage::new(dir.path().to_path_buf());
-        let healthy = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse healthy OID");
+        let healthy = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse healthy OID");
         assert_eq!(
             storage
                 .exist_checked_batch(&[healthy])
@@ -2618,10 +2630,14 @@ mod tests {
         )
         .expect("publish second pack before its index");
         let storage = LocalStorage::new(dir.path().to_path_buf());
-        let first = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse first pack OID");
-        let second = ObjectHash::from_str("035f9b742ebf552ed87f003d4944480bfea6ba99")
-            .expect("parse second pack OID");
+        let first = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse first pack OID");
+        let second = crate::internal::object_format::parse_repo_oid(
+            "035f9b742ebf552ed87f003d4944480bfea6ba99",
+        )
+        .expect("parse second pack OID");
         tokio::time::timeout(
             Duration::from_secs(2),
             storage.exist_checked_batch(&[first]),
@@ -2765,13 +2781,15 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(hash_kind)]
     async fn bounded_get_rejects_oversized_loose_declaration_before_payload_decode() {
-        use std::{io::Write as _, str::FromStr};
+        use std::io::Write as _;
 
         let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
         let dir = tempfile::tempdir().expect("create bounded-get fixture");
         let storage = LocalStorage::new(dir.path().to_path_buf());
-        let hash = ObjectHash::from_str("1111111111111111111111111111111111111111")
-            .expect("parse fixture object ID");
+        let hash = crate::internal::object_format::parse_repo_oid(
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("parse fixture object ID");
         let path = storage.get_obj_path(&hash);
         std::fs::create_dir_all(path.parent().expect("object shard parent"))
             .expect("create object shard");
@@ -2806,8 +2824,6 @@ mod tests {
     #[test]
     #[serial_test::serial(hash_kind)]
     fn read_pack_obj_resolves_ofs_delta_base() {
-        use std::str::FromStr;
-
         set_hash_kind(HashKind::Sha1);
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2820,7 +2836,10 @@ mod tests {
         command::index_pack::build_index_v1(pack.to_str().unwrap(), idx.to_str().unwrap())
             .expect("build v1 index for fixture");
 
-        let ofs_delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72").unwrap();
+        let ofs_delta = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .unwrap();
         let obj = LocalStorage::read_pack_by_idx(&idx, &ofs_delta)
             .expect("reading the OFS_DELTA object must resolve its base offset correctly")
             .expect("object must be present in the pack");
@@ -2843,8 +2862,6 @@ mod tests {
     #[test]
     #[serial_test::serial(hash_kind)]
     fn object_size_probe_does_not_build_a_missing_pack_index() {
-        use std::str::FromStr;
-
         set_hash_kind(HashKind::Sha1);
         let dir = tempfile::tempdir().expect("tempdir");
         let pack_dir = dir.path().join("pack");
@@ -2854,8 +2871,10 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/packs/ofs-delta-sha1.pack");
         std::fs::copy(&fixture, &pack).expect("copy fixture pack");
         let storage = LocalStorage::new(dir.path().to_path_buf());
-        let object = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse fixture object ID");
+        let object = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse fixture object ID");
 
         assert_eq!(
             storage
@@ -2880,8 +2899,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(hash_kind)]
     async fn bounded_pack_read_does_not_build_an_unrelated_missing_index() {
-        use std::str::FromStr;
-
         set_hash_kind(HashKind::Sha1);
         let dir = tempfile::tempdir().expect("tempdir");
         let pack_dir = dir.path().join("pack");
@@ -2902,8 +2919,10 @@ mod tests {
         let unrelated_idx = unrelated_pack.with_extension("idx");
         std::fs::copy(&fixture, &unrelated_pack).expect("copy unrelated pack fixture");
         let storage = LocalStorage::new(dir.path().to_path_buf());
-        let object = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse fixture object ID");
+        let object = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse fixture object ID");
 
         storage
             .get_with_limit(&object, crate::utils::preview_object::MAX_OBJECT_BYTES)
@@ -2918,8 +2937,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(hash_kind)]
     async fn bounded_delta_read_does_not_populate_the_global_pack_cache() {
-        use std::str::FromStr;
-
         set_hash_kind(HashKind::Sha1);
         let dir = tempfile::tempdir().expect("tempdir");
         let pack_dir = dir.path().join("pack");
@@ -2940,8 +2957,10 @@ mod tests {
         )
         .expect("build fixture index");
 
-        let object = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse delta object ID");
+        let object = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse delta object ID");
         let file_name = pack
             .file_name()
             .and_then(|name| name.to_str())
@@ -3001,10 +3020,14 @@ mod tests {
             .put(&loose, b"loose", ObjectType::Blob)
             .await
             .expect("store loose object");
-        let packed_delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse packed delta hash");
-        let packed_base = ObjectHash::from_str("b1a36d7748643b07e2bd006211e9e6a492f6bb8b")
-            .expect("parse packed base hash");
+        let packed_delta = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse packed delta hash");
+        let packed_base = crate::internal::object_format::parse_repo_oid(
+            "b1a36d7748643b07e2bd006211e9e6a492f6bb8b",
+        )
+        .expect("parse packed base hash");
         let missing = ObjectHash::Sha1([0x33; 20]);
         let result = storage
             .exist_checked_batch(&[loose, packed_delta, missing, packed_base, packed_delta])
@@ -3040,8 +3063,10 @@ mod tests {
             fs::copy(&seed_index, pack.with_extension("idx")).expect("copy another index");
         }
 
-        let packed = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse packed object ID");
+        let packed = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse packed object ID");
         let missing_a = ObjectHash::Sha1([0x33; 20]);
         let missing_b = ObjectHash::Sha1([0x44; 20]);
         let result = storage

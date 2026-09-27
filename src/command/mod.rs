@@ -496,7 +496,7 @@ pub(crate) fn stream_file_blob_hash_bounded(
     // byte past it. Reading cap+1 would overrun the very bound this function
     // exists to enforce, exactly when the caller is at its limit.
     let mut reader = io::BufReader::new(file).take(len);
-    let mut hasher = HashAlgorithm::new();
+    let mut hasher = HashAlgorithm::new_for_kind(git_internal::hash::get_hash_kind());
 
     hasher.update(b"blob ");
     hasher.update(len.to_string().as_bytes());
@@ -520,7 +520,7 @@ pub(crate) fn stream_file_blob_hash_bounded(
     if reader.into_inner().into_inner().metadata()?.len() != len {
         return Ok((None, total)); // grew under the read
     }
-    ObjectHash::from_bytes(&hasher.finalize())
+    ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &hasher.finalize())
         .map(|oid| (Some(oid), total))
         .map_err(io::Error::other)
 }
@@ -530,7 +530,7 @@ fn stream_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {
     let file = File::open(path)?;
     let len = file.metadata()?.len();
     let mut reader = io::BufReader::new(file);
-    let mut hasher = HashAlgorithm::new();
+    let mut hasher = HashAlgorithm::new_for_kind(git_internal::hash::get_hash_kind());
 
     hasher.update(b"blob ");
     hasher.update(len.to_string().as_bytes());
@@ -545,7 +545,8 @@ fn stream_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {
         hasher.update(&buffer[..read]);
     }
 
-    ObjectHash::from_bytes(&hasher.finalize()).map_err(io::Error::other)
+    ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &hasher.finalize())
+        .map_err(io::Error::other)
 }
 
 /// Get the commit hash from branch name or commit hash, support remote branch
@@ -601,7 +602,11 @@ mod tests {
         let temp_path = tempdir().unwrap();
         test::setup_with_new_libra_in(temp_path.path()).await;
         let _guard = test::ChangeDirGuard::new(temp_path.path());
-        let object = Commit::from_tree_id(ObjectHash::new(&[1; 20]), vec![], "\nCommit_1");
+        let object = Commit::from_tree_id(
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            vec![],
+            "\nCommit_1",
+        );
         save_object(&object, &object.id).unwrap();
         let _ = load_object::<Commit>(&object.id).unwrap();
     }

@@ -8,14 +8,10 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use clap::Parser;
-use git_internal::{
-    errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
-};
+use git_internal::{errors::GitError, hash::ObjectHash};
 use sea_orm::DatabaseTransaction;
 use serde::Serialize;
 
@@ -1797,14 +1793,14 @@ async fn setup_mirror_repository(
             Head::Branch(name)
         }
         (Some(advertised), _) => {
-            let oid = ObjectHash::from_str(&advertised._hash).map_err(|error| {
-                CloneError::SetupFailed {
+            let oid = crate::internal::object_format::parse_repo_oid(&advertised._hash).map_err(
+                |error| CloneError::SetupFailed {
                     message: format!(
                         "mirror HEAD '{}' is not a valid object id: {error}",
                         advertised._hash
                     ),
-                }
-            })?;
+                },
+            )?;
             Head::Detached(oid)
         }
         _ => {
@@ -1928,7 +1924,7 @@ pub(crate) async fn setup_repository(
             from: remote_config.url.clone(),
         };
         let context = ReflogContext {
-            old_oid: ObjectHash::zero_str(get_hash_kind()).to_string(),
+            old_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
             new_oid: origin_branch.commit.to_string(),
             action,
         };
@@ -2410,7 +2406,7 @@ mod tests {
         let _cwd = ChangeDirGuard::new(repo.path());
 
         let db = get_db_conn_instance().await;
-        let hash = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let hash = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
 
         // Simulate a post-fetch state: two remote-tracking branches plus the
         // cached remote HEAD (a `Head` row, not a `Branch` row).

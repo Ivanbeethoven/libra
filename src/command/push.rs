@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::Write,
     path::Path,
-    str::FromStr,
     time::Duration,
 };
 
@@ -12,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
@@ -978,7 +977,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     })?
     .map_err(|error| map_push_discovery_error(&repo_url, error))?;
 
-    let local_kind = get_hash_kind();
+    let local_kind = git_internal::hash::get_hash_kind();
     if discovery.hash_kind != local_kind {
         return Err(PushError::HashKindMismatch {
             remote: discovery.hash_kind.to_string(),
@@ -1061,7 +1060,9 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
             let pushed_tips: Vec<ObjectHash> = plans
                 .iter()
                 .filter(|plan| plan.update.kind == PushRefUpdateKind::Update)
-                .filter_map(|plan| ObjectHash::from_str(&plan.update.new_oid).ok())
+                .filter_map(|plan| {
+                    crate::internal::object_format::parse_repo_oid(&plan.update.new_oid).ok()
+                })
                 .collect();
             for tag_ref in collect_follow_tag_refs(&pushed_tips, &remote_refs).await? {
                 let remote_ref = tag_ref.full_ref.clone();
@@ -1171,7 +1172,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         capabilities.push("push-cert");
     }
     let capability = capabilities.join(" ");
-    let zero_oid = ObjectHash::zero_str(get_hash_kind());
+    let zero_oid = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
 
     // Build the `<old> <new> <ref>` command tuples shared by both wire forms.
     let commands: Vec<(String, String, String)> = plans
@@ -1659,7 +1660,7 @@ async fn resolve_local_ref(input: &str) -> Result<ResolvedLocalRef, PushError> {
         .map_err(|error| PushError::RepoState(error.to_string()))?
         .and_then(|reference| reference.target)
     {
-        let oid = ObjectHash::from_str(&target).map_err(|error| {
+        let oid = crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
             PushError::RepoState(format!("invalid tag target '{input}': {error}"))
         })?;
         return Ok(ResolvedLocalRef {
@@ -1692,7 +1693,7 @@ async fn resolve_tag_ref(short_name: &str, original: &str) -> Result<ResolvedLoc
         .map_err(|error| PushError::RepoState(error.to_string()))?
         .and_then(|reference| reference.target)
         .ok_or_else(|| PushError::SourceRefNotFound(original.to_string()))?;
-    let oid = ObjectHash::from_str(&target).map_err(|error| {
+    let oid = crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
         PushError::RepoState(format!("invalid tag target '{short_name}': {error}"))
     })?;
     Ok(ResolvedLocalRef {
@@ -1733,7 +1734,7 @@ async fn validate_force_if_includes(
         let Some(Some(tracking_oid)) = tracking.get(remote_ref) else {
             continue; // no tracking expectation — the lease already handled it
         };
-        let Ok(tip) = ObjectHash::from_str(tracking_oid) else {
+        let Ok(tip) = crate::internal::object_format::parse_repo_oid(tracking_oid) else {
             return Err(PushError::ForceIfIncludesRejected {
                 remote_ref: remote_ref.clone(),
                 tracking_oid: tracking_oid.clone(),
@@ -1763,7 +1764,7 @@ async fn validate_force_if_includes(
         let mut starts: Vec<ObjectHash> = Vec::new();
         for entry in &entries {
             for oid_text in [&entry.new_oid, &entry.old_oid] {
-                if let Ok(oid) = ObjectHash::from_str(oid_text) {
+                if let Ok(oid) = crate::internal::object_format::parse_repo_oid(oid_text) {
                     starts.push(oid);
                 }
             }
@@ -1947,8 +1948,8 @@ fn add_update_ref_plan(
     let remote_hash = remote_refs
         .get(&remote_ref)
         .cloned()
-        .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()));
-    let old_oid = ObjectHash::from_str(&remote_hash)
+        .unwrap_or_else(|| ObjectHash::zero_str(git_internal::hash::get_hash_kind()));
+    let old_oid = crate::internal::object_format::parse_repo_oid(&remote_hash)
         .map_err(|_| PushError::RepoState(format!("invalid remote hash: {remote_hash}")))?;
 
     let can_update = match local_ref.kind {
@@ -2013,7 +2014,7 @@ fn add_delete_ref_plan_named(
             name: display_name.to_string(),
         });
     };
-    let old_oid = ObjectHash::from_str(&remote_hash)
+    let old_oid = crate::internal::object_format::parse_repo_oid(&remote_hash)
         .map_err(|_| PushError::RepoState(format!("invalid remote hash: {remote_hash}")))?;
     plans.push(RefUpdatePlan {
         update: PushRefUpdate {
@@ -2021,7 +2022,7 @@ fn add_delete_ref_plan_named(
             local_ref: String::new(),
             remote_ref,
             old_oid: Some(remote_hash),
-            new_oid: ObjectHash::zero_str(get_hash_kind()),
+            new_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()),
             forced: false,
         },
         old_oid,
@@ -2205,7 +2206,7 @@ async fn collect_advertised_haves(refs: &[crate::internal::protocol::DiscRef]) -
     let mut commit_tips = HashSet::new();
 
     for reference in refs {
-        let Ok(oid) = ObjectHash::from_str(reference.hash()) else {
+        let Ok(oid) = crate::internal::object_format::parse_repo_oid(reference.hash()) else {
             continue;
         };
         let Ok(object) = tag::load_object_trait(&oid).await else {
@@ -2781,7 +2782,7 @@ async fn update_remote_tracking(
                 .map_err(|error| {
                     map_update_remote_tracking_branch_error(&remote_tracking_branch, error)
                 })?
-                .map_or(ObjectHash::zero_str(get_hash_kind()).to_string(), |b| {
+                .map_or(ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(), |b| {
                     b.commit.to_string()
                 });
 
@@ -3128,7 +3129,7 @@ fn incremental_objs_from_haves(
 }
 
 fn zero_object_hash() -> ObjectHash {
-    match get_hash_kind() {
+    match git_internal::hash::get_hash_kind() {
         HashKind::Sha1 => ObjectHash::Sha1([0; 20]),
         HashKind::Sha256 => ObjectHash::Sha256([0; 32]),
         HashKind::Blake3 => ObjectHash::Blake3([0; 32]),
@@ -3232,7 +3233,6 @@ fn diff_tree_objs(
 
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
 
     use git_internal::{
         hash::ObjectHash,
@@ -3290,7 +3290,7 @@ mod test {
         assert_eq!(sanitize_remote_ref_rejection(""), "");
         // The direct enum construction covers both algorithms without a
         // fallible conversion, allocation, or a production expect.
-        let previous = get_hash_kind();
+        let previous = git_internal::hash::get_hash_kind();
         for kind in [HashKind::Sha1, HashKind::Sha256] {
             git_internal::hash::set_hash_kind(kind);
             let oid = zero_object_hash();
@@ -4044,10 +4044,14 @@ mod test {
     }
 
     fn test_ref_update_plan(remote_ref: &str) -> RefUpdatePlan {
-        let old_oid = ObjectHash::from_str("1111111111111111111111111111111111111111")
-            .expect("test old oid should parse");
-        let new_oid = ObjectHash::from_str("2222222222222222222222222222222222222222")
-            .expect("test new oid should parse");
+        let old_oid = crate::internal::object_format::parse_repo_oid(
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("test old oid should parse");
+        let new_oid = crate::internal::object_format::parse_repo_oid(
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("test new oid should parse");
         RefUpdatePlan {
             update: PushRefUpdate {
                 kind: PushRefUpdateKind::Update,
@@ -4066,8 +4070,10 @@ mod test {
     /// A plan whose server-advertised OID (`update.old_oid`) is controllable, for
     /// force-with-lease unit tests.
     fn lease_plan(remote_ref: &str, server_oid: Option<&str>) -> RefUpdatePlan {
-        let placeholder = ObjectHash::from_str("3333333333333333333333333333333333333333")
-            .expect("placeholder oid should parse");
+        let placeholder = crate::internal::object_format::parse_repo_oid(
+            "3333333333333333333333333333333333333333",
+        )
+        .expect("placeholder oid should parse");
         RefUpdatePlan {
             update: PushRefUpdate {
                 kind: PushRefUpdateKind::Update,
@@ -4522,10 +4528,13 @@ mod test {
                 new_oid: "cccc000000000000000000000000000000000003".to_string(),
                 forced: false,
             },
-            old_oid: ObjectHash::from_str(full_oid).expect("full oid should parse"),
+            old_oid: crate::internal::object_format::parse_repo_oid(full_oid)
+                .expect("full oid should parse"),
             new_oid: Some(
-                ObjectHash::from_str("cccc000000000000000000000000000000000003")
-                    .expect("new oid should parse"),
+                crate::internal::object_format::parse_repo_oid(
+                    "cccc000000000000000000000000000000000003",
+                )
+                .expect("new oid should parse"),
             ),
             local_kind: Some(LocalRefKind::Branch),
         };
@@ -5150,7 +5159,10 @@ old1 new1 refs/heads/main\n"
 
     #[test]
     fn test_is_ancestor() {
-        let commit_id = ObjectHash::from_str("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0").unwrap();
+        let commit_id = crate::internal::object_format::parse_repo_oid(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        )
+        .unwrap();
         assert!(is_ancestor(&commit_id, &commit_id));
     }
 

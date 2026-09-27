@@ -18,7 +18,7 @@
 //! a bounded retry loop ([`SQLITE_BUSY_MAX_RETRIES`]) for transient `database is
 //! locked` errors that show up under multi-task contention.
 
-use std::{str::FromStr, time::Duration};
+use std::time::Duration;
 
 use git_internal::hash::ObjectHash;
 use sea_orm::{
@@ -217,9 +217,11 @@ fn branch_from_model(model: reference::Model) -> Result<Option<Branch>, BranchSt
     let Some(commit_str) = model.commit.as_ref() else {
         return Ok(None);
     };
-    let commit = ObjectHash::from_str(commit_str).map_err(|e| BranchStoreError::Corrupt {
-        name: name.clone(),
-        detail: e.to_string(),
+    let commit = crate::internal::object_format::parse_repo_oid(commit_str).map_err(|e| {
+        BranchStoreError::Corrupt {
+            name: name.clone(),
+            detail: e.to_string(),
+        }
     })?;
     // A well-formed id of the WRONG algorithm parses cleanly and only fails
     // much later, inside object loading, as a panic. Fail closed at the read
@@ -977,7 +979,7 @@ pub enum ConditionalDeleteOutcome {
 
 #[cfg(test)]
 mod tests {
-    use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind_for_test};
+    use git_internal::hash::{HashKind, set_hash_kind_for_test};
     use serial_test::serial;
     use tempfile::tempdir;
 
@@ -1017,7 +1019,7 @@ mod tests {
             held.commit().await.expect("release the lock");
         });
 
-        let tip = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let tip = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
         let started = std::time::Instant::now();
         Branch::update_branch("queued", &tip, None)
             .await
@@ -1053,16 +1055,16 @@ mod tests {
         test::setup_with_new_libra_in(temp_path.path()).await;
         let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-        let base = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let base = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
         Branch::update_branch("rb", &base, None)
             .await
             .expect("create branch");
-        let base_hash = ObjectHash::from_str(&base).unwrap();
+        let base_hash = crate::internal::object_format::parse_repo_oid(&base).unwrap();
         let moved_hash = {
             // Any different valid hash.
             let mut hex = base.clone();
             hex.replace_range(0..2, "aa");
-            ObjectHash::from_str(&hex).unwrap()
+            crate::internal::object_format::parse_repo_oid(&hex).unwrap()
         };
 
         // Wrong expected tip → kept.
@@ -1102,7 +1104,7 @@ mod tests {
         test::setup_with_new_libra_in(temp_path.path()).await;
         let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-        let commit_hash = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let commit_hash = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
         Branch::update_branch("upstream/origin/master", &commit_hash, None)
             .await
             .unwrap(); // should match

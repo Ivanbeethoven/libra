@@ -2997,7 +2997,7 @@ async fn set_hash_kind_from_repo() -> Result<()> {
 
 /// Map a `core.objectformat` lookup onto [`HashKind`].
 ///
-/// - `Ok(Some(value))` → [`object_format::parse_config_value`]
+/// - `Ok(Some(value))` → [`crate::internal::object_format::parse_config_value`]
 /// - `Ok(None)` → `HashKind::Sha1` (legacy repos without the key)
 /// - `Err(_)` → propagated (fail-closed; never swallowed into sha1)
 fn hash_kind_from_object_format_lookup(

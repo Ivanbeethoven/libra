@@ -83,7 +83,6 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::Path,
-    str::FromStr,
     sync::Arc,
 };
 
@@ -580,7 +579,7 @@ struct ObjectReader {
 
 impl ObjectReader {
     fn exists_str(&self, oid: &str) -> bool {
-        ObjectHash::from_str(oid)
+        crate::internal::object_format::parse_repo_oid(oid)
             .map(|hash| self.storage.exist(&hash))
             .unwrap_or(false)
     }
@@ -709,7 +708,7 @@ fn sweep_e4_checkpoint_objects(
     let mut oid = root_tree_oid.to_string();
     let mut inner_tree: Option<Tree> = None;
     for (depth, label) in labels.iter().enumerate() {
-        let tree = match ObjectHash::from_str(&oid) {
+        let tree = match crate::internal::object_format::parse_repo_oid(&oid) {
             Ok(hash) => match reader.read_tree(&hash) {
                 Ok(tree) => {
                     sweep.record(&mut seen, label, &oid, "tree", None, true);
@@ -1553,7 +1552,7 @@ async fn scan_checkpoint_store(
                     continue;
                 }
                 None => {
-                    match ObjectHash::from_str(&oid)
+                    match crate::internal::object_format::parse_repo_oid(&oid)
                         .map_err(|e| anyhow::anyhow!("invalid OID '{oid}': {e}"))
                         .and_then(|hash| reader.read_raw(&hash))
                     {
@@ -1806,7 +1805,7 @@ async fn build_class2_plan(
             RepairPlan::Manual,
         ));
     };
-    let metadata_bytes = match ObjectHash::from_str(metadata_blob)
+    let metadata_bytes = match crate::internal::object_format::parse_repo_oid(metadata_blob)
         .map_err(|e| anyhow::anyhow!("invalid metadata blob OID '{metadata_blob}': {e}"))
         .and_then(|hash| reader.read_raw(&hash))
     {
@@ -2062,7 +2061,7 @@ fn row_layout_is_legacy_v1(reader: &ObjectReader, tree_oid: &str, checkpoint_id:
     let (Some(prefix), Some(rest)) = (checkpoint_id.get(..2), checkpoint_id.get(2..)) else {
         return false;
     };
-    let Ok(root_oid) = ObjectHash::from_str(tree_oid) else {
+    let Ok(root_oid) = crate::internal::object_format::parse_repo_oid(tree_oid) else {
         return false;
     };
     let Ok(root) = reader.read_tree(&root_oid) else {
@@ -2152,7 +2151,7 @@ fn blob_oid_hex(bytes: &[u8]) -> String {
     let header = format!("blob {}\0", bytes.len());
     let mut content = header.into_bytes();
     content.extend_from_slice(bytes);
-    ObjectHash::new(&content).to_string()
+    ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &content).to_string()
 }
 
 /// Minimal parse of a run manifest's non-null `findings_oid` (avoids pulling
@@ -2317,7 +2316,7 @@ async fn scan_agent_findings(
         }
 
         // Blob present — ensure a correctly-shaped object_index row.
-        let Ok(hash) = ObjectHash::from_str(&findings_oid) else {
+        let Ok(hash) = crate::internal::object_format::parse_repo_oid(&findings_oid) else {
             continue;
         };
         let o_size = reader.read_raw(&hash).map(|b| b.len() as i64).unwrap_or(0);
@@ -2637,9 +2636,10 @@ pub(crate) async fn repair_session_object_index(
                     "checkpoint {checkpoint_id} transcript size is absent from manifest; run `libra agent doctor --repair`"
                 ),
                 None => {
-                    let hash = ObjectHash::from_str(&oid).map_err(|error| {
-                        anyhow::anyhow!("invalid checkpoint object id {oid}: {error}")
-                    })?;
+                    let hash =
+                        crate::internal::object_format::parse_repo_oid(&oid).map_err(|error| {
+                            anyhow::anyhow!("invalid checkpoint object id {oid}: {error}")
+                        })?;
                     i64::try_from(reader.read_raw(&hash)?.len())
                         .context("checkpoint object exceeds object-index size range")?
                 }

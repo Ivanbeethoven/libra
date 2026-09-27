@@ -636,7 +636,11 @@ mod tests {
     use super::*;
 
     fn build_commit(message: &str) -> Commit {
-        let mut commit = Commit::from_tree_id(ObjectHash::new(&[1; 20]), vec![], message);
+        let mut commit = Commit::from_tree_id(
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            vec![],
+            message,
+        );
         commit.author.name = "Alice".into();
         commit.author.email = "alice@test.com".into();
         commit.author.timestamp = 1_600_000_000;
@@ -664,8 +668,8 @@ mod tests {
     #[test]
     fn format_custom_parent_placeholders() {
         let mut commit = build_commit("Child subject");
-        let parent_a = ObjectHash::new(&[2; 20]);
-        let parent_b = ObjectHash::new(&[3; 20]);
+        let parent_a = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[2; 20]);
+        let parent_b = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[3; 20]);
         commit.parent_commit_ids = vec![parent_a, parent_b];
 
         let formatter = CommitFormatter::new(FormatType::Custom("%P|%p".into()));

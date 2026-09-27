@@ -18,9 +18,9 @@
 //! append-only, 0600 JSONL file, redaction-clean (no erased content, no
 //! cleartext) — see [`audit`].
 
-use std::{path::PathBuf, str::FromStr};
+use std::path::PathBuf;
 
-use git_internal::hash::{ObjectHash, get_hash_kind};
+use git_internal::hash::ObjectHash;
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 use crate::{
@@ -225,7 +225,7 @@ pub fn is_tombstoned_cached(hash: &ObjectHash) -> bool {
 }
 
 fn hash_kind_str() -> &'static str {
-    match get_hash_kind() {
+    match git_internal::hash::get_hash_kind() {
         git_internal::hash::HashKind::Sha1 => "sha1",
         git_internal::hash::HashKind::Sha256 => "sha256",
         git_internal::hash::HashKind::Blake3 => "blake3",
@@ -331,7 +331,7 @@ pub async fn recover_incomplete() -> CliResult<usize> {
         .map_err(|e| CliError::fatal(format!("obliteration recovery scan failed: {e}")))?;
     let mut completed = 0usize;
     for oid in incomplete {
-        let Ok(hash) = ObjectHash::from_str(&oid) else {
+        let Ok(hash) = crate::internal::object_format::parse_repo_oid(&oid) else {
             continue;
         };
         // Mandatory durable audit BEFORE the destructive delete (Codex P1): a

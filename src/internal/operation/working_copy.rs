@@ -143,7 +143,8 @@ mod tests {
     use super::*;
 
     fn oid(byte: u8) -> ObjectHash {
-        ObjectHash::from_bytes(&[byte; 20]).expect("test object id")
+        ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &[byte; 20])
+            .expect("test object id")
     }
 
     #[test]

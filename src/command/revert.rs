@@ -4,7 +4,6 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use clap::Parser;
@@ -539,7 +538,7 @@ fn parse_remaining_ids(remaining: &[String]) -> Result<Vec<ObjectHash>, RevertEr
     remaining
         .iter()
         .map(|s| {
-            ObjectHash::from_str(s).map_err(|e| {
+            crate::internal::object_format::parse_repo_oid(s).map_err(|e| {
                 RevertError::LoadObject(format!(
                     "invalid pending commit id '{s}' in revert state: {e}"
                 ))
@@ -648,9 +647,9 @@ async fn run_revert_continue() -> Result<RevertOutput, RevertError> {
         }
     }
 
-    let orig_head = ObjectHash::from_str(&state.orig_head)
+    let orig_head = crate::internal::object_format::parse_repo_oid(&state.orig_head)
         .map_err(|e| RevertError::LoadObject(e.to_string()))?;
-    let reverted_commit_id = ObjectHash::from_str(&state.reverted_commit)
+    let reverted_commit_id = crate::internal::object_format::parse_repo_oid(&state.reverted_commit)
         .map_err(|e| RevertError::LoadObject(e.to_string()))?;
 
     // Build the revert commit from the (resolved) index tree.
@@ -790,8 +789,8 @@ async fn run_revert_skip() -> Result<RevertOutput, RevertError> {
 /// conflict, so the `update_head` is a no-op for `--skip` and the reset target
 /// for `--abort`.
 async fn restore_to_orig_head(orig_head_str: &str) -> Result<(), RevertError> {
-    let orig_head =
-        ObjectHash::from_str(orig_head_str).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+    let orig_head = crate::internal::object_format::parse_repo_oid(orig_head_str)
+        .map_err(|e| RevertError::LoadObject(e.to_string()))?;
     let commit: Commit =
         load_object(&orig_head).map_err(|e| RevertError::LoadObject(e.to_string()))?;
     let tree: Tree =

@@ -1,5 +1,5 @@
 use git_internal::{
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     utils::HashAlgorithm,
 };
 use sha1::{Digest, Sha1};
@@ -40,7 +40,7 @@ pub(crate) fn infer_idx_v2_hash_kind(bytes: &[u8]) -> Result<Option<HashKind>, S
         0 => Err("pack index v2 layout does not match sha1 or sha256".to_string()),
         1 => Ok(candidates.pop()),
         _ => {
-            let current = get_hash_kind();
+            let current = git_internal::hash::get_hash_kind();
             if candidates.contains(&current) {
                 Ok(Some(current))
             } else {
@@ -97,7 +97,7 @@ fn idx_v2_layout_matches_hash_kind(bytes: &[u8], object_count: usize, kind: Hash
 }
 
 pub(super) fn parse_idx_v2(bytes: &[u8]) -> Result<ParsedIndex, String> {
-    let hash_len = get_hash_kind().size();
+    let hash_len = git_internal::hash::get_hash_kind().size();
     if bytes.len() < 8 + FANOUT_LEN + hash_len * 2 {
         return Err("pack index v2 is too short".to_string());
     }
@@ -171,8 +171,11 @@ pub(super) fn parse_idx_v2(bytes: &[u8]) -> Result<ParsedIndex, String> {
     for i in 0..object_count {
         let hash_start = i * hash_len;
         let hash_end = hash_start + hash_len;
-        let hash = ObjectHash::from_bytes(&names[hash_start..hash_end])
-            .map_err(|error| format!("invalid v2 object hash: {error}"))?;
+        let hash = ObjectHash::from_bytes_for_kind(
+            git_internal::hash::get_hash_kind(),
+            &names[hash_start..hash_end],
+        )
+        .map_err(|error| format!("invalid v2 object hash: {error}"))?;
 
         let crc_start = i * 4;
         let crc32 = u32::from_be_bytes(
@@ -206,8 +209,11 @@ pub(super) fn parse_idx_v2(bytes: &[u8]) -> Result<ParsedIndex, String> {
     validate_sorted_entries(&entries)?;
     validate_fanout_matches_entries(&fanout, &entries)?;
 
-    let pack_hash = ObjectHash::from_bytes(&bytes[trailer_start..trailer_start + hash_len])
-        .map_err(|error| format!("invalid v2 pack hash: {error}"))?;
+    let pack_hash = ObjectHash::from_bytes_for_kind(
+        git_internal::hash::get_hash_kind(),
+        &bytes[trailer_start..trailer_start + hash_len],
+    )
+    .map_err(|error| format!("invalid v2 pack hash: {error}"))?;
     let index_hash = bytes[trailer_start + hash_len..].to_vec();
 
     let computed_git_hash = hash_bytes(&bytes[..bytes.len() - index_hash_len]);
@@ -229,7 +235,7 @@ pub(super) fn parse_idx_v2(bytes: &[u8]) -> Result<ParsedIndex, String> {
 }
 
 fn hash_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut hash = HashAlgorithm::new();
+    let mut hash = HashAlgorithm::new_for_kind(git_internal::hash::get_hash_kind());
     hash.update(bytes);
     hash.finalize()
 }

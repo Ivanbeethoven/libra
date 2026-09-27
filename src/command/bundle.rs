@@ -20,12 +20,11 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use clap::{Parser, Subcommand};
 use git_internal::{
-    hash::{ObjectHash, get_hash_kind, set_hash_kind},
+    hash::{ObjectHash, set_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
@@ -258,7 +257,7 @@ async fn collect_bundle_heads(
                 .with_exit_code(128)
                 .with_stable_code(StableErrorCode::RepoCorrupt)
         })?;
-        let oid = ObjectHash::from_str(&target).map_err(|error| {
+        let oid = crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
             CliError::fatal(format!(
                 "bundle: stored tag '{name}' has invalid target '{target}': {error}"
             ))
@@ -494,7 +493,7 @@ async fn encode_pack(entries: Vec<Entry>) -> CliResult<Vec<u8>> {
     let (pack_tx, mut pack_rx) = mpsc::channel::<Vec<u8>>(128);
     let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(128);
     let mut encoder = PackEncoder::new(count, 0, pack_tx);
-    let kind = get_hash_kind();
+    let kind = git_internal::hash::get_hash_kind();
     let encoder_handle = tokio::spawn(async move {
         set_hash_kind(kind);
         encoder.encode(entry_rx).await
@@ -667,7 +666,7 @@ fn unbundle(file: &Path) -> CliResult<()> {
 
     let storage = util::objects_storage();
     for (oid, name) in &header.heads {
-        let oid = ObjectHash::from_str(oid).map_err(|error| {
+        let oid = crate::internal::object_format::parse_repo_oid(oid).map_err(|error| {
             CliError::fatal(format!(
                 "bundle head '{name}' has invalid object id: {error}"
             ))
@@ -692,7 +691,7 @@ fn unbundle(file: &Path) -> CliResult<()> {
 fn build_bundle_index(pack: &Path, index: &Path) -> CliResult<()> {
     let pack_name = pack.to_string_lossy().into_owned();
     let index_name = index.to_string_lossy().into_owned();
-    match get_hash_kind() {
+    match git_internal::hash::get_hash_kind() {
         git_internal::hash::HashKind::Sha1 => index_pack::build_index_v1(&pack_name, &index_name),
         git_internal::hash::HashKind::Sha256 | git_internal::hash::HashKind::Blake3 => {
             index_pack::build_index_v2(&pack_name, &index_name)
@@ -784,7 +783,7 @@ pub(crate) fn verify_prerequisites(header: &BundleHeader, exit_code: i32) -> Cli
     let storage = util::objects_storage();
     let mut missing = Vec::new();
     for (oid, _) in &header.prerequisites {
-        match ObjectHash::from_str(oid) {
+        match crate::internal::object_format::parse_repo_oid(oid) {
             Ok(hash) if storage.get(&hash).is_ok() => {}
             _ => missing.push(oid.clone()),
         }
@@ -801,7 +800,7 @@ pub(crate) fn verify_prerequisites(header: &BundleHeader, exit_code: i32) -> Cli
 }
 
 pub(crate) fn validate_bundle_pack(pack: &[u8], exit_code: i32) -> CliResult<ObjectHash> {
-    let hash_len = get_hash_kind().size();
+    let hash_len = git_internal::hash::get_hash_kind().size();
     if pack.len() < 12 + hash_len || &pack[0..4] != b"PACK" || pack[4..8] != [0, 0, 0, 2] {
         return Err(
             CliError::fatal("bundle pack is missing or not a version-2 pack".to_string())
@@ -810,14 +809,17 @@ pub(crate) fn validate_bundle_pack(pack: &[u8], exit_code: i32) -> CliResult<Obj
         );
     }
     let payload_len = pack.len() - hash_len;
-    let expected = ObjectHash::from_bytes(&pack[payload_len..]).map_err(|error| {
-        CliError::fatal(format!(
-            "bundle pack has an invalid checksum trailer: {error}"
-        ))
-        .with_exit_code(exit_code)
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?;
-    let actual = ObjectHash::new(&pack[..payload_len]);
+    let expected =
+        ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &pack[payload_len..])
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "bundle pack has an invalid checksum trailer: {error}"
+                ))
+                .with_exit_code(exit_code)
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+    let actual =
+        ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &pack[..payload_len]);
     if actual != expected {
         return Err(CliError::fatal(format!(
             "bundle pack checksum mismatch: expected {expected}, computed {actual}"
@@ -879,12 +881,12 @@ pub(crate) fn parse_header(bytes: &[u8], exit_code: i32) -> CliResult<BundleHead
         if let Some(rest) = text.strip_prefix('-') {
             // Prerequisite: `-<oid> [comment]`.
             let (oid, comment) = split_oid_rest(rest);
-            ObjectHash::from_str(&oid)
+            crate::internal::object_format::parse_repo_oid(&oid)
                 .map_err(|_| invalid(&format!("invalid prerequisite object id '{oid}'")))?;
             prerequisites.push((oid, comment));
         } else {
             let (oid, name) = split_oid_rest(text);
-            ObjectHash::from_str(&oid)
+            crate::internal::object_format::parse_repo_oid(&oid)
                 .map_err(|_| invalid(&format!("invalid head object id '{oid}'")))?;
             if name != "HEAD" && (!name.starts_with("refs/") || !util::is_valid_refname(&name)) {
                 return Err(invalid(&format!("invalid advertised ref '{name}'")));
@@ -974,7 +976,7 @@ mod tests {
 
     #[test]
     fn parses_a_v2_header_with_heads() {
-        let oid = "a".repeat(get_hash_kind().hex_len());
+        let oid = "a".repeat(git_internal::hash::get_hash_kind().hex_len());
         let bytes = format!("# v2 git bundle\n{oid} refs/heads/main\n\nPACK");
         let header = parse_header(bytes.as_bytes(), 1).unwrap();
         assert_eq!(header.heads, vec![(oid, "refs/heads/main".into())]);
@@ -983,8 +985,8 @@ mod tests {
 
     #[test]
     fn parses_prerequisites() {
-        let prerequisite = "d".repeat(get_hash_kind().hex_len());
-        let head = "b".repeat(get_hash_kind().hex_len());
+        let prerequisite = "d".repeat(git_internal::hash::get_hash_kind().hex_len());
+        let head = "b".repeat(git_internal::hash::get_hash_kind().hex_len());
         let bytes =
             format!("# v2 git bundle\n-{prerequisite} comment here\n{head} refs/heads/x\n\nPACK");
         let header = parse_header(bytes.as_bytes(), 1).unwrap();

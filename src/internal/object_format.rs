@@ -9,7 +9,7 @@
 
 use anyhow::{Result, bail};
 use git_internal::{
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     utils::HashAlgorithm,
 };
 
@@ -48,7 +48,7 @@ pub fn pack_index_is_v2(kind: HashKind) -> bool {
 /// (`set_hash_kind` / CLI preflight). Prefer [`parse_hex_for_kind`] when the
 /// repository kind is known explicitly.
 pub fn parse_repo_oid(hex: &str) -> Result<ObjectHash> {
-    parse_hex_for_kind(get_hash_kind(), hex)
+    parse_hex_for_kind(git_internal::hash::get_hash_kind(), hex)
 }
 
 /// Parse a raw hex OID for an explicit repository `kind`.

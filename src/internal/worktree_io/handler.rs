@@ -513,7 +513,8 @@ fn hash_regular_file_handle(
     mut file: std::fs::File,
     length: u64,
 ) -> io::Result<git_internal::hash::ObjectHash> {
-    let mut hasher = git_internal::utils::HashAlgorithm::new();
+    let mut hasher =
+        git_internal::utils::HashAlgorithm::new_for_kind(git_internal::hash::get_hash_kind());
     hasher.update(b"blob ");
     hasher.update(length.to_string().as_bytes());
     hasher.update(b"\0");
@@ -539,7 +540,11 @@ fn hash_regular_file_handle(
             "worktree file changed while it was being hashed",
         ));
     }
-    git_internal::hash::ObjectHash::from_bytes(&hasher.finalize()).map_err(io::Error::other)
+    git_internal::hash::ObjectHash::from_bytes_for_kind(
+        git_internal::hash::get_hash_kind(),
+        &hasher.finalize(),
+    )
+    .map_err(io::Error::other)
 }
 
 fn hash_lfs_file_handle(file: &std::fs::File, length: u64) -> io::Result<(String, u64)> {
@@ -618,7 +623,7 @@ pub(crate) fn read_object_blob_request(
 ) -> Result<Vec<u8>, ObjectBlobStatus> {
     use crate::utils::client_storage::{ClientStorage, ObjectReadFailure};
 
-    let Ok(hash) = oid.parse::<git_internal::hash::ObjectHash>() else {
+    let Ok(hash) = crate::internal::object_format::parse_repo_oid(oid) else {
         return Err(ObjectBlobStatus::Failed);
     };
     // Local-only + alternates, no directory creation / remote hydrate

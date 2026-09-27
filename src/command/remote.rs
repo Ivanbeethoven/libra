@@ -7,7 +7,6 @@ use std::{
 };
 
 use clap::{Subcommand, ValueEnum};
-use git_internal::hash::get_hash_kind;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter,
     TransactionTrait,
@@ -1287,7 +1286,7 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
     let (_remote_client, discovery) =
         fetch::discover_remote_with_name(&remote_config.url, Some(&remote_config.name)).await?;
 
-    let local_kind = get_hash_kind();
+    let local_kind = git_internal::hash::get_hash_kind();
     if discovery.hash_kind != local_kind {
         return Err(RemoteError::ObjectFormatMismatch {
             remote: discovery.hash_kind.to_string(),

@@ -113,7 +113,8 @@ mod tests {
     fn entry(name: &str, byte: u8) -> IndexEntry {
         IndexEntry::new_from_blob(
             name.to_string(),
-            ObjectHash::from_bytes(&[byte; 20]).expect("oid"),
+            ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &[byte; 20])
+                .expect("oid"),
             3,
         )
     }

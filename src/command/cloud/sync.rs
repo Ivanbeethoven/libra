@@ -263,7 +263,7 @@ pub(crate) async fn run_cloud_sync(
 fn parse_object_index_hash(obj: &object_index::Model) -> CloudResult<ObjectHash> {
     let bytes =
         hex::decode(&obj.o_id).map_err(|e| CloudError::Generic(format!("Invalid hash: {}", e)))?;
-    ObjectHash::from_bytes(&bytes)
+    ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes)
         .map_err(|e| CloudError::Generic(format!("Invalid object hash: {}", e)))
 }
 

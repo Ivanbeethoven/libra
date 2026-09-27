@@ -1221,12 +1221,10 @@ fn resolve_loose_object_prefix(
     storage: &Path,
     prefix: &str,
 ) -> Option<git_internal::hash::ObjectHash> {
-    use std::str::FromStr;
-
     if prefix.len() < 4 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    if let Ok(full) = git_internal::hash::ObjectHash::from_str(prefix) {
+    if let Ok(full) = crate::internal::object_format::parse_repo_oid(prefix) {
         return Some(full);
     }
     let fanout = storage.join("objects").join(&prefix[..2]);
@@ -1242,7 +1240,7 @@ fn resolve_loose_object_prefix(
             matched = Some(format!("{}{name}", &prefix[..2]));
         }
     }
-    git_internal::hash::ObjectHash::from_str(&matched?).ok()
+    crate::internal::object_format::parse_repo_oid(&matched?).ok()
 }
 
 /// Split a (possibly multi-file) unified diff into per-file sections. Git-style

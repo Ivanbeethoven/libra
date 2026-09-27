@@ -10,7 +10,7 @@ use std::{
 use clap::{Parser, ValueEnum};
 use git_internal::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::{
         index::Index,
         object::{
@@ -2353,7 +2353,7 @@ fn output_porcelain_v2(
 }
 
 fn zero_hash_str() -> String {
-    ObjectHash::zero_str(get_hash_kind())
+    ObjectHash::zero_str(git_internal::hash::get_hash_kind())
 }
 
 fn write_unmerged_porcelain_v2(
@@ -4145,7 +4145,7 @@ mod test {
     fn short_format_surface_emits_all_seven_unmerged_xy_codes() {
         use crate::command::unmerged::{UnmergedEntry, UnmergedStage};
 
-        let hash = ObjectHash::new(&[0u8; 20]);
+        let hash = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[0u8; 20]);
         let mk = |name: &str, stages: [bool; 3]| {
             let stage = |present: bool| {
                 present.then_some(UnmergedStage {

@@ -6,16 +6,12 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use clap::Parser;
-use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
-    internal::{
-        index::{Index, IndexEntry},
-        object::blob::Blob,
-    },
+use git_internal::internal::{
+    index::{Index, IndexEntry},
+    object::blob::Blob,
 };
 use serde::Serialize;
 
@@ -228,9 +224,9 @@ fn parse_cacheinfo(spec: &str) -> Result<IndexEntry, String> {
         ));
     }
 
-    let hash = ObjectHash::from_str(oid_str)
+    let hash = crate::internal::object_format::parse_repo_oid(oid_str)
         .map_err(|_| format!("invalid object id '{oid_str}' in --cacheinfo"))?;
-    let expected_len = get_hash_kind().hex_len();
+    let expected_len = git_internal::hash::get_hash_kind().hex_len();
     if oid_str.len() != expected_len {
         return Err(format!(
             "object id '{oid_str}' does not match the repository hash format (expected {expected_len} hex chars)"

@@ -6,15 +6,11 @@
 use std::{
     io::Error as IoError,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use bytes::Bytes;
 use futures_util::stream;
-use git_internal::{
-    errors::GitError,
-    hash::{HashKind, ObjectHash},
-};
+use git_internal::{errors::GitError, hash::HashKind};
 
 use super::{DiscRef, DiscoveryResult, FetchStream};
 use crate::{
@@ -128,7 +124,7 @@ fn hash_kind_from_heads(heads: &[(String, String)]) -> Result<HashKind, GitError
             "bundle advertises no heads".to_string(),
         ));
     };
-    match ObjectHash::from_str(oid) {
+    match crate::internal::object_format::parse_repo_oid(oid) {
         Ok(_) if oid.len() == 40 => Ok(HashKind::Sha1),
         Ok(_) if oid.len() == 64 => Ok(HashKind::Sha256),
         Ok(_) => Err(GitError::NetworkError(format!(

@@ -1417,3 +1417,28 @@ fn gc_refuses_a_manifest_that_is_not_a_json_object() {
         "and must say why: {combined}"
     );
 }
+
+/// B3-08: `parse_object_hash` must honour the repository hash kind (blake3),
+/// not infer SHA-256 from a 32-byte width.
+#[tokio::test]
+#[serial(hash_kind)]
+async fn maintenance_parse_object_hash_blake3() {
+    use git_internal::hash::{HashKind, ObjectHash, set_hash_kind_for_test};
+    use libra::command::maintenance::parse_object_hash;
+
+    let _guard = set_hash_kind_for_test(HashKind::Blake3);
+    let expected = ObjectHash::new_for_kind(HashKind::Blake3, b"b3-08-maintenance-oid");
+    let hex = expected.to_string();
+    assert_eq!(hex.len(), 64, "blake3 OIDs are 64 hex chars");
+
+    let parsed = parse_object_hash(&hex).expect("blake3 hex must parse under Blake3 kind");
+    assert_eq!(parsed, expected);
+    assert_eq!(parsed.kind(), HashKind::Blake3);
+
+    // A SHA-1-width hex must not be accepted while the process kind is Blake3.
+    let sha1_hex = "1".repeat(40);
+    assert!(
+        parse_object_hash(&sha1_hex).is_none(),
+        "width-based SHA-1 inference must stay closed under Blake3"
+    );
+}

@@ -1,12 +1,7 @@
 //! Handles checkout-style flows to show the current branch, switch to existing branches, or create and switch to a new one using restore utilities.
 
-use std::str::FromStr;
-
 use clap::Parser;
-use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
-    internal::object::commit::Commit,
-};
+use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 use serde::Serialize;
 
 use crate::{
@@ -306,7 +301,7 @@ pub async fn execute(args: CheckoutArgs) {
 pub async fn execute_safe(args: CheckoutArgs, output: &OutputConfig) -> CliResult<()> {
     let result = run_checkout(args, output).await.map_err(CliError::from)?;
     if !matches!(result.action.as_str(), "show-current" | "already-on") {
-        let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
         let old = result
             .previous_commit
             .clone()
@@ -389,11 +384,12 @@ async fn run_checkout(
         let Some(commit) = previous_commit.as_deref() else {
             return Err(CheckoutError::UnbornHead);
         };
-        let commit_id =
-            ObjectHash::from_str(commit).map_err(|_| CheckoutError::BranchStoreCorrupt {
+        let commit_id = crate::internal::object_format::parse_repo_oid(commit).map_err(|_| {
+            CheckoutError::BranchStoreCorrupt {
                 context: "resolve HEAD for --detach".to_string(),
                 detail: format!("invalid HEAD commit '{commit}'"),
-            })?;
+            }
+        })?;
         switch::detach_head_in_place(commit_id, switch::NavigationCommand::Checkout)
             .await
             .map_err(map_switch_error)?;
@@ -545,7 +541,7 @@ async fn run_checkout(
             get_commit_base(branch_name)
                 .await
                 .ok()
-                .or_else(|| ObjectHash::from_str(branch_name).ok())
+                .or_else(|| crate::internal::object_format::parse_repo_oid(branch_name).ok())
         }
     } else {
         None
@@ -813,7 +809,7 @@ async fn resolve_checkout_create_startpoint(
         Some(spec) => get_commit_base(spec)
             .await
             .ok()
-            .or_else(|| ObjectHash::from_str(spec).ok())
+            .or_else(|| crate::internal::object_format::parse_repo_oid(spec).ok())
             .ok_or_else(|| CheckoutError::InvalidObjectName(spec.to_string()))?,
         None => match Head::current_commit_result().await.map_err(|error| {
             CheckoutError::BranchStoreCorrupt {

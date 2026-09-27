@@ -768,10 +768,7 @@ fn write_record<W: Write>(writer: &mut W, bytes: &[u8], separator: u8) -> CliRes
 #[cfg(test)]
 mod tests {
     use clap::Parser;
-    use git_internal::{
-        hash::{ObjectHash, get_hash_kind},
-        internal::object::tree::TreeItemMode,
-    };
+    use git_internal::{hash::ObjectHash, internal::object::tree::TreeItemMode};
 
     use super::{
         LsTreeArgs, RawLsTreeEntry, abbreviate_hash, mode_string, normalize_one_path_filter,
@@ -865,8 +862,11 @@ mod tests {
 
     #[test]
     fn raw_entry_is_cloneable_for_directory_filtering() {
-        let hash = ObjectHash::from_bytes(&vec![1; get_hash_kind().size()])
-            .expect("test hash bytes should match active hash kind");
+        let hash = ObjectHash::from_bytes_for_kind(
+            git_internal::hash::get_hash_kind(),
+            &vec![1; git_internal::hash::get_hash_kind().size()],
+        )
+        .expect("test hash bytes should match active hash kind");
         let raw = RawLsTreeEntry {
             mode: TreeItemMode::Tree,
             object_id: hash,

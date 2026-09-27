@@ -13,7 +13,7 @@ use std::{
 
 use git_internal::{
     errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
 };
 use ignore::{
@@ -1618,7 +1618,7 @@ fn ensure_hash_kind(
     display_name: &str,
     stored_reference: bool,
 ) -> Result<ObjectHash, CommitBaseError> {
-    let expected = get_hash_kind();
+    let expected = git_internal::hash::get_hash_kind();
     if object_id.kind() == expected {
         return Ok(object_id);
     }
@@ -1702,7 +1702,7 @@ async fn resolve_tag_atom_typed(
             "tag reference 'refs/tags/{tag_name}' has no object id"
         ))
     })?;
-    let object_id = target.parse::<ObjectHash>().map_err(|error| {
+    let object_id = crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
         CommitBaseError::CorruptReference(format!(
             "tag reference 'refs/tags/{tag_name}' has invalid object id '{target}': {error}"
         ))
@@ -1770,11 +1770,10 @@ async fn resolve_remote_branch_atom_typed(
 }
 
 async fn resolve_hash_atom_typed(name: &str) -> Result<ResolvedAtom, CommitBaseError> {
-    let hash_kind = get_hash_kind();
+    let hash_kind = git_internal::hash::get_hash_kind();
     let expected_len = hash_kind.hex_len();
     if name.len() == expected_len && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        let object_id = name
-            .parse::<ObjectHash>()
+        let object_id = crate::internal::object_format::parse_repo_oid(name)
             .map_err(|_| invalid_reference(name))?;
         return Ok(ResolvedAtom {
             object_id: ensure_hash_kind(object_id, name, false)?,
@@ -1994,12 +1993,13 @@ async fn resolve_reflog_selector_typed(
             "reflog entry '{ref_name}@{{{index}}}' does not exist"
         ))
     })?;
-    let object_id = entry.new_oid.parse::<ObjectHash>().map_err(|error| {
-        CommitBaseError::CorruptReference(format!(
-            "reflog entry '{ref_name}@{{{index}}}' has invalid object id '{}': {error}",
-            entry.new_oid
-        ))
-    })?;
+    let object_id =
+        crate::internal::object_format::parse_repo_oid(&entry.new_oid).map_err(|error| {
+            CommitBaseError::CorruptReference(format!(
+                "reflog entry '{ref_name}@{{{index}}}' has invalid object id '{}': {error}",
+                entry.new_oid
+            ))
+        })?;
     validate_referenced_object(&objects_storage(), object_id, display_name, None)
 }
 

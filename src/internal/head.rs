@@ -1,6 +1,6 @@
 //! HEAD management backed by the database, supporting local and remote heads, detached states, and transaction-safe query/update helpers.
 
-use std::{str::FromStr, time::Duration};
+use std::time::Duration;
 
 use git_internal::hash::{HashKind, ObjectHash};
 use sea_orm::{
@@ -68,9 +68,11 @@ fn parse_ref_commit_for_kind(
     what: &str,
     repo_kind: HashKind,
 ) -> Result<ObjectHash, BranchStoreError> {
-    let commit = ObjectHash::from_str(raw).map_err(|error| BranchStoreError::Corrupt {
-        name: ref_name.to_string(),
-        detail: format!("invalid {what}: {error}"),
+    let commit = crate::internal::object_format::parse_repo_oid(raw).map_err(|error| {
+        BranchStoreError::Corrupt {
+            name: ref_name.to_string(),
+            detail: format!("invalid {what}: {error}"),
+        }
     })?;
     if commit.kind() != repo_kind {
         return Err(BranchStoreError::Corrupt {
@@ -347,8 +349,7 @@ impl Head {
                 detail: format!(
                     "HEAD reference is missing from storage for worktree '{}'; restore this worktree's HEAD reference before retrying",
                     scope.worktree_id().unwrap_or("main")
-                ),
-            })?;
+                )})?;
         let repo_kind = repository_hash_kind_with_conn(db).await?;
         decode_local_head(head, repo_kind)
     }
@@ -873,7 +874,7 @@ mod tests {
     /// Regression for v0.17.238: a remote HEAD row that is detached
     /// (`name = NULL`) but whose stored commit hash is unparseable must
     /// surface as `BranchStoreError::Corrupt`. Before v0.17.238 the lossy
-    /// `remote_current_with_conn` would panic via `ObjectHash::from_str(...).unwrap()`.
+    /// `remote_current_with_conn` would panic via `crate::internal::object_format::parse_repo_oid(...).unwrap()`.
     /// The error message names the canonical refspec
     /// (`refs/remotes/<remote>/HEAD`) so operators can locate the bad row.
     #[tokio::test]
@@ -1070,8 +1071,10 @@ mod tests {
         )
         .await
         .expect("target may retain its own branch");
-        let target_oid = ObjectHash::from_str(&"1".repeat(40)).expect("target oid");
-        let main_oid = ObjectHash::from_str(&"2".repeat(40)).expect("main oid");
+        let target_oid =
+            crate::internal::object_format::parse_repo_oid(&"1".repeat(40)).expect("target oid");
+        let main_oid =
+            crate::internal::object_format::parse_repo_oid(&"2".repeat(40)).expect("main oid");
         Head::update_for_scope_result_with_conn(&db, Head::Detached(target_oid), None, &target)
             .await
             .expect("update only target HEAD");

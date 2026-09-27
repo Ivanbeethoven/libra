@@ -23,7 +23,7 @@
 //! state instead of starting a second one, which is the plan's
 //! "response was lost → query by operation id" recovery contract.
 
-use std::{path::PathBuf, str::FromStr, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use git_internal::hash::ObjectHash;
 use serde_json::{Value, json};
@@ -176,7 +176,7 @@ fn validate_paths(params: &Option<Value>) -> Result<Vec<String>, BridgeError> {
 /// only the bridge writes these columns, so the caller sees an actionable
 /// `internal` error instead of an `invalid_params` it cannot act on.
 pub fn parse_stored_commit_oid(raw: &str, what: &str) -> Result<ObjectHash, BridgeError> {
-    ObjectHash::from_str(raw).map_err(|e| {
+    crate::internal::object_format::parse_repo_oid(raw).map_err(|e| {
         BridgeError::internal(format!(
             "{what} records the malformed object id '{raw}' ({e}); the bridge checkpoint store is \
              inconsistent — inspect it with `libra agent checkpoint list`"
@@ -246,26 +246,23 @@ pub async fn diff_data(
             "rename_from": file.rename_from,
             "binary": file.binary.is_some(),
             "patch": body,
-            "patch_omitted": omitted,
-        }));
+            "patch_omitted": omitted}));
     }
     if total_files > limit {
         warnings.push(json!({
-            "code": "diff_truncated",
-            "message": format!(
-                "{total_files} files changed; this page returns the first {limit}. Narrow the \
-                 request with 'paths' or raise 'limit' (cap {MAX_PAGE})."
-            ),
-        }));
+        "code": "diff_truncated",
+        "message": format!(
+            "{total_files} files changed; this page returns the first {limit}. Narrow the \
+             request with 'paths' or raise 'limit' (cap {MAX_PAGE})."
+        )}));
     }
     if files.iter().any(|f| f["patch_omitted"] == json!(true)) {
         warnings.push(json!({
-            "code": "diff_patch_budget_exhausted",
-            "message": format!(
-                "the {MAX_DIFF_PATCH_BYTES}-byte patch budget was exhausted; files after the cut \
-                 report stats only (patch_omitted=true). Request them individually with 'paths'."
-            ),
-        }));
+        "code": "diff_patch_budget_exhausted",
+        "message": format!(
+            "the {MAX_DIFF_PATCH_BYTES}-byte patch budget was exhausted; files after the cut \
+             report stats only (patch_omitted=true). Request them individually with 'paths'."
+        )}));
     }
 
     let data = json!({
@@ -276,8 +273,7 @@ pub async fn diff_data(
         "insertions": output.total_insertions,
         "deletions": output.total_deletions,
         "limit": limit,
-        "files": files,
-    });
+        "files": files});
     Ok((data, warnings))
 }
 
@@ -449,8 +445,7 @@ pub async fn commit_create(
         "head": output.head,
         "root_commit": output.root_commit,
         "signoff": output.signoff,
-        "signed": output.signed,
-    }))
+        "signed": output.signed}))
 }
 
 /// Validate a `commit.create` message param.
@@ -519,8 +514,7 @@ pub async fn checkpoint_restore(target: &ObjectHash) -> Result<Value, BridgeErro
         "target_commit": target.to_string(),
         "restored_paths": plan.restore.len(),
         "deleted_paths": plan.delete.len(),
-        "head_moved": false,
-    }))
+        "head_moved": false}))
 }
 
 // ---------------------------------------------------------------------------
@@ -610,8 +604,7 @@ pub fn review_state(run_id: &str) -> Result<Value, BridgeError> {
                 "run_id": run_id,
                 "state": "starting",
                 "terminal_state": Value::Null,
-                "running": true,
-            }));
+                "running": true}));
         }
         return Err(BridgeError::internal(format!(
             "review run '{run_id}' was recorded for this operation but its state is missing; \
@@ -629,8 +622,7 @@ pub fn review_state(run_id: &str) -> Result<Value, BridgeError> {
         "running": !state.is_terminal(),
         "cancel_requested": state.cancel_requested,
         "created_at": state.created_at,
-        "updated_at": state.updated_at,
-    }))
+        "updated_at": state.updated_at}))
 }
 
 /// Start a read-only review run and return its identifiers.
@@ -769,8 +761,7 @@ pub async fn review_start(request: &ReviewRequest) -> Result<(String, Value), Br
             "starting_sha": starting_sha_label,
             "agents": request.agents,
             "terminal_state": Value::Null,
-            "running": true,
-        }),
+            "running": true}),
     ))
 }
 

@@ -15,7 +15,7 @@
 //! option set (e.g. `--keep`, `--scissors`, `--whitespace`,
 //! `--interactive`).
 
-use std::{collections::HashSet, fs, str::FromStr};
+use std::{collections::HashSet, fs};
 
 use clap::Parser;
 use git_internal::{
@@ -160,12 +160,14 @@ impl AmState {
     }
 
     fn from_sequence(sequence: AmSequenceState) -> CliResult<Self> {
-        let head_orig = ObjectHash::from_str(sequence.head_orig.trim()).map_err(|error| {
+        let head_orig = crate::internal::object_format::parse_repo_oid(sequence.head_orig.trim())
+            .map_err(|error| {
             am_state_error(format!("saved am original HEAD is invalid: {error}"))
         })?;
-        let expected_head = ObjectHash::from_str(sequence.current_oid.trim()).map_err(|error| {
-            am_state_error(format!("saved am expected HEAD is invalid: {error}"))
-        })?;
+        let expected_head = crate::internal::object_format::parse_repo_oid(
+            sequence.current_oid.trim(),
+        )
+        .map_err(|error| am_state_error(format!("saved am expected HEAD is invalid: {error}")))?;
         let payload: AmPayload = serde_json::from_str(&sequence.payload)
             .map_err(|error| am_state_error(format!("saved am state is invalid: {error}")))?;
         if payload.patches.is_empty()

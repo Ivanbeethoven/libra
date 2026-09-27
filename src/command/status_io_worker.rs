@@ -274,7 +274,7 @@ pub(crate) fn deadline_file_blob_hash(
     for event in events {
         if let IoEvent::DoneHash { hex } = event {
             return Ok(unwrap_wire(hex).and_then(|hex| {
-                hex.parse::<git_internal::hash::ObjectHash>()
+                crate::internal::object_format::parse_repo_oid(&hex)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
             }));
         }

@@ -1,12 +1,7 @@
 //! Switch command to change branches safely, validating clean state, handling creation, and delegating checkout behavior to restore logic.
 
-use std::str::FromStr;
-
 use clap::Parser;
-use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
-    internal::index::Index,
-};
+use git_internal::{hash::ObjectHash, internal::index::Index};
 use serde::Serialize;
 
 use super::{
@@ -496,12 +491,13 @@ pub(crate) async fn resolve_previous_checkout_target() -> Result<PreviousCheckou
     }
 
     if detached_source_matches_old_oid(source, &entry.old_oid) {
-        let commit = ObjectHash::from_str(&entry.old_oid).map_err(|error| {
-            previous_checkout_invalid_error(format!(
-                "entry {} has an invalid old object ID: {error}",
-                entry.id
-            ))
-        })?;
+        let commit =
+            crate::internal::object_format::parse_repo_oid(&entry.old_oid).map_err(|error| {
+                previous_checkout_invalid_error(format!(
+                    "entry {} has an invalid old object ID: {error}",
+                    entry.id
+                ))
+            })?;
         load_object::<git_internal::internal::object::commit::Commit>(&commit).map_err(
             |error| {
                 previous_checkout_invalid_error(format!(
@@ -892,10 +888,9 @@ pub async fn execute(args: SwitchArgs) {
 pub async fn execute_safe(args: SwitchArgs, output: &OutputConfig) -> CliResult<()> {
     let result = run_switch(args, output).await.map_err(CliError::from)?;
     if !result.already_on {
-        let old = result
-            .previous_commit
-            .clone()
-            .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
+        let old = result.previous_commit.clone().unwrap_or_else(|| {
+            ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()
+        });
         run_advisory_repo_hook(
             RepoHook::PostCheckout,
             &[old, result.commit.clone(), "1".to_string()],
@@ -1053,7 +1048,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
             let Some(commit) = previous_commit.as_deref() else {
                 return Err(SwitchError::UnbornHead);
             };
-            let commit_hash = ObjectHash::from_str(commit)
+            let commit_hash = crate::internal::object_format::parse_repo_oid(commit)
                 .map_err(|error| SwitchError::CommitResolve(error.to_string()))?;
             detach_head_in_place(commit_hash, NavigationCommand::Switch).await?;
             return Ok(SwitchOutput {
@@ -1314,7 +1309,7 @@ pub(crate) async fn switch_to_orphan_branch(
         previous_branch,
         previous_commit,
         branch: Some(new_branch_name),
-        commit: ObjectHash::zero_str(get_hash_kind()).to_string(),
+        commit: ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
         created: true,
         detached: false,
         unborn: true,
@@ -1348,7 +1343,7 @@ where
         .await
         .map_err(map_branch_store_error)?
         .map(|oid| oid.to_string())
-        .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
+        .unwrap_or_else(|| ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string());
     let from = match Head::current_result_with_conn(db)
         .await
         .map_err(map_branch_store_error)?
@@ -1370,7 +1365,7 @@ async fn switch_head_to_unborn_branch(
         navigation_reflog_action(navigation_command, from_ref_name, branch_name.to_string());
     let context = ReflogContext {
         old_oid,
-        new_oid: ObjectHash::zero_str(get_hash_kind()).to_string(),
+        new_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
         action,
     };
     let branch_name = branch_name.to_string();
@@ -1726,7 +1721,6 @@ async fn current_switch_state() -> Result<(Option<String>, Option<String>), Swit
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
 
     use super::*;
     use crate::command::restore::RestoreArgs;
@@ -1864,7 +1858,10 @@ mod tests {
     #[test]
     /// Test parsing RestoreArgs from command-line style arguments
     fn test_parse_from() {
-        let commit_id = ObjectHash::from_str("0cb5eb6281e1c0df48a70716869686c694706189").unwrap();
+        let commit_id = crate::internal::object_format::parse_repo_oid(
+            "0cb5eb6281e1c0df48a70716869686c694706189",
+        )
+        .unwrap();
         let restore_args = RestoreArgs::parse_from([
             "restore", // important, the first will be ignored
             "--worktree",

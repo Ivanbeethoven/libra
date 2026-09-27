@@ -852,8 +852,11 @@ fn bootstrap_pointer(heads: &super::OpHeadsView) -> Result<WorkspaceStatePointer
         .max_by_key(|(_, generation)| *generation)
         .map(|(op_id, generation)| (op_id.clone(), *generation))
         .unwrap_or_else(|| ("bootstrap".to_string(), 0));
-    let zero_oid = ObjectHash::from_bytes(&vec![0; git_internal::hash::get_hash_kind().size()])
-        .map_err(|error| OperationError::Storage(error.to_string()))?;
+    let zero_oid = ObjectHash::from_bytes_for_kind(
+        git_internal::hash::get_hash_kind(),
+        &vec![0; git_internal::hash::get_hash_kind().size()],
+    )
+    .map_err(|error| OperationError::Storage(error.to_string()))?;
     Ok(WorkspaceStatePointer::new(last_op_id, zero_oid, generation))
 }
 

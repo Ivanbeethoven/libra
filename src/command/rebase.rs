@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use anyhow::Context;
@@ -271,7 +270,7 @@ pub(crate) fn held_autostash_oid_in_gitdir(
         })?
         .and_then(|aux| aux.autostash)
         .map(|oid| {
-            ObjectHash::from_str(&oid).map_err(|error| {
+            crate::internal::object_format::parse_repo_oid(&oid).map_err(|error| {
                 CliError::fatal(format!(
                     "rebase-aux.json contains invalid autostash object '{oid}': {error}"
                 ))
@@ -561,11 +560,11 @@ impl RebaseState {
         let empty_mode =
             parse_rebase_empty_mode(empty_mode_str.trim()).unwrap_or(RebaseEmptyMode::Keep);
 
-        let onto =
-            ObjectHash::from_str(onto_str.trim()).map_err(|e| format!("Invalid onto hash: {e}"))?;
-        let orig_head = ObjectHash::from_str(orig_head_str.trim())
+        let onto = crate::internal::object_format::parse_repo_oid(onto_str.trim())
+            .map_err(|e| format!("Invalid onto hash: {e}"))?;
+        let orig_head = crate::internal::object_format::parse_repo_oid(orig_head_str.trim())
             .map_err(|e| format!("Invalid orig_head hash: {e}"))?;
-        let current_head = ObjectHash::from_str(current_head_str.trim())
+        let current_head = crate::internal::object_format::parse_repo_oid(current_head_str.trim())
             .map_err(|e| format!("Invalid current_head hash: {e}"))?;
         let todo = VecDeque::from(Self::parse_hash_list(&todo_str)?);
         let autosquash = autosquash_value != 0;
@@ -574,7 +573,7 @@ impl RebaseState {
         let done = Self::parse_hash_list(&done_str)?;
         let stopped_sha = match stopped_str {
             Some(s) if !s.trim().is_empty() => Some(
-                ObjectHash::from_str(s.trim())
+                crate::internal::object_format::parse_repo_oid(s.trim())
                     .map_err(|e| format!("Invalid stopped_sha hash: {e}"))?,
             ),
             _ => None,
@@ -731,17 +730,17 @@ impl RebaseState {
 
         let onto_str = fs::read_to_string(dir.join("onto"))
             .map_err(|e| format!("Failed to read onto: {}", e))?;
-        let onto = ObjectHash::from_str(onto_str.trim())
+        let onto = crate::internal::object_format::parse_repo_oid(onto_str.trim())
             .map_err(|e| format!("Invalid onto hash: {}", e))?;
 
         let orig_head_str = fs::read_to_string(dir.join("orig-head"))
             .map_err(|e| format!("Failed to read orig-head: {}", e))?;
-        let orig_head = ObjectHash::from_str(orig_head_str.trim())
+        let orig_head = crate::internal::object_format::parse_repo_oid(orig_head_str.trim())
             .map_err(|e| format!("Invalid orig-head hash: {}", e))?;
 
         let current_head_str = fs::read_to_string(dir.join("current-head"))
             .map_err(|e| format!("Failed to read current-head: {}", e))?;
-        let current_head = ObjectHash::from_str(current_head_str.trim())
+        let current_head = crate::internal::object_format::parse_repo_oid(current_head_str.trim())
             .map_err(|e| format!("Invalid current-head hash: {}", e))?;
 
         let todo_content = fs::read_to_string(dir.join("todo")).unwrap_or_default();
@@ -755,7 +754,7 @@ impl RebaseState {
             let stopped_str = fs::read_to_string(dir.join("stopped-sha"))
                 .map_err(|e| format!("Failed to read stopped-sha: {}", e))?;
             Some(
-                ObjectHash::from_str(stopped_str.trim())
+                crate::internal::object_format::parse_repo_oid(stopped_str.trim())
                     .map_err(|e| format!("Invalid stopped-sha hash: {}", e))?,
             )
         } else {
@@ -783,7 +782,7 @@ impl RebaseState {
         for line in content.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
-                let hash = ObjectHash::from_str(trimmed)
+                let hash = crate::internal::object_format::parse_repo_oid(trimmed)
                     .map_err(|e| format!("Invalid commit hash '{}': {}", trimmed, e))?;
                 commits.push(hash);
             }
@@ -2430,7 +2429,7 @@ fn interactive_has_remaining_work() -> bool {
 fn interactive_known_hashes(aux: &RebaseAuxState) -> Vec<ObjectHash> {
     aux.interactive_known
         .iter()
-        .filter_map(|oid| ObjectHash::from_str(oid).ok())
+        .filter_map(|oid| crate::internal::object_format::parse_repo_oid(oid).ok())
         .collect()
 }
 
@@ -3604,7 +3603,7 @@ async fn recover_stale_rebase_aux() -> Result<(), RebaseError> {
         return Ok(());
     };
     if let Some(stash) = aux.autostash {
-        let oid = ObjectHash::from_str(&stash).map_err(|error| {
+        let oid = crate::internal::object_format::parse_repo_oid(&stash).map_err(|error| {
             RebaseError::Autostash(format!(
                 "rebase-aux.json contains invalid stash object '{stash}': {error}"
             ))
@@ -3680,7 +3679,7 @@ async fn resolve_rebase_autostash() -> Result<(), RebaseError> {
     let Some(stash) = aux.autostash.take() else {
         return Ok(());
     };
-    let oid = ObjectHash::from_str(&stash).map_err(|error| {
+    let oid = crate::internal::object_format::parse_repo_oid(&stash).map_err(|error| {
         RebaseError::Autostash(format!(
             "rebase-aux.json contains invalid stash object '{stash}': {error}"
         ))
@@ -3801,7 +3800,7 @@ fn resolve_rebase_rewrite(
             anyhow::bail!("rebase update-refs rewrite mapping contains a cycle at {current}");
         }
         if let Some(rewritten) = aux.rewrites.get(current) {
-            return ObjectHash::from_str(rewritten)
+            return crate::internal::object_format::parse_repo_oid(rewritten)
                 .map_err(anyhow::Error::msg)
                 .context("rebase update-refs recorded an invalid rewritten object");
         }
@@ -4034,7 +4033,7 @@ async fn reflog_fork_point(
     let mut candidates = vec![upstream_id];
     for entry in entries {
         for value in [entry.new_oid, entry.old_oid] {
-            if let Ok(candidate) = ObjectHash::from_str(&value) {
+            if let Ok(candidate) = crate::internal::object_format::parse_repo_oid(&value) {
                 candidates.push(candidate);
             }
         }
@@ -4913,7 +4912,7 @@ async fn finalize_rebase(
         && aux.update_refs
     {
         for update in &aux.refs_to_update {
-            let old_oid = ObjectHash::from_str(&update.old_oid)
+            let old_oid = crate::internal::object_format::parse_repo_oid(&update.old_oid)
                 .map_err(anyhow::Error::msg)
                 .with_context(|| {
                     format!(
@@ -5627,7 +5626,6 @@ fn write_workdir_symlink(workdir: &Path, path: &Path, target: &[u8]) -> Result<(
 mod tests {
     #[cfg(unix)]
     use std::path::Path;
-    use std::str::FromStr;
 
     use clap::Parser;
     use git_internal::internal::object::tree::TreeItemMode;
@@ -5688,8 +5686,6 @@ mod tests {
     fn interactive_action_marker_roundtrip_and_old_reader_length() {
         use std::collections::VecDeque;
 
-        use git_internal::hash::ObjectHash;
-
         let encoded = encode_todo_actions_blob("pick\npick".to_string(), true);
         assert_eq!(encoded, "interactive\npick\npick");
         let (interactive, tokens) = decode_todo_actions_blob(&encoded);
@@ -5702,7 +5698,10 @@ mod tests {
         assert!(interactive);
         assert!(tokens.is_empty());
 
-        let oid = ObjectHash::from_str("0123456789abcdef0123456789abcdef01234567").expect("oid");
+        let oid = crate::internal::object_format::parse_repo_oid(
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .expect("oid");
         let todo = VecDeque::from([oid]);
         let actions = RebaseState::parse_action_list("interactive\npick", 1, false, &todo)
             .expect("marker + pick");
@@ -5715,13 +5714,20 @@ mod tests {
 
     #[test]
     fn interactive_replay_filters_pick_drop_and_rejects_other_ops() {
-        use git_internal::hash::ObjectHash;
-
         use crate::command::rebase_todo::TodoInstruction;
 
-        let a = ObjectHash::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("a");
-        let b = ObjectHash::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").expect("b");
-        let c = ObjectHash::from_str("cccccccccccccccccccccccccccccccccccccccc").expect("c");
+        let a = crate::internal::object_format::parse_repo_oid(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("a");
+        let b = crate::internal::object_format::parse_repo_oid(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .expect("b");
+        let c = crate::internal::object_format::parse_repo_oid(
+            "cccccccccccccccccccccccccccccccccccccccc",
+        )
+        .expect("c");
         let known = [a, b, c];
 
         let picks = interactive_replay_items(
@@ -6902,16 +6908,12 @@ fn rebuild_index_from_tree(
 
 #[cfg(test)]
 mod rebuild_index_tests {
-    use std::str::FromStr;
 
-    use git_internal::{
-        hash::ObjectHash,
-        internal::{
-            index::Index,
-            object::{
-                blob::Blob,
-                tree::{Tree, TreeItem, TreeItemMode},
-            },
+    use git_internal::internal::{
+        index::Index,
+        object::{
+            blob::Blob,
+            tree::{Tree, TreeItem, TreeItemMode},
         },
     };
     use tempfile::tempdir;
@@ -6962,8 +6964,10 @@ mod rebuild_index_tests {
         setup_with_new_libra_in(repo.path()).await;
         let _guard = ChangeDirGuard::new(repo.path());
 
-        let missing_blob =
-            ObjectHash::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let missing_blob = crate::internal::object_format::parse_repo_oid(
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .unwrap();
         let tree = Tree::from_tree_items(vec![TreeItem::new(
             TreeItemMode::Blob,
             missing_blob,
@@ -6985,7 +6989,10 @@ mod rebuild_index_tests {
         setup_with_new_libra_in(repo.path()).await;
         let _guard = ChangeDirGuard::new(repo.path());
 
-        let gitlink = ObjectHash::from_str("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let gitlink = crate::internal::object_format::parse_repo_oid(
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .unwrap();
         let tree = Tree::from_tree_items(vec![TreeItem::new(
             TreeItemMode::Commit,
             gitlink,

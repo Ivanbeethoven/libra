@@ -6,7 +6,6 @@ use std::{
     future::Future,
     io::Error as IoError,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::OnceLock,
 };
 
@@ -14,7 +13,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
+    hash::{HashKind, ObjectHash, set_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
@@ -130,7 +129,7 @@ struct HashKindRestoreGuard {
 
 impl HashKindRestoreGuard {
     fn switch_to(hash_kind: HashKind) -> Self {
-        let previous = get_hash_kind();
+        let previous = git_internal::hash::get_hash_kind();
         set_hash_kind(hash_kind);
         Self { previous }
     }
@@ -312,17 +311,18 @@ impl LocalClient {
                         let Some(blob_hash) = note.note_hash else {
                             continue;
                         };
-                        let blob_oid = match ObjectHash::from_str(&blob_hash) {
-                            Ok(oid) => oid,
-                            Err(e) => {
-                                warnings.push(format!(
-                                    "skipped source dependency note for {}: invalid blob id \
+                        let blob_oid =
+                            match crate::internal::object_format::parse_repo_oid(&blob_hash) {
+                                Ok(oid) => oid,
+                                Err(e) => {
+                                    warnings.push(format!(
+                                        "skipped source dependency note for {}: invalid blob id \
                                      {blob_hash}: {e}",
-                                    note.annotated_object
-                                ));
-                                continue;
-                            }
-                        };
+                                        note.annotated_object
+                                    ));
+                                    continue;
+                                }
+                            };
                         let bytes = match storage.get(&blob_oid) {
                             Ok(bytes) => bytes,
                             Err(e) => {
@@ -521,7 +521,8 @@ impl LocalClient {
                     let mut tag_entries: Vec<Entry> = Vec::new();
                     let mut commit_targets: Vec<String> = Vec::new();
                     for want_hash in want {
-                        let Ok(oid) = git_internal::hash::ObjectHash::from_str(want_hash) else {
+                        let Ok(oid) = crate::internal::object_format::parse_repo_oid(want_hash)
+                        else {
                             commit_targets.push(want_hash.clone());
                             continue;
                         };
@@ -723,7 +724,7 @@ fn read_git_repo_refs(repo_path: &Path) -> std::io::Result<Vec<DiscRef>> {
 /// object id, reading from a strictly local store. Returns `None` on any read
 /// failure so a malformed tag never breaks the whole advertisement.
 fn peel_tag(storage: &ClientStorage, oid: &str) -> Option<String> {
-    let mut current = ObjectHash::from_str(oid).ok()?;
+    let mut current = crate::internal::object_format::parse_repo_oid(oid).ok()?;
     for _ in 0..32 {
         match storage.get_object_type(&current) {
             Ok(ObjectType::Tag) => {
@@ -798,7 +799,7 @@ fn collect_git_repo_entries(
     // Resolve each want; peel annotated tags (emitting each tag object) down to
     // the commit they target.
     for spec in want {
-        let Ok(oid) = ObjectHash::from_str(spec) else {
+        let Ok(oid) = crate::internal::object_format::parse_repo_oid(spec) else {
             continue;
         };
         if matches!(storage.get_object_type(&oid), Ok(ObjectType::Tag)) {
@@ -1028,7 +1029,7 @@ fn include_reachable_tags(
         if !seen.contains(target) || have_set.contains(target) || seen.contains(&r._hash) {
             continue;
         }
-        if let Ok(oid) = ObjectHash::from_str(&r._hash)
+        if let Ok(oid) = crate::internal::object_format::parse_repo_oid(&r._hash)
             && matches!(storage.get_object_type(&oid), Ok(ObjectType::Tag))
         {
             let tag = Tag::from_bytes(&storage.get(&oid)?, oid)?;

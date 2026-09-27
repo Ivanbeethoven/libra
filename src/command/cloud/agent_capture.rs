@@ -817,9 +817,15 @@ async fn ensure_agent_capture_objects_remote(
         let bytes = hex::decode(oid).map_err(|error| {
             CloudError::Generic(format!("invalid required agent-capture oid {oid}: {error}"))
         })?;
-        hashes.push(ObjectHash::from_bytes(&bytes).map_err(|error| {
-            CloudError::Generic(format!("invalid required agent-capture oid {oid}: {error}"))
-        })?);
+        hashes.push(
+            ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes).map_err(
+                |error| {
+                    CloudError::Generic(format!(
+                        "invalid required agent-capture oid {oid}: {error}"
+                    ))
+                },
+            )?,
+        );
     }
 
     let remote_rows = d1_client
@@ -991,12 +997,15 @@ async fn load_full_remote_object_manifest(
                     row.o_id
                 ))
             })?;
-            hashes.push(ObjectHash::from_bytes(&bytes).map_err(|error| {
-                CloudError::Generic(format!(
-                    "invalid retained remote object id {}: {error}",
-                    row.o_id
-                ))
-            })?);
+            hashes.push(
+                ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes)
+                    .map_err(|error| {
+                        CloudError::Generic(format!(
+                            "invalid retained remote object id {}: {error}",
+                            row.o_id
+                        ))
+                    })?,
+            );
         }
         let exists = r2_storage.exist_batch(&hashes).await;
         if let Some((missing, _)) = page.iter().zip(exists).find(|(_, exists)| !*exists) {

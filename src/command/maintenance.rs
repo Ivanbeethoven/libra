@@ -29,7 +29,7 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use git_internal::{
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
 };
 use sea_orm::EntityTrait;
@@ -1121,27 +1121,31 @@ async fn run_loose_objects(
         .filter_map(|(hash_str, _)| parse_object_hash(hash_str))
         .collect();
 
-    let publication =
-        match pack_writer::write_pack_with_index(&storage, &hashes, &pack_dir, get_hash_kind())
-            .await
-        {
-            Ok(Some(publication)) => publication,
-            Ok(None) => {
-                return Ok(TaskResult {
-                    task: "loose-objects".to_string(),
-                    success: true,
-                    objects_removed: 0,
-                    objects_packed: 0,
-                    refs_packed: 0,
-                    packs_repacked: 0,
-                    object_index_rows_removed: 0,
-                    message: "no old loose objects to pack".to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(CliError::fatal(format!("failed to create pack file: {e}")));
-            }
-        };
+    let publication = match pack_writer::write_pack_with_index(
+        &storage,
+        &hashes,
+        &pack_dir,
+        git_internal::hash::get_hash_kind(),
+    )
+    .await
+    {
+        Ok(Some(publication)) => publication,
+        Ok(None) => {
+            return Ok(TaskResult {
+                task: "loose-objects".to_string(),
+                success: true,
+                objects_removed: 0,
+                objects_packed: 0,
+                refs_packed: 0,
+                packs_repacked: 0,
+                object_index_rows_removed: 0,
+                message: "no old loose objects to pack".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(CliError::fatal(format!("failed to create pack file: {e}")));
+        }
+    };
 
     // §C.4.3 writer-vs-deleter: the pack is published, so the shared hold
     // ends and the UNLINKS take the exclusive one. A shared hold cannot be
@@ -1486,29 +1490,33 @@ async fn run_incremental_repack(
         .into_iter()
         .collect();
 
-    let new_publication =
-        match pack_writer::write_pack_with_index(&storage, &all_hashes, &pack_dir, get_hash_kind())
-            .await
-        {
-            Ok(Some(publication)) => publication,
-            Ok(None) => {
-                return Ok(TaskResult {
-                    task: "incremental-repack".to_string(),
-                    success: true,
-                    objects_removed: 0,
-                    objects_packed: 0,
-                    refs_packed: 0,
-                    packs_repacked: 0,
-                    object_index_rows_removed: 0,
-                    message: "no objects to repack".to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(CliError::fatal(format!(
-                    "failed to create consolidated pack: {e}"
-                )));
-            }
-        };
+    let new_publication = match pack_writer::write_pack_with_index(
+        &storage,
+        &all_hashes,
+        &pack_dir,
+        git_internal::hash::get_hash_kind(),
+    )
+    .await
+    {
+        Ok(Some(publication)) => publication,
+        Ok(None) => {
+            return Ok(TaskResult {
+                task: "incremental-repack".to_string(),
+                success: true,
+                objects_removed: 0,
+                objects_packed: 0,
+                refs_packed: 0,
+                packs_repacked: 0,
+                object_index_rows_removed: 0,
+                message: "no objects to repack".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(CliError::fatal(format!(
+                "failed to create consolidated pack: {e}"
+            )));
+        }
+    };
 
     // Pre-delete RE-VERIFICATION (W2 §C.4.3 race hardening): the pack list
     // was captured BEFORE the root walk (a pack arriving later is never
@@ -4409,19 +4417,12 @@ pub(crate) fn list_loose_objects(repo_path: &Path) -> io::Result<Vec<(String, Pa
     Ok(result)
 }
 
-/// Parse a hex string into an ObjectHash.
+/// Parse a hex string into an ObjectHash using the process/repository hash kind.
 ///
-/// The hash kind is inferred from the decoded byte length (20 → SHA-1, 32 →
-/// SHA-256) rather than from `ObjectHash::from_bytes`, which reads the
-/// thread-local hash kind and would reject a SHA-256 id (or misread it) if this
-/// runs on a Tokio worker thread that never had the repository's kind set.
-pub(crate) fn parse_object_hash(hex_str: &str) -> Option<ObjectHash> {
-    let bytes = hex::decode(hex_str).ok()?;
-    match bytes.len() {
-        20 => Some(ObjectHash::Sha1(bytes.try_into().ok()?)),
-        32 => Some(ObjectHash::Sha256(bytes.try_into().ok()?)),
-        _ => None,
-    }
+/// Width-based inference (20 → SHA-1 / 32 → SHA-256) is forbidden under
+/// plan-20260907 B3-08 / GC-B3-02 — blake3 OIDs are also 32 bytes.
+pub fn parse_object_hash(hex_str: &str) -> Option<ObjectHash> {
+    crate::internal::object_format::parse_repo_oid(hex_str).ok()
 }
 
 /// Remove empty directories under the given path.
@@ -4644,13 +4645,14 @@ mod tests {
     #[test]
     #[serial_test::serial(hash_kind)]
     fn commit_graph_build_roundtrip() {
-        use std::str::FromStr;
-
         use git_internal::internal::object::signature::Signature;
 
         git_internal::hash::set_hash_kind(HashKind::Sha1);
 
-        let tree = ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap();
+        let tree = crate::internal::object_format::parse_repo_oid(
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
         let sig =
             Signature::from_data(b"committer t <t@example.com> 1000000000 +0000".to_vec()).unwrap();
         let root = Commit::new(sig.clone(), sig.clone(), tree, vec![], "root");
@@ -4708,13 +4710,14 @@ mod tests {
     #[test]
     #[serial_test::serial(hash_kind)]
     fn commit_graph_build_writes_octopus_edge_chunk() {
-        use std::str::FromStr;
-
         use git_internal::internal::object::signature::Signature;
 
         git_internal::hash::set_hash_kind(HashKind::Sha1);
 
-        let tree = ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap();
+        let tree = crate::internal::object_format::parse_repo_oid(
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
         let sig =
             Signature::from_data(b"committer t <t@example.com> 1000000000 +0000".to_vec()).unwrap();
         // Three distinct roots (distinct messages → distinct ids) and a merge

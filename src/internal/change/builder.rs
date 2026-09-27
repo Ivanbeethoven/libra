@@ -1,8 +1,5 @@
 //! Single entry point for new and rewritten Change revisions.
 
-use std::str::FromStr;
-
-use git_internal::hash::ObjectHash;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction};
 use thiserror::Error;
 use uuid::Uuid;
@@ -538,8 +535,10 @@ mod tests {
         let database = db::create_database(dir.path().join("repo.db").to_str().unwrap())
             .await
             .expect("database");
-        let predecessor =
-            ObjectHash::from_str("0123456789abcdef0123456789abcdef01234567").expect("legacy oid");
+        let predecessor = crate::internal::object_format::parse_repo_oid(
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .expect("legacy oid");
         let synthetic = synthetic_change_id_for_legacy_predecessor(&predecessor.to_string())
             .expect("synthetic id");
         let rewritten = ChangeRevisionBuilder::for_rewrite(
@@ -576,7 +575,7 @@ mod tests {
 /// no sidecar projection (ADR-OL-04). Returns `None` when the OID does not
 /// parse as an object hash.
 fn synthetic_change_id_for_legacy_predecessor(predecessor_oid: &str) -> Option<ChangeId> {
-    ObjectHash::from_str(predecessor_oid)
+    crate::internal::object_format::parse_repo_oid(predecessor_oid)
         .ok()
         .map(|hash| ChangeId::synthetic_for_commit(hash.kind().as_str(), hash.as_ref()))
 }

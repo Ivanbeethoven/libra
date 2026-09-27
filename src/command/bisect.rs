@@ -25,7 +25,6 @@
 use std::{
     collections::{HashSet, VecDeque},
     process::Command,
-    str::FromStr,
 };
 
 use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
@@ -338,15 +337,16 @@ impl BisectState {
             let completed: i64 = result.try_get_by_index(7).unwrap_or(0);
             let first_parent: i64 = result.try_get_by_index(8).unwrap_or(0);
 
-            let orig_head = ObjectHash::from_str(&orig_head_str)
+            let orig_head = crate::internal::object_format::parse_repo_oid(&orig_head_str)
                 .map_err(|e| format!("invalid orig_head hash: {e}"))?;
 
-            let bad = bad_str.and_then(|s| ObjectHash::from_str(&s).ok());
+            let bad = bad_str.and_then(|s| crate::internal::object_format::parse_repo_oid(&s).ok());
 
             let good: Vec<ObjectHash> = serde_json::from_str(&good_json)
                 .map_err(|e| format!("failed to parse good commits: {e}"))?;
 
-            let current = current_str.and_then(|s| ObjectHash::from_str(&s).ok());
+            let current =
+                current_str.and_then(|s| crate::internal::object_format::parse_repo_oid(&s).ok());
 
             let skipped: Vec<ObjectHash> = skipped_json
                 .and_then(|s| serde_json::from_str(&s).ok())

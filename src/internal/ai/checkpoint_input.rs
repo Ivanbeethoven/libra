@@ -23,12 +23,8 @@
 //! checkpoint is missing, malformed, or not locally materializable);
 //! this module only turns an already-validated spec into files.
 
-use std::{
-    path::{Path, PathBuf},
-    str::FromStr,
-};
+use std::path::{Path, PathBuf};
 
-use git_internal::hash::ObjectHash;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::object::read_git_object_bounded;
@@ -87,7 +83,7 @@ pub fn materialize_checkpoint_input(
     let mut dirs: Vec<PathBuf> = Vec::new();
     for file in &spec.files {
         let rel = sanitize_rel_path(&file.rel_path)?;
-        let oid = ObjectHash::from_str(&file.oid).map_err(|e| {
+        let oid = crate::internal::object_format::parse_repo_oid(&file.oid).map_err(|e| {
             format!(
                 "invalid blob oid '{}' in checkpoint input spec: {e}",
                 file.oid

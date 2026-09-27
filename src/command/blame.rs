@@ -564,7 +564,7 @@ fn get_file_lines(
 /// commit. NOTE: the original line number is approximated by the final line
 /// number — the blame walk does not track per-commit origin line numbers.
 fn render_blame_porcelain(result: &BlameOutput, file: &str, line_porcelain: bool) -> CliResult<()> {
-    use std::{collections::HashSet, io::Write, str::FromStr};
+    use std::{collections::HashSet, io::Write};
 
     let lines = &result.lines;
     // For each line, record the group size when it starts a new consecutive run
@@ -592,10 +592,11 @@ fn render_blame_porcelain(result: &BlameOutput, file: &str, line_porcelain: bool
         }
 
         if line_porcelain || emitted.insert(line.hash.clone()) {
-            let hash = ObjectHash::from_str(&line.hash).map_err(|_| {
-                CliError::fatal(format!("invalid blame commit hash '{}'", line.hash))
-                    .with_stable_code(StableErrorCode::RepoCorrupt)
-            })?;
+            let hash =
+                crate::internal::object_format::parse_repo_oid(&line.hash).map_err(|_| {
+                    CliError::fatal(format!("invalid blame commit hash '{}'", line.hash))
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                })?;
             let commit = load_object::<Commit>(&hash).map_err(|e| {
                 CliError::fatal(format!("failed to load commit {}: {e}", line.hash))
                     .with_stable_code(StableErrorCode::RepoCorrupt)

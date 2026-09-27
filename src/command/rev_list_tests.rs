@@ -1,6 +1,6 @@
 use clap::Parser;
 use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::object::{
         commit::Commit,
         signature::{Signature, SignatureType},
@@ -23,8 +23,11 @@ fn test_signature(timestamp: usize) -> Signature {
 }
 
 fn test_hash(byte: u8) -> ObjectHash {
-    ObjectHash::from_bytes(&vec![byte; get_hash_kind().size()])
-        .expect("test hash bytes should match active hash kind")
+    ObjectHash::from_bytes_for_kind(
+        git_internal::hash::get_hash_kind(),
+        &vec![byte; git_internal::hash::get_hash_kind().size()],
+    )
+    .expect("test hash bytes should match active hash kind")
 }
 
 fn test_commit(id: ObjectHash, timestamp: usize) -> Commit {

@@ -920,16 +920,17 @@ pub(crate) async fn restore_indexed_objects_from_remote(
     for idx in indexes {
         let decoded = hex::decode(&idx.o_id)
             .map_err(|e| CloudError::Generic(format!("Invalid hash: {}", e)))?;
-        let hash = match ObjectHash::from_bytes(&decoded) {
-            Ok(hash) => hash,
-            Err(e) => {
-                report
-                    .warnings
-                    .push(format!("error: invalid object hash '{}': {}", idx.o_id, e));
-                report.failed += 1;
-                continue;
-            }
-        };
+        let hash =
+            match ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &decoded) {
+                Ok(hash) => hash,
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("error: invalid object hash '{}': {}", idx.o_id, e));
+                    report.failed += 1;
+                    continue;
+                }
+            };
 
         if let Ok((data, object_type)) = local_storage.get(&hash).await
             && ObjectHash::from_type_and_data(object_type, &data) == hash

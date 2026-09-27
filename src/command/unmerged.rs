@@ -84,7 +84,7 @@ mod tests {
     use super::*;
 
     fn entry(stages: [bool; 3]) -> UnmergedEntry {
-        let hash = ObjectHash::new(&[0u8; 20]);
+        let hash = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[0u8; 20]);
         let stage = |present: bool| {
             present.then_some(UnmergedStage {
                 mode: 0o100644,

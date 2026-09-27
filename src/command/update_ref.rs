@@ -10,11 +10,7 @@
 //! representable here.
 
 use clap::Parser;
-use git_internal::{
-    errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
-    internal::object::types::ObjectType,
-};
+use git_internal::{errors::GitError, hash::ObjectHash, internal::object::types::ObjectType};
 use sea_orm::TransactionError;
 use serde::Serialize;
 
@@ -148,7 +144,7 @@ pub async fn execute_safe(args: UpdateRefArgs, output: &OutputConfig) -> CliResu
         .with_hint("switch that worktree to another branch first, or run the command there"));
     }
 
-    let hash_kind = get_hash_kind();
+    let hash_kind = git_internal::hash::get_hash_kind();
     let zero = ObjectHash::zero_str(hash_kind);
 
     // Disambiguate positionals: `-d <ref> [<old>]` vs `<ref> <new> [<old>]`.

@@ -609,7 +609,7 @@ mod tests {
         fn id(n: u32) -> ObjectHash {
             let mut bytes = [0u8; 20];
             bytes[..4].copy_from_slice(&n.to_be_bytes());
-            ObjectHash::new(&bytes)
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &bytes)
         }
 
         /// Add commit `n` with the given parents and committer date.

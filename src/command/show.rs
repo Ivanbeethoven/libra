@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::IsTerminal,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use clap::Parser;
@@ -1086,7 +1085,7 @@ async fn collect_object_output(
 }
 
 fn resolve_existing_object_hash(object_ref: &str) -> Option<ObjectHash> {
-    let hash = ObjectHash::from_str(object_ref).ok()?;
+    let hash = crate::internal::object_format::parse_repo_oid(object_ref).ok()?;
     let storage = ClientStorage::init(path::objects());
     storage.exist(&hash).then_some(hash)
 }

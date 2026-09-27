@@ -437,7 +437,7 @@ fn decode_and_validate_object_buffer(
     expected_hash: &ObjectHash,
     buffer: Vec<u8>,
 ) -> Result<(String, Vec<u8>), GitError> {
-    let actual_hash = ObjectHash::new(&buffer);
+    let actual_hash = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &buffer);
     if &actual_hash != expected_hash {
         return Err(GitError::InvalidObjectInfo(format!(
             "loose object content hashes to {actual_hash}, expected {expected_hash}"
@@ -671,7 +671,7 @@ pub(crate) fn git_object_hash(object_type: &str, data: &[u8]) -> ObjectHash {
     let header = format!("{} {}\0", object_type, data.len());
     let mut content = header.into_bytes();
     content.extend_from_slice(data);
-    ObjectHash::new(&content)
+    ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &content)
 }
 
 /// Write one loose object and report whether this call created its payload.

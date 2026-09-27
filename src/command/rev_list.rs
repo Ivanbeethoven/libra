@@ -472,7 +472,7 @@ fn collect_rev_list_objects(
     // `--max-count`/`--skip`/filters are NOT here, so their objects are NOT
     // suppressed (matching Git).
     for id in excluded_ids {
-        if let Ok(commit_id) = id.parse::<ObjectHash>() {
+        if let Ok(commit_id) = crate::internal::object_format::parse_repo_oid(id) {
             seed_uninteresting_objects(commit_id, &mut walk);
         }
     }

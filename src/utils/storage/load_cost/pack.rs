@@ -5,10 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use git_internal::{
-    errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
-};
+use git_internal::{errors::GitError, hash::ObjectHash};
 
 const IDX_MAGIC: [u8; 4] = [0xff, 0x74, 0x4f, 0x63];
 const FANOUT_BYTES: u64 = 256 * 4;
@@ -72,7 +69,7 @@ impl PackIndex {
             *value = read_u32(&mut file)?;
         }
         let object_count = u64::from(fanout[255]);
-        let hash_size = get_hash_kind().size() as u64;
+        let hash_size = git_internal::hash::get_hash_kind().size() as u64;
         if matches!(version, IndexVersion::V1) && hash_size != 20 {
             return Err(invalid(format!(
                 "pack index v1 at {} only supports SHA-1",
@@ -260,7 +257,10 @@ impl PackProbe {
                 self.read_delta_cost(object_offset, encoded_size, base_offset, depth)
             }
             7 => {
-                let base_hash = read_hash(&mut self.pack, get_hash_kind().size() as u64)?;
+                let base_hash = read_hash(
+                    &mut self.pack,
+                    git_internal::hash::get_hash_kind().size() as u64,
+                )?;
                 let base_offset = self.index.lookup_one(base_hash)?.ok_or_else(|| {
                     invalid(format!(
                         "REF_DELTA base {base_hash} is absent from {}",
@@ -628,7 +628,7 @@ fn read_hash(reader: &mut impl Read, hash_size: u64) -> Result<ObjectHash, GitEr
         .map_err(|error| invalid(format!("invalid object hash size: {error}")))?;
     let mut bytes = vec![0u8; size];
     reader.read_exact(&mut bytes)?;
-    ObjectHash::from_bytes(&bytes)
+    ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes)
         .map_err(|error| invalid(format!("invalid object hash in pack index: {error}")))
 }
 
@@ -681,7 +681,6 @@ pub(super) fn load_costs_with_stats(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
 
     use git_internal::hash::{HashKind, set_hash_kind};
 
@@ -704,8 +703,10 @@ mod tests {
             idx.to_str().expect("UTF-8 idx path"),
         )
         .expect("build fixture index");
-        let delta = ObjectHash::from_str("1b59abc09609574e73330d56815f04ebb4d9bd72")
-            .expect("parse delta OID");
+        let delta = crate::internal::object_format::parse_repo_oid(
+            "1b59abc09609574e73330d56815f04ebb4d9bd72",
+        )
+        .expect("parse delta OID");
 
         let (costs, stats) =
             load_costs_with_stats(&pack_dir, &[delta, delta]).expect("batch probe packed delta");

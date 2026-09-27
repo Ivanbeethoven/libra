@@ -8,13 +8,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    str::FromStr,
     sync::{Arc, Mutex},
 };
 
 use clap::{Parser, ValueEnum};
 use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::{
         index::{Index, IndexEntry},
         object::{
@@ -1088,8 +1087,10 @@ async fn maybe_print_merge_stat(show_stat: bool, result: &MergeOutput, output: &
     let (Some(old), Some(new)) = (result.old_commit.as_deref(), result.commit.as_deref()) else {
         return;
     };
-    let (Ok(old_hash), Ok(new_hash)) = (ObjectHash::from_str(old), ObjectHash::from_str(new))
-    else {
+    let (Ok(old_hash), Ok(new_hash)) = (
+        crate::internal::object_format::parse_repo_oid(old),
+        crate::internal::object_format::parse_repo_oid(new),
+    ) else {
         return;
     };
     match crate::command::diff::diff_stat_between_commits(&old_hash, &new_hash).await {
@@ -4825,11 +4826,13 @@ async fn run_merge_quit(output: &OutputConfig) -> Result<MergeOutput, MergeError
         .map(|snapshot| {
             verify_autostash_ownership(snapshot.recorded_owner.as_deref())
                 .map_err(PullMergeError::Autostash)?;
-            let oid = ObjectHash::from_str(&snapshot.sidecar.stash_commit).map_err(|error| {
-                PullMergeError::Autostash(format!(
-                    "merge-autostash.json holds an invalid OID: {error}"
-                ))
-            })?;
+            let oid =
+                crate::internal::object_format::parse_repo_oid(&snapshot.sidecar.stash_commit)
+                    .map_err(|error| {
+                        PullMergeError::Autostash(format!(
+                            "merge-autostash.json holds an invalid OID: {error}"
+                        ))
+                    })?;
             Ok::<_, PullMergeError>((snapshot, oid))
         })
         .transpose()?;
@@ -4962,9 +4965,10 @@ async fn apply_fast_forward_merge(
     let context = ReflogContext {
         // If there was no previous commit, this is an initial commit merge (e.g., on an empty branch).
         // Use the zero-hash in that case.
-        old_oid: old_oid_opt.map_or(ObjectHash::zero_str(get_hash_kind()).to_string(), |id| {
-            id.to_string()
-        }),
+        old_oid: old_oid_opt.map_or(
+            ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
+            |id| id.to_string(),
+        ),
         new_oid: target_commit.id.to_string(),
         action,
     };
@@ -5332,9 +5336,10 @@ async fn update_head_with_reflog(
         policy: policy.to_string(),
     };
     let context = ReflogContext {
-        old_oid: old_oid_opt.map_or(ObjectHash::zero_str(get_hash_kind()).to_string(), |id| {
-            id.to_string()
-        }),
+        old_oid: old_oid_opt.map_or(
+            ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
+            |id| id.to_string(),
+        ),
         new_oid: new_oid.to_string(),
         action,
     };
@@ -5363,7 +5368,7 @@ async fn update_head_with_reflog(
 }
 
 fn object_hash_from_state(field: &str, value: &str) -> Result<ObjectHash, PullMergeError> {
-    ObjectHash::from_str(value)
+    crate::internal::object_format::parse_repo_oid(value)
         .map_err(|error| PullMergeError::StateLoad(format!("invalid {field} '{value}': {error}")))
 }
 
@@ -11982,7 +11987,7 @@ fn resolve_df_conflicts(
                 ConflictKind::FileDirectory { file, .. } => *file,
                 // Only the KIND matters for the "is a file beneath" test.
                 _ => MergeTreeEntry {
-                    hash: ObjectHash::new(&[0u8; 20]),
+                    hash: ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[0u8; 20]),
                     mode: TreeItemMode::Blob,
                 },
             },
@@ -14134,7 +14139,7 @@ mod merge_rename_content_test;
 mod repository_fixture {
     use std::{env, panic::AssertUnwindSafe, path::PathBuf};
 
-    use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind};
+    use git_internal::hash::{HashKind, set_hash_kind};
 
     use crate::utils::{
         pager::LIBRA_TEST_ENV,
@@ -14174,7 +14179,7 @@ mod repository_fixture {
                 .path()
                 .canonicalize()
                 .expect("canonical merge repository");
-            let hash_kind = HashKindRestore(get_hash_kind());
+            let hash_kind = HashKindRestore(git_internal::hash::get_hash_kind());
             let non_interactive = ScopedEnvVar::set(LIBRA_TEST_ENV, "1");
             let config = ConfigDbFixture::new().expect("isolated merge configuration");
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -14217,7 +14222,7 @@ mod repository_fixture {
 
     fn assert_merge_fixture_restoration(unwind: bool) {
         let _cwd_lock = cwd_lock_guard();
-        let _hash_kind = HashKindRestore(get_hash_kind());
+        let _hash_kind = HashKindRestore(git_internal::hash::get_hash_kind());
         set_hash_kind(HashKind::Sha256);
         let _non_interactive = ScopedEnvVar::set(LIBRA_TEST_ENV, "0");
         let original_cwd = env::current_dir().expect("original CWD");
@@ -14253,7 +14258,7 @@ mod repository_fixture {
                 fixture.repo_path
             );
             assert!(fixture.repo.path().join(".libra").is_dir());
-            assert_eq!(get_hash_kind(), HashKind::Sha1);
+            assert_eq!(git_internal::hash::get_hash_kind(), HashKind::Sha1);
             assert_eq!(env::var_os(LIBRA_TEST_ENV), Some("1".into()));
             assert_eq!(
                 env::var_os("LIBRA_CONFIG_GLOBAL_DB"),
@@ -14270,7 +14275,7 @@ mod repository_fixture {
         assert_eq!(result.is_err(), unwind);
         assert_eq!(env::current_dir().expect("restored CWD"), original_cwd);
         assert_eq!(keys.map(env::var_os), previous);
-        assert_eq!(get_hash_kind(), HashKind::Sha256);
+        assert_eq!(git_internal::hash::get_hash_kind(), HashKind::Sha256);
         assert!(
             pool.expect("fixture pool was acquired").is_closed(),
             "cached pool must close before cleanup"
@@ -14456,9 +14461,9 @@ mod ext_driver {
     fn input<'a>(path: &'a Path, labels: ExternalMergeLabels<'a>) -> ExternalMergeInput<'a> {
         ExternalMergeInput {
             path,
-            base_id: ObjectHash::new(&[1; 20]),
-            ours_id: ObjectHash::new(&[2; 20]),
-            theirs_id: ObjectHash::new(&[3; 20]),
+            base_id: ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            ours_id: ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[2; 20]),
+            theirs_id: ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[3; 20]),
             base: b"base\n",
             ours: b"ours\n",
             theirs: b"theirs\n",
@@ -14769,7 +14774,7 @@ mod tests {
 
     fn merge_entry(byte: u8, mode: TreeItemMode) -> MergeTreeEntry {
         MergeTreeEntry {
-            hash: ObjectHash::new(&[byte; 20]),
+            hash: ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[byte; 20]),
             mode,
         }
     }
@@ -15029,7 +15034,8 @@ mod tests {
 
     #[test]
     fn git_conflict_labels_helper_pins_git_forms() {
-        let id = ObjectHash::from_str(&"abcd1234".repeat(5)[..40]).expect("valid sha-1 hex");
+        let id = crate::internal::object_format::parse_repo_oid(&"abcd1234".repeat(5)[..40])
+            .expect("valid sha-1 hex");
         let merge = GitConflictLabels::for_merge("refs/heads/side", Some(&id));
         assert_eq!(merge.ours, "HEAD");
         assert_eq!(merge.theirs, "refs/heads/side");
@@ -15483,14 +15489,19 @@ mod tests {
     fn gitlink_side(entries: &[(&str, u8)]) -> GitlinkEntries {
         entries
             .iter()
-            .map(|(path, byte)| (PathBuf::from(path), ObjectHash::new(&[*byte; 20])))
+            .map(|(path, byte)| {
+                (
+                    PathBuf::from(path),
+                    ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[*byte; 20]),
+                )
+            })
             .collect()
     }
 
     #[test]
     fn split_gitlink_entries_separates_pointers_from_mergeable_entries() {
-        let blob = ObjectHash::new(&[1; 20]);
-        let gitlink = ObjectHash::new(&[2; 20]);
+        let blob = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]);
+        let gitlink = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[2; 20]);
         let (mergeable, gitlinks) = split_gitlink_entries(vec![
             (PathBuf::from("a.txt"), blob, TreeItemMode::Blob),
             (PathBuf::from("vendor"), gitlink, TreeItemMode::Commit),
@@ -15662,7 +15673,7 @@ mod recursive {
     };
 
     fn oid(byte: u8) -> ObjectHash {
-        ObjectHash::new(&[byte; 20])
+        ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[byte; 20])
     }
 
     /// Register `content` as a blob the fold can read back, and return the
@@ -16596,7 +16607,7 @@ mod tree {
     }
 
     fn blob_id(byte: u8) -> ObjectHash {
-        ObjectHash::new(&[byte; 20])
+        ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[byte; 20])
     }
 
     fn build(graph: &mut CountingTrees, node: &Node) -> (ObjectHash, TreeItemMode) {
@@ -17360,7 +17371,10 @@ mod tree {
                                     bytes[1] = s as u8;
                                     bytes[2] = f as u8;
                                     bytes[3] = if changed(d, s, f) { 1 } else { 0 };
-                                    let node = Node::Id(ObjectHash::new(&bytes));
+                                    let node = Node::Id(ObjectHash::new_for_kind(
+                                        git_internal::hash::get_hash_kind(),
+                                        &bytes,
+                                    ));
                                     (format!("f{f}.txt"), node)
                                 })
                                 .collect();
@@ -17446,7 +17460,13 @@ mod tree {
                                     bytes[1] = s as u8;
                                     bytes[2] = f as u8;
                                     bytes[3] = u8::from(touch_dir_zero && d == 0);
-                                    (format!("f{f}.txt"), Node::Id(ObjectHash::new(&bytes)))
+                                    (
+                                        format!("f{f}.txt"),
+                                        Node::Id(ObjectHash::new_for_kind(
+                                            git_internal::hash::get_hash_kind(),
+                                            &bytes,
+                                        )),
+                                    )
                                 })
                                 .collect();
                             (format!("s{s}"), Node::Dir(files))
@@ -17963,7 +17983,7 @@ mod df {
 
     fn marker(byte: u8) -> MergeTreeEntry {
         MergeTreeEntry {
-            hash: ObjectHash::new(&[byte; 20]),
+            hash: ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[byte; 20]),
             mode: TreeItemMode::Tree,
         }
     }

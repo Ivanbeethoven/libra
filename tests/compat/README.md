@@ -115,3 +115,5 @@ top-level `[[test]]` entries in `Cargo.toml`.
   [`tests/command/mod.rs`](../command/mod.rs)).
 - Cross-platform tests (worktree dir deletion, etc.) should annotate
   platform-specific differences with `cfg(unix)` / `cfg(windows)`.
+
+- `compat_object_hash_parsing_guard.rs` — B3-08 production `ObjectHash::from_str` / `parse::<ObjectHash>` / `from_bytes_infer_kind` zero-hit guard with width/thread-local allowlist.

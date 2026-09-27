@@ -8,7 +8,7 @@
 //!
 //! - Without prefix: `aa/bbcc...` (Standard Git object layout)
 //! - With prefix: `prefix/objects/aa/bbcc...` (Isolated layout, e.g. `repo_id/objects/...`)
-use std::{io::Read, str::FromStr, sync::Arc};
+use std::{io::Read, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -363,7 +363,7 @@ impl Storage for RemoteStorage {
                 let hash_str = path_str.replace('/', "");
 
                 if hash_str.starts_with(prefix)
-                    && let Ok(hash) = ObjectHash::from_str(&hash_str)
+                    && let Ok(hash) = crate::internal::object_format::parse_repo_oid(&hash_str)
                 {
                     results.push(hash);
                 }
@@ -390,7 +390,7 @@ impl Storage for RemoteStorage {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, sync::Arc};
+    use std::sync::Arc;
 
     use bytes::Bytes;
     use git_internal::{
@@ -402,7 +402,7 @@ mod tests {
     use super::{RemoteStorage, Storage};
 
     fn test_hash() -> ObjectHash {
-        ObjectHash::from_str("1111111111111111111111111111111111111111")
+        crate::internal::object_format::parse_repo_oid("1111111111111111111111111111111111111111")
             .expect("test hash is valid")
     }
 
