@@ -3816,7 +3816,7 @@ fn index_received_pack(
     // A SHA-1 pack may already have a valid v2 index created by Git or by
     // `libra index-pack --index-version 2`. Build the same format before the
     // byte comparison, since v1 and v2 represent the same pack differently.
-    let use_v2_index = hash_kind != HashKind::Sha1
+    let use_v2_index = crate::internal::object_format::pack_index_is_v2(hash_kind)
         || (index_file.exists() && existing_sha1_index_is_v2(&index_file)?);
     let index_dir = index_file.parent().ok_or_else(|| FetchError::LocalState {
         message: format!(

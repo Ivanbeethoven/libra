@@ -16,7 +16,8 @@ libra bundle unbundle <file>
 - `create` 写完整、非 thin bundle。显式修订可与 `--all`、`--branches`、`--tags` 组合，且至少需要一种选择。`--all` 与显式 `HEAD` 会广告一行 `HEAD`（分离 HEAD 指向该提交；附着 HEAD 仍写 `HEAD`，不改写成 `refs/heads/<branch>`）。annotated tag head 保留 tag 对象 OID，pack 包含其目标闭包。输出先写入私有临时文件并同步，再 rename 到目标。
 - `verify` 校验 v2 头、本地 prerequisite、pack 版本与完整 pack checksum。
 - `list-heads` 只打印 `<oid> <ref>` advertised heads，不导入对象。
-- `unbundle` 校验 prerequisite/checksum，构建正确的 SHA-1 或 SHA-256 pack index，并把 pack/index 对装入对象库。它打印 heads，但按 `git bundle unbundle` 语义**不更新 refs**。重复导入会先核对已安装 pair，再报告成功。
+- `unbundle` 校验 prerequisite/checksum，按仓库 hash kind 构建正确的 pack index（SHA-1 → idx v1；SHA-256 与 blake3 → idx v2），并把 pack/index 对装入对象库。跨 kind bundle 会 fail-closed（checksum / OID 宽度），且不留下 pack/index 残留。它打印 heads，但按 `git bundle unbundle` 语义**不更新 refs**。重复导入会先核对已安装 pair，再报告成功。
+- blake3 仓库在此路径上完整支持：`create`/`verify`/`list-heads`/`unbundle` 使用 BLAKE3 pack trailer 与 idx v2。系统 Git 无法消费 blake3 bundle。
 
 bundle 输入、收集的原始对象数据和最终输出各自以 1 GiB 为上限。这也会约束 pack 压缩前的内存，因此原始数据超过上限、即使高度可压缩的对象图也会被拒绝。创建端只支持完整历史；prerequisite/thin/增量范围 bundle 仍延后。
 

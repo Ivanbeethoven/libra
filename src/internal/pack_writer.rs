@@ -21,10 +21,8 @@
 //!   the trailer instead of the pack bytes, producing packs that failed
 //!   `index-pack` verification; routing everything through `PackEncoder` fixes
 //!   that.
-//! - `PackEncoder::new` seeds its trailer hasher from the thread-local hash kind
-//!   *at construction*, so it is built inside the spawned task **after**
-//!   `set_hash_kind`, and the kind is threaded in explicitly rather than read
-//!   from a thread-local that may not survive an `.await`.
+//! - `PackEncoder::new_with_hash_kind` takes the repository hash kind explicitly
+//!   so the trailer hasher does not depend on a Tokio worker's thread-local.
 
 use std::{
     fs, io,
@@ -81,19 +79,16 @@ fn entry_from_storage(storage: &ClientStorage, hash: &ObjectHash) -> io::Result<
 /// Encode already-loaded entries into the raw bytes of a pack stream.
 ///
 /// Public so both the disk path (below) and callers that need the bytes without
-/// a file can share the one encoder. `hash_kind` is passed explicitly because
-/// `PackEncoder` reads the thread-local hash kind when it is constructed, and a
-/// Tokio worker thread may not carry the kind set before this `.await`.
+/// a file can share the one encoder. `hash_kind` is passed to
+/// [`PackEncoder::new_with_hash_kind`] so a Tokio worker thread does not need a
+/// matching thread-local.
 pub async fn encode_pack_bytes(entries: Vec<Entry>, hash_kind: HashKind) -> io::Result<Vec<u8>> {
     let (entry_tx, entry_rx) = tokio::sync::mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1_000);
     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1_000);
 
     let total_objects = entries.len();
     let encode_handle = tokio::spawn(async move {
-        // Seed the encoder's trailer hasher from the repository's hash kind
-        // before constructing it — see the module docs.
-        set_hash_kind(hash_kind);
-        let mut encoder = PackEncoder::new(total_objects, 0, stream_tx);
+        let mut encoder = PackEncoder::new_with_hash_kind(hash_kind, total_objects, 0, stream_tx);
         encoder.encode(entry_rx).await
     });
 

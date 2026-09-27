@@ -67,7 +67,8 @@ fn build_index_v1_inner(
         .transpose()?
         .map(|spool| Arc::new(Mutex::new(spool)));
     let commit_edges_c = commit_edges.clone();
-    let mut pack = Pack::new(
+    let mut pack = Pack::new_with_hash_kind(
+        HashKind::Sha1,
         Some(8),
         Some(1024 * 1024 * 1024),
         Some(tmp_path.to_path_buf()),

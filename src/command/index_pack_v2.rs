@@ -127,7 +127,8 @@ fn build_index_v2_inner(
         .map(|spool| Arc::new(Mutex::new(spool)));
     let commit_edges_c = commit_edges.clone();
 
-    let mut pack = Pack::new(
+    let mut pack = Pack::new_with_hash_kind(
+        git_internal::hash::get_hash_kind(),
         Some(8),
         Some(1024 * 1024 * 1024),
         Some(tmp_path.to_path_buf()),

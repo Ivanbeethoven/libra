@@ -1187,7 +1187,9 @@ impl LocalStorage {
         let mut idxs = Vec::new();
         for pack in packs {
             let idx = pack.with_extension("idx");
-            let want_v2 = git_internal::hash::get_hash_kind() == HashKind::Sha256;
+            let want_v2 = crate::internal::object_format::pack_index_is_v2(
+                git_internal::hash::get_hash_kind(),
+            );
             let needs_rebuild = if idx.exists() {
                 if want_v2 {
                     !matches!(Self::read_idx_version_path(&idx), Ok(IdxVersion::V2))

@@ -31,6 +31,14 @@
 - Alternates read the base repo's `config_kv` `core.objectformat` and refuse cross-kind /
   unknown-format borrows.
 
+### bundle / pack / idx blake3 (B3-05)
+
+- blake3 repositories write and read pack indexes as idx v2 (same as SHA-256); SHA-1 stays idx v1.
+- Pack encode/decode call sites use `PackEncoder::new_with_hash_kind` /
+  `Pack::new_with_hash_kind` with an explicit repository kind.
+- Empty packs use a BLAKE3 32-byte trailer; cross-kind `bundle unbundle` fails closed
+  with no residual pack/index writes.
+
 
 
 

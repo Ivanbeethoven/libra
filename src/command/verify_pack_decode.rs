@@ -6,7 +6,7 @@ use std::{
 };
 
 use git_internal::{
-    hash::ObjectHash,
+    hash::{ObjectHash, get_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         pack::{Pack, entry::Entry, pack_index::IndexEntry},
@@ -47,7 +47,13 @@ pub(crate) fn decode_pack(pack_file: &Path) -> CliResult<DecodedPack> {
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
 
-    let mut pack = Pack::new(Some(8), Some(1024 * 1024 * 1024), Some(tmp_path), true);
+    let mut pack = Pack::new_with_hash_kind(
+        get_hash_kind(),
+        Some(8),
+        Some(1024 * 1024 * 1024),
+        Some(tmp_path),
+        true,
+    );
     pack.decode(
         &mut reader,
         move |entry: MetaAttached<Entry, EntryMeta>| {

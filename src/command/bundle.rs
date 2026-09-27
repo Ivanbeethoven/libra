@@ -24,7 +24,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use git_internal::{
-    hash::{ObjectHash, set_hash_kind},
+    hash::ObjectHash,
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
@@ -492,12 +492,9 @@ async fn encode_pack(entries: Vec<Entry>) -> CliResult<Vec<u8>> {
     let count = entries.len();
     let (pack_tx, mut pack_rx) = mpsc::channel::<Vec<u8>>(128);
     let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(128);
-    let mut encoder = PackEncoder::new(count, 0, pack_tx);
     let kind = git_internal::hash::get_hash_kind();
-    let encoder_handle = tokio::spawn(async move {
-        set_hash_kind(kind);
-        encoder.encode(entry_rx).await
-    });
+    let mut encoder = PackEncoder::new_with_hash_kind(kind, count, 0, pack_tx);
+    let encoder_handle = tokio::spawn(async move { encoder.encode(entry_rx).await });
     let producer_handle = tokio::spawn(async move {
         for entry in entries {
             entry_tx
@@ -691,13 +688,13 @@ fn unbundle(file: &Path) -> CliResult<()> {
 fn build_bundle_index(pack: &Path, index: &Path) -> CliResult<()> {
     let pack_name = pack.to_string_lossy().into_owned();
     let index_name = index.to_string_lossy().into_owned();
-    match git_internal::hash::get_hash_kind() {
-        git_internal::hash::HashKind::Sha1 => index_pack::build_index_v1(&pack_name, &index_name),
-        git_internal::hash::HashKind::Sha256 | git_internal::hash::HashKind::Blake3 => {
-            index_pack::build_index_v2(&pack_name, &index_name)
-        }
-    }
-    .map_err(|error| {
+    let kind = git_internal::hash::get_hash_kind();
+    let result = if crate::internal::object_format::pack_index_is_v2(kind) {
+        index_pack::build_index_v2(&pack_name, &index_name)
+    } else {
+        index_pack::build_index_v1(&pack_name, &index_name)
+    };
+    result.map_err(|error| {
         CliError::fatal(format!("failed to index bundle pack: {error}"))
             .with_exit_code(128)
             .with_stable_code(StableErrorCode::RepoCorrupt)

@@ -1172,11 +1172,7 @@ async fn encode_pack_bytes(entries: Vec<Entry>, hash_kind: HashKind) -> Result<V
 
     let total_objects = entries.len();
     let encode_handle = tokio::spawn(async move {
-        // Set the hash kind BEFORE constructing the encoder: `PackEncoder::new`
-        // initializes the pack-trailer hasher from the thread-local, so it must
-        // see the repository's kind (not whatever this worker thread last had).
-        set_hash_kind(hash_kind);
-        let mut encoder = PackEncoder::new(total_objects, 0, stream_tx);
+        let mut encoder = PackEncoder::new_with_hash_kind(hash_kind, total_objects, 0, stream_tx);
         encoder.encode(entry_rx).await
     });
 

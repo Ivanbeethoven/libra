@@ -1310,7 +1310,8 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1_000_000);
         let (stream_tx, mut stream_rx) = mpsc::channel(1_000_000);
 
-        let encoder = PackEncoder::new(objs.len(), 0, stream_tx);
+        let encoder =
+            PackEncoder::new_with_hash_kind(discovery.hash_kind, objs.len(), 0, stream_tx);
         encoder
             .encode_async(entry_rx)
             .await
@@ -4330,6 +4331,20 @@ mod test {
         assert_eq!(
             sha256_pack[12..],
             <Sha256 as Sha256Digest>::digest(&sha256_pack[..12])[..]
+        );
+
+        let blake3_pack = encode_empty_pack(HashKind::Blake3);
+        assert_eq!(&blake3_pack[..12], header);
+        assert_eq!(
+            blake3_pack.len(),
+            44,
+            "blake3 empty pack trailer is 32 bytes"
+        );
+        let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+        hasher.update(&blake3_pack[..12]);
+        assert_eq!(
+            blake3_pack[12..],
+            hasher.finalize_object_hash().as_ref()[..]
         );
     }
 

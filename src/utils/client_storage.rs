@@ -3856,7 +3856,7 @@ mod tests {
 
     use git_internal::{
         errors::GitError,
-        hash::{HashKind, ObjectHash, set_hash_kind, set_hash_kind_for_test},
+        hash::{HashKind, ObjectHash, set_hash_kind_for_test},
         internal::{
             metadata::{EntryMeta, MetaAttached},
             object::{ObjectTrait, blob::Blob, types::ObjectType},
@@ -4323,12 +4323,9 @@ mod tests {
         assert!(!entries.is_empty(), "encode requires at least one entry");
         let (pack_tx, mut pack_rx) = mpsc::channel::<Vec<u8>>(128);
         let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(entries.len());
-        let mut encoder = PackEncoder::new(entries.len(), 0, pack_tx);
         let kind = git_internal::hash::get_hash_kind();
-        let encode_handle = tokio::spawn(async move {
-            set_hash_kind(kind);
-            encoder.encode(entry_rx).await
-        });
+        let mut encoder = PackEncoder::new_with_hash_kind(kind, entries.len(), 0, pack_tx);
+        let encode_handle = tokio::spawn(async move { encoder.encode(entry_rx).await });
 
         for entry in entries {
             entry_tx

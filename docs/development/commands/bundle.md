@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra bundle create/verify/list-heads/unbundle` 提供常见 Git v2 离线备份与对象迁移路径，保留 annotated tag object，并支持 SHA-1/SHA-256。
+`libra bundle create/verify/list-heads/unbundle` 提供常见 Git v2 离线备份与对象迁移路径，保留 annotated tag object，并支持 SHA-1/SHA-256/blake3（blake3 与 sha256 一样写 idx v2；跨 kind unbundle fail-closed）。
 
 ## 对比 Git 与兼容性
 
@@ -16,10 +16,10 @@
 
 - 入口：`BundleArgs`/`BundleSubcommand` → `execute_safe`；所有子命令 require repo/hash-kind preflight。
 - `collect_bundle_heads` 合并 selectors 并按 ref name 去重；tag row 保留 raw OID。`collect_reachable_object` 用共享 `seen` 单次遍历 tag target、commit 历史和 tree/blob closure，避免多 ref 重复扫描；gitlink 不跨仓库追踪。
-- 对象转 `Entry` 时显式传播序列化错误，并在保留前按 raw data 累计 1 GiB cap；`encode_pack` 复用 `PackEncoder`，spawn task 显式传播 hash kind，以固定 128 容量 channel 边生产边排空。header+pack 总输出也不得超过 cap。
+- 对象转 `Entry` 时显式传播序列化错误，并在保留前按 raw data 累计 1 GiB cap；`encode_pack` 复用 `PackEncoder::new_with_hash_kind`（显式传仓库 kind，不依赖 spawn 内 thread-local），以固定 128 容量 channel 边生产边排空。header+pack 总输出也不得超过 cap。
 - create 使用同目录 UUID private temp + create_new，flush/sync_all 后 rename；失败清 temp，不追随可预测 temp symlink。
 - `read_bundle_bounded` 同时做 metadata 与 streaming growth cap。`validate_bundle_pack` 校验 magic/version 和 hash-kind-aware trailer checksum。
-- unbundle 写 UUID temp pack、sync、build_index_v1(SHA-1)/v2(SHA-256)，先 rename pack 后 index，index 失败删除 pack。若 deterministic final pair 已存在，则逐字节核对 pack并重建 temp index核对 installed index，避免对损坏 pair 报成功。
+- unbundle 写 UUID temp pack、sync、经 `pack_index_is_v2` 选择 build_index_v1(SHA-1)/v2(SHA-256|blake3)，先 rename pack 后 index，index 失败删除 pack。若 deterministic final pair 已存在，则逐字节核对 pack并重建 temp index核对 installed index，避免对损坏 pair 报成功。
 - unbundle 不修改 SQLite refs/HEAD/index/worktree；输出 heads 供调用者显式 `update-ref`。prerequisite 缺失/partial pair/checksum/index/rename error 均 fail-closed。
 
 ## 实现历史
