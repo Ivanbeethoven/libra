@@ -4997,14 +4997,6 @@ mod tests {
                 "large-media content store — separate from the object store",
             ),
             (
-                "chunks",
-                "chunked content store — separate from the object store",
-            ),
-            (
-                "manifests",
-                "chunk manifests — describe the chunk store, not git objects",
-            ),
-            (
                 "obliteration-audit.jsonl",
                 "audit trail; the AntiRoot itself is the `object_obliteration` table",
             ),

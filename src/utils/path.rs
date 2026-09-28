@@ -56,21 +56,32 @@ pub(crate) fn try_preview_scratch_storage() -> io::Result<PathBuf> {
     util::try_get_storage_path(None)
 }
 
-/// FastCDC media chunk store root (lore.md §6): a physical SIBLING of
-/// `objects/`, wholly outside the Git object graph. Content-addressed chunk
-/// files live under `media/chunks/<ab>/<chunk_hash>`; it is NEVER walked as a
-/// loose-object store. Gated behind the `fastcdc` feature at the call sites.
+/// Algorithm namespace for the `fastcdc-v2020-32k` media cache (C-08).
+/// Legacy `.libra/media/{chunks,manifests}` from `fastcdc-v1` is not this path.
+pub const MEDIA_CACHE_NAMESPACE: &str = "fastcdc-v2020-32k";
+
+/// Root of the current media cache: `.libra/media/fastcdc-v2020-32k/`.
 #[cfg(feature = "fastcdc")]
-pub fn media_chunks() -> PathBuf {
-    util::storage_path().join("media").join("chunks")
+pub fn media_root() -> PathBuf {
+    util::storage_path()
+        .join("media")
+        .join(MEDIA_CACHE_NAMESPACE)
 }
 
-/// FastCDC media manifest store root (lore.md §6): content-addressed manifest
-/// JSON files under `media/manifests/<media_oid>.json`. Sibling of `objects/`,
-/// outside the Git object graph.
+/// FastCDC media chunk store (lore.md §6): a physical sibling of `objects/`,
+/// wholly outside the Git object graph. Chunk files live under
+/// `media/<namespace>/chunks/<ab>/<chunk_hash>` and are never walked as loose
+/// objects. Gated behind the `fastcdc` feature at the call sites.
+#[cfg(feature = "fastcdc")]
+pub fn media_chunks() -> PathBuf {
+    media_root().join("chunks")
+}
+
+/// Paged FastCDC manifest root: `media/<namespace>/manifests/<oid>/summary.json`
+/// plus immutable pages. Sibling of `objects/`, outside the Git object graph.
 #[cfg(feature = "fastcdc")]
 pub fn media_manifests() -> PathBuf {
-    util::storage_path().join("media").join("manifests")
+    media_root().join("manifests")
 }
 
 pub fn database() -> PathBuf {

@@ -40,9 +40,12 @@ to disable the extension in a repository.
 Host-only HTTP remotes retain the legacy root LFS endpoints (for example,
 `http://localhost:8000/locks`). Use a repository path for scoped FastCDC transfers.
 
-Normal LFS uploads send missing chunks and finalize a verified full object;
-downloads reuse verified local chunks. Standard LFS pointers remain unchanged,
-and unsupported remotes or missing manifests use full-object LFS. Mega isolates
+Normal LFS uploads prepare a summary, put pages, seal, send only missing chunks,
+and poll a durable finalize task until id, oid, and size match. Downloads pin
+`manifest_id` and reuse verified local chunks under
+`.libra/media/fastcdc-v2020-32k/`. Standard LFS pointers remain unchanged.
+Before a transfer starts, unsupported remotes or missing manifests use
+full-object LFS; after it starts, protocol failures fail closed. Mega isolates
 the extension by authenticated user and repository path; this is not a complete
 repository ACL implementation. See [`libra media`](media.md) for the transfer
 flow and current retention, quota, and maintenance limitations.

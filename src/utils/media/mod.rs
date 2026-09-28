@@ -1,6 +1,6 @@
 //! FastCDC LFS media chunking and authenticated Mega transport (lore.md §6).
 //!
-//! This module is the honest v1 of lore.md §6 "LFS FastCDC chunking": a
+//! This module is lore.md §6 "LFS FastCDC chunking" (`fastcdc-v2020-32k` recipe): a
 //! strictly feature-gated (`fastcdc`, default OFF) **client** layer that
 //! content-defines chunks of a media object, builds a versioned manifest,
 //! stores chunks in a local content-addressed store, reassembles + verifies,
@@ -25,12 +25,23 @@
 //!   artifact) when the remote cannot serve a standard fallback and no local
 //!   fallback object exists. Reassembly verifies the full `media_oid` BEFORE the
 //!   atomic publish.
+//! - **Paging is not identity (P-01):** the canonical manifest id hashes the
+//!   chunk sequence, not page boundaries. Local layouts store a bounded summary
+//!   plus immutable pages under `.libra/media/fastcdc-v2020-32k/`. The hash/offset
+//!   index there is derived data and can be deleted and rebuilt; it is not
+//!   repository config. The legacy `.libra/media/{chunks,manifests}` cache is
+//!   left in place and is not read, written, or deleted.
+//! - **Paged transfer (P-02/P-04):** upload prepares a summary, puts canonical
+//!   pages, seals, PUTs only hashes named by the paged missing cursor, and polls
+//!   a durable finalize task. Download pins `manifest_id` and checks id, oid,
+//!   and size before replacing the destination.
 
 pub mod capability;
 pub mod chunk_store;
 pub mod chunker;
 pub mod manifest;
 pub mod negotiate;
+pub mod page_cache;
 pub mod transfer;
 
 use ring::digest::{Context, SHA256};

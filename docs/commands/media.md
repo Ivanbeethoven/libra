@@ -9,24 +9,35 @@ fallback to standard Git LFS.
 
 `media` is a Libra-only extension (`intentionally-different`): Git has no media
 chunking concept. The Git object graph is never touched — a chunk is never a Git
-object ID, and chunks/manifests live in a private `.libra/media/` store that is a
-sibling of `objects/`. The `media_oid` is always SHA-256 of the full file
+object ID, and chunks/manifests live in a private
+`.libra/media/fastcdc-v2020-32k/` store that is a sibling of `objects/`. A leftover
+`.libra/media/{chunks,manifests}` cache from `fastcdc-v1` is not read, written,
+or deleted. The `media_oid` is always SHA-256 of the full file
 (independent of `core.objectformat`), byte-identical to a standard LFS pointer
 OID.
+
+
+## Upgrade / recovery (C-08)
+
+New-recipe writes go under `.libra/media/fastcdc-v2020-32k/`. The legacy
+`.libra/media/{chunks,manifests}` tree and standard LFS objects are retained —
+not migrated and not deleted. On a bad cutover, stop writing the new namespace
+and switch back to a matching older binary + legacy space; do not only revert
+code against active data.
 
 ## Subcommands
 
 | Subcommand | Description | Example |
 |---|---|---|
-| `chunk <path> [--store]` | FastCDC-chunk a file and emit its manifest; `--store` persists chunks + manifest to `.libra/media`. | `libra media chunk big.psd --store` |
-| `inspect <manifest>` | Parse and validate a manifest JSON file. | `libra media inspect .libra/media/manifests/<oid>.json` |
+| `chunk <path> [--store]` | FastCDC-chunk a file and emit its manifest; `--store` persists chunks + manifest under `.libra/media/fastcdc-v2020-32k`. | `libra media chunk big.psd --store` |
+| `inspect <manifest>` | Validate a paged manifest summary (or one page envelope) and print the summary. Does not dump every chunk. | `libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json` |
 | `verify <path> \| --media-oid <oid>` | Reassemble from the local chunk store and verify the full `media_oid` (never publishes a corrupt file). | `libra media verify big.psd` |
 | `probe [--remote <name>]` | Probe the remote's media capability endpoint and report the transfer decision (chunked vs standard-LFS fallback). | `libra media probe --remote origin` |
 | `--json` | Structured JSON envelope on stdout (global flag). | `libra --json media chunk big.psd` |
 
 ## Safe fallback
 
-`media probe` reports the remote's capabilities: `chunked (fastcdc-v1)` or
+`media probe` reports the remote's capabilities: `chunked (fastcdc-v2020-32k)` or
 `standard-lfs (fallback)` with a reason such as no capability endpoint, disabled
 server support, incompatible algorithm, insufficient required capabilities,
 unknown protocol version, or a server error after backoff. It assumes the
@@ -35,9 +46,13 @@ it does **not** read `lfs.fastcdc` and does not report `blocked` under these
 assumptions. A `chunked` probe result therefore does not prove that transfers are
 enabled in this repository.
 
-Actual LFS transfers also apply `lfs.fastcdc` and require the server to retain a
-complete standard-LFS fallback and accept manifests. Chunk-only advertisements
-use basic LFS instead. A monoengine server built with `--features fastcdc`
+Actual LFS transfers also apply `lfs.fastcdc`. Before a media transfer starts,
+a missing capability endpoint, an old algorithm, or insufficient paging limits
+(`manifest_paging` must be `v1`, with page and envelope budgets of 4096 entries
+and 1 MiB) stay on standard LFS. Chunk-only advertisements use basic LFS
+instead. `range_read=false` does not block a full chunked transfer. After the
+transfer has started, authentication, hash, and protocol failures fail closed
+and do not silently upload or download the whole object. A monoengine server built with `--features fastcdc`
 implements the authenticated extension; other remotes retain the standard Git LFS
 fallback. This is not standard Git FastCDC interoperability.
 
@@ -78,23 +93,45 @@ Keep the repository URL in `origin`. The LFS client preserves
 `<repo>.git/info/lfs`; capability discovery appends `libra/media/v1/capabilities`
 to that LFS URL. The Bearer header is attached automatically from the stored token.
 
-Normal LFS push/upload now prepares a versioned manifest, uploads only missing
-chunks, and finalizes. The FastCDC-capable server verifies chunk hashes, full
-SHA-256 and the frozen FastCDC boundaries, writes the complete standard-LFS
-object, then publishes the manifest. Repeating push resumes from missing chunks.
-Downloads use finalized manifests, reuse verified local chunks, and atomically
-publish only verified full content. Invalid manifests or corrupted remote chunks
-are errors and preserve the existing destination. No manifest, unsupported
-capabilities or disabled feature means standard full-object LFS. Objects exceeding
-the negotiated manifest/chunk count limits also use basic upload before any
-manifest is sent. Chunk-only uploads are not supported. Outside a Libra
-repository, the public LFS download client uses basic LFS instead of creating a
-repository cache.
+Normal LFS push/upload prepares a bounded summary (`POST manifests`), puts
+canonical pages (`PUT manifests/{id}/pages/{page_no}`), seals the layout, then
+PUTs only hashes named by `GET manifests/{id}/missing?cursor=`. Duplicate hashes
+on that cursor are uploaded once; a hash outside the disk index is an error.
+Finalize is a durable task: `POST manifests/{id}/finalize` returns HTTP 202 with
+`task_id` and a same-origin `status_url`. The client polls `GET tasks/{task_id}`
+through `pending` and `running`, re-queues a retryable `failed` task with the
+same `task_id`, and accepts `complete` only when `manifest_id`, `oid`, and
+`size` match the local summary. A 429 honors `Retry-After` (clamped to 1–30
+seconds) and stops after a few attempts. One request times out at 120 seconds;
+ten minutes without progress is an error. There is no fixed deadline for a
+transfer that keeps making progress.
+
+Downloads pin `manifest_id`. `GET manifests/by-media/{oid}` and
+`GET finalized/{manifest_id}` must agree on id, oid, and size. Pages come from
+`GET finalized/{manifest_id}/pages` and chunk bytes from
+`GET finalized/{manifest_id}/chunks/{hash}`. The destination is replaced only
+after the reassembled SHA-256 matches. Invalid manifests or corrupted remote
+chunks are errors and preserve the existing destination. No manifest, unsupported
+capabilities, or a disabled feature means standard full-object LFS. A protocol
+failure after prepare does not fall back.
+
+There is no whole-file byte, chunk-count, or manifest-size product cap. `media
+chunk` pages the layout (at most 4096 entries per page, compact entries array at
+most 960 KiB, envelope at most 1 MiB) and prints a summary. Page boundaries are
+not part of the canonical manifest id. `--store` writes
+`.libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json`, immutable
+`pages/<n>.json`, chunk bytes, and a derived hash/offset index under
+`.libra/media/fastcdc-v2020-32k/index/local/<manifest_id>/`. That index can be
+deleted and is rebuilt on verify; it is not repository config. A server that
+still requires a full manifest body is retried once, and only when the compact
+JSON fits in the 1 MiB envelope. A larger layout fails closed. Chunk-only
+uploads are not supported. Outside a Libra repository, the public LFS download
+client uses basic LFS instead of creating a repository cache.
 
 The initial extension isolates chunks by authenticated user and repository;
 another user's data is fetched through the standard full-object fallback. It
 requires Bearer access tokens and does not introduce a public chunk-hash API.
-Manifests are limited to 10 MiB / 8192 chunks and chunks to 8 MiB. This is an
+Chunk payload is at most 256 KiB. This is an
 opt-in transport; deployments need explicit retention and quota planning.
 
 The ignored live test `monoengine_fastcdc_http_interop` is not Mega-only. Run it
@@ -131,7 +168,7 @@ current implementation does not claim completion of all Lore §6.5–6.8 guarant
 ```bash
 libra media chunk big.psd                 # chunk a file; print the manifest summary
 libra media chunk big.psd --store         # also persist chunks + manifest locally
-libra media inspect .libra/media/manifests/<oid>.json
+libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json
 libra media verify big.psd                # reassemble from the store and verify media_oid
 libra media probe --remote origin         # capability-probe; falls back to standard LFS
 libra --json media chunk big.psd          # structured JSON output for agents

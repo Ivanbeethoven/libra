@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-28（本次完成 plan-20260925 Session Capture 收口复核及最终全量验证；并收口 issues/497 至 v0.27.2；issues/496 CLH-01..04 落地并发布 v0.29.1；其余行沿用原 2026-09-27 快照，未逐项复核）。
+> **当前快照：** 2026-09-28（本次完成 plan-20260925 Session Capture 收口复核及最终全量验证；并收口 issues/497 至 v0.27.2；issues/496 CLH-01..04 落地并发布 v0.30.1；其余行沿用原 2026-09-27 快照，未逐项复核）。
 
 ---
 
@@ -77,7 +77,7 @@
 | [`issues/487.md`](issues/487.md) | 本地 Git 转换挂死与中断恢复 | 未启动 | IG-01..IG-05（5 卡） |
 | [`issues/488.md`](issues/488.md) | `grep` 的 `--exclude-standard` 与子目录作用域 | 未启动 | GR-01/02（2 卡） |
 | [`issues/490.md`](issues/490.md) | skip-worktree 索引位与 `add` 稀疏路径诊断 | 未启动 | SW-01..SW-07（7 卡；SW-06 已迁至 plan-20260918） |
-| [`issues/496.md`](issues/496.md) | 本地路径 clone 停住（Fetching objects 0% CPU） | **实施中（待 Codex 评审）** | CLH-01..04 `done`（根因 ADR-CLH-01：`local_client.rs` 旧 `encode_pack_bytes` 同任务先喂满有界输入通道再排空有界输出通道的循环等待；已复用 `pack_writer::encode_pack_bytes`，新增 pack_writer 单元回归 + clone 集成回归；文档/`COMPATIBILITY.md`/`../libra-backend` 同步；发布 `v0.29.1`） |
+| [`issues/496.md`](issues/496.md) | 本地路径 clone 停住（Fetching objects 0% CPU） | **实施中（待 Codex 评审）** | CLH-01..04 `done`（根因 ADR-CLH-01：`local_client.rs` 旧 `encode_pack_bytes` 同任务先喂满有界输入通道再排空有界输出通道的循环等待；已复用 `pack_writer::encode_pack_bytes`，新增 pack_writer 单元回归 + clone 集成回归；文档/`COMPATIBILITY.md`/`../libra-backend` 同步；发布 `v0.30.1`） |
 | [`issues/497.md`](issues/497.md) | 删除最后一个被跟踪文件后 commit 报 nothing to commit | **已收口** | CD-01..CD-04 全部 `done`/`complete`；`v0.27.2`（PR #581 squash merge `859d7fb`；PR head `base.yml` 7/7 + CodeQL 绿；`release.yml` 8/8 + stable manifest `0.27.2`）；ER-07 签名例外 EX-CD-01（仓库 vault 不可 unseal，操作者 2026-09-24 裁决维持未签名发布） |
 | [`issues/498.md`](issues/498.md) | `tag <name> <commit>` 不接受显式目标提交 | 未启动 | TT-01..TT-04（4 卡；与 #533/#478 协调） |
 | [`issues/477b.md`](issues/477b.md) | 历史改写收口后续（#522/#523/#525/#526/#527/#533/#536；#528 并入 #495） | 未启动 | HW-01..HW-07（7 卡） |
@@ -85,6 +85,7 @@
 | [`issues/468.md`](issues/468.md) | Data collection and refinement | 未启动 | DC-01..DC-04（4 卡） |
 | [`issues/500.md`](issues/500.md) | Feature：Centralized Storage for Libra Statistics Data | 未启动 | CS-01..CS-04（4 卡） |
 | [`issues/577.md`](issues/577.md) | SSH 公钥认证失败误报 pkt-line 协议错误与配置文档 | **已收口** | 2026-09-27：SA-02/SA-01 均为 `done` / `complete`；PR #578 合并为 `5eb833f9`，v0.24.1 发布与 8/8 release jobs 全绿；网站 `cf@667d7da8`、Worker `c7011920` 和七个生产页验证完成；Issue #577 CLOSED |
+| [`issues/582.md`](issues/582.md) | Git 相容的互動式 SSH 主機金鑰確認 | 已排期 | HKT-00..HKT-02 全部 `pending`；HKT-00 先移交 issues/480 HP-17 與 plan-20260901 DEFER-07，再依序交付 cascade 與受限 TTY confirmation |
 
 ---
 
@@ -335,6 +336,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`issues/487`](issues/487.md) | IG-01 | 本地传输复用已修复的 pack 编码器 | 无（必最先完成） | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/488`](issues/488.md) | GR-01 | `grep --exclude-standard` / `--no-exclude-standard` | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/490`](issues/490.md) | SW-01 | 采用支持 index v3 扩展标志的 `git-internal` | 无 | 尚未 Codex review | DEP-AD-07：与 plan-20260918 串行 | ❌ 禁止开工 |
+| [`issues/582`](issues/582.md) | HKT-00 | 固定安全 host-key interaction 設計，並移交 HP-17／DEFER-07 | 无 | R1 `PASS`（計劃自審） | DEP-HKT-01/02/03：開工時須刷新既有計劃與固定 Git/OpenSSH 參照 | ⚠️ 設計卡可重核後啟動；HKT-01／02 必須依序等待前卡 `done/complete` |
 
 > 说明：✅ = 无任何门控，可立即开工；⚠️ = 内部无前置但仍有外部/跨计划 `DEP-*` 或发布队列约束；❌ = 计划级 review 门未过（多数 issue 计划尚未 Codex review），按模板 ER-05 / GC-01 **禁止**标 `in-progress`。
 >
