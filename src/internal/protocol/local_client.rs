@@ -15,7 +15,6 @@ use git_internal::{
     errors::GitError,
     hash::{HashKind, ObjectHash, set_hash_kind},
     internal::{
-        metadata::{EntryMeta, MetaAttached},
         object::{
             ObjectTrait,
             blob::Blob,
@@ -24,7 +23,7 @@ use git_internal::{
             tree::{Tree, TreeItemMode},
             types::ObjectType,
         },
-        pack::{encode::PackEncoder, entry::Entry},
+        pack::entry::Entry,
     },
 };
 use tokio::sync::Mutex;
@@ -1204,40 +1203,6 @@ fn empty_pack_bytes(hash_kind: HashKind) -> Vec<u8> {
     pack
 }
 
-/// Encode `entries` (non-empty) into a v2 pack, propagating the repository hash
-/// kind into the encoder's spawned task.
-async fn encode_pack_bytes(entries: Vec<Entry>, hash_kind: HashKind) -> Result<Vec<u8>, IoError> {
-    let (entry_tx, entry_rx) = tokio::sync::mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1_000);
-    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(1_000);
-
-    let total_objects = entries.len();
-    let encode_handle = tokio::spawn(async move {
-        let mut encoder = PackEncoder::new_with_hash_kind(hash_kind, total_objects, 0, stream_tx);
-        encoder.encode(entry_rx).await
-    });
-
-    for entry in entries {
-        let meta_entry = MetaAttached {
-            inner: entry,
-            meta: EntryMeta::default(),
-        };
-        if let Err(e) = entry_tx.send(meta_entry).await {
-            return Err(IoError::other(format!("Failed to send entry: {}", e)));
-        }
-    }
-    drop(entry_tx);
-
-    let mut pack_data = Vec::new();
-    while let Some(chunk) = stream_rx.recv().await {
-        pack_data.extend(chunk);
-    }
-    encode_handle
-        .await
-        .map_err(|e| IoError::other(format!("Encode task panicked: {}", e)))?
-        .map_err(|e| IoError::other(format!("Pack encoding failed: {}", e)))?;
-    Ok(pack_data)
-}
-
 async fn encode_entries_to_fetch_response(
     entries: Vec<Entry>,
     shallow: Vec<String>,
@@ -1250,7 +1215,11 @@ async fn encode_entries_to_fetch_response(
     let pack_data = if entries.is_empty() {
         empty_pack_bytes(hash_kind)
     } else {
-        encode_pack_bytes(entries, hash_kind).await?
+        // ADR-CLH-01 / ADR-IG-01: reuse the single fixed pack encoder. The
+        // pre-fix in-house copy fed every entry into a bounded channel before
+        // draining the output, deadlocking the fetch on > ~2 000 objects
+        // (symptom: local-path clone stuck at "Fetching objects", 0% CPU).
+        crate::internal::pack_writer::encode_pack_bytes(entries, hash_kind).await?
     };
 
     if pack_data.len() < 12 || &pack_data[0..4] != b"PACK" {

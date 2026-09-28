@@ -185,6 +185,11 @@ fails closed with `LBR-REPO-002` on both a plain path and `file://`.
 libra clone -l /path/to/source /path/to/dest
 ```
 
+A **local-path clone of a large repository** (thousands of commits / hundreds of
+thousands of reachable objects) is encoded through the same shared pack encoder
+as `repack`/`pack-objects`/`maintenance`; it does not hang at “Fetching objects”
+(ADR-CLH-01 / issues/496).
+
 ### `--depth <N>`
 
 Create a shallow clone with history truncated to the specified number of commits.

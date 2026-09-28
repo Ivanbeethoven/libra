@@ -6,7 +6,13 @@
 //! repository. Without the explicit live-test flag and credentials, the tests
 //! are skipped so normal acceptance runs do not depend on external GitHub state.
 
-use std::{fs, process::Command, sync::OnceLock};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use libra::{command, command::clone::CloneArgs, internal::head::Head, utils::test};
 use serial_test::serial;
@@ -2961,4 +2967,110 @@ fn clone_rejects_unknown_git_source_format() {
         assert_eq!(report.error_code, "LBR-IO-001", "{report:?}");
         assert!(!dest.join(".libra").exists(), "zero-write: no .libra");
     }
+}
+
+/// Build a Git source with a single commit containing `file_count` distinct
+/// root blobs. Reaching and encoding all of them yields far more entries than
+/// the sum of the two bounded channel capacities (1_000 + 1_000 = 2_000), which
+/// is exactly the regime in which the pre-fix in-house encoder in
+/// `local_client.rs::encode_pack_bytes` deadlocked the local-path clone at
+/// "Fetching objects" (0% CPU). This is much faster than a long linear history
+/// while still exercising the ADR-CLH-01 fix end-to-end.
+fn create_wide_git_repo(file_count: usize) -> tempfile::TempDir {
+    assert!(file_count > 2_000, "must exceed both channel capacities");
+    let dir = tempdir().expect("wide git tempdir");
+    let repo = dir.path();
+    super::git_success(repo, &["init", "-b", "main"]);
+    super::git_success(repo, &["config", "user.name", "Wide Tester"]);
+    super::git_success(repo, &["config", "user.email", "wide@test"]);
+    super::git_success(repo, &["config", "commit.gpgsign", "false"]);
+    for i in 0..file_count {
+        fs::write(repo.join(format!("f{i:05}.txt")), format!("content {i}\n"))
+            .expect("write wide source file");
+    }
+    super::git_success(repo, &["add", "-A"]);
+    super::git_success(repo, &["commit", "-m", "wide single commit"]);
+    dir
+}
+
+/// Run the Libra binary via `base_libra_command`'s isolated HOME, but poll it
+/// with a hard deadline: return `(output, timed_out)`. If the clone deadlocks
+/// (the ADR-CLH-01 regression), the child never exits, `timed_out` becomes
+/// `true` and the test fails instead of hanging the whole suite.
+fn run_libra_command_with_timeout(
+    args: &[&str],
+    cwd: &Path,
+    budget: Duration,
+) -> (std::process::Output, bool) {
+    use std::process::Stdio;
+
+    let mut child = super::base_libra_command(args, cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn libra binary");
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                let output = child.wait_with_output().expect("failed to collect output");
+                return (output, false);
+            }
+            Ok(None) => {
+                if start.elapsed() > budget {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().expect("failed to collect output");
+                    return (output, true);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("failed to poll libra child: {error}"),
+        }
+    }
+}
+
+/// ADR-CLH-01 regression guard: a local-path clone of a source with more than
+/// the channel-capacity object count must complete inside a generous time
+/// budget rather than hang at "Fetching objects" (0% CPU).
+#[test]
+fn test_clone_local_git_large_object_set_completes_in_budget() {
+    use super::run_libra_command;
+
+    let file_count = 2_500;
+    let wide = create_wide_git_repo(file_count);
+    let source = wide.path().to_str().unwrap().to_string();
+    let dest_root = tempdir().expect("dest root");
+    let dest = dest_root.path().join("wide-clone");
+    let dest_str = dest.to_str().unwrap().to_string();
+
+    let (out, timed_out) = run_libra_command_with_timeout(
+        &["clone", &source, &dest_str],
+        dest_root.path(),
+        Duration::from_secs(60),
+    );
+    assert!(
+        !timed_out,
+        "local clone of {file_count}-blob source hung at Fetching objects: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    super::assert_cli_success(&out, "large local clone should complete");
+    assert!(dest.join(".libra").exists(), "clone created a repo");
+
+    // Integrity: all objects were encoded and the working tree was materialized.
+    let log = run_libra_command(&["log", "--oneline"], &dest);
+    super::assert_cli_success(&log, "log on cloned repo");
+    assert_eq!(
+        String::from_utf8_lossy(&log.stdout).lines().count(),
+        1,
+        "single-commit history cloned exactly once"
+    );
+    let checked_out = fs::read_dir(&dest)
+        .expect("read cloned working tree")
+        .count();
+    assert!(
+        checked_out >= file_count,
+        "expected all {file_count} wide files checked out, found {checked_out}"
+    );
+    let status = run_libra_command(&["status", "--short", "--branch"], &dest);
+    super::assert_cli_success(&status, "status on cloned repo");
 }

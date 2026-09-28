@@ -651,14 +651,13 @@ impl LFSClient {
         })?;
 
         #[cfg(feature = "fastcdc")]
-        if let Ok(storage) = util::try_get_storage_path(None)
+        if util::try_get_storage_path(None).is_ok()
             && let Some(media) = self.media_client(false).await?
         {
             // The public LFSClient also supports callers outside a repository;
             // those use basic LFS instead of a repository-only cache that panics.
-            let store = crate::utils::media::chunk_store::MediaChunkStore::at(
-                storage.join("media").join("chunks"),
-            );
+            // Chunks land in the algorithm namespace, not the legacy v1 cache.
+            let store = crate::utils::media::chunk_store::MediaChunkStore::open();
             if media.download(oid, size, path.as_ref(), &store).await? {
                 if let Some((report, _)) = reporter.as_mut() {
                     report(100.0)?;

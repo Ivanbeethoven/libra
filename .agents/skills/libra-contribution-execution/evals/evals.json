@@ -1,0 +1,23 @@
+{
+  "skill_name": "libra-contribution-execution",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I'm already on branch `codex/my-feature`. Please implement task card ABC-02 from the current plan; the card does not specify a branch change.",
+      "expected_output": "Inspect Libra worktree status and the task card, preserve unrelated changes, and continue on the contributor's current branch unless repository policy or a specific instruction requires a branch change. Implement only the authorized card scope and run its specified verification.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "While implementing the selected card, I found it needs a new migration and overlaps another active card. Go ahead and add both to this PR.",
+      "expected_output": "Explain that scope and write-set/dependency changes require a maintainer decision. Do not silently expand implementation; report the evidence and ask to update/resequence the plan first.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "The card is implemented. Push the branch and open a PR; I have authorized opening the PR but didn't mention pushing.",
+      "expected_output": "Prepare the PR description and create the PR only if the authorized workflow can do so without unapproved push; otherwise explain that pushing is a separate operation requiring explicit authorization. Do not infer push authorization from PR authorization.",
+      "files": []
+    }
+  ]
+}

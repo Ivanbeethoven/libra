@@ -1,0 +1,23 @@
+{
+  "skill_name": "libra-plan-task-authoring",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Can I start card WT-03 now? It looks like a zero-dependency card, but the status page mentions DEP-WT-08.",
+      "expected_output": "Inspect plan and status sources, distinguish internal indegree from external DEP blockers, identify the declared availability criterion, and state readiness based on evidence. Do not treat zero in-plan prerequisites as sufficient readiness.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "The clarified request spans CLI output, persisted state, and a compatibility change. Draft a plan and cards in the repository, but don't implement them.",
+      "expected_output": "Read current template/status and source anchors, check duplicates and dependencies, draft independently reviewable cards with acceptance, verification, and DAG edges, register external dependencies as DEP entries, and present as a maintainer-review draft. Plan authoring does not authorize implementation.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Issue triage is complete, but acceptance of a breaking change is still undecided. Make the task card ready so implementation can begin.",
+      "expected_output": "Identify the compatibility decision as a maintainer gate, leave it unresolved, and do not label the card ready or authorize implementation until the decision and other gates are settled.",
+      "files": []
+    }
+  ]
+}
