@@ -38,6 +38,7 @@ use crate::{
     command::{
         read_worktree_blob_bytes,
         status::{self, Changes},
+        status_untracked,
     },
     internal::ai::automation::{VCS_EVENT_POST_ADD, dispatch_current_repo_vcs_event_to_history},
     utils::{
@@ -560,13 +561,26 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         ignore_case,
     };
 
-    let (mut visible_changes, mut ignored_changes) = if args.force {
-        status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
-    } else {
-        status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
-    };
+    // ScorpioFS heuristic fast path: on a mount the upper layer is the only
+    // writable surface, so the daemon's changed-path set IS the complete candidate
+    // set. That replaces the per-tracked-file stat storm and the whole-tree readdir
+    // with one bounded HTTP call (O(touched), not O(tree)) — the difference between
+    // seconds and minutes on a large monorepo. `--force` needs the ignored set folded
+    // in, which the fast path supplies too. Falls back to the full scan whenever the
+    // mount/daemon/state is unavailable, so behaviour off a mount is unchanged.
+    let (mut visible_changes, mut ignored_changes) =
+        match status_untracked::scorpiofs_staged_candidates(ignore_case).await {
+            Some(pair) => pair,
+            None => {
+                if args.force {
+                    status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+                        .map_err(|source| AddError::Status { source })?
+                } else {
+                    status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
+                        .map_err(|source| AddError::Status { source })?
+                }
+            }
+        };
     if args.force {
         visible_changes.extend(ignored_changes.clone());
         ignored_changes = Changes::default();

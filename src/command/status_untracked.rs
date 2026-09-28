@@ -89,6 +89,100 @@ pub(crate) fn collect_status_worktree_changes(
     })
 }
 
+/// The daemon's upper-layer change set, classified against the index but **not**
+/// collapsed or filtered — the shared core behind every ScorpioFS fast path.
+pub(crate) struct ScorpioCandidates {
+    /// Tracked paths whose upper content hashes differ from the index.
+    pub(crate) tracked_modified: Vec<PathBuf>,
+    ///Tracked paths with a whiteout in the upper layer.
+    pub(crate) tracked_deleted: Vec<PathBuf>,
+    /// Untracked paths present in the upper layer, as concrete files (never
+    /// collapsed to their parent directory).
+    pub(crate) untracked: Vec<PathBuf>,
+    /// The same, but matched by an ignore rule.
+    pub(crate) ignored: Vec<PathBuf>,
+    pub(crate) index: Index,
+    pub(crate) tracked: TrackedPaths,
+}
+
+/// Fetch and classify the upper layer's change set.
+///
+/// Returns `None` (callers fall back to the full scan) when not on a ScorpioFS
+/// mount, when the daemon is unreachable or pre-Worktree-v2, or when the response
+/// cannot be loaded.
+pub(crate) async fn scorpiofs_candidates(ignore_case: bool) -> Option<ScorpioCandidates> {
+    use crate::command::sync::{ScorpioState, current_mount_id, http, scorpio_endpoint};
+    use std::time::Duration;
+
+    let mount_id = current_mount_id()?;
+    let workdir = util::try_working_dir().ok()?;
+    let index_path = path::try_index().ok()?;
+    let index = Index::load(&index_path).ok()?;
+
+    let url = format!("{}/worktrees/{}/state", scorpio_endpoint(), mount_id);
+    // Bounded wait: these paths must stay fast even when the daemon is gone.
+    let response = http()
+        .get(&url)
+        .timeout(Duration::from_millis(800))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let state = response.json::<ScorpioState>().await.ok()?;
+
+    let tracked = TrackedPaths::from_index(&index, ignore_case);
+    let mut candidates = ScorpioCandidates {
+        tracked_modified: Vec::new(),
+        tracked_deleted: Vec::new(),
+        untracked: Vec::new(),
+        ignored: Vec::new(),
+        index,
+        tracked,
+    };
+    for change in &state.changes {
+        let p = change.path.trim_start_matches("./");
+        // The `.libra` pointer is VCS metadata living in the upper layer; it
+        // never participates in status.
+        if p.is_empty() || p == ".libra" || p.starts_with(".libra/") {
+            continue;
+        }
+        let rel = PathBuf::from(p);
+        match change.kind.as_str() {
+            "deleted" => {
+                if candidates.index.tracked(p, 0) {
+                    candidates.tracked_deleted.push(rel);
+                }
+            }
+            "added" | "modified" => {
+                if candidates.index.tracked(p, 0) {
+                    // Ignore rules never apply to tracked files (Git semantics):
+                    // an edited `app.log` stays `modified` even when `*.log` is
+                    // ignored. Test the hash first, so a matching ignore rule
+                    // cannot silently swallow a real edit.
+                    // The daemon hashes upper content in the same git-blob-OID
+                    // domain as the index; a touch or reverted write hashes
+                    // back to the index value, which means clean.
+                    let clean = match (&change.content_hash, candidates.index.get(p, 0)) {
+                        (Some(h), Some(entry)) => *h == entry.hash.to_string(),
+                        _ => false,
+                    };
+                    if !clean {
+                        candidates.tracked_modified.push(rel);
+                    }
+                } else if util::check_gitignore(&workdir, &workdir.join(&rel)) {
+                    candidates.ignored.push(rel);
+                } else {
+                    candidates.untracked.push(rel);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(candidates)
+}
+
 /// ScorpioFS heuristic fast path: the mount's upper layer is the only writable
 /// surface, so the daemon's changed-path set IS the complete candidate set for
 /// unstaged changes — nothing outside it can differ from the index baseline.
@@ -104,87 +198,62 @@ pub(crate) async fn scorpiofs_worktree_changes(
     include_ignored: bool,
     ignore_case: bool,
 ) -> Option<StatusWorktreeChanges> {
-    use crate::command::sync::{ScorpioState, current_mount_id, http, scorpio_endpoint};
-    use std::time::Duration;
-
     if matches!(untracked_mode, UntrackedFiles::All) {
         return None;
     }
-    let mount_id = current_mount_id()?;
-    let workdir = util::try_working_dir().ok()?;
-    let index_path = path::try_index().ok()?;
-    let index = Index::load(&index_path).ok()?;
+    let candidates = scorpiofs_candidates(ignore_case).await?;
+    let ScorpioCandidates {
+        tracked_modified,
+        tracked_deleted,
+        mut untracked,
+        ignored,
+        index,
+        tracked,
+    } = candidates;
 
-    let url = format!("{}/worktrees/{}/state", scorpio_endpoint(), mount_id);
-    // Bounded wait: status must stay fast even when the daemon is gone.
-    let response = http()
-        .get(&url)
-        .timeout(Duration::from_millis(800))
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let state = response.json::<ScorpioState>().await.ok()?;
-
-    let tracked = TrackedPaths::from_index(&index, ignore_case);
-    let mut unstaged = Changes::default();
-    let mut ignored_files = Vec::new();
-    for change in &state.changes {
-        let p = change.path.trim_start_matches("./");
-        // The `.libra` pointer is VCS metadata living in the upper layer; it
-        // never participates in status.
-        if p.is_empty() || p == ".libra" || p.starts_with(".libra/") {
-            continue;
-        }
-        let rel = PathBuf::from(p);
-        let is_tracked = index.tracked(p, 0);
-        match change.kind.as_str() {
-            "deleted" => {
-                if is_tracked {
-                    unstaged.deleted.push(rel);
-                }
-            }
-            "added" | "modified" => {
-                if is_tracked {
-                    // Ignore rules never apply to tracked files (Git semantics):
-                    // an edited `app.log` stays `modified` even when `*.log` is
-                    // ignored. Test the hash first, so a matching ignore rule
-                    // cannot silently swallow a real edit.
-                    // The daemon hashes upper content in the same git-blob-OID
-                    // domain as the index; a touch or reverted write hashes
-                    // back to the index value, which means clean.
-                    let clean = match (&change.content_hash, index.get(p, 0)) {
-                        (Some(h), Some(entry)) => *h == entry.hash.to_string(),
-                        _ => false,
-                    };
-                    if !clean {
-                        unstaged.modified.push(rel);
-                    }
-                } else {
-                    let absolute = workdir.join(&rel);
-                    if util::check_gitignore(&workdir, &absolute) {
-                        if include_ignored {
-                            ignored_files.push(rel);
-                        }
-                    } else if !matches!(untracked_mode, UntrackedFiles::No) {
-                        unstaged.new.push(rel);
-                    }
-                }
-            }
-            _ => {}
-        }
+    if matches!(untracked_mode, UntrackedFiles::No) {
+        untracked.clear();
     }
     if matches!(untracked_mode, UntrackedFiles::Normal) {
-        unstaged.new = collapse_untracked_directories(unstaged.new, &tracked);
+        untracked = collapse_untracked_directories(untracked, &tracked);
     }
     Some(StatusWorktreeChanges {
-        unstaged,
-        ignored_files,
+        unstaged: Changes {
+            new: untracked,
+            modified: tracked_modified,
+            deleted: tracked_deleted,
+            renamed: Vec::new(),
+        },
+        ignored_files: if include_ignored { ignored } else { Vec::new() },
         index,
         io_blocked: Vec::new(),
     })
+}
+
+/// ScorpioFS fast path for staging (`add`): the same candidate set as
+/// [`scorpiofs_worktree_changes`], but with untracked paths left as concrete files.
+///
+/// `add` stages files, so a directory collapsed by the `Normal` untracked mode
+/// would be the wrong input. Returns `(visible, ignored)` in the shape
+/// `changes_to_be_staged_split_*` produces, or `None` to fall back to the full scan
+/// — which also covers `--untracked-files` never being in play here, since `add`
+/// always wants every untracked file.
+pub(crate) async fn scorpiofs_staged_candidates(
+    ignore_case: bool,
+) -> Option<(Changes, Changes)> {
+    let candidates = scorpiofs_candidates(ignore_case).await?;
+    Some((
+        Changes {
+            new: candidates.untracked,
+            modified: candidates.tracked_modified,
+            deleted: candidates.tracked_deleted,
+            renamed: Vec::new(),
+        },
+        Changes {
+            new: candidates.ignored,
+            ..Changes::default()
+        },
+    ))
 }
 
 pub(crate) fn changes_to_current_directory(mut changes: Changes) -> Changes {
