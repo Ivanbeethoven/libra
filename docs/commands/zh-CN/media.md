@@ -4,6 +4,11 @@ FastCDC LFS 媒体分块客户端（lore.md §6），是受 `fastcdc` 功能开�
 
 `media` 是 Libra 专有扩展（`intentionally-different`）：Git 没有媒体分块概念。它不修改 Git 对象图，chunk hash 不是 Git object ID；块和 manifest 存放在与 `objects/` 同级的私有 `.libra/media/fastcdc-v2020-32k/` 中。旧配方留下的 `.libra/media/{chunks,manifests}` 不读取、不写入、不删除。`media_oid` 始终是完整文件的 SHA-256，独立于 `core.objectformat`，与标准 LFS pointer OID 一致。
 
+
+## 升级 / 恢复（C-08）
+
+新配方写入 `.libra/media/fastcdc-v2020-32k/`，不迁移、不删除旧的 `.libra/media/{chunks,manifests}`，也不触碰标准 LFS 对象。异常时停写新空间，切回匹配的旧二进制与旧空间；不可仅 revert 代码而继续对活动数据写入。
+
 ## 子命令
 
 | 子命令 | 说明 | 示例 |

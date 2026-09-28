@@ -1342,7 +1342,7 @@ async fn paged_upload_finalize_and_download_round_trip() {
 }
 
 #[test]
-fn legacy_v1_cache_survives_a_namespaced_chunk() {
+fn c08_upgrade_retains_legacy_v1_and_standard_lfs() {
     let repo = tempfile::tempdir().unwrap();
     let p = repo.path();
     ok(&["init"], p);
@@ -1352,6 +1352,10 @@ fn legacy_v1_cache_survives_a_namespaced_chunk() {
     fs::create_dir_all(legacy_manifest.parent().unwrap()).unwrap();
     fs::write(&legacy_chunk, b"keep-me").unwrap();
     fs::write(&legacy_manifest, b"{\"v\":1}").unwrap();
+    // Standard LFS object store is a sibling of media — must not be deleted on upgrade.
+    let lfs_obj = p.join(".libra/lfs/objects").join("d".repeat(64));
+    fs::create_dir_all(lfs_obj.parent().unwrap()).unwrap();
+    fs::write(&lfs_obj, b"standard-lfs-retained").unwrap();
 
     let src = p.join("clip.bin");
     fs::write(&src, b"namespace me").unwrap();
@@ -1363,12 +1367,14 @@ fn legacy_v1_cache_survives_a_namespaced_chunk() {
     let oid = js["data"]["media_oid"].as_str().unwrap();
     assert_eq!(fs::read(&legacy_chunk).unwrap(), b"keep-me");
     assert_eq!(fs::read(&legacy_manifest).unwrap(), b"{\"v\":1}");
+    assert_eq!(fs::read(&lfs_obj).unwrap(), b"standard-lfs-retained");
     assert!(
         media_ns(p)
             .join("manifests")
             .join(oid)
             .join("summary.json")
-            .is_file()
+            .is_file(),
+        "new writes must land under the algorithm namespace"
     );
     assert!(!p.join(".libra/media/manifests").join(oid).exists());
 }

@@ -16,6 +16,15 @@ or deleted. The `media_oid` is always SHA-256 of the full file
 (independent of `core.objectformat`), byte-identical to a standard LFS pointer
 OID.
 
+
+## Upgrade / recovery (C-08)
+
+New-recipe writes go under `.libra/media/fastcdc-v2020-32k/`. The legacy
+`.libra/media/{chunks,manifests}` tree and standard LFS objects are retained —
+not migrated and not deleted. On a bad cutover, stop writing the new namespace
+and switch back to a matching older binary + legacy space; do not only revert
+code against active data.
+
 ## Subcommands
 
 | Subcommand | Description | Example |

@@ -70,10 +70,10 @@ impl PageCache {
         if !guard.map.contains_key(key) {
             return None;
         }
-        if let Some(pos) = guard.order.iter().position(|candidate| candidate == key) {
-            if let Some(found) = guard.order.remove(pos) {
-                guard.order.push_back(found);
-            }
+        if let Some(pos) = guard.order.iter().position(|candidate| candidate == key)
+            && let Some(found) = guard.order.remove(pos)
+        {
+            guard.order.push_back(found);
         }
         guard.map.get(key).map(|entry| entry.bytes.clone())
     }
@@ -224,10 +224,14 @@ mod tests {
             if pages == 16 {
                 assert_eq!(cache.len(), 32, "16 pages x 2 sessions fit");
             } else if pages == 256 {
-                assert!(256 * 2 * PAGE_BODY < PAGE_CACHE_BUDGET);
+                const {
+                    assert!(256 * 2 * PAGE_BODY < PAGE_CACHE_BUDGET);
+                }
                 assert_eq!(cache.len(), 512, "256 pages x 2 sessions fit");
             } else {
-                assert!(4096 * 2 * PAGE_BODY > PAGE_CACHE_BUDGET);
+                const {
+                    assert!(4096 * 2 * PAGE_BODY > PAGE_CACHE_BUDGET);
+                }
                 assert!(cache.len() < 4096, "evicted before retaining every page");
                 assert!(cache.get(&key(SESSION_A, 0)).is_none());
                 assert!(cache.get(&key(SESSION_B, 4095)).is_some());

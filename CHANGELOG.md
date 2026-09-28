@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.30.0] — 2026-09-28
+
+### FastCDC Media protocol family (REL-FL-01 / FL-06; FL-01 + FL-07 + FL-02)
+
+- Recipe frozen as `fastcdc-v2020-32k` (`fastcdc` 3.2.1, v2020 Level1,
+  32 KiB / 64 KiB / 256 KiB) behind `--features fastcdc`, with shared golden
+  vectors identical to mega2 MF-06.
+- Local manifests are paged (P-01a); rebuildable disk hash/offset index;
+  CLI `chunk` / `inspect` / `verify` are summary-oriented.
+- Transfers use prepare / page / seal / missing / async finalize; cache root is
+  `.libra/media/fastcdc-v2020-32k/`. Legacy `.libra/media/{chunks,manifests}`
+  and standard LFS objects are retained (C-08).
+- **Minimum compatible client:** this release for the new algorithm namespace.
+  Older FastCDC (`fastcdc-v1`) layouts are not read.
+
 ## [0.29.0] — 2026-09-28
 
 ### AI repository commit refs with HashKind (B3-10)
