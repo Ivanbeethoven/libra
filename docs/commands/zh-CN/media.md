@@ -16,7 +16,7 @@ FastCDC LFS 媒体分块客户端（lore.md §6），是受 `fastcdc` 功能开�
 
 ## 安全回退
 
-`media probe` 只报告远端能力：`chunked (fastcdc-v1)`，或 `standard-lfs (fallback)` 并附带原因，例如没有能力端点、服务端禁用、算法不兼容、所需能力不足、协议版本不兼容或退避后的服务端错误。它假定仓库允许分块且本地存在完整 fallback，**不会读取 `lfs.fastcdc`**，在这些假定下也不会报告 `blocked`。因此，probe 输出 `chunked` 不等于当前仓库已经启用实际分块传输。
+`media probe` 只报告远端能力：`chunked (fastcdc-v2020-32k)`，或 `standard-lfs (fallback)` 并附带原因，例如没有能力端点、服务端禁用、算法不兼容、所需能力不足、协议版本不兼容或退避后的服务端错误。它假定仓库允许分块且本地存在完整 fallback，**不会读取 `lfs.fastcdc`**，在这些假定下也不会报告 `blocked`。因此，probe 输出 `chunked` 不等于当前仓库已经启用实际分块传输。
 
 实际 LFS 传输还会检查 `lfs.fastcdc`，并要求服务端保留标准完整对象、允许 manifest。仅提供 chunk-only 的远端回退 basic LFS。以 `--features fastcdc` 构建的 Mega 实现了需要认证的扩展；其他远端继续使用标准 Git LFS。
 

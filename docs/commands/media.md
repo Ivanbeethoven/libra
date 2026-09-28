@@ -26,7 +26,7 @@ OID.
 
 ## Safe fallback
 
-`media probe` reports the remote's capabilities: `chunked (fastcdc-v1)` or
+`media probe` reports the remote's capabilities: `chunked (fastcdc-v2020-32k)` or
 `standard-lfs (fallback)` with a reason such as no capability endpoint, disabled
 server support, incompatible algorithm, insufficient required capabilities,
 unknown protocol version, or a server error after backoff. It assumes the

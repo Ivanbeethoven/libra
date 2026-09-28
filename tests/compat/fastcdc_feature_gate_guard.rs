@@ -3,8 +3,8 @@
 //! 2026-08-27): the `fastcdc` FastCDC
 //! media-chunking feature must NEVER leak into the default binary. Textual
 //! guards (always run, DEFAULT features): the feature stays out of `default`,
-//! stays a pure in-tree feature (`fastcdc = []`, no bundled deps), and every
-//! media use-site stays behind `#[cfg(feature = "fastcdc")]`.
+//! enables only the optional `fastcdc` crate (`dep:fastcdc`, not in default),
+//! and every media use-site stays behind `#[cfg(feature = "fastcdc")]`.
 
 use std::fs;
 
@@ -24,12 +24,14 @@ fn fastcdc_feature_stays_out_of_default() {
         .lines()
         .find(|line| line.trim_start().starts_with("fastcdc"))
         .expect("fastcdc feature line must exist");
-    // v1 adds no new crates: the feature stays `fastcdc = []`. If a future phase
-    // bundles an optional dep, this guard must be updated to assert it stays
-    // `optional = true` rather than joining the default graph.
+    // FL-01: optional `fastcdc = "=3.2.1"` crate, wired only via this feature.
     assert!(
-        fastcdc_line.contains("[]"),
-        "the fastcdc feature must stay a pure in-tree feature (no bundled deps): {fastcdc_line}"
+        fastcdc_line.contains("dep:fastcdc"),
+        "the fastcdc feature must enable the optional crate via dep:fastcdc: {fastcdc_line}"
+    );
+    assert!(
+        cargo.contains("fastcdc = { version = \"=3.2.1\", optional = true }"),
+        "fastcdc crate must stay optional = true at =3.2.1"
     );
 }
 

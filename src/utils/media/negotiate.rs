@@ -172,7 +172,7 @@ mod tests {
         Capabilities {
             version: "1".to_string(),
             chunked_lfs: true,
-            chunk_algorithms: vec!["fastcdc-v1".to_string()],
+            chunk_algorithms: vec!["fastcdc-v2020-32k".to_string()],
             hash_algorithms: vec!["sha256".to_string()],
             max_chunk_size: 8 * 1024 * 1024,
             max_manifest_size: 10 * 1024 * 1024,
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(
             d,
             TransferDecision::Chunked {
-                algorithm: "fastcdc-v1".to_string()
+                algorithm: "fastcdc-v2020-32k".to_string()
             }
         );
         // Chunked is still chosen when the server keeps a fallback even without a

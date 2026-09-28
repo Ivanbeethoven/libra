@@ -1,6 +1,6 @@
 //! FastCDC LFS media chunking and authenticated Mega transport (lore.md §6).
 //!
-//! This module is the honest v1 of lore.md §6 "LFS FastCDC chunking": a
+//! This module is lore.md §6 "LFS FastCDC chunking" (`fastcdc-v2020-32k` recipe): a
 //! strictly feature-gated (`fastcdc`, default OFF) **client** layer that
 //! content-defines chunks of a media object, builds a versioned manifest,
 //! stores chunks in a local content-addressed store, reassembles + verifies,

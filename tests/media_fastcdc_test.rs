@@ -21,7 +21,7 @@ fn media_bin() -> &'static str {
 fn supported_capabilities(fallback: bool) -> serde_json::Value {
     serde_json::json!({
         "version": "1", "chunked_lfs": true,
-        "chunk_algorithms": ["fastcdc-v1"], "hash_algorithms": ["sha256"],
+        "chunk_algorithms": ["fastcdc-v2020-32k"], "hash_algorithms": ["sha256"],
         "max_chunk_size": 8 * 1024 * 1024, "max_manifest_size": 10 * 1024 * 1024,
         "supports_batch_exists": true, "supports_range_read": false,
         "supports_standard_lfs_fallback": fallback
@@ -826,7 +826,7 @@ fn chunk_store_verify_roundtrip() {
         js["data"]["chunk_count"].as_u64().unwrap() > 1,
         "multi-chunk"
     );
-    assert_eq!(js["data"]["algorithm"].as_str(), Some("fastcdc-v1"));
+    assert_eq!(js["data"]["algorithm"].as_str(), Some("fastcdc-v2020-32k"));
 
     // Manifest + chunk store landed under a private .libra/media sibling of objects/.
     let manifest = p

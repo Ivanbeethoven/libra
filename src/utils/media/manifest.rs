@@ -261,7 +261,7 @@ mod tests {
     fn sample() -> MediaManifest {
         MediaManifest {
             version: 1,
-            algorithm: "fastcdc-v1".to_string(),
+            algorithm: "fastcdc-v2020-32k".to_string(),
             hash_algorithm: "sha256".to_string(),
             media_oid: "a".repeat(64),
             media_size: 10,
@@ -286,7 +286,7 @@ mod tests {
             created_by: CreatedBy {
                 client: "libra".to_string(),
                 version: "0".to_string(),
-                capabilities: vec!["fastcdc-v1".to_string(), "sha256".to_string()],
+                capabilities: vec!["fastcdc-v2020-32k".to_string(), "sha256".to_string()],
             },
             fallback_oid: None,
         }
