@@ -114,6 +114,24 @@ struct PlannedPut {
     length: u64,
 }
 
+/// Trust boundary for range export (C-07): local bytes are trimmed covering
+/// chunks from an authenticated finalized summary; they do not independently
+/// recompute the full-object canonical id or SHA-256.
+pub const TRUST_BOUNDARY_C07: &str = "authenticated finalized summary and covering chunks; local range bytes do not independently prove full-object oid/SHA-256";
+
+/// Outcome of [`MediaClient::export_range`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RangeExportReport {
+    pub manifest_id: String,
+    pub oid: String,
+    pub size: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub covering_chunks: u64,
+    pub downloaded_chunks: u64,
+    pub trust_boundary: &'static str,
+}
+
 pub struct MediaClient {
     client: Client,
     base: Url,
@@ -569,6 +587,223 @@ impl MediaClient {
         chunk_store::write_summary(&layout, &summary)?;
         chunk_store::reassemble_paged(&layout, &summary, path)?;
         Ok(true)
+    }
+
+    /// Discover a client for explicit range export. Ordinary LFS fallback is a
+    /// hard refusal (C-03 / ADR-FL-03).
+    pub async fn discover_for_range(client: Client, lfs_url: &Url) -> Result<Self> {
+        let outcome = capability::probe_with_client(lfs_url.as_str(), client.clone()).await;
+        match negotiate::negotiate_range_export(&outcome, true) {
+            TransferDecision::Chunked { .. } => {}
+            TransferDecision::StandardLfs { reason } => {
+                bail!("FastCDC range export blocked: {}", reason.as_str())
+            }
+            TransferDecision::Block { reason } => {
+                bail!("FastCDC range export blocked: {}", reason.as_str())
+            }
+        }
+        let ProbeOutcome::Ok(caps) = outcome else {
+            bail!("FastCDC range export blocked: remote has no media capability");
+        };
+        let mut base = lfs_url.clone();
+        base.set_path(&format!(
+            "{}/libra/media/v1/",
+            lfs_url.path().trim_end_matches('/')
+        ));
+        base.set_fragment(None);
+        let token = match crate::internal::auth::HostScope::from_request_url(&base) {
+            Some(scope) => match crate::internal::auth::lookup(&scope).await {
+                crate::internal::auth::Lookup::Valid { token, .. } => Some(token),
+                _ => None,
+            },
+            None => None,
+        };
+        Ok(Self {
+            client,
+            base,
+            token,
+            max_manifest: usize::try_from(caps.max_manifest_size.min(MAX_ENVELOPE_SIZE as u64))
+                .unwrap_or(MAX_ENVELOPE_SIZE),
+        })
+    }
+
+    /// Export `[offset, offset+length)` into a new file without hydrating the
+    /// whole object. Pins `manifest_id`, fetches only covering pages, and GETs
+    /// the unique covering hashes missing from a valid local cache.
+    pub async fn export_range(
+        &self,
+        oid: &str,
+        size: u64,
+        offset: u64,
+        length: u64,
+        path: &Path,
+        store: &MediaChunkStore,
+    ) -> Result<RangeExportReport> {
+        if !is_sha256_hex(oid) {
+            bail!("invalid LFS object SHA-256");
+        }
+        chunk_store::validate_byte_range(size, offset, length)?;
+        let Some(published) = self.read_by_media(oid).await? else {
+            bail!("FastCDC range export requires a finalized Media object");
+        };
+        if published.oid != oid || published.size != size {
+            bail!("FastCDC manifest does not match requested LFS object");
+        }
+        let summary = self.finalized_summary(&published.manifest_id).await?;
+        if summary.manifest_id != published.manifest_id
+            || summary.oid != oid
+            || summary.size != size
+        {
+            bail!("FastCDC manifest does not match requested LFS object");
+        }
+        let (layout, chunks) = store.resolved_cache();
+        let covering = if length == 0 {
+            Vec::new()
+        } else {
+            self.fetch_covering_pages(&layout, &summary, offset, length)
+                .await?
+        };
+        let mut unique = HashSet::new();
+        let mut downloaded = 0u64;
+        for entry in &covering {
+            if !unique.insert(entry.chunk_hash.clone()) {
+                continue;
+            }
+            if chunks
+                .get_chunk(&entry.chunk_hash)
+                .ok()
+                .is_some_and(|bytes| bytes.len() as u64 == entry.length)
+            {
+                continue;
+            }
+            let response = self
+                .request(
+                    Method::GET,
+                    &format!(
+                        "finalized/{}/chunks/{}",
+                        summary.manifest_id, entry.chunk_hash
+                    ),
+                )?
+                .send()
+                .await
+                .context("FastCDC request failed")?;
+            let response = Self::expect_success(response, "chunk download").await?;
+            let bytes = self.read_limited(response, chunker::MAX_SIZE).await?;
+            if bytes.len() as u64 != entry.length || sha256_hex(&bytes) != entry.chunk_hash {
+                bail!("FastCDC chunk size or SHA-256 mismatch");
+            }
+            chunks.put_chunk(&bytes)?;
+            downloaded += 1;
+        }
+        chunk_store::write_range_export(&chunks, &covering, offset, length, path)?;
+        Ok(RangeExportReport {
+            manifest_id: summary.manifest_id,
+            oid: summary.oid,
+            size: summary.size,
+            offset,
+            length,
+            covering_chunks: unique.len() as u64,
+            downloaded_chunks: downloaded,
+            trust_boundary: TRUST_BOUNDARY_C07,
+        })
+    }
+
+    async fn fetch_covering_pages(
+        &self,
+        layout: &Path,
+        summary: &ManifestSummary,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<manifest::ChunkEntry>> {
+        let mut covering = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut guard = CursorGuard::new();
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow::anyhow!("range offset+length overflow"))?;
+        let offset_s = offset.to_string();
+        let length_s = length.to_string();
+        loop {
+            let mut extras: Vec<(&str, String)> = Vec::new();
+            if let Some(value) = cursor.as_ref() {
+                extras.push(("cursor", value.clone()));
+            } else {
+                extras.push(("offset", offset_s.clone()));
+                extras.push(("length", length_s.clone()));
+            }
+            let extra_ref: Vec<(&str, &str)> =
+                extras.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let response = self
+                .request_query(
+                    Method::GET,
+                    &format!("finalized/{}/pages", summary.manifest_id),
+                    &extra_ref,
+                )?
+                .send()
+                .await
+                .context("FastCDC request failed")?;
+            let response = Self::expect_success(response, "finalized covering pages").await?;
+            let body: FinalizedPagesBody = self.json(response).await?;
+            if body.manifest_id != summary.manifest_id {
+                bail!("FastCDC page does not match the pinned manifest");
+            }
+            if body.pages.is_empty() {
+                break;
+            }
+            guard.observe(body.next_cursor.as_deref())?;
+            for item in body.pages {
+                let page = ManifestPage {
+                    page_no: item.page_no,
+                    entries: item.entries,
+                };
+                let bytes = serde_json::to_vec(&page).context("invalid FastCDC page JSON")?;
+                parse_page_envelope(&bytes)?;
+                let mut covered = item.offset_start;
+                for entry in &page.entries {
+                    if entry.offset != covered {
+                        bail!(
+                            "finalized covering page offset {} breaks contiguity (expected {covered})",
+                            entry.offset
+                        );
+                    }
+                    covered = advance_coverage(covered, entry)?;
+                    let chunk_end = entry
+                        .offset
+                        .checked_add(entry.length)
+                        .ok_or_else(|| anyhow::anyhow!("chunk offset overflow"))?;
+                    if entry.offset < end && chunk_end > offset {
+                        covering.push(entry.clone());
+                    }
+                }
+                if item.offset_end != covered {
+                    bail!("finalized page offset range does not match its entries");
+                }
+                chunk_store::write_page(layout, &summary.oid, &page)?;
+            }
+            match body.next_cursor {
+                None => break,
+                Some(next) => cursor = Some(next),
+            }
+        }
+        covering.sort_by_key(|entry| entry.offset);
+        covering.dedup_by_key(|entry| entry.offset);
+        if covering.is_empty() {
+            bail!("FastCDC covering pages do not intersect the requested range");
+        }
+        let first = covering
+            .first()
+            .expect("INVARIANT: covering non-empty after is_empty check");
+        let last = covering
+            .last()
+            .expect("INVARIANT: covering non-empty after is_empty check");
+        let last_end = last
+            .offset
+            .checked_add(last.length)
+            .ok_or_else(|| anyhow::anyhow!("chunk offset overflow"))?;
+        if first.offset > offset || last_end < end {
+            bail!("FastCDC covering pages do not fully cover the requested range");
+        }
+        Ok(covering)
     }
 
     async fn finalized_summary(&self, manifest_id: &str) -> Result<ManifestSummary> {

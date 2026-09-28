@@ -33,6 +33,7 @@ code against active data.
 | `inspect <manifest>` | Validate a paged manifest summary (or one page envelope) and print the summary. Does not dump every chunk. | `libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json` |
 | `verify <path> \| --media-oid <oid>` | Reassemble from the local chunk store and verify the full `media_oid` (never publishes a corrupt file). | `libra media verify big.psd` |
 | `probe [--remote <name>]` | Probe the remote's media capability endpoint and report the transfer decision (chunked vs standard-LFS fallback). | `libra media probe --remote origin` |
+| `fetch <path> --offset <u64> --length <u64> --output <file> [--remote <name>]` | Export a byte range from a finalized Media object into a **new** fragment file (ADR-FL-03). Parses the LFS/Media pointer at `path`, pins `manifest_id`, fetches covering pages only, and GETs the unique covering hashes missing from a valid local cache. Refuses to overwrite an existing target or symlink; does not mutate hydrate state, the tracked pointer, or the whole-object LFS cache. Zero `length` is allowed when `offset ≤ size`. Explicit range export never falls back to whole-object LFS. JSON output states the C-07 trust boundary: authenticated covering chunks do not independently prove the full-object oid/SHA-256. Unlike [`hydrate`](hydrate.md), this writes a separate slice file rather than replacing a tracked path. | `libra media fetch asset.bin --offset 0 --length 4096 --output slice.bin` |
 | `--json` | Structured JSON envelope on stdout (global flag). | `libra --json media chunk big.psd` |
 
 ## Safe fallback
@@ -50,7 +51,9 @@ Actual LFS transfers also apply `lfs.fastcdc`. Before a media transfer starts,
 a missing capability endpoint, an old algorithm, or insufficient paging limits
 (`manifest_paging` must be `v1`, with page and envelope budgets of 4096 entries
 and 1 MiB) stay on standard LFS. Chunk-only advertisements use basic LFS
-instead. `range_read=false` does not block a full chunked transfer. After the
+instead. `range_read=false` does not block a full chunked transfer or a
+covering-chunk `media fetch`. Explicit range export never falls back to
+whole-object LFS. After the
 transfer has started, authentication, hash, and protocol failures fail closed
 and do not silently upload or download the whole object. A monoengine server built with `--features fastcdc`
 implements the authenticated extension; other remotes retain the standard Git LFS

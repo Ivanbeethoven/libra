@@ -1703,6 +1703,104 @@ pub fn reassemble_paged(
     Ok(())
 }
 
+/// ADR-FL-03 range bounds: zero length requires `offset ≤ size`; any positive
+/// span must fit entirely inside `[0, size)` without overflow.
+pub fn validate_byte_range(size: u64, offset: u64, length: u64) -> Result<(), MediaStoreError> {
+    if length == 0 {
+        if offset > size {
+            return Err(invalid(format!(
+                "range offset {offset} is past object size {size}"
+            )));
+        }
+        return Ok(());
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| invalid("range offset+length overflow"))?;
+    if end > size {
+        return Err(invalid(format!(
+            "range [{offset}, {end}) extends past object size {size}"
+        )));
+    }
+    Ok(())
+}
+
+/// Write a byte slice assembled from covering chunks to a new file.
+///
+/// Does not modify hydrate state, the tracked pointer, or a whole-object LFS
+/// cache entry. The destination must not exist (including as a symlink); the
+/// publish uses same-directory temp + hard-link no-clobber semantics.
+pub fn write_range_export(
+    store: &MediaChunkStore,
+    covering: &[ChunkEntry],
+    offset: u64,
+    length: u64,
+    dest: &Path,
+) -> Result<(), MediaStoreError> {
+    let io_error = |source| MediaStoreError::Io {
+        path: dest.display().to_string(),
+        source,
+    };
+    let target = std::path::absolute(dest).map_err(io_error)?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut writer = crate::utils::atomic_stream::StreamingAtomicFile::new_in(
+        parent,
+        atomic_write::sync_data_enabled(),
+    )
+    .map_err(io_error)?;
+    if length == 0 {
+        return writer.persist_create_new(&target).map_err(io_error);
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| invalid("range offset+length overflow"))?;
+    let mut written = 0u64;
+    let mut expected = covering.first().map(|entry| entry.offset);
+    for entry in covering {
+        if let Some(want) = expected
+            && entry.offset != want
+        {
+            return Err(invalid(format!(
+                "covering chunk offset {} breaks contiguity (expected {want})",
+                entry.offset
+            )));
+        }
+        let chunk_end = entry
+            .offset
+            .checked_add(entry.length)
+            .ok_or_else(|| invalid("chunk offset overflow"))?;
+        if chunk_end <= offset || entry.offset >= end {
+            expected = Some(chunk_end);
+            continue;
+        }
+        let bytes = store.get_chunk(&entry.chunk_hash)?;
+        if bytes.len() as u64 != entry.length {
+            return Err(io_error(std::io::Error::other(
+                "chunk length does not match manifest",
+            )));
+        }
+        let skip = offset.saturating_sub(entry.offset) as usize;
+        let take_end = (end.min(chunk_end) - entry.offset) as usize;
+        let slice = bytes
+            .get(skip..take_end)
+            .ok_or_else(|| invalid("range slice exceeds chunk bytes"))?;
+        writer.write_all(slice).map_err(io_error)?;
+        written = written
+            .checked_add(slice.len() as u64)
+            .ok_or_else(|| invalid("range write length overflow"))?;
+        expected = Some(chunk_end);
+    }
+    if written != length {
+        return Err(invalid(format!(
+            "range export wrote {written} bytes but requested {length}"
+        )));
+    }
+    writer.persist_create_new(&target).map_err(io_error)
+}
+
 #[cfg(test)]
 mod paging_tests {
     use super::*;

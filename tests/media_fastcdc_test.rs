@@ -733,6 +733,34 @@ async fn monoengine_fastcdc_http_interop() {
         "other users retain complete standard LFS access"
     );
 
+    // FL-04: prior-style cache + pinned range export for MF-05 consumers.
+    let range_offset = data.len() as u64 / 4;
+    let range_length = (256 * 1024u64).min(data.len() as u64 - range_offset);
+    let range_out = dir.path().join("range-slice.bin");
+    let range_report = media
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            range_offset,
+            range_length,
+            &range_out,
+            &store,
+        )
+        .await
+        .expect("pinned range export must succeed against finalized Media");
+    assert_eq!(range_report.offset, range_offset);
+    assert_eq!(range_report.length, range_length);
+    assert_eq!(
+        fs::read(&range_out).unwrap(),
+        data[range_offset as usize..(range_offset + range_length) as usize]
+    );
+    assert!(
+        range_report
+            .trust_boundary
+            .contains("authenticated finalized"),
+        "JSON/help trust boundary must stay explicit"
+    );
+
     // Reproduce the finalize crash window: a complete basic object is present,
     // but this user's manifest has not been published. Batch now omits upload
     // actions; the normal push path must still repair the missing manifest.
@@ -1691,6 +1719,307 @@ fn c08_upgrade_retains_legacy_v1_and_standard_lfs() {
         "new writes must land under the algorithm namespace"
     );
     assert!(!p.join(".libra/media/manifests").join(oid).exists());
+}
+
+#[tokio::test]
+async fn range_export_covers_unique_hashes_and_refuses_overwrite() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        extract::{Path, Query},
+        response::IntoResponse,
+        routing::get,
+    };
+    use libra::utils::media::{
+        chunk_store::{self, MediaChunkStore},
+        manifest::MediaManifest,
+        transfer::{MediaClient, TRUST_BOUNDARY_C07},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    // Multi-chunk payload so a mid-file range spans more than one chunk.
+    let mut data = Vec::with_capacity(3 * 1024 * 1024);
+    let mut x: u64 = 0xC0FFEE_DADABABA;
+    while data.len() < 3 * 1024 * 1024 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        data.push((x >> 32) as u8);
+    }
+    let source = dir.path().join("source.bin");
+    fs::write(&source, &data).unwrap();
+    let (manifest, _) = MediaManifest::build_from_file(&source).unwrap();
+    assert!(manifest.chunks.len() >= 2);
+    let real_id = manifest.id().unwrap();
+    let summary = serde_json::json!({
+        "version": manifest.version,
+        "algorithm": manifest.algorithm,
+        "hash_algorithm": manifest.hash_algorithm,
+        "oid": manifest.media_oid,
+        "size": manifest.media_size,
+        "chunk_count": manifest.chunks.len(),
+        "page_count": 1,
+        "manifest_id": real_id.clone(),
+        "created_by": manifest.created_by.clone(),
+    });
+    let published = summary.clone();
+    let pages = serde_json::json!({
+        "manifest_id": real_id.clone(),
+        "pages": [{
+            "page_no": 0,
+            "offset_start": 0,
+            "offset_end": manifest.media_size,
+            "entries": manifest.chunks.clone(),
+        }],
+    });
+    let chunk_gets = Arc::new(AtomicUsize::new(0));
+    let chunks_map: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(
+            manifest
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    let start = chunk.offset as usize;
+                    let end = start + chunk.length as usize;
+                    (chunk.chunk_hash.clone(), data[start..end].to_vec())
+                })
+                .collect(),
+        ));
+
+    let app = Router::new()
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/capabilities",
+            get(|| async { Json(supported_capabilities(true)) }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/by-media/{oid}",
+            get({
+                let published = published.clone();
+                move || {
+                    let published = published.clone();
+                    async move { Json(published) }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/finalized/{id}",
+            get({
+                let summary = summary.clone();
+                move || {
+                    let summary = summary.clone();
+                    async move { Json(summary) }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/finalized/{id}/pages",
+            get({
+                let pages = pages.clone();
+                let chunks = manifest.chunks.clone();
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let pages = pages.clone();
+                    let chunks = chunks.clone();
+                    async move {
+                        if let (Some(off), Some(len)) = (query.get("offset"), query.get("length")) {
+                            let offset: u64 = off.parse().unwrap();
+                            let length: u64 = len.parse().unwrap();
+                            let end = offset + length;
+                            let intersects = chunks
+                                .iter()
+                                .any(|c| c.offset < end && c.offset + c.length > offset);
+                            if !intersects {
+                                return Json(serde_json::json!({
+                                    "manifest_id": pages["manifest_id"],
+                                    "pages": [],
+                                    "next_cursor": null,
+                                }))
+                                .into_response();
+                            }
+                            // Real server returns the full intersecting page.
+                            return Json(pages.clone()).into_response();
+                        }
+                        Json(pages.clone()).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/finalized/{id}/chunks/{hash}",
+            get({
+                let counted = chunk_gets.clone();
+                let chunks_map = chunks_map.clone();
+                move |Path((_, hash)): Path<(String, String)>| {
+                    let counted = counted.clone();
+                    let chunks_map = chunks_map.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        chunks_map.lock().unwrap().get(&hash).cloned().unwrap()
+                    }
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = url::Url::parse(&format!(
+        "http://{}/repo.git/info/lfs/?tenant=test",
+        listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = MediaClient::discover_for_range(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        &base,
+    )
+    .await
+    .unwrap();
+    let store = MediaChunkStore::at(dir.path().join("chunks"));
+
+    // Bounds matrix.
+    assert!(chunk_store::validate_byte_range(manifest.media_size, 0, 0).is_ok());
+    assert!(chunk_store::validate_byte_range(manifest.media_size, manifest.media_size, 0).is_ok());
+    assert!(
+        chunk_store::validate_byte_range(manifest.media_size, manifest.media_size + 1, 0).is_err()
+    );
+    assert!(
+        chunk_store::validate_byte_range(manifest.media_size, 0, manifest.media_size + 1).is_err()
+    );
+
+    let mid = &manifest.chunks[manifest.chunks.len() / 2];
+    let offset = mid.offset + mid.length / 4;
+    let length = mid.length / 2
+        + manifest
+            .chunks
+            .get(manifest.chunks.len() / 2 + 1)
+            .map(|n| n.length / 3)
+            .unwrap_or(0)
+            .max(1);
+    let length = length.min(manifest.media_size - offset);
+
+    let dest = dir.path().join("slice.bin");
+    let report = client
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            offset,
+            length,
+            &dest,
+            &store,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("export_range failed: {e:#}"));
+    assert_eq!(report.offset, offset);
+    assert_eq!(report.length, length);
+    assert_eq!(report.trust_boundary, TRUST_BOUNDARY_C07);
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        data[offset as usize..(offset + length) as usize]
+    );
+    let cold_gets = chunk_gets.load(Ordering::SeqCst);
+    assert_eq!(cold_gets as u64, report.downloaded_chunks);
+    assert_eq!(cold_gets as u64, report.covering_chunks);
+    assert!(cold_gets >= 1);
+
+    // Hot cache: no further GETs for the same covering set.
+    let dest2 = dir.path().join("slice2.bin");
+    let again = client
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            offset,
+            length,
+            &dest2,
+            &store,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.downloaded_chunks, 0);
+    assert_eq!(chunk_gets.load(Ordering::SeqCst), cold_gets);
+    assert_eq!(fs::read(&dest2).unwrap(), fs::read(&dest).unwrap());
+
+    // Zero-length at EOF.
+    let empty = dir.path().join("empty.bin");
+    let zero = client
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            manifest.media_size,
+            0,
+            &empty,
+            &store,
+        )
+        .await
+        .unwrap();
+    assert_eq!(zero.length, 0);
+    assert_eq!(fs::read(&empty).unwrap(), b"");
+
+    // No-clobber / symlink refusal.
+    let err = client
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            offset,
+            length,
+            &dest,
+            &store,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err:#}");
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        data[offset as usize..(offset + length) as usize]
+    );
+
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&dest, &link).unwrap();
+        let err = client
+            .export_range(
+                &manifest.media_oid,
+                manifest.media_size,
+                offset,
+                length,
+                &link,
+                &store,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink") || err.to_string().contains("already exists"),
+            "{err:#}"
+        );
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            data[offset as usize..(offset + length) as usize]
+        );
+    }
+
+    // Overflow refuses and leaves no temp residue at the destination.
+    let overflow = dir.path().join("overflow.bin");
+    assert!(
+        client
+            .export_range(
+                &manifest.media_oid,
+                manifest.media_size,
+                manifest.media_size.saturating_sub(1),
+                2,
+                &overflow,
+                &store,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!overflow.exists());
+
+    task.abort();
 }
 
 #[test]

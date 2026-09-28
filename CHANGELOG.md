@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.30.4] — 2026-09-28
+
+### Media range fragment export (FL-04)
+
+- `libra media fetch <path> --offset --length --output` exports a byte range
+  from finalized Media into a new no-clobber file (ADR-FL-03 / C-07).
+- Covering pages use `finalized/{id}/pages?offset&length`; only unique
+  covering hashes missing from a valid local cache are downloaded.
+- Explicit range export never falls back to whole-object LFS; JSON/help
+  state the authenticated trust boundary.
+
 ## [0.30.3] — 2026-09-28
 
 ### Prior re-chunk for FastCDC media (FL-03)

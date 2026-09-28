@@ -4,6 +4,8 @@
 (lore.md 3.3). It is the honest, platform-portable v1 of Lore's "hydrating
 VFS": an EXPLICIT command, not a transparent FUSE-on-access filesystem (that
 remains a `worktree-fuse` follow-up). Whole-object only — no FastCDC range.
+For an authenticated Media byte-range fragment into a separate file, use
+[`libra media fetch`](media.md) (feature-gated `fastcdc`).
 
 ## Compatibility
 

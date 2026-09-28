@@ -11,13 +11,15 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::{
-    internal::config::ConfigKv,
+    internal::{config::ConfigKv, protocol::lfs_client::LFSClient},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
+        lfs,
         media::{
             capability, chunk_store,
             manifest::{ManifestPage, ManifestSummary},
             negotiate::{self, ProbeOutcome, TransferDecision},
+            transfer::{self, TRUST_BOUNDARY_C07},
         },
         output::{OutputConfig, emit_json_data},
     },
@@ -32,6 +34,8 @@ EXAMPLES:
     libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json   Validate a manifest summary
     libra media verify big.psd                Reassemble from the store and verify the media_oid
     libra media probe                         Probe the remote's chunked-LFS capability (falls back to standard LFS)
+    libra media fetch pointer.bin --offset 0 --length 4096 --output slice.bin
+                                              Export a byte range from finalized Media (not whole hydrate)
     libra --json media chunk big.psd          Structured JSON output for agents
 
 NOTES:
@@ -39,7 +43,11 @@ NOTES:
     media_oid is always SHA-256 of the full file (standard-LFS-compatible), and
     chunks live in a private .libra/media/fastcdc-v2020-32k store outside the Git object graph.
     Cross-machine chunked transfer requires Mega built with --features fastcdc
-    and a stored access token. Other remotes fall back to standard Git LFS.";
+    and a stored access token. Other remotes fall back to standard Git LFS.
+    `media fetch` writes a new fragment file only; it never mutates the pointer,
+    index, hydrate state, or whole-object LFS cache. Range bytes come from an
+    authenticated finalized summary and covering chunks — they do not
+    independently prove the full-object oid/SHA-256 (C-07).";
 
 #[derive(Parser, Debug)]
 #[command(after_help = MEDIA_EXAMPLES)]
@@ -83,6 +91,26 @@ enum MediaCommand {
         #[clap(long)]
         remote: Option<String>,
     },
+    /// Export a byte range from a finalized Media object into a new file.
+    ///
+    /// `path` must be an LFS pointer (or Media pointer) already published as
+    /// finalized Media. Unlike `hydrate`, this never replaces the tracked file.
+    Fetch {
+        /// Working-tree path whose LFS pointer supplies oid/size.
+        path: String,
+        /// Inclusive start offset into the Media object.
+        #[clap(long)]
+        offset: u64,
+        /// Number of bytes to export (zero writes an empty file when offset ≤ size).
+        #[clap(long)]
+        length: u64,
+        /// Destination path; must not already exist (symlink rejected).
+        #[clap(long)]
+        output: String,
+        /// Remote name (default: the current branch's remote, else `origin`).
+        #[clap(long)]
+        remote: Option<String>,
+    },
 }
 
 pub async fn execute_safe(args: MediaArgs, output: &OutputConfig) -> CliResult<()> {
@@ -95,6 +123,13 @@ pub async fn execute_safe(args: MediaArgs, output: &OutputConfig) -> CliResult<(
         MediaCommand::Inspect { manifest } => inspect(&manifest, output),
         MediaCommand::Verify { path, media_oid } => verify(path, media_oid, output).await,
         MediaCommand::Probe { remote } => probe(remote, output).await,
+        MediaCommand::Fetch {
+            path,
+            offset,
+            length,
+            output: dest,
+            remote,
+        } => fetch(&path, offset, length, &dest, remote, output).await,
     }
 }
 
@@ -312,28 +347,99 @@ struct ProbeReport {
     chunked: bool,
 }
 
+#[derive(Serialize)]
+struct FetchReport {
+    path: String,
+    remote: String,
+    output: String,
+    oid: String,
+    size: u64,
+    offset: u64,
+    length: u64,
+    manifest_id: String,
+    covering_chunks: u64,
+    downloaded_chunks: u64,
+    trust_boundary: &'static str,
+}
+
+async fn fetch(
+    path: &str,
+    offset: u64,
+    length: u64,
+    dest: &str,
+    remote: Option<String>,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let (oid, size) = lfs::parse_pointer_file(path).map_err(|e| {
+        CliError::fatal(format!(
+            "media fetch requires an LFS/Media pointer at '{path}': {e}"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+    })?;
+    let (remote_name, url) = resolve_remote_url(remote).await?;
+    let lfs = LFSClient::from_remote_url(&url).map_err(|e| {
+        CliError::fatal(format!(
+            "failed to resolve LFS URL for remote '{remote_name}': {e}"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+    })?;
+    let client = transfer::MediaClient::discover_for_range(lfs.client.clone(), &lfs.lfs_url)
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("media fetch negotiation failed: {e}"))
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+        })?;
+    let store = chunk_store::MediaChunkStore::open();
+    let report = client
+        .export_range(
+            &oid,
+            size,
+            offset,
+            length,
+            std::path::Path::new(dest),
+            &store,
+        )
+        .await
+        .map_err(|e| {
+            CliError::fatal(format!("media fetch failed: {e}"))
+                .with_stable_code(StableErrorCode::NetworkProtocol)
+        })?;
+    let body = FetchReport {
+        path: path.to_string(),
+        remote: remote_name,
+        output: dest.to_string(),
+        oid: report.oid,
+        size: report.size,
+        offset: report.offset,
+        length: report.length,
+        manifest_id: report.manifest_id,
+        covering_chunks: report.covering_chunks,
+        downloaded_chunks: report.downloaded_chunks,
+        trust_boundary: TRUST_BOUNDARY_C07,
+    };
+    if output.is_json() {
+        return emit_json_data("media.fetch", &body, output);
+    }
+    if !output.quiet {
+        println!(
+            "wrote {} bytes from {}@{}+{} (covering {}, downloaded {})",
+            body.length,
+            body.oid,
+            body.offset,
+            body.length,
+            body.covering_chunks,
+            body.downloaded_chunks
+        );
+        println!("trust: {}", body.trust_boundary);
+        println!("output: {}", body.output);
+    }
+    Ok(())
+}
+
 async fn probe(remote: Option<String>, output: &OutputConfig) -> CliResult<()> {
     // Resolve the remote URL: explicit --remote, else the current branch's
     // remote, else `origin`.
-    let (remote_name, url) = match remote {
-        Some(name) => {
-            let u = ConfigKv::get_remote_url(&name).await.map_err(|_| {
-                CliError::fatal(format!("remote '{name}' has no configured URL"))
-                    .with_stable_code(StableErrorCode::CliInvalidTarget)
-            })?;
-            (name, u)
-        }
-        None => match ConfigKv::get_current_remote_url().await {
-            Ok(Some(u)) => ("origin".to_string(), u),
-            _ => {
-                let u = ConfigKv::get_remote_url("origin").await.map_err(|_| {
-                    CliError::fatal("no remote configured (pass --remote <name>)")
-                        .with_stable_code(StableErrorCode::CliInvalidTarget)
-                })?;
-                ("origin".to_string(), u)
-            }
-        },
-    };
+    let (remote_name, url) = resolve_remote_url(remote).await?;
 
     let outcome = capability::probe(&url).await;
     // Report what WOULD happen assuming the repo enabled chunked LFS and a local
@@ -367,6 +473,28 @@ async fn probe(remote: Option<String>, output: &OutputConfig) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+async fn resolve_remote_url(remote: Option<String>) -> CliResult<(String, String)> {
+    match remote {
+        Some(name) => {
+            let u = ConfigKv::get_remote_url(&name).await.map_err(|_| {
+                CliError::fatal(format!("remote '{name}' has no configured URL"))
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+            })?;
+            Ok((name, u))
+        }
+        None => match ConfigKv::get_current_remote_url().await {
+            Ok(Some(u)) => Ok(("origin".to_string(), u)),
+            _ => {
+                let u = ConfigKv::get_remote_url("origin").await.map_err(|_| {
+                    CliError::fatal("no remote configured (pass --remote <name>)")
+                        .with_stable_code(StableErrorCode::CliInvalidTarget)
+                })?;
+                Ok(("origin".to_string(), u))
+            }
+        },
+    }
 }
 
 fn describe(decision: &TransferDecision) -> (String, Option<String>, bool) {

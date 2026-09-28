@@ -65,6 +65,59 @@ impl StreamingAtomicFile {
         self.persist_with_post_replace_hook(target, || Ok(()))
     }
 
+    /// Publish `target` only when it does not already exist (ADR-FL-03).
+    /// Symlinks and concurrent creators fail without replacing the destination.
+    #[cfg(feature = "fastcdc")]
+    pub(crate) fn persist_create_new(mut self, target: &Path) -> io::Result<()> {
+        let parent = target.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("atomic stream target has no parent: {}", target.display()),
+            )
+        })?;
+        ensure_dir_exists(parent, self.sync)?;
+        match fs::symlink_metadata(target) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::other(
+                    "range export refuses to write through a symlink target",
+                ));
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "range export target already exists",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.temporary.flush()?;
+        if self.sync {
+            self.temporary.as_file().sync_all()?;
+        }
+        let temporary = self.temporary.path().to_path_buf();
+        match fs::hard_link(&temporary, target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "range export target already exists",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+        // Drop removes the staging path; the hard-linked destination keeps the
+        // bytes. A failure after the link still leaves a complete file.
+        drop(self.temporary);
+        if self.sync {
+            fsync_parent_dir(parent)?;
+            if self.staging_dir != parent {
+                fsync_parent_dir(&self.staging_dir)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Variant used by recovery tests that need to stop after the replacement
     /// is visible but before its directory entry is synced. Production callers
     /// use [`Self::persist`], whose hook is a no-op.

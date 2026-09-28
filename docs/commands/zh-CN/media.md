@@ -17,13 +17,14 @@ FastCDC LFS 媒体分块客户端（lore.md §6），是受 `fastcdc` 功能开�
 | `inspect <manifest>` | 校验分页 manifest 摘要（或单页信封）并打印摘要，不展开全部 chunk。 | `libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json` |
 | `verify <path> \| --media-oid <oid>` | 从本地 chunk store 重组并验证完整 `media_oid`（永不发布损坏文件）。 | `libra media verify big.psd` |
 | `probe [--remote <name>]` | 探测远端 media capability endpoint 并报告传输决策（chunked vs standard-LFS fallback）。 | `libra media probe --remote origin` |
+| `fetch <path> --offset <u64> --length <u64> --output <file> [--remote <name>]` | 从已 finalize 的 Media 导出字节范围到**新**片段文件（ADR-FL-03）。解析 `path` 上的 LFS/Media 指针，固定 `manifest_id`，只取覆盖页，并 GET 覆盖集合减去有效缓存的唯一 hash。拒绝覆盖已存在目标或 symlink；不改 hydrate、tracked 指针或完整 LFS 缓存。零 `length` 在 `offset ≤ size` 时允许。显式范围导出禁止整对象 LFS fallback。JSON 标明 C-07 信任边界：认证覆盖块不能独立证明全文件 oid/SHA-256。与 [`hydrate`](hydrate.md) 不同，本命令写入独立切片文件，不替换 tracked 路径。 | `libra media fetch asset.bin --offset 0 --length 4096 --output slice.bin` |
 | `--json` | stdout 上的结构化 JSON 信封（全局标志）。 | `libra --json media chunk big.psd` |
 
 ## 安全回退
 
 `media probe` 只报告远端能力：`chunked (fastcdc-v2020-32k)`，或 `standard-lfs (fallback)` 并附带原因，例如没有能力端点、服务端禁用、算法不兼容、所需能力不足、协议版本不兼容或退避后的服务端错误。它假定仓库允许分块且本地存在完整 fallback，**不会读取 `lfs.fastcdc`**，在这些假定下也不会报告 `blocked`。因此，probe 输出 `chunked` 不等于当前仓库已经启用实际分块传输。
 
-实际 LFS 传输还会检查 `lfs.fastcdc`。传输开始前，没有能力端点、旧算法或分页限额不足（`manifest_paging` 必须为 `v1`，单页 4096 条、信封 1 MiB）时继续使用标准 LFS。仅提供 chunk-only 的远端回退 basic LFS。`range_read=false` 不阻止完整分块传输。传输开始后，认证、哈希或协议失败会直接报错，不会静默改传整个对象。以 `--features fastcdc` 构建的 Mega 实现了需要认证的扩展；其他远端继续使用标准 Git LFS。
+实际 LFS 传输还会检查 `lfs.fastcdc`。传输开始前，没有能力端点、旧算法或分页限额不足（`manifest_paging` 必须为 `v1`，单页 4096 条、信封 1 MiB）时继续使用标准 LFS。仅提供 chunk-only 的远端回退 basic LFS。`range_read=false` 不阻止完整分块传输或 covering-chunk 的 `media fetch`。显式范围导出禁止整对象 LFS fallback。传输开始后，认证、哈希或协议失败会直接报错，不会静默改传整个对象。以 `--features fastcdc` 构建的 Mega 实现了需要认证的扩展；其他远端继续使用标准 Git LFS。
 
 ## 与 Mega 联动传输
 
