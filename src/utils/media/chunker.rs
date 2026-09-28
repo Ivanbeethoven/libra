@@ -7,7 +7,7 @@
 //! Chunk hashes and `media_oid` remain SHA-256 (application digest domain);
 //! they never follow repository `core.objectformat` (ADR-B3-04 / GC-B3-02).
 
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 
 use fastcdc::v2020::{ChunkData, FastCDC, Normalization, StreamCDC};
 
@@ -96,6 +96,182 @@ pub fn chunk_bytes(data: &[u8]) -> Vec<Chunk> {
             }
         })
         .collect()
+}
+
+/// Prior layout span used by ADR-FL-04 coherence planning (metadata only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PriorSpan {
+    pub offset: u64,
+    pub length: u64,
+    pub chunk_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Segment {
+    Reuse(Chunk),
+    Dirty { start: u64, end: u64 },
+}
+
+/// Plan a same-length prior re-chunk against `reader`.
+///
+/// Returns `Ok(None)` when the caller should fall back to a full-file cold cut
+/// (absorb failed, or an empty prior with non-zero size). Size mismatches are
+/// the caller's responsibility — pass same-size priors only. Prior spans must
+/// already be structurally valid and cover `media_size`.
+pub fn rechunk_with_prior<R: Read + Seek>(
+    reader: &mut R,
+    media_size: u64,
+    prior: &[PriorSpan],
+) -> io::Result<Option<Vec<Chunk>>> {
+    if media_size == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    if prior.is_empty() {
+        return Ok(None);
+    }
+    let mut segments: Vec<Segment> = Vec::new();
+    for span in prior {
+        let end = span
+            .offset
+            .checked_add(span.length)
+            .ok_or_else(|| io::Error::other("prior chunk offset overflow"))?;
+        if end > media_size {
+            return Err(io::Error::other("prior chunk exceeds media size"));
+        }
+        let actual = hash_span(reader, span.offset, span.length)?;
+        if actual == span.chunk_hash {
+            push_reuse(
+                &mut segments,
+                Chunk {
+                    offset: span.offset,
+                    length: span.length,
+                    chunk_hash: span.chunk_hash.clone(),
+                },
+            );
+        } else {
+            push_dirty(&mut segments, span.offset, end);
+        }
+    }
+    materialize_segments(reader, media_size, segments)
+}
+
+fn push_reuse(segments: &mut Vec<Segment>, chunk: Chunk) {
+    segments.push(Segment::Reuse(chunk));
+}
+
+fn push_dirty(segments: &mut Vec<Segment>, start: u64, end: u64) {
+    if let Some(Segment::Dirty { end: e, .. }) = segments.last_mut()
+        && *e == start
+    {
+        *e = end;
+        return;
+    }
+    segments.push(Segment::Dirty { start, end });
+}
+
+fn materialize_segments<R: Read + Seek>(
+    reader: &mut R,
+    media_size: u64,
+    segments: Vec<Segment>,
+) -> io::Result<Option<Vec<Chunk>>> {
+    let mut out: Vec<Chunk> = Vec::new();
+    let mut i = 0usize;
+    while i < segments.len() {
+        match &segments[i] {
+            Segment::Reuse(chunk) => {
+                out.push(chunk.clone());
+                i += 1;
+            }
+            Segment::Dirty { start, end } => {
+                let mut lo = *start;
+                let mut hi = *end;
+                let mut left = i;
+                let mut right = i;
+                loop {
+                    let planned = cdc_span(reader, lo, hi - lo)?;
+                    if chunks_are_legal(&planned, media_size) {
+                        out.extend(planned);
+                        i = right + 1;
+                        break;
+                    }
+                    let mut expanded = false;
+                    if left > 0
+                        && let Segment::Reuse(prev) = &segments[left - 1]
+                    {
+                        lo = prev.offset;
+                        left -= 1;
+                        while out.last().is_some_and(|c| c.offset >= lo) {
+                            out.pop();
+                        }
+                        expanded = true;
+                    }
+                    if right + 1 < segments.len()
+                        && let Segment::Reuse(next) = &segments[right + 1]
+                    {
+                        hi = next
+                            .offset
+                            .checked_add(next.length)
+                            .ok_or_else(|| io::Error::other("chunk offset overflow"))?;
+                        right += 1;
+                        expanded = true;
+                    }
+                    if !expanded {
+                        return Ok(None);
+                    }
+                    if lo == 0 && hi == media_size {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+fn chunks_are_legal(chunks: &[Chunk], media_size: u64) -> bool {
+    if chunks.is_empty() {
+        return media_size == 0;
+    }
+    for chunk in chunks {
+        if chunk.length == 0 || chunk.length > MAX_SIZE as u64 {
+            return false;
+        }
+        let ends_at_eof = chunk
+            .offset
+            .checked_add(chunk.length)
+            .is_some_and(|end| end == media_size);
+        if !ends_at_eof && chunk.length < MIN_SIZE as u64 {
+            return false;
+        }
+    }
+    true
+}
+
+/// SHA-256 of `length` bytes starting at `offset`.
+pub fn hash_span<R: Read + Seek>(reader: &mut R, offset: u64, length: u64) -> io::Result<String> {
+    let bytes = read_span(reader, offset, length)?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Read `length` bytes starting at `offset`.
+pub fn read_span<R: Read + Seek>(reader: &mut R, offset: u64, length: u64) -> io::Result<Vec<u8>> {
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; length as usize];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn cdc_span<R: Read + Seek>(reader: &mut R, offset: u64, length: u64) -> io::Result<Vec<Chunk>> {
+    let data = read_span(reader, offset, length)?;
+    let mut out = Vec::new();
+    for mut chunk in chunk_bytes(&data) {
+        chunk.offset = chunk
+            .offset
+            .checked_add(offset)
+            .ok_or_else(|| io::Error::other("chunk offset overflow"))?;
+        out.push(chunk);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -239,5 +415,73 @@ mod tests {
             }
             assert_eq!(off as usize, data.len(), "{name} coverage");
         }
+    }
+
+    #[test]
+    fn prior_same_bytes_reuses_every_span() {
+        let data = fixture_bytes("fixed_seq", 1_048_576);
+        let cold = chunk_bytes(&data);
+        let prior: Vec<PriorSpan> = cold
+            .iter()
+            .map(|c| PriorSpan {
+                offset: c.offset,
+                length: c.length,
+                chunk_hash: c.chunk_hash.clone(),
+            })
+            .collect();
+        let mut cursor = io::Cursor::new(&data[..]);
+        let planned = rechunk_with_prior(&mut cursor, data.len() as u64, &prior)
+            .unwrap()
+            .expect("same bytes stay coherent");
+        assert_eq!(planned, cold);
+    }
+
+    #[test]
+    fn prior_same_length_edit_reuses_only_matching_hashes() {
+        let mut data = fixture_bytes("fixed_seq", 1_048_576);
+        let cold = chunk_bytes(&data);
+        assert!(cold.len() >= 3, "fixture must yield multiple chunks");
+        let prior: Vec<PriorSpan> = cold
+            .iter()
+            .map(|c| PriorSpan {
+                offset: c.offset,
+                length: c.length,
+                chunk_hash: c.chunk_hash.clone(),
+            })
+            .collect();
+        // Flip one byte inside the middle chunk so only that region is dirty.
+        let mid = &cold[cold.len() / 2];
+        let flip_at = mid.offset as usize + (mid.length as usize / 2);
+        data[flip_at] ^= 0xff;
+        let mut cursor = io::Cursor::new(&data[..]);
+        let planned = rechunk_with_prior(&mut cursor, data.len() as u64, &prior)
+            .unwrap()
+            .expect("same-length edit stays coherent");
+        let mut reused = 0usize;
+        for chunk in &planned {
+            if let Some(old) = prior
+                .iter()
+                .find(|p| p.offset == chunk.offset && p.length == chunk.length)
+            {
+                if old.chunk_hash == chunk.chunk_hash {
+                    reused += 1;
+                    let start = chunk.offset as usize;
+                    let end = start + chunk.length as usize;
+                    assert_eq!(chunk.chunk_hash, sha256_hex(&data[start..end]));
+                }
+            }
+        }
+        assert!(reused >= 1, "at least one unchanged prior chunk is reused");
+        let covered: u64 = planned.iter().map(|c| c.length).sum();
+        assert_eq!(covered, data.len() as u64);
+        assert!(chunks_are_legal(&planned, data.len() as u64));
+    }
+
+    #[test]
+    fn prior_empty_with_nonzero_size_requests_cold_cut() {
+        let data = fixture_bytes("fixed_seq", 65_536);
+        let mut cursor = io::Cursor::new(&data[..]);
+        let planned = rechunk_with_prior(&mut cursor, data.len() as u64, &[]).unwrap();
+        assert!(planned.is_none());
     }
 }

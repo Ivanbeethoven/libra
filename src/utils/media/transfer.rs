@@ -260,6 +260,12 @@ impl MediaClient {
 
     /// Returns true when the object is published, or after a paged upload and
     /// a completed finalize task. Protocol failures after prepare are errors.
+    ///
+    /// Prefers a pre-saved local layout keyed by `oid` (from `media chunk
+    /// --store`, optionally with `--prior-manifest`). Before prepare the source
+    /// size, full-file oid, and per-chunk hashes are re-checked; a mismatch
+    /// fails closed without contacting the remote. A missing/evicted cache
+    /// falls back to a cold cut.
     pub async fn upload(&self, oid: &str, size: u64, path: &Path) -> Result<bool> {
         if !is_sha256_hex(oid) {
             bail!("invalid LFS object SHA-256");
@@ -276,19 +282,24 @@ impl MediaClient {
         let root = chunk_store::repo_media_root()?;
         let source = path.to_path_buf();
         let root_for_stream = root.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            chunk_store::stream_media_file(&source, &root_for_stream, true)
-        })
-        .await
-        .context("FastCDC paging task failed")??;
-        if outcome.summary.oid != oid || outcome.summary.size != size {
-            bail!("local LFS object size or SHA-256 mismatch");
+        if chunk_store::verify_cached_layout(&root, oid, size, path)?.is_none() {
+            let outcome = tokio::task::spawn_blocking(move || {
+                chunk_store::stream_media_file(&source, &root_for_stream, true)
+            })
+            .await
+            .context("FastCDC paging task failed")??;
+            if outcome.summary.oid != oid || outcome.summary.size != size {
+                bail!("local LFS object size or SHA-256 mismatch");
+            }
         }
-        self.prepare(&root, &outcome.summary).await?;
-        self.put_pages(&root, &outcome.summary).await?;
-        self.seal(&outcome.summary).await?;
-        self.upload_missing(path, &root, &outcome.summary).await?;
-        self.wait_finalize(&outcome.summary).await?;
+        // ADR-FL-04: re-check source size / oid / per-chunk hashes before prepare.
+        let summary = chunk_store::verify_cached_layout(&root, oid, size, path)?
+            .ok_or_else(|| anyhow::anyhow!("FastCDC layout missing before prepare"))?;
+        self.prepare(&root, &summary).await?;
+        self.put_pages(&root, &summary).await?;
+        self.seal(&summary).await?;
+        self.upload_missing(path, &root, &summary).await?;
+        self.wait_finalize(&summary).await?;
         Ok(true)
     }
 

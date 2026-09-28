@@ -1341,6 +1341,320 @@ async fn paged_upload_finalize_and_download_round_trip() {
     assert!(!message.contains("\"manifest_id\""), "{message}");
 }
 
+/// FL-03: `media chunk --prior-manifest --store` then upload must consume the
+/// pre-saved coherent layout; a source change before prepare fails closed.
+#[tokio::test]
+#[serial_test::serial(cwd)]
+async fn prior_chunk_cli_upload_consumes_cached_layout_and_rejects_source_change() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        body::Bytes,
+        extract::{Path, Query},
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{get, post, put},
+    };
+    use libra::utils::{
+        media::{manifest::ChunkEntry, transfer::MediaClient},
+        test::ChangeDirGuard,
+    };
+    use serde_json::Value;
+
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    ok(&["init"], p);
+    let _cwd = ChangeDirGuard::new(p);
+
+    // Build a multi-chunk original, then a same-length edit.
+    let mut data = Vec::with_capacity(1_048_576);
+    let mut counter: u64 = 0;
+    while data.len() < 1_048_576 {
+        let mut h = ring::digest::Context::new(&ring::digest::SHA256);
+        h.update(b"libra-fastcdc-fixture");
+        h.update(&counter.to_le_bytes());
+        let raw = h.finish();
+        let take = (1_048_576 - data.len()).min(raw.as_ref().len());
+        data.extend_from_slice(&raw.as_ref()[..take]);
+        counter += 1;
+    }
+    let original = p.join("orig.bin");
+    fs::write(&original, &data).unwrap();
+    let prior_out = ok(
+        &[
+            "--json",
+            "media",
+            "chunk",
+            original.to_str().unwrap(),
+            "--store",
+        ],
+        p,
+    );
+    let prior_js = json(&prior_out);
+    let prior_manifest = prior_js["data"]["manifest_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let cold = libra::utils::media::chunker::chunk_bytes(&data);
+    let mid = &cold[cold.len() / 2];
+    let flip = mid.offset as usize + mid.length as usize / 2;
+    let mut edited = data.clone();
+    edited[flip] ^= 0xff;
+    let edited_path = p.join("edit.bin");
+    fs::write(&edited_path, &edited).unwrap();
+    let oid = hex::encode(ring::digest::digest(&ring::digest::SHA256, &edited).as_ref());
+    let size = edited.len() as u64;
+
+    let chunk_out = ok(
+        &[
+            "--json",
+            "media",
+            "chunk",
+            edited_path.to_str().unwrap(),
+            "--store",
+            "--prior-manifest",
+            &prior_manifest,
+        ],
+        p,
+    );
+    let chunk_js = json(&chunk_out);
+    assert_eq!(chunk_js["data"]["media_oid"].as_str(), Some(oid.as_str()));
+    let expected_manifest_id = chunk_js["data"]["manifest_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        media_ns(p)
+            .join("manifests")
+            .join(&oid)
+            .join("summary.json")
+            .is_file()
+    );
+
+    // Illegal prior must fail and must not publish under a fresh oid.
+    let bad = p.join("bad-prior.json");
+    fs::write(&bad, b"{").unwrap();
+    let ghost = p.join("ghost.bin");
+    fs::write(&ghost, b"ghost-bytes-for-illegal-prior!!!!").unwrap();
+    let bad_out = run(
+        &[
+            "media",
+            "chunk",
+            ghost.to_str().unwrap(),
+            "--store",
+            "--prior-manifest",
+            bad.to_str().unwrap(),
+        ],
+        p,
+    );
+    assert_ne!(bad_out.status.code(), Some(0));
+    let ghost_oid = hex::encode(
+        ring::digest::digest(&ring::digest::SHA256, b"ghost-bytes-for-illegal-prior!!!!").as_ref(),
+    );
+    assert!(
+        !media_ns(p)
+            .join("manifests")
+            .join(&ghost_oid)
+            .join("summary.json")
+            .exists(),
+        "illegal prior must not publish a new cache manifest"
+    );
+
+    let pages_box: Arc<Mutex<Vec<Vec<ChunkEntry>>>> = Arc::new(Mutex::new(Vec::new()));
+    let prepared: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let puts = Arc::new(AtomicUsize::new(0));
+    let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let app = Router::new()
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/capabilities",
+            get(|| async { Json(supported_capabilities(true)) }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests",
+            post({
+                let prepared = prepared.clone();
+                let expected_manifest_id = expected_manifest_id.clone();
+                move |body: Bytes| {
+                    let prepared = prepared.clone();
+                    let expected_manifest_id = expected_manifest_id.clone();
+                    async move {
+                        let value: Value = serde_json::from_slice(&body).unwrap();
+                        assert!(value.get("chunks").is_none(), "prepare is a summary");
+                        assert_eq!(
+                            value["manifest_id"].as_str(),
+                            Some(expected_manifest_id.as_str()),
+                            "upload must consume the pre-saved prior layout"
+                        );
+                        let manifest_id = value["manifest_id"].as_str().unwrap().to_owned();
+                        *prepared.lock().unwrap() = Some(value);
+                        Json(serde_json::json!({
+                            "manifest_id": manifest_id,
+                            "missing_chunks": [],
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/pages/{page_no}",
+            put({
+                let pages_box = pages_box.clone();
+                move |Path((_, page_no)): Path<(String, u32)>, body: Bytes| {
+                    let pages_box = pages_box.clone();
+                    async move {
+                        let page: Value = serde_json::from_slice(&body).unwrap();
+                        let entries: Vec<ChunkEntry> =
+                            serde_json::from_value(page["entries"].clone()).unwrap();
+                        let mut pages = pages_box.lock().unwrap();
+                        if pages.len() == page_no as usize {
+                            pages.push(entries);
+                        }
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/seal",
+            post({
+                let prepared = prepared.clone();
+                move || {
+                    let prepared = prepared.clone();
+                    async move {
+                        let summary = prepared.lock().unwrap().clone().unwrap();
+                        Json(serde_json::json!({
+                            "manifest_id": summary["manifest_id"],
+                            "sealed": true,
+                            "seal_generation": 1,
+                            "page_count": summary["page_count"],
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/missing",
+            get({
+                let pages_box = pages_box.clone();
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let pages_box = pages_box.clone();
+                    async move {
+                        let pages = pages_box.lock().unwrap();
+                        let flat: Vec<ChunkEntry> = pages.iter().flatten().cloned().collect();
+                        let cursor = query.get("cursor").and_then(|v| v.parse::<usize>().ok());
+                        let start = cursor.unwrap_or(0).min(flat.len());
+                        Json(serde_json::json!({
+                            "hashes": flat[start..]
+                                .iter()
+                                .map(|chunk| &chunk.chunk_hash)
+                                .collect::<Vec<_>>(),
+                            "next_cursor": Value::Null,
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/chunks/{hash}",
+            put({
+                let puts = puts.clone();
+                move || {
+                    let puts = puts.clone();
+                    async move {
+                        puts.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/finalize",
+            post({
+                let prepared = prepared.clone();
+                move || {
+                    let prepared = prepared.clone();
+                    async move {
+                        let summary = prepared.lock().unwrap().clone().unwrap();
+                        (
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!({
+                                "task_id": "task-1",
+                                "manifest_id": summary["manifest_id"],
+                                "state": "pending",
+                                "status_url": "tasks/task-1",
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/tasks/{id}",
+            get({
+                let prepared = prepared.clone();
+                let published = published.clone();
+                move || {
+                    let prepared = prepared.clone();
+                    let published = published.clone();
+                    async move {
+                        published.store(true, Ordering::SeqCst);
+                        let summary = prepared.lock().unwrap().clone().unwrap();
+                        Json(serde_json::json!({
+                            "task_id": "task-1",
+                            "manifest_id": summary["manifest_id"],
+                            "state": "complete",
+                            "bytes_verified": summary["size"],
+                            "pages_verified": summary["page_count"],
+                            "oid": summary["oid"],
+                            "size": summary["size"],
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/by-media/{oid}",
+            get(|| async { StatusCode::NOT_FOUND }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let endpoint = format!("http://127.0.0.1:{port}/repo.git/info/lfs/");
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let media = MediaClient::discover(http, &url::Url::parse(&endpoint).unwrap(), false)
+        .await
+        .unwrap()
+        .expect("paged server");
+    assert!(media.upload(&oid, size, &edited_path).await.unwrap());
+    assert!(puts.load(Ordering::SeqCst) > 0);
+    let prepared_id = prepared.lock().unwrap().clone().unwrap()["manifest_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(prepared_id, expected_manifest_id);
+
+    // Source change before prepare rejects and does not start a new prepare.
+    let changed = p.join("changed.bin");
+    fs::write(&changed, b"tampered-before-prepare").unwrap();
+    // Keep oid/size from the previous object so the cache is found then rejected.
+    let err = media.upload(&oid, size, &changed).await.unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("changed") || message.contains("mismatch") || message.contains("prepare"),
+        "{message}"
+    );
+}
+
 #[test]
 fn c08_upgrade_retains_legacy_v1_and_standard_lfs() {
     let repo = tempfile::tempdir().unwrap();

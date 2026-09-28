@@ -24,6 +24,10 @@
   `index/local/<manifest_id>/`，可删除后从页重建，不写全局配置库。
   旧 `.libra/media/{chunks,manifests}`（`fastcdc-v1`）不读取、不写入、不删除。
   `media chunk` / `inspect` / `verify` 不构造全文件 chunk `Vec` 或整包 JSON。
+  `--prior-manifest`（须配合 `--store`）按 ADR-FL-04 做同长度 coherence：合法
+  prior 逐块与新字节比较，只复用匹配 hash；长度变化冷切；非法 prior 失败且不
+  发布新缓存。`MediaClient::upload` 优先消费该缓存布局，prepare 前重验源
+  size/oid/逐块 hash，变化则失败关闭。
 - `capability` 在仓库 LFS URL 后追加 `libra/media/v1/capabilities`。
   协商要求 `manifest_paging=v1`、`supports_manifest_id_read`、`batch_exists`、
   标准 LFS fallback，以及页/信封/块限额。`range_read=false` 不阻止完整分块传输。

@@ -27,6 +27,8 @@ pub const MEDIA_EXAMPLES: &str = "\
 EXAMPLES:
     libra media chunk big.psd                 FastCDC-chunk a file; print the manifest summary
     libra media chunk big.psd --store         Also persist chunks + manifest to the local media store
+    libra media chunk edit.psd --prior-manifest old/summary.json --store
+                                              Re-chunk with ADR-FL-04 prior coherence (requires --store)
     libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json   Validate a manifest summary
     libra media verify big.psd                Reassemble from the store and verify the media_oid
     libra media probe                         Probe the remote's chunked-LFS capability (falls back to standard LFS)
@@ -55,6 +57,10 @@ enum MediaCommand {
         /// Persist the chunks and the manifest to the local media store.
         #[clap(long)]
         store: bool,
+        /// Prior paged summary (or whole-manifest JSON) for same-length coherence.
+        /// Requires `--store`. Illegal priors fail without publishing a new cache.
+        #[clap(long = "prior-manifest", value_name = "FILE")]
+        prior_manifest: Option<String>,
     },
     /// Parse and validate a manifest JSON file.
     Inspect {
@@ -81,7 +87,11 @@ enum MediaCommand {
 
 pub async fn execute_safe(args: MediaArgs, output: &OutputConfig) -> CliResult<()> {
     match args.command {
-        MediaCommand::Chunk { path, store } => chunk(&path, store, output).await,
+        MediaCommand::Chunk {
+            path,
+            store,
+            prior_manifest,
+        } => chunk(&path, store, prior_manifest.as_deref(), output).await,
         MediaCommand::Inspect { manifest } => inspect(&manifest, output),
         MediaCommand::Verify { path, media_oid } => verify(path, media_oid, output).await,
         MediaCommand::Probe { remote } => probe(remote, output).await,
@@ -101,7 +111,19 @@ struct ChunkSummary {
     manifest_path: Option<String>,
 }
 
-async fn chunk(path: &str, store: bool, output: &OutputConfig) -> CliResult<()> {
+async fn chunk(
+    path: &str,
+    store: bool,
+    prior_manifest: Option<&str>,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if prior_manifest.is_some() && !store {
+        return Err(CliError::fatal(
+            "--prior-manifest requires --store so the coherent layout is cached for upload"
+                .to_string(),
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
     let stored_root;
     let scratch;
     let root = if store {
@@ -117,8 +139,14 @@ async fn chunk(path: &str, store: bool, output: &OutputConfig) -> CliResult<()> 
         })?;
         scratch.path()
     };
-    let outcome = chunk_store::stream_media_file(std::path::Path::new(path), root, store)
-        .map_err(|err| media_store_err("chunk media file", err))?;
+    let prior_path = prior_manifest.map(std::path::Path::new);
+    let outcome = chunk_store::stream_media_file_with_prior(
+        std::path::Path::new(path),
+        root,
+        store,
+        prior_path,
+    )
+    .map_err(|err| media_store_err("chunk media file", err))?;
     let manifest_path = store.then(|| outcome.manifest_path.display().to_string());
     let summary = ChunkSummary {
         media_oid: outcome.summary.oid,

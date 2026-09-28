@@ -13,7 +13,7 @@ FastCDC LFS 媒体分块客户端（lore.md §6），是受 `fastcdc` 功能开�
 
 | 子命令 | 说明 | 示例 |
 |---|---|---|
-| `chunk <path> [--store]` | 对文件做 FastCDC 分块并输出 manifest；`--store` 会把 chunks + manifest 持久化到 `.libra/media/fastcdc-v2020-32k`。 | `libra media chunk big.psd --store` |
+| `chunk <path> [--store] [--prior-manifest <file>]` | 对文件做 FastCDC 分块并输出 manifest；`--store` 会把 chunks + manifest 持久化到 `.libra/media/fastcdc-v2020-32k`。`--prior-manifest`（必须配合 `--store`）按 ADR-FL-04 做同长度 coherence：只复用 hash 匹配的旧块，变化区重切，长度变化则冷切；非法 prior 失败且不发布新缓存布局。 | `libra media chunk edit.psd --prior-manifest old/summary.json --store` |
 | `inspect <manifest>` | 校验分页 manifest 摘要（或单页信封）并打印摘要，不展开全部 chunk。 | `libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json` |
 | `verify <path> \| --media-oid <oid>` | 从本地 chunk store 重组并验证完整 `media_oid`（永不发布损坏文件）。 | `libra media verify big.psd` |
 | `probe [--remote <name>]` | 探测远端 media capability endpoint 并报告传输决策（chunked vs standard-LFS fallback）。 | `libra media probe --remote origin` |
@@ -52,6 +52,8 @@ libra media probe --remote origin
 
 本地分块没有全文件字节数、chunk 条数或 manifest 大小的产品上限。`media chunk` 按页产出布局（每页最多 4096 条，紧凑 entries 数组最多 960 KiB，信封最多 1 MiB）并只打印摘要。分页边界不参与 canonical manifest id。`--store` 写入 `.libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json`、不可变 `pages/<n>.json`、chunk 字节，以及 `.libra/media/fastcdc-v2020-32k/index/local/<manifest_id>/` 下的派生 hash/offset 索引。该索引可以删除，verify 时会从页重建，它不是仓库配置。仍要求整包 manifest 的服务端只在紧凑 JSON 能放进 1 MiB 信封时重试一次；更大的布局直接失败。
 
+`media chunk --prior-manifest <file> --store` 是明确的 prior coherence 入口（ADR-FL-04）。`<file>` 可以是分页 summary 路径/目录，也可以是整包 manifest JSON。同长度编辑会按旧块 offset 比较新字节 hash，只复用匹配块；变化区重切，若产生不足 32 KiB 的非尾片段则吸收相邻复用块后重切，必要时退回全文件冷切。长度变化（插入/删除）按冷切处理，不声称历史边界优化。损坏的 prior 报错，且不向新 oid 发布缓存布局。上传优先消费该缓存：prepare 前重新检查源 size、全文件 oid 与逐块 hash，源文件变化则失败关闭且不向远端提交；缓存缺失/被驱逐时可冷切。
+
 Mega 当前按「认证用户＋仓库路径」隔离块和 manifest，其他用户通过既有标准 LFS 完整对象路径下载。这些端点要求 Bearer 访问令牌，不提供公开的裸 chunk-hash 查询或下载；这并不等于实现了完整仓库 ACL。chunk payload 上限为 256 KiB。
 
 Pending 描述符在 24 小时后过期，重新准备 manifest 可继续查询和上传缺块；过期数据不会自动回收。此扩展需要显式启用，部署前应规划保留策略与配额，不能对仍被已发布 manifest 引用的块直接设置生命周期删除。
@@ -65,6 +67,7 @@ Pending 描述符在 24 小时后过期，重新准备 manifest 可继续查询�
 ```bash
 libra media chunk big.psd                 # 对文件分块；打印 manifest 摘要
 libra media chunk big.psd --store         # 同时本地持久化 chunks + manifest
+libra media chunk edit.psd --prior-manifest old/summary.json --store
 libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json
 libra media verify big.psd                # 从 store 重组并验证 media_oid
 libra media probe --remote origin         # capability probe；回退到标准 LFS
