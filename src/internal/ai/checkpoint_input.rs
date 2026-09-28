@@ -83,7 +83,7 @@ pub fn materialize_checkpoint_input(
     let mut dirs: Vec<PathBuf> = Vec::new();
     for file in &spec.files {
         let rel = sanitize_rel_path(&file.rel_path)?;
-        let oid = crate::internal::object_format::parse_repo_oid(&file.oid).map_err(|e| {
+        let oid = crate::internal::ai::util::parse_repo_object_id(&file.oid).map_err(|e| {
             format!(
                 "invalid blob oid '{}' in checkpoint input spec: {e}",
                 file.oid

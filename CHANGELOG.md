@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.29.0] — 2026-09-28
+
+### AI repository commit refs with HashKind (B3-10)
+
+- Repository commit anchors use Libra tagged `repo-commit:<kind>:<kind-native hex>`
+  via `RepoCommitRef` / `RepoCommitRefStore` (`ai_index_task_run.base_commit_ref`
+  from B3-16). Agent bridge, traces, checkpoint, and projection resolvers accept
+  tagged or bare kind-native hex under the repository kind.
+- `IntegrityHash` remains SHA-256-only and never carries a repository OID; blake3
+  repo OIDs must not be passed as Run/PatchSet integrity digests.
+- Unborn-HEAD all-zero sentinels stay rejected as commit refs. The removed
+  `libra code` MCP `--stdio` surface is not restored — contract lives on agent
+  bridge / projection.
+
 ## [0.28.0] — 2026-09-28
 
 ### Cloud object-format metadata (REL-B3-02 / B3-17; B3-09 + B3-14)
