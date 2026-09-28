@@ -38,7 +38,7 @@ libra maintenance run [--task <task>] [--dry-run] [--quiet]
 | `loose-objects` | 将旧 loose objects 打包进新的 pack 文件 |
 | `pack-refs` | 将单独 ref 文件折叠进 `packed-refs` |
 | `incremental-repack` | 重新打包现有 pack 文件 |
-| `commit-graph` | 写出 Git-compatible v1 commit-graph 文件（包括通过 EDGE chunk 支持 octopus merges，以及 32-byte OIDs + SHA-256 trailer 的 SHA-256 仓库） |
+| `commit-graph` | 写出 Git-compatible v1 commit-graph 文件（包括通过 EDGE chunk 支持 octopus merges，以及 32-byte OIDs + SHA-256 trailer 的 SHA-256 仓库）。**blake3 仓库跳过该任务**（Git CGPH 没有 blake3 `hash_version`）：发出 warning、不改动已有 `objects/info/commit-graph*`，历史查询回退对象遍历（`log` / `rev-list`） |
 | `prefetch` | 预取 remote refs（需要 remote config；会跳过） |
 
 ### `register`

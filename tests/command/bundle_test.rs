@@ -160,6 +160,181 @@ fn bundle_outside_repository_is_an_error() {
     assert_eq!(result.status.code(), Some(128));
 }
 
+fn create_committed_blake3_repo() -> tempfile::TempDir {
+    let repo = tempdir().expect("blake3 repo root");
+    let init = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "blake3"],
+        repo.path(),
+    );
+    assert_cli_success(&init, "init blake3");
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "Test User"], repo.path()),
+        "user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "test@example.com"], repo.path()),
+        "user.email",
+    );
+    fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("write tracked");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "add tracked",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit base",
+    );
+    repo
+}
+
+#[test]
+fn bundle_blake3_roundtrip() {
+    let repo = create_committed_blake3_repo();
+    let path = repo.path().join("blake3.bundle");
+    let create = run_libra_command(
+        &["bundle", "create", path.to_str().unwrap(), "HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&create, "bundle create blake3");
+    let bytes = fs::read(&path).expect("read bundle");
+    assert!(
+        bytes.starts_with(b"# v2 git bundle\n"),
+        "missing v2 signature"
+    );
+    assert!(
+        bytes.windows(6).any(|w| w == b"\n\nPACK"),
+        "missing PACK after header"
+    );
+
+    let verify = run_libra_command(&["bundle", "verify", path.to_str().unwrap()], repo.path());
+    assert_cli_success(&verify, "bundle verify blake3");
+    assert!(
+        String::from_utf8_lossy(&verify.stdout).contains("is okay"),
+        "verify stdout: {}",
+        String::from_utf8_lossy(&verify.stdout)
+    );
+
+    let dest = tempdir().expect("blake3 unbundle dest");
+    let init = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "blake3"],
+        dest.path(),
+    );
+    assert_cli_success(&init, "init dest blake3");
+    let unbundle = run_libra_command(&["bundle", "unbundle", path.to_str().unwrap()], dest.path());
+    assert_cli_success(&unbundle, "unbundle blake3→blake3");
+    let pack_dir = dest.path().join(".libra/objects/pack");
+    let mut found_v2 = false;
+    for entry in fs::read_dir(&pack_dir).expect("read pack dir") {
+        let entry = entry.expect("dirent");
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".idx") {
+            let idx = fs::read(entry.path()).expect("read idx");
+            assert_eq!(&idx[0..4], &[0xFF, 0x74, 0x4F, 0x63], "idx magic");
+            assert_eq!(
+                u32::from_be_bytes(idx[4..8].try_into().unwrap()),
+                2,
+                "blake3 unbundle must install idx v2"
+            );
+            found_v2 = true;
+        }
+    }
+    assert!(found_v2, "unbundle must install at least one .idx");
+}
+
+#[test]
+fn bundle_cross_kind_unbundle_rejected() {
+    let sha1 = create_committed_repo_via_cli();
+    let sha1_bundle = sha1.path().join("sha1.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", sha1_bundle.to_str().unwrap(), "HEAD"],
+            sha1.path(),
+        ),
+        "create sha1 bundle",
+    );
+
+    let blake3 = create_committed_blake3_repo();
+    let blake3_bundle = blake3.path().join("blake3.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", blake3_bundle.to_str().unwrap(), "HEAD"],
+            blake3.path(),
+        ),
+        "create blake3 bundle",
+    );
+
+    let into_blake3 = tempdir().expect("empty blake3 target");
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--vault", "false", "--object-format", "blake3"],
+            into_blake3.path(),
+        ),
+        "init empty blake3",
+    );
+    let pack_dir = into_blake3.path().join(".libra/objects/pack");
+    let before: Vec<_> = fs::read_dir(&pack_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    let reject = run_libra_command(
+        &["bundle", "unbundle", sha1_bundle.to_str().unwrap()],
+        into_blake3.path(),
+    );
+    assert_ne!(
+        reject.status.code(),
+        Some(0),
+        "sha1 bundle must not unbundle into blake3: {}",
+        String::from_utf8_lossy(&reject.stderr)
+    );
+    let after: Vec<_> = fs::read_dir(&pack_dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        before, after,
+        "rejected cross-kind unbundle must leave no pack/idx residue"
+    );
+    // No temp leftovers either.
+    if pack_dir.is_dir() {
+        for entry in fs::read_dir(&pack_dir).expect("re-read pack dir") {
+            let name = entry.expect("dirent").file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.starts_with(".bundle-"),
+                "temp unbundle artifact left behind: {name}"
+            );
+        }
+    }
+
+    let into_sha1 = tempdir().expect("empty sha1 target");
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], into_sha1.path()),
+        "init empty sha1",
+    );
+    let reject_rev = run_libra_command(
+        &["bundle", "unbundle", blake3_bundle.to_str().unwrap()],
+        into_sha1.path(),
+    );
+    assert_ne!(
+        reject_rev.status.code(),
+        Some(0),
+        "blake3 bundle must not unbundle into sha1: {}",
+        String::from_utf8_lossy(&reject_rev.stderr)
+    );
+    let sha1_pack = into_sha1.path().join(".libra/objects/pack");
+    if sha1_pack.is_dir() {
+        for entry in fs::read_dir(&sha1_pack).expect("sha1 pack dir") {
+            let name = entry.expect("dirent").file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.ends_with(".pack")
+                    && !name.ends_with(".idx")
+                    && !name.starts_with(".bundle-"),
+                "blake3→sha1 rejection left residue: {name}"
+            );
+        }
+    }
+}
+
 /// M-BCREATE C1–C5: `--all` / explicit `HEAD` advertise a `HEAD` line.
 #[test]
 fn test_bundle_create_advertises_head_matrix() {

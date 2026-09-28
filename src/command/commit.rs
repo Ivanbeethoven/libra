@@ -4,13 +4,12 @@ use std::{
     collections::HashSet,
     io::{IsTerminal, Read, Write},
     path::PathBuf,
-    str::FromStr,
 };
 
 use chrono::DateTime;
 use clap::Parser;
 use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::{
         index::Index,
         object::{
@@ -1131,16 +1130,28 @@ async fn run_commit_with_index(
                 .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
         }
 
-        // Skip empty commit check for --amend operations
-        if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
-            // No files have ever been staged — distinct from "staged but unchanged"
-            return Err(CommitError::NothingToCommitNoTracked);
-        }
-
-        // Verify staged changes relative to HEAD (skip for --amend)
+        // Verify staged changes relative to HEAD (skip for --amend). Computed
+        // before the empty-index check below because a staged deletion of the
+        // LAST tracked file leaves the index empty (`libra rm` / `add -A`)
+        // while still being a real change to commit (issue #497).
         let staged_changes = status::changes_to_be_committed_safe()
             .await
             .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
+
+        // Skip empty commit check for --amend operations. "No files have ever
+        // been staged" must be distinguished from "staged but unchanged": the
+        // former is only true when the index is empty AND there is nothing to
+        // commit relative to HEAD. An empty index that still carries staged
+        // deletions (removing the final tracked file) must proceed to commit.
+        if tracked_entries.is_empty()
+            && staged_changes.is_empty()
+            && !args.allow_empty
+            && !is_amend
+            && !auto_stage_applied
+        {
+            return Err(CommitError::NothingToCommitNoTracked);
+        }
+
         if staged_changes.is_empty() && !args.allow_empty && !is_amend {
             return Err(classify_nothing_to_commit()?);
         }
@@ -3178,7 +3189,7 @@ enum ObjectHasher {
 
 impl ObjectHasher {
     fn new() -> Self {
-        match get_hash_kind() {
+        match git_internal::hash::get_hash_kind() {
             git_internal::hash::HashKind::Sha1 => {
                 use sha1::Digest as _;
                 Self::Sha1(sha1::Sha1::new())
@@ -3264,8 +3275,8 @@ fn hash_regular_auto_stage_blob(path: &std::path::Path) -> Result<Blob, CommitEr
             ),
         });
     }
-    let id =
-        ObjectHash::from_bytes(&hasher.finish()).map_err(|detail| CommitError::AutoStageRead {
+    let id = ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &hasher.finish())
+        .map_err(|detail| CommitError::AutoStageRead {
             path: path.display().to_string(),
             detail: format!("failed to construct preview object ID: {detail}"),
         })?;
@@ -3414,7 +3425,7 @@ async fn update_head<C: ConnectionTrait>(db: &C, commit_id: &str) -> Result<(), 
         }
         Head::Detached(_) => {
             let head = Head::Detached(
-                ObjectHash::from_str(commit_id)
+                crate::internal::object_format::parse_repo_oid(commit_id)
                     .map_err(|e| CommitError::HeadUpdate(format!("invalid commit id: {e}")))?,
             );
             // Propagated: a swallowed HEAD write left `commit` reporting
@@ -3447,8 +3458,11 @@ async fn update_head_and_reflog(commit_id: &str, commit_message: &str) -> Result
 
 async fn new_reflog_context(commit_id: &str, message: &str) -> ReflogContext {
     // INVARIANT: zero-filled bytes of the correct hash size always produce a valid ObjectHash
-    let zero_hash =
-        ObjectHash::from_bytes(&vec![0u8; get_hash_kind().size()]).expect("zero hash is valid");
+    let zero_hash = ObjectHash::from_bytes_for_kind(
+        git_internal::hash::get_hash_kind(),
+        &vec![0u8; git_internal::hash::get_hash_kind().size()],
+    )
+    .expect("zero hash is valid");
     let old_oid = Head::current_commit()
         .await
         .unwrap_or(zero_hash)
@@ -4029,7 +4043,11 @@ mod test {
                 timezone: "+0000".to_string(),
             };
 
-            let zero = ObjectHash::from_bytes(&vec![0u8; get_hash_kind().size()]).unwrap();
+            let zero = ObjectHash::from_bytes_for_kind(
+                git_internal::hash::get_hash_kind(),
+                &vec![0u8; git_internal::hash::get_hash_kind().size()],
+            )
+            .unwrap();
             let commit = Commit::new(author, commiter, zero, Vec::new(), &content);
 
             let commit_data = commit.to_data().unwrap();

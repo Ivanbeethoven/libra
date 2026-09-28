@@ -7,7 +7,7 @@
 | `DIRECTORY` | `cli.init-directory-and-quiet` | 目标目录和 `.libra/libra.db` 被创建 |
 | `-q` / `--quiet` | `cli.init-directory-and-quiet` | 成功但不输出普通 banner |
 | `-b` / `--initial-branch` | `cli.init-branch-and-format-options` | 初始分支可通过公开命令观察 |
-| `--object-format` | `cli.init-branch-and-format-options` | `core.objectformat` 为 `sha1` / `sha256`，非法值失败 |
+| `--object-format` | `cli.init-branch-and-format-options` | `core.objectformat` 为 `sha1` / `sha256` / `blake3`，非法值失败 |
 | `--ref-format` | `cli.init-branch-and-format-options` | `core.initrefformat` 为 `strict` / `filesystem`，非法值失败 |
 | `--bare` | `cli.init-bare-and-shared` | 存储根为目标目录本身，无普通 `.libra/` 工作区布局 |
 | `--shared` | `cli.init-bare-and-shared` | 支持值成功，非法值失败并提示支持值 |

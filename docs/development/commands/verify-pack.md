@@ -6,7 +6,7 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。validates one or more `.idx` files against matching `.pack` siblings; `-s` / `--stat-only` supported; `--pack` is available for a single explicit pack path
+- 兼容级别：`partial`。仓库内按 `core.objectformat` 解析 idx（含 blake3）；仓库外必须 `--hash-kind`（禁止从布局猜测）；`-s` / `--stat-only` / `--pack` 仍支持
 
 - 当前矩阵明确仍是部分兼容；未覆盖的 Git surface 必须显式列在“还未实现的功能”。
 
@@ -29,7 +29,7 @@ flowchart TD
     E --> G["副作用边界<br/>只读：仅读取 .idx / .pack"]
 ```
 
-- 底层操作对象：pack / idx 对象（传输包、索引、delta 和完整性校验）；`ObjectHash`（SHA-1/SHA-256 对象 ID）；`IndexEntry`（pack-index 条目，承载 hash / crc32 / offset，来自 `git_internal::internal::pack::pack_index`，与工作树 `.libra/index` 无关）；`ObjectType`（blob/tree/commit/tag 类型分派）；`Entry::chain_len`（stat-only delta 链统计）
+- 底层操作对象：pack / idx 对象（传输包、索引、delta 和完整性校验）；`ObjectHash`（SHA-1/SHA-256/BLAKE3 对象 ID）；`IndexEntry`（pack-index 条目，承载 hash / crc32 / offset，来自 `git_internal::internal::pack::pack_index`，与工作树 `.libra/index` 无关）；`ObjectType`（blob/tree/commit/tag 类型分派）；`Entry::chain_len`（stat-only delta 链统计）。idx v2 不再在 `[Sha1, Sha256]` 中推断 kind，改由仓库 kind 或 `--hash-kind` 显式决定（`idx_v2_matches_hash_kind`）。
 - 输出与错误契约：人类输出、`--json` / `--machine` 输出和 quiet/verbose 分支必须继续走现有 `OutputConfig` / `emit_json_data` / `CliError` 路径；单 idx JSON 保持 `VerifyPackOutput` 原形，多 idx JSON 使用 `{ verified, count, results }` 包装；新增失败模式要补稳定错误码、用户提示和回归测试。
 - 副作用边界：凡是写入索引、对象库、refs/HEAD、reflog、SQLite/D1、工作树或远端的路径，都必须先完成参数校验和 dry-run/预检分支，再执行持久化，避免部分写入后静默成功。
 

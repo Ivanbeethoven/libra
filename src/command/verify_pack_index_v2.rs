@@ -1,5 +1,5 @@
 use git_internal::{
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     utils::HashAlgorithm,
 };
 use sha1::{Digest, Sha1};
@@ -12,9 +12,14 @@ use super::{
     verify_pack_types::{ParsedIndex, ParsedIndexEntry},
 };
 
-pub(crate) fn infer_idx_v2_hash_kind(bytes: &[u8]) -> Result<Option<HashKind>, String> {
+/// Validate that a v2 index's byte layout matches `kind` (no guessing among kinds).
+///
+/// Returns `Ok(true)` when the file is a v2 index whose tables/trailer lengths fit
+/// `kind`, `Ok(false)` when the file is not a v2 index, and `Err` when the header
+/// looks like v2 but the layout is truncated or inconsistent.
+pub(crate) fn idx_v2_matches_hash_kind(bytes: &[u8], kind: HashKind) -> Result<bool, String> {
     if !bytes.starts_with(&IDX_MAGIC) {
-        return Ok(None);
+        return Ok(false);
     }
 
     let version = u32::from_be_bytes(
@@ -25,29 +30,19 @@ pub(crate) fn infer_idx_v2_hash_kind(bytes: &[u8]) -> Result<Option<HashKind>, S
             .map_err(|_| "truncated v2 version".to_string())?,
     );
     if version != 2 {
-        return Ok(None);
+        return Ok(false);
     }
 
     let fanout = parse_fanout(bytes, 8)?;
     validate_fanout_monotonic(&fanout)?;
     let object_count = fanout[255] as usize;
-    let mut candidates = [HashKind::Sha1, HashKind::Sha256]
-        .into_iter()
-        .filter(|kind| idx_v2_layout_matches_hash_kind(bytes, object_count, *kind))
-        .collect::<Vec<_>>();
-
-    match candidates.len() {
-        0 => Err("pack index v2 layout does not match sha1 or sha256".to_string()),
-        1 => Ok(candidates.pop()),
-        _ => {
-            let current = get_hash_kind();
-            if candidates.contains(&current) {
-                Ok(Some(current))
-            } else {
-                Ok(candidates.into_iter().next())
-            }
-        }
+    if !idx_v2_layout_matches_hash_kind(bytes, object_count, kind) {
+        return Err(format!(
+            "pack index v2 layout does not match {}",
+            kind.as_str()
+        ));
     }
+    Ok(true)
 }
 
 fn idx_v2_layout_matches_hash_kind(bytes: &[u8], object_count: usize, kind: HashKind) -> bool {
@@ -97,7 +92,8 @@ fn idx_v2_layout_matches_hash_kind(bytes: &[u8], object_count: usize, kind: Hash
 }
 
 pub(super) fn parse_idx_v2(bytes: &[u8]) -> Result<ParsedIndex, String> {
-    let hash_len = get_hash_kind().size();
+    let hash_kind = git_internal::hash::get_hash_kind();
+    let hash_len = hash_kind.size();
     if bytes.len() < 8 + FANOUT_LEN + hash_len * 2 {
         return Err("pack index v2 is too short".to_string());
     }
@@ -171,7 +167,7 @@ pub(super) fn parse_idx_v2(bytes: &[u8]) -> Result<ParsedIndex, String> {
     for i in 0..object_count {
         let hash_start = i * hash_len;
         let hash_end = hash_start + hash_len;
-        let hash = ObjectHash::from_bytes(&names[hash_start..hash_end])
+        let hash = ObjectHash::from_bytes_for_kind(hash_kind, &names[hash_start..hash_end])
             .map_err(|error| format!("invalid v2 object hash: {error}"))?;
 
         let crc_start = i * 4;
@@ -206,12 +202,13 @@ pub(super) fn parse_idx_v2(bytes: &[u8]) -> Result<ParsedIndex, String> {
     validate_sorted_entries(&entries)?;
     validate_fanout_matches_entries(&fanout, &entries)?;
 
-    let pack_hash = ObjectHash::from_bytes(&bytes[trailer_start..trailer_start + hash_len])
-        .map_err(|error| format!("invalid v2 pack hash: {error}"))?;
+    let pack_hash =
+        ObjectHash::from_bytes_for_kind(hash_kind, &bytes[trailer_start..trailer_start + hash_len])
+            .map_err(|error| format!("invalid v2 pack hash: {error}"))?;
     let index_hash = bytes[trailer_start + hash_len..].to_vec();
 
-    let computed_git_hash = hash_bytes(&bytes[..bytes.len() - index_hash_len]);
-    let computed_libra_hash = hash_bytes(&bytes[..trailer_start]);
+    let computed_git_hash = hash_bytes(hash_kind, &bytes[..bytes.len() - index_hash_len]);
+    let computed_libra_hash = hash_bytes(hash_kind, &bytes[..trailer_start]);
     let computed_legacy_sha1_libra_hash = sha1_bytes(&bytes[..trailer_start]);
     if index_hash != computed_git_hash
         && index_hash != computed_libra_hash
@@ -228,8 +225,8 @@ pub(super) fn parse_idx_v2(bytes: &[u8]) -> Result<ParsedIndex, String> {
     })
 }
 
-fn hash_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut hash = HashAlgorithm::new();
+fn hash_bytes(kind: HashKind, bytes: &[u8]) -> Vec<u8> {
+    let mut hash = HashAlgorithm::new_for_kind(kind);
     hash.update(bytes);
     hash.finalize()
 }

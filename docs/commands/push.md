@@ -17,7 +17,7 @@ libra push [OPTIONS] [<repository> [<refspec>...]]
 remote. When invoked without arguments it pushes the current branch to its configured
 upstream remote. A configured local upstream (`branch.<name>.remote=.`) is refused
 before any network write (`LBR-CLI-003`, exit 129; Git `push` is 128 — intentional).
-Network support for local upstreams is deferred to [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480). An explicit repository argument `.` keeps the existing `remote '.' not found` path. When a `repository` and one or more `refspec` values are given, all
+Network support for local upstreams is deferred to [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480). An explicit repository argument `.` keeps the existing `remote '.' not found` path. The `repository` may be an anonymous local-path / `file://` URL spec, which is resolved as a remote and reaches the local-push target check (issues/480 HP-06). When a `repository` and one or more `refspec` values are given, all
 refspecs are validated before any network write and then sent in one receive-pack
 request. `--tags` pushes all local tags, and `--mirror` mirrors local branch/tag refs
 to the remote, including deletion of remote-only refs.
@@ -433,11 +433,16 @@ restrictive stance: when you name a remote you must also name the ref. The bare
 This eliminates an entire class of "I accidentally pushed to production" mistakes without
 reducing the expressiveness of the command for scripted or agent-driven workflows.
 
-### Why keep local file remotes rejected?
+### Pushing to a local repository
 
-Libra still treats local file remote push as an intentionally different surface. The
-C8 ref update expansion applies to network receive-pack transports; local-path remotes
-continue to fail closed to avoid undefined concurrent filesystem mutation semantics.
+`libra push <local-path> <branch>` (or a `file://` URL) pushes into a local
+repository (issues/480 HP-07/HP-08). The target is opened by path (no process
+cwd switch): for a **Libra** target, missing objects are written to its object
+store and refs are compare-and-swap guarded in a single transaction; for a
+**Git** target, objects are encoded into a self-contained pack + idx and refs are
+updated atomically via `<ref>.lock` + rename. A rejected update (checked-out
+branch on a non-bare target, non-fast-forward without `+`/`--force`) leaves the
+target untouched.
 
 ### Why integrated LFS push?
 
@@ -494,6 +499,7 @@ trigger a fuzzy match suggestion via edit distance.
 | Local file remote | `LBR-CLI-003` | 129 | "push supports network remotes only" |
 | Invalid remote URL | `LBR-CLI-002` | 129 | "check the remote URL" |
 | Authentication failed | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
+| SSH public-key rejection during discovery | `LBR-AUTH-002` | 128 | Check the selected key, SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
 | Discovery failed | `LBR-NET-001` | 128 | "check the remote URL and network connectivity" |
 | Network timeout | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Non-fast-forward | `LBR-CONFLICT-002` | 128 | "pull first, or use --force (data loss risk)" |
@@ -506,6 +512,8 @@ trigger a fuzzy match suggestion via edit distance.
 | LFS upload failed | `LBR-NET-001` | 128 | "check LFS endpoint configuration" |
 | Tracking ref update failed | `LBR-IO-002` | 128 | -- |
 | Repository state error | `LBR-REPO-002` | 128 | "try 'libra status' to verify" |
+
+Non-sha1 wire kinds advertise `object-format=sha256` or `object-format=blake3` on the first receive-pack line; sha1 omits the capability. Blake3↔blake3 local push succeeds. HashKindMismatch maps to `LBR-NET-002` / exit 128 (blake3-extension hint when either side is blake3). Covered by `blake3_push_round_trip` and `protocol_object_format_mismatch_error_contract`.
 
 ### Timeout Policy
 
@@ -546,19 +554,20 @@ SSH advertisement lengths `0001` through `0003`, incomplete headers (including
 zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
 reason and marker are retained without captured SSH stdout/stderr.
 
-An incomplete required header has one host-trust exception: local SSH exit status
-255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
-returns fixed host-verification guidance and `LBR-NET-001`. This classification
-does not verify the remote fingerprint. Other missing advertisements, including
-authentication failures, still use `LBR-NET-002`; an available non-zero local exit
-status adds `SSH exited with status N` and fixed connectivity, trusted-host,
-ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+An incomplete required discovery header has two prioritized exceptions. A recognized host-key
+diagnostic with local SSH exit status 255 returns fixed verification guidance and
+`LBR-NET-001`; this does not verify the remote fingerprint. A complete
+`Permission denied (<method-list>)` diagnostic containing the exact `publickey`
+method, direct exit status 255 and no stdout bytes returns the fixed public-key
+message with `LBR-AUTH-002`. Because stderr can be forged, this code does not prove
+why access was denied. All other missing advertisements remain `LBR-NET-002`, and
+original SSH diagnostic text is hidden.
 
 After an incomplete required header, Libra allows up to 100 milliseconds to
 observe the SSH exit status, then requests termination if needed. Other read
 errors request termination immediately. The status window, direct-child reap and
-output collection share a two-second cleanup deadline. Protocol and typed
-host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+output collection share a two-second cleanup deadline. Protocol, typed host-trust,
+and public-key authentication errors take precedence over secondary cleanup warnings. Ordinary IO
 and timeout errors keep their transport classification and may include a fixed
 local cleanup warning. Termination can change the observed exit status. This
 does not promise cleanup of arbitrary descendant processes.
@@ -583,6 +592,15 @@ provider console or another trusted channel before manually updating
 and compare the displayed fingerprint before accepting it. For example,
 `ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
 port. Do not accept a fingerprint that has not been verified.
+
+For the strict discovery-only public-key rejection above, the fixed hint asks you
+to check `libra config list --ssh-keys`, your SSH agent and repository access, and
+links the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh).
+The config command must be run inside an existing Libra repository.
+
+For at least 30 days after v0.24.1 is released and through at least the next
+patch release, whichever is later, automation should accept both `LBR-AUTH-002`
+and the legacy `LBR-NET-002` for this SSH discovery failure.
 
 `ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
 `no` values. `ask` leaves that SSH option to the user's SSH configuration;

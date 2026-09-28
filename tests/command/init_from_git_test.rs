@@ -855,3 +855,248 @@ fn test_init_from_git_repository_human_progress_is_only_init_stage_text() {
         "nested fetch output should stay suppressed during init, got: {stderr}"
     );
 }
+
+fn snapshot_paths(root: &Path) -> Vec<String> {
+    let mut entries = Vec::new();
+    if !root.exists() {
+        return entries;
+    }
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(rd) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(rel.clone());
+            if path.is_dir() {
+                walk(base, &path, out);
+            }
+        }
+    }
+    walk(root, root, &mut entries);
+    entries.sort();
+    entries
+}
+
+fn assert_convert_rejected_before_write(
+    git_dir: &Path,
+    target: &Path,
+    extra_args: &[&str],
+    expected_code: &str,
+    expected_exit: i32,
+) {
+    let parent = target.parent().unwrap();
+    // Pre-create the CLI test HOME so the harness does not appear as a
+    // post-failure residual in the target snapshot.
+    fs::create_dir_all(target.join(".libra-test-home").join(".config")).unwrap();
+    let before_target = snapshot_paths(target);
+    let before_parent = snapshot_paths(parent);
+    let ignore_path = target.join(".libraignore");
+    let before_ignore = ignore_path.exists();
+    let vault_path = target.join(".libra").join("vault");
+    let before_vault = vault_path.exists();
+
+    let mut args = vec!["--json", "init", "--from-git-repository"];
+    let git_s = git_dir.to_str().unwrap();
+    args.push(git_s);
+    args.extend_from_slice(extra_args);
+
+    let output = libra_command(target)
+        .args(&args)
+        .output()
+        .expect("run libra init --from-git-repository");
+    assert_eq!(
+        output.status.code(),
+        Some(expected_exit),
+        "exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_human, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, expected_code, "{report:?}");
+    if expected_code == "LBR-CLI-002" {
+        assert!(
+            report.hints.iter().any(|h| h.contains("fresh")
+                || h.contains("libra init --object-format")
+                || h.contains("SHA-256/BLAKE3")),
+            "hint must point at fresh init: {:?}",
+            report.hints
+        );
+    }
+    assert_eq!(snapshot_paths(target), before_target, "target snapshot");
+    assert_eq!(snapshot_paths(parent), before_parent, "parent snapshot");
+    assert_eq!(ignore_path.exists(), before_ignore, ".libraignore");
+    assert_eq!(vault_path.exists(), before_vault, "vault");
+    assert!(!target.join(".libra").exists(), "no .libra residual");
+}
+
+#[test]
+fn init_from_git_rejects_sha256_object_format() {
+    let (temp_root, git_dir) = create_simple_git_repo();
+    let target = temp_root.path().join("libra-repo");
+    fs::create_dir_all(&target).unwrap();
+    assert_convert_rejected_before_write(
+        &git_dir,
+        &target,
+        &["--vault", "false", "--object-format", "sha256"],
+        "LBR-CLI-002",
+        129,
+    );
+}
+
+#[test]
+fn init_from_git_rejects_blake3_object_format() {
+    let (temp_root, git_dir) = create_simple_git_repo();
+    let target = temp_root.path().join("libra-repo");
+    fs::create_dir_all(&target).unwrap();
+    assert_convert_rejected_before_write(
+        &git_dir,
+        &target,
+        &["--vault", "false", "--object-format", "blake3"],
+        "LBR-CLI-002",
+        129,
+    );
+}
+
+#[test]
+fn init_from_git_rejects_sha256_source_git() {
+    let (temp_root, git_dir) = create_simple_git_repo();
+    // Fake a SHA-256 Git source via config (Convert preflight reads config only).
+    let git_config = git_dir.join(".git").join("config");
+    let mut text = fs::read_to_string(&git_config).unwrap();
+    if !text.contains("repositoryformatversion") {
+        text.push_str("\n[core]\n\trepositoryformatversion = 1\n");
+    } else {
+        text = text.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    }
+    text.push_str("\n[extensions]\n\tobjectformat = sha256\n");
+    fs::write(&git_config, text).unwrap();
+
+    let target = temp_root.path().join("libra-repo");
+    fs::create_dir_all(&target).unwrap();
+    assert_convert_rejected_before_write(
+        &git_dir,
+        &target,
+        &["--vault", "false"],
+        "LBR-CLI-002",
+        129,
+    );
+}
+
+#[test]
+fn init_from_git_rejects_unknown_source_format() {
+    let (temp_root, git_dir) = create_simple_git_repo();
+    let git_config = git_dir.join(".git").join("config");
+    let mut text = fs::read_to_string(&git_config).unwrap();
+    text = text.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    if !text.contains("repositoryformatversion = 1") {
+        text.push_str("\n[core]\n\trepositoryformatversion = 1\n");
+    }
+    text.push_str("\n[extensions]\n\tobjectformat = not-a-hash\n");
+    fs::write(&git_config, text).unwrap();
+
+    let target = temp_root.path().join("libra-repo");
+    fs::create_dir_all(&target).unwrap();
+    assert_convert_rejected_before_write(
+        &git_dir,
+        &target,
+        &["--vault", "false"],
+        "LBR-REPO-002",
+        128,
+    );
+}
+
+#[test]
+fn init_from_git_rejects_unreadable_source_config() {
+    let (temp_root, git_dir) = create_simple_git_repo();
+    let git_config = git_dir.join(".git").join("config");
+    fs::remove_file(&git_config).unwrap();
+    // Directory-as-config: read_to_string fails with IsADirectory / equivalent.
+    fs::create_dir(&git_config).unwrap();
+
+    let target = temp_root.path().join("libra-repo");
+    fs::create_dir_all(&target).unwrap();
+    assert_convert_rejected_before_write(
+        &git_dir,
+        &target,
+        &["--vault", "false"],
+        "LBR-IO-001",
+        128,
+    );
+}
+
+#[test]
+fn init_from_git_source_config_parser_fixtures() {
+    use git_internal::hash::HashKind;
+    use libra::internal::protocol::local_client::{
+        GitSourceObjectFormatError, parse_git_source_objectformat,
+    };
+
+    // Missing objectformat → Sha1
+    assert_eq!(
+        parse_git_source_objectformat("[core]\n\trepositoryformatversion = 0\n").unwrap(),
+        HashKind::Sha1
+    );
+
+    // v1 + sha256
+    assert_eq!(
+        parse_git_source_objectformat(
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n"
+        )
+        .unwrap(),
+        HashKind::Sha256
+    );
+
+    // objectformat without v1 → fail-closed
+    assert!(matches!(
+        parse_git_source_objectformat(
+            "[core]\n\trepositoryformatversion = 0\n[extensions]\n\tobjectformat = sha256\n"
+        ),
+        Err(GitSourceObjectFormatError::ExtensionWithoutV1)
+    ));
+
+    // Comments must not match
+    assert_eq!(
+        parse_git_source_objectformat(
+            "# [extensions]\n#\tobjectformat = sha256\n[core]\n\trepositoryformatversion = 1\n"
+        )
+        .unwrap(),
+        HashKind::Sha1
+    );
+
+    // Last value wins; case-insensitive keys
+    assert_eq!(
+        parse_git_source_objectformat(
+            "[Core]\n\tRepositoryFormatVersion = 1\n[Extensions]\n\tObjectFormat = sha1\n\tobjectformat = sha256\n"
+        )
+        .unwrap(),
+        HashKind::Sha256
+    );
+
+    // Unknown value fail-closed
+    assert!(matches!(
+        parse_git_source_objectformat(
+            "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = blake3\n"
+        ),
+        Err(GitSourceObjectFormatError::UnknownValue(_))
+    ));
+
+    // include / includeIf are NOT followed: include-reachable sha256 stays Sha1
+    let temp = tempdir().unwrap();
+    let included = temp.path().join("extra.conf");
+    fs::write(&included, "[extensions]\n\tobjectformat = sha256\n").unwrap();
+    let main = format!(
+        "[core]\n\trepositoryformatversion = 1\n[include]\n\tpath = {}\n",
+        included.display()
+    );
+    assert_eq!(
+        parse_git_source_objectformat(&main).unwrap(),
+        HashKind::Sha1,
+        "include must not be followed"
+    );
+}

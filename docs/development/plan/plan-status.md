@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-28（下次更新时替换）。
+> **当前快照：** 2026-09-28（本次完成 plan-20260925 Session Capture 收口复核及最终全量验证；并收口 issues/497 至 v0.27.2；其余行沿用原 2026-09-27 快照，未逐项复核）。
 
 ---
 
@@ -21,7 +21,7 @@
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
 | [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | ACF-01..09 全部 `pending`；Entire `main@9c06bfb13` 對標已完成；Claude R8 字面 `VERDICT: PASS`（P0/P1/P2=0）；是 0902/0904/0905/0911 production、0916 CAP-07 與 0923 DM-05 session consumer contract 的前置 |
-| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿） |
+| [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿；2026-09-28 最终本地门 8241/8241 passed，本轮不 bump 版本） |
 | [`plan-20260923.md`](plan-20260923.md) | Cross-cutting (implemented CLI completion) | 已排期 | English static-first rewrite; CP-00..20 pending; CP-00 inventory precedes implementation approval; CP-06 static acceptance blocks all dynamic work; no implementation/release claimed |
 | [`plan-20260918.md`](plan-20260918.md) | 横切（`add` 命令收口） | **实施中** | OI-01..03 `done/complete`（v0.23.4/5/6）；**OI-04 `in-progress`（v0.23.7）**；OI-05..WT-07 `pending` |
 | [`plan-20260919.md`](plan-20260919.md) | 横切（global 配置迁 XDG） | 实施中 | GCX-01 `done/complete`（v0.23.1）；GCX-02/03/04 于 2026-09-22 完成实现+测试+文档，`locally-accepted`（版本 bump 与 D 组发布未执行；本轮按操作者指示未调用 Codex review） |
@@ -78,12 +78,13 @@
 | [`issues/488.md`](issues/488.md) | `grep` 的 `--exclude-standard` 与子目录作用域 | 未启动 | GR-01/02（2 卡） |
 | [`issues/490.md`](issues/490.md) | skip-worktree 索引位与 `add` 稀疏路径诊断 | 未启动 | SW-01..SW-07（7 卡；SW-06 已迁至 plan-20260918） |
 | [`issues/496.md`](issues/496.md) | 本地路径 clone 停住（Fetching objects 0% CPU） | 未启动 | CLH-01..CLH-04（4 卡） |
-| [`issues/497.md`](issues/497.md) | 删除最后一个被跟踪文件后 commit 报 nothing to commit | 未启动 | CD-01..CD-04（4 卡） |
+| [`issues/497.md`](issues/497.md) | 删除最后一个被跟踪文件后 commit 报 nothing to commit | **已收口** | CD-01..CD-04 全部 `done`/`complete`；`v0.27.2`（PR #581 squash merge `859d7fb`；PR head `base.yml` 7/7 + CodeQL 绿；`release.yml` 8/8 + stable manifest `0.27.2`）；ER-07 签名例外 EX-CD-01（仓库 vault 不可 unseal，操作者 2026-09-24 裁决维持未签名发布） |
 | [`issues/498.md`](issues/498.md) | `tag <name> <commit>` 不接受显式目标提交 | 未启动 | TT-01..TT-04（4 卡；与 #533/#478 协调） |
 | [`issues/477b.md`](issues/477b.md) | 历史改写收口后续（#522/#523/#525/#526/#527/#533/#536；#528 并入 #495） | 未启动 | HW-01..HW-07（7 卡） |
 | [`issues/451.md`](issues/451.md) | RFC：version-aware M2 Episode memory | 未启动 | RFC-01..RFC-04（4 卡） |
 | [`issues/468.md`](issues/468.md) | Data collection and refinement | 未启动 | DC-01..DC-04（4 卡） |
 | [`issues/500.md`](issues/500.md) | Feature：Centralized Storage for Libra Statistics Data | 未启动 | CS-01..CS-04（4 卡） |
+| [`issues/577.md`](issues/577.md) | SSH 公钥认证失败误报 pkt-line 协议错误与配置文档 | **已收口** | 2026-09-27：SA-02/SA-01 均为 `done` / `complete`；PR #578 合并为 `5eb833f9`，v0.24.1 发布与 8/8 release jobs 全绿；网站 `cf@667d7da8`、Worker `c7011920` 和七个生产页验证完成；Issue #577 CLOSED |
 | [`issues/582.md`](issues/582.md) | Git 相容的互動式 SSH 主機金鑰確認 | 已排期 | HKT-00..HKT-02 全部 `pending`；HKT-00 先移交 issues/480 HP-17 與 plan-20260901 DEFER-07，再依序交付 cascade 與受限 TTY confirmation |
 
 ---
@@ -99,7 +100,6 @@
 | [`plan-20260902.md`](plan-20260902.md) | OG-00..OG-15 | OG-00/04 以各自 review gate 為準；其余 production 卡等待 `DEP-ACF-MIRROR` |
 | [`plan-20260904.md`](plan-20260904.md) | 6 張 RG + 29 張已定義 CX 卡（共 35 卡） | CX-00/12 以原 Phase 0 gate 為準；其餘 33 張 production 卡等待 `DEP-ACF-MIRROR`；CX-30 另受 DEP-CLI-mirror |
 | [`plan-20260905.md`](plan-20260905.md) | CC-00..CC-06 | CC-00 以原 review gate 為準；CC-01..06 等待 `DEP-ACF-MIRROR`，且 reasoning 卡保留 RG 前置 |
-| [`plan-20260925.md`](plan-20260925.md) | SCAP-02、SCAP-01 | R9 对同一修订版 Codex 与 Claude 均为字面 `VERDICT: PASS` 且 P0/P1/P2 为 0。SCAP-02 的登记已在 `fba6cbc`，本卡只核对。SCAP-01 依赖该登记 |
 | [`plan-20260923.md`](plan-20260923.md) | CP-00..20 pending; expand bounded domain cards after inventory if needed | Audit handoff, required review PASS and DEP-CP-01..07; dynamic implementation requires CP-06 done/complete |
 | [`plan-20260906.md`](plan-20260906.md) | SC-01..SC-07、SC-CLOSE | — |
 | [`plan-20260907.md`](plan-20260907.md) | B3-00..B3-17 | Phase 0 冻结；是 plan-20260913 的前置 |
@@ -116,6 +116,17 @@
 ## 三、实施中的计划、待退役的历史方案与当前卡
 
 按执行窗口排序；当前执行与并行工作树见「四、当前执行指针」。
+
+### issues/577（SSH 公钥认证拒绝诊断与设置指南）
+
+SA-02 与 SA-01 均为 `done` / `complete`。Claude I11 第二次重基最终候选审查取得
+字面 `VERDICT: PASS`（P0–P3=0）；最终 fmt、Clippy、Nextest 8208/8208、release
+build 与隔离 locked install 全绿。候选 `ea89d047` 经 PR #578 的 12/12 检查后
+squash merge 为 `5eb833f9`；v0.24.1 标签指向该提交，release workflow
+`36296462821` 的 8/8 jobs 全绿，四平台 CDN 摘要、签名稳定清单、公开安装和上一版
+固定产物均已验证。网站签名提交为 `cf@667d7da8`，活动 Worker 为 `c7011920`，
+SSH 指南与六命令生产页均为 HTTP 200。Issue #577 已关闭；完整证据见
+`evidence/issues-577/sa-01-d-gate-20260927.md`。
 
 ### plan-20260927（六命令模块拆分，22 个独立切片）
 
@@ -283,7 +294,8 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿）。
+- **当前正在执行：** `plan-20260907` B3-00（发布者：本会话执行该卡的 Agent）。`plan-20260925` SCAP-01 / SCAP-02 已 `done`/`complete`（`v0.23.55` / `fa3849e`，D 组全绿；2026-09-28 本地最终门 8241/8241 passed，本轮不 bump 版本）。
+- **本会话已收口：** `issues/577` SA-02/SA-01 已 `done`/`complete`；PR #578、v0.24.1、8/8 release jobs、网站 `cf` 与生产页 D 证据均完成，Issue #577 CLOSED。
 - **SCAP-01 与 B3-00：** SCAP-01 已收口，`runtime.rs` 写集互斥结束；B3-00 继续在 `main` 上推进。
 - **下一步：** `issues/474` 已收口（DEP-CL-07 完成，#474 CLOSED）。B3-00 另轨。
 - **并行窗口（不在本执行指针）：** `plan-20260927` 的 CM-01 等 pinned scope FIX-CM-01，CM-06/10 有上述本地进度，所有卡 C/T-5 等 scope FIX 发布；CM-10 还等 CM-03/CM-13 共享文件、FIX-CM-LIVE-GATE 与 FIX-CM-CLOUD-LIVE-SAFETY 独立发布；真实 Cloud L3 只在受保护 release-SHA CI 写 job，DEP-CM-05 的 vars-ready 已过、premerge/postrelease 未过，live-compat workflow 当前 `disabled_manually`，由 root 满足受保护环境、凭据迁移与恢复门后重开；FIX-CM-04 待修订计划 Claude PASS，CM-04 阻塞；FIX-CM-08 与 CM-13 待开工，尚无本计划远端发布。Operation 独立 P1 交 `DEFER-CM-OP-01`，worktree approved-project 写入缺口交 `DEFER-CM-WT-01`，Cloud 小型 status 抽离交 `DEFER-CM-CLOUD-STATUS`。`issues/476` WT-03 仍等 DEP-WT-08；`plan-20260918` 其余 add 卡待推进。MEM-01/02 由 `plan-20260926` 承接，该计划评审门未过，禁止开工。
@@ -378,6 +390,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 | DEP-ID | 类型 | 内容 | 现状 |
 |---|---|---|---|
+| DEP-SA-03 | Issue #577 与 plan-20260927 共享写集/发布窗口 | #577 SA-01 使用 `tests/command/mod.rs`、serial registry/nextest、版本面；与 CM/FIX 命中相同文件的实施和全部发布顺序串行，前卡推送后重基重测。SA-02 网站指南先行，其网站 `cf` 写集也须核对其它计划实际页面写集。 | **已解除（2026-09-27）**；#577 经两次主线重基、最终全量、PR #578、v0.24.1 和网站 D 门完成，SA-02/SA-01 均 `done`/`complete`。后续 CM/FIX 从已发布 main 重新核写集。 |
 | DEP-CM-01 / DEP-CM-02 / DEP-CM-03 | 命令写集、发布窗口与 Cloud L3 | 13 张 CM + 9 张 FIX，共 22 卡；开工前核实际同文件写集。FIX-CM-01 → CM-01，FIX-CM-04 → CM-04，CM-05 → CM-13，CM-07 → FIX-CM-08 → CM-08，CM-03/CM-13 → FIX-CM-LIVE-GATE → FIX-CM-CLOUD-RECOVERY-AUTH → FIX-CM-CLOUD-RECOVERY-CLEANUP → FIX-CM-CLOUD-REPO-SCOPE → FIX-CM-CLOUD-LIVE-SAFETY → CM-10 → CM-11。其它全部卡 C/T-5 等 scope FIX 独立发布。`tests/INDEX.md` 全写者按 FIX-CM-01 → CM-01 → CM-06 → CM-02 → CM-03 → CM-07 → FIX-CM-08 → CM-08 → CM-09 → CM-12 → CM-04 → CM-05 → CM-13 → FIX-CM-LIVE-GATE → FIX-CM-CLOUD-RECOVERY-AUTH → FIX-CM-CLOUD-RECOVERY-CLEANUP → FIX-CM-CLOUD-REPO-SCOPE → FIX-CM-CLOUD-LIVE-SAFETY → CM-10 → CM-11 串行发布，CM-03 → CM-10 另串行写 serial registry；`CM-Publisher` `/root` 精确暂存。真实 Cloud L3 只在受保护 release-SHA CI dispatch 写 job 执行，按安全卡/CM-10/CM-11 各自 `E-CM-L3-SAFETY/10/11` 证独立期望、D1/R2 只读、trigger 全 SQL 基线、全库加密备份 runner 外上传读回、global/逐例 manifest、限定补偿/清理。 | 生效；CM-01、CM-04 `blocked`/空，CM-06、CM-10 `in-progress`/空，其余 17 卡 `pending`/空，均未发布。用户精确期望已确认，四 vars API readback 4/4；D1 25 triggers 中 16 remote-existing/unmatched 尚待 owner 核签。DEP-CM-03 与三个 E 仍 `unknown`；本地仅 fake/mock/default C，不执行真实 D1/R2 写。 |
 | DEP-CM-04 | CM-07 网站 `cf` 开工基线 | 仅要求开工前只读核后端 VCS、远端 `cf` pre-SHA 与 `status.en.md` blob、隔离 clone、签名/DCO/普通推送配置权限和站点命令可用。网站页编辑、新源码锚点/porcelain-v2 修正、gen:docs/typecheck/build、签名推送、远端及实际部署证据，均为 CM-07 自身交付门；已推后失败按远端 post-SHA 条件化签名补偿，远端竞态/部署不确定进入 `remote-pending`。 | 开工基线未重核，网站未交付；DEP-CM-04 不要求先完成 CM-07 网站变更，避免自环；只 Git push 不算部署。 |
 | DEP-CM-05 | Cloud CI 首写与发布门 | `vars-ready`：四项非密 repo vars 最后一项由 root 于 2026-09-25 08:35:02 UTC 设置，GitHub API exact readback 4/4 与用户确认 tuple 一致；workflow id `283278914` 于 07:27 UTC 禁用、API `disabled_manually`，无待/运行 job。`premerge`：安全卡先交付、CM-10/11 各自重基复核；本地/mock 负例证首写前 secret→独立 vars 比对、D1/R2 只读、trigger/schema/lease 预检、全库 SQL/Time Travel bookmark `age` 加密 runner 外 artifact 上传读回、global/逐例 manifest、失败非零/no-skip；只阻合入，不要求 release SHA 或不可读真实 secrets。`postrelease`：先将七项 Cloud repo secrets 迁受保护 environment、移除 repo 副本与 `base.yml` 默认注入，删除 schedule；独立 `cloud-live-recover.yml` 受保护恢复入口、custodian、dry-run，root 才能 enable/API 核 active。每卡自己的 release SHA 经受保护 `workflow_dispatch` nonce/run 授权，由 `genedna` 设置并回读精确 grant、无需独立 actor 审批；job 首步用仅 Variables-read token 最长 10 分钟实时 GET，严格绑定 run/attempt/ref/SHA/nonce 后才映射 Cloud 凭据并运行真实身份/备份/manifest、两个完整 target、写后善后与 artifact 后才可 D/complete。 | `vars-ready=passed; premerge=unknown; postrelease=unknown`。七项凭据迁移、protected environment、独立恢复与真实 release-SHA CI D 尚未执行；workflow 仍 `disabled_manually`，root 是恢复 owner。当前无真实 Cloud 写；不能以旧 `skip=true`、本地结果、旧 SHA 或被过滤目标替代。 |

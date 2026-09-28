@@ -6,7 +6,7 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。branch/tag update, multi-refspec, delete (`-d`/`--delete` 或 `:<ref>` refspec), `--tags`, and `--mirror` supported; `--force-with-lease[=<ref>[:<expect>]]`（发送前校验远端仍匹配 tracking-ref/expected OID，与 `--force` 互斥）和 `--porcelain`（机器可读的每 ref 行，与 `--json`/`--machine` 互斥）supported；`--atomic` supported（经 `resolve_atomic_capability` 在远端 discovery 通告 `atomic` 时附加该 capability，使远端要么全部更新要么全部不更新；远端未通告则提前以 `PushError::AtomicUnsupported` 拒绝）；`--push-option`/`-o <opt>` supported（经 `resolve_push_options_capability` 在远端通告 `push-options` 时附加 capability + 在命令 flush 后经 `encode_push_options` 追加 push-options 段；未通告则 `PushError::PushOptionsUnsupported`）；`--follow-tags` supported（经 `collect_follow_tag_refs`：列出 annotated tag，其 target 经 `is_ancestor` 可达任一被推送 ref 的 tip 且远端缺失时，由 `follow_tag_should_push` 选中并加入推送计划）；`--signed` supported（经 `resolve_push_cert_nonce` 在远端通告 `push-cert[=<nonce>]` 时取 nonce，`build_push_certificate` 构造 `certificate version 0.1` 文本，复用 vault `pgp_sign`/`signature_to_armored` 签名，`encode_push_cert_section` 以 `push-cert\0<caps>` … `push-cert-end` 帧封装；未通告则 `PushError::PushSignUnsupported`，无签名密钥则 `PushSignNoKey`）；`--no-progress` supported（经 `progress_output_config(output, args.no_progress)` 在 `--no-progress` 时把传给 “Compressing objects”/“Writing objects” `ProgressReporter` 的 output 的 `progress` 强制为 `ProgressMode::None`，抑制进度条，对齐 `git push --no-progress`）；`--force-if-includes`、`--thin`/`--no-thin` 与 `--no-verify`（Git 兼容接受入口；Libra 的 push 不运行客户端 `pre-push` hook，且 Git hooks bridge 按 D3 拒绝，故无可绕过）作为 **no-op** 接受。local file remote rejected — intentional (see [docs/development/commands/_compatibility.md#d2-本地-file-remote-的-push](docs/development/commands/_compatibility.md#d2-本地-file-remote-的-push))
+- 兼容级别：`partial`。branch/tag update, multi-refspec, delete (`-d`/`--delete` 或 `:<ref>` refspec), `--tags`, and `--mirror` supported; `--force-with-lease[=<ref>[:<expect>]]`（发送前校验远端仍匹配 tracking-ref/expected OID，与 `--force` 互斥）和 `--porcelain`（机器可读的每 ref 行，与 `--json`/`--machine` 互斥）supported；`--atomic` supported（经 `resolve_atomic_capability` 在远端 discovery 通告 `atomic` 时附加该 capability，使远端要么全部更新要么全部不更新；远端未通告则提前以 `PushError::AtomicUnsupported` 拒绝）；`--push-option`/`-o <opt>` supported（经 `resolve_push_options_capability` 在远端通告 `push-options` 时附加 capability + 在命令 flush 后经 `encode_push_options` 追加 push-options 段；未通告则 `PushError::PushOptionsUnsupported`）；`--follow-tags` supported（经 `collect_follow_tag_refs`：列出 annotated tag，其 target 经 `is_ancestor` 可达任一被推送 ref 的 tip 且远端缺失时，由 `follow_tag_should_push` 选中并加入推送计划）；`--signed` supported（经 `resolve_push_cert_nonce` 在远端通告 `push-cert[=<nonce>]` 时取 nonce，`build_push_certificate` 构造 `certificate version 0.1` 文本，复用 vault `pgp_sign`/`signature_to_armored` 签名，`encode_push_cert_section` 以 `push-cert\0<caps>` … `push-cert-end` 帧封装；未通告则 `PushError::PushSignUnsupported`，无签名密钥则 `PushSignNoKey`）；`--no-progress` supported（经 `progress_output_config(output, args.no_progress)` 在 `--no-progress` 时把传给 “Compressing objects”/“Writing objects” `ProgressReporter` 的 output 的 `progress` 强制为 `ProgressMode::None`，抑制进度条，对齐 `git push --no-progress`）；`--force-if-includes`、`--thin`/`--no-thin` 与 `--no-verify`（Git 兼容接受入口；Libra 的 push 不运行客户端 `pre-push` hook，且 Git hooks bridge 按 D3 拒绝，故无可绕过）作为 **no-op** 接受。本地 Libra 与本地 Git file remote push 均已支持（issues/480 HP-07/HP-08：按路径打开目标、对象先写（Git 目标打包 + idx + `<ref>.lock` 原子更新）、ref 单事务 CAS（Libra 目标）、非裸检出分支保护与非快进拒绝；Git 目标 `git fsck --full` 证据）；
 
 - 当前矩阵明确仍是部分兼容；未覆盖的 Git surface 必须显式列在“还未实现的功能”。
 
@@ -121,19 +121,20 @@ SSH advertisement lengths `0001` through `0003`, incomplete headers (including
 zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
 reason and marker are retained without captured SSH stdout/stderr.
 
-An incomplete required header has one host-trust exception: local SSH exit status
-255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
-returns fixed host-verification guidance and `LBR-NET-001`. This classification
-does not verify the remote fingerprint. Other missing advertisements, including
-authentication failures, still use `LBR-NET-002`; an available non-zero local exit
-status adds `SSH exited with status N` and fixed connectivity, trusted-host,
-ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+An incomplete required discovery header has two prioritized exceptions. A recognized host-key
+diagnostic with local SSH exit status 255 returns fixed verification guidance and
+`LBR-NET-001`; this does not verify the remote fingerprint. A complete
+`Permission denied (<method-list>)` diagnostic containing the exact `publickey`
+method, direct exit status 255 and no stdout bytes returns the fixed public-key
+message with `LBR-AUTH-002`. Because stderr can be forged, this code does not prove
+why access was denied. All other missing advertisements remain `LBR-NET-002`, and
+original SSH diagnostic text is hidden.
 
 After an incomplete required header, Libra allows up to 100 milliseconds to
 observe the SSH exit status, then requests termination if needed. Other read
 errors request termination immediately. The status window, direct-child reap and
-output collection share a two-second cleanup deadline. Protocol and typed
-host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+output collection share a two-second cleanup deadline. Protocol, typed host-trust,
+and public-key authentication errors take precedence over secondary cleanup warnings. Ordinary IO
 and timeout errors keep their transport classification and may include a fixed
 local cleanup warning. Termination can change the observed exit status. This
 does not promise cleanup of arbitrary descendant processes.
@@ -340,3 +341,18 @@ framing of the advertisement buffer before calling the shared parser.
 ## Issue #477 notes
 
 本地 upstream（remote=.）fail-closed
+
+## Issue #577 SSH 公钥拒绝诊断
+
+Push discovery 接收共享 SSH 客户端的带类型公钥拒绝，并使用专用 push error
+variant 映射为 `LBR-AUTH-002`（exit 128），不复用缺失凭据的 `LBR-AUTH-001`。
+分类要求首标头零字节 EOF、直接退出码255、无 stdout 与精确 `publickey` 方法；
+host-key 优先，send-pack 第二进程和坏帧保留原语义。输出只含固定消息与指向 SSH
+设置指南的固定 hint；可伪造 stderr 不用于断言拒绝访问的具体原因。
+迁移窗口从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚）；窗口内
+自动化应同时接受该失败的 `LBR-AUTH-002` 与旧 `LBR-NET-002`。
+
+
+## B3-07 capability-first wire kind
+
+See the user-facing command page for capability-first discovery, `object-format=blake3` negotiation, and mismatch stable codes. Named tests: `parse_discovery_does_not_infer_sha256_from_64_hex`, `blake3_*_round_trip`, `protocol_object_format_mismatch_error_contract`.

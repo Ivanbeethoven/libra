@@ -1067,6 +1067,24 @@ async fn apply_migration_compatibility<C: ConnectionTrait>(
     version: i64,
     name: &str,
 ) -> Result<(), DbErr> {
+    if version == 2026092701 && name == "ai_task_run_base_commit_ref" {
+        // B3-16: additive nullable tagged-ref column. SQLite has no
+        // `ADD COLUMN IF NOT EXISTS`, so install through the probe helper.
+        // Unit fixtures that call `run_builtin_migrations` on an empty
+        // in-memory DB never bootstrap the AI projection tables — skip the
+        // ALTER when the table is absent so those fixtures keep working.
+        if sqlite_table_exists(conn, "ai_index_task_run").await? {
+            add_column_if_missing(
+                conn,
+                "ai_index_task_run",
+                "base_commit_ref",
+                "ALTER TABLE `ai_index_task_run` ADD COLUMN `base_commit_ref` TEXT",
+                None,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
     if version != 2026071407 || name != "agent_subagent_replication" {
         return Ok(());
     }
@@ -1866,6 +1884,17 @@ pub(crate) fn repository_migrations() -> Vec<Migration> {
             ),
             down: None,
         },
+        // B3-16: additive nullable `base_commit_ref` on `ai_index_task_run`.
+        // Plan writeset keeps the 2026090701_* SQL filenames; the registered
+        // version must sit AFTER the current tip (2026091901) because
+        // `run_pending` treats a missing lower receipt under a higher tip as
+        // historical divergence and will not replay it.
+        sql_migration(
+            2026092701,
+            "ai_task_run_base_commit_ref",
+            include_str!("../../../sql/migrations/2026090701_ai_task_run_base_commit_ref.sql"),
+            include_str!("../../../sql/migrations/2026090701_ai_task_run_base_commit_ref_down.sql"),
+        ),
     ]
 }
 
@@ -2326,9 +2355,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 65);
+        assert_eq!(runner.len(), 66);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026091901));
+        assert_eq!(runner.max_registered_version(), Some(2026092701));
     }
 
     #[test]

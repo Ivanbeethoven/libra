@@ -8,7 +8,7 @@
 libra remote <subcommand> [OPTIONS] [ARGS]
 libra remote show
 libra remote -v
-libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror] <name> <url>
+libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror[=fetch|push]] <name> <url>
 libra remote remove <name>
 libra remote rename <old> <new>
 libra remote get-url [--push] [--all] <name>
@@ -51,9 +51,11 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 | `<url>` | 远程的 fetch URL | `https://example.com/repo.git` |
 | `-f`, `--fetch` | 添加后立即从新远程 fetch | |
 | `-t`, `--track <branch>` | 只跟踪指定分支——写入特定的 `remote.<name>.fetch` refspec 取代默认通配。可重复。 | `-t main -t dev` |
-| `-m`, `--master <branch>` | 将远程 HEAD（`refs/remotes/<name>/HEAD`）指向 `<branch>`（即使跟踪 ref 尚不存在也会写入，与 Git 一致） | `-m main` |
+| `-m`, `--master <branch>` | 将远程 HEAD（`refs/remotes/<name>/HEAD`）指向 `<branch>`（即使跟踪 ref 尚不存在也会写入，与 Git 一致）；与任何 `--mirror` 形式互斥（exit 128） | `-m main` |
 | `--tags` / `--no-tags` | 设置 `remote.<name>.tagOpt` 为 fetch 全部/不 fetch 标签（互斥） | |
-| `--mirror` | 将远程标记为镜像——写入 `remote.<name>.mirror=true` 标记（类似 Git `remote add --mirror=fetch`）。与 `-t`/`--track` 互斥。该标记仅为信息性：Libra 不写 `+refs/*:refs/*` refspec，因为 `libra fetch` 尚不感知镜像（与 `libra clone --mirror` 一致）。 | `--mirror` |
+| `--mirror[=fetch\|push]` | 注册镜像。裸 `--mirror` 写 `+refs/*:refs/*` 与 `remote.<name>.mirror=true` 并输出弃用警告；`--mirror=fetch` 只写 `+refs/*:refs/*`；`--mirror=push` 只写 `remote.<name>.mirror=true` 标记。fetch 镜像允许 `-t`，push 镜像拒绝 `-t`（exit 128）。 | `--mirror=push` |
+
+不带 `-t` 时，`remote add` 写入默认 fetch refspec `+refs/heads/*:refs/remotes/<name>/*`（与 Git 一致）。fetch 镜像改写为 `+refs/*:refs/*`；push 镜像不写 fetch refspec，只写 `mirror=true` 标记。裸形式会附带 Git 的弃用警告，与 Git 2.55 一致。
 
 ### 子命令：`remove`
 
@@ -65,7 +67,7 @@ libra remote update [-p | --prune] [<group> | <remote>...]
 
 ### 子命令：`rename`
 
-重命名已有远程。该操作在一个事务中迁移 `remote.<old>.*` 配置（包括 fetch refspec 的目标）、`branch.*.remote` 值、SSH 密钥命名空间、所有 `refs/remotes/<old>/*` tracking ref、remote HEAD 以及对应 reflog。目标命名空间冲突时失败且不留下部分迁移。remote 与 SSH subsection 按完整远程名精确匹配，因此重命名 `corp` 不会捕获独立的 `corp.prod` 远程。
+重命名已有远程。该操作在一个事务中迁移 `remote.<old>.*` 配置（包括 fetch refspec 的目标）、`branch.*.remote` 值、SSH 密钥命名空间、所有 `refs/remotes/<old>/*` tracking ref、remote HEAD 以及对应 reflog。它还会把指向旧远程名的仓库级 `remote.pushDefault` 与每个 `branch.<branch>.pushRemote` 改写为新远程名。全局/系统级 `remote.pushDefault` 指向旧名时保持不变并输出警告（与 Git 一致）。目标命名空间冲突时失败且不留下部分迁移。remote 与 SSH subsection 按完整远程名精确匹配，因此重命名 `corp` 不会捕获独立的 `corp.prod` 远程。
 
 | 参数 | 说明 | 示例 |
 |----------|-------------|---------|
@@ -259,7 +261,7 @@ Git 重载 `git remote`（无子命令）列出远程名称，`git remote -v` �
 | 列出 URL | `libra remote -v` | `git remote -v` | `jj git remote list`（始终 verbose） |
 | 添加远程 | `libra remote add <n> <u>` | `git remote add <n> <u>` | `jj git remote add <n> <u>` |
 | 添加远程并 fetch | `libra remote add -f <n> <u>` | `git remote add -f <n> <u>` | N/A |
-| 添加镜像远程 | `libra remote add --mirror <n> <u>`（仅标记） | `git remote add --mirror=fetch <n> <u>` | N/A |
+| 添加镜像远程 | `libra remote add --mirror <n> <u>`（写 `+refs/*:refs/*` 与标记，并告警） | `git remote add --mirror=fetch <n> <u>` | N/A |
 | 移除远程 | `libra remote remove <n>` | `git remote remove <n>` | `jj git remote remove <n>` |
 | 重命名远程 | `libra remote rename <o> <n>` | `git remote rename <o> <n>` | `jj git remote rename <o> <n>` |
 | 获取 URL | `libra remote get-url <n>` | `git remote get-url <n>` | N/A |
@@ -287,3 +289,17 @@ Git 重载 `git remote`（无子命令）列出远程名称，`git remote -v` �
 | 无法修剪远程跟踪分支 | `LBR-IO-002` | 128 | -- |
 | Prune 期间远程对象格式不匹配 | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | Prune 期间远程发现 / auth / 网络失败 | 与 fetch 对齐的网络/auth 代码 | 128 | 见 `libra fetch` 错误表 |
+| 在线 `show`、`update`、`prune`、`set-head --auto` 或 `add -f` discovery 遭 SSH 公钥拒绝 | `LBR-AUTH-002` | 128 | 检查 `libra config list --ssh-keys`、SSH agent 与仓库权限；参阅 [SSH 设置指南](https://libra.tools/en/docs/getting-started/ssh) |
+
+prune 会联系远端，对象格式不匹配时 fail-closed，返回 `LBR-REPO-003` / 退出码 128。线格式来自 `object-format` capability（不用 OID 长度推断）。覆盖测试：`protocol_object_format_mismatch_error_contract`。
+
+该 SSH 分类只在首个标头零字节 EOF、直接退出码255、无 stdout，以及完整
+`Permission denied (<method-list>)` 含精确 `publickey` 方法时触发；host-key
+失败仍有更高优先级。固定消息和 hint 不显示原始 stderr。stderr 可被伪造，
+因此错误码不证明拒绝访问的具体原因。其它畸形或缺失广告保留原网络/协议错误码。
+`remote add -f` 的 fetch 失败时，仍保留 fetch 开始前已经添加的远程配置。
+固定 hint 中的 config 命令必须在已有 Libra 仓库内运行。
+
+从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚），自动化应接受
+`LBR-AUTH-002`，并兼容各入口的旧代码：在线 `show` 与 `set-head --auto` 为
+`LBR-NET-001`，`update`、`prune` 与 `add -f` 为 `LBR-NET-002`。

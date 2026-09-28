@@ -741,6 +741,7 @@ impl D1Client {
                 repo_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 is_synced INTEGER DEFAULT 0,
+                object_format TEXT,
                 UNIQUE(repo_id, o_id)
             )
         "#;
@@ -782,6 +783,7 @@ impl D1Client {
                             repo_id TEXT NOT NULL,
                             created_at INTEGER NOT NULL,
                             is_synced INTEGER DEFAULT 0,
+                            object_format TEXT,
                             UNIQUE(repo_id, o_id)
                         )
                     "#,
@@ -789,14 +791,20 @@ impl D1Client {
                 )
                 .await?;
 
-                self.execute(
+                // Prefer copying an existing object_format when the source
+                // already carries it; older tables yield NULL via the probe.
+                let copy_sql = if table_sql.contains("object_format") {
                     r#"
-                        INSERT INTO object_index_v2 (o_id, o_type, o_size, repo_id, created_at, is_synced)
-                        SELECT o_id, o_type, o_size, repo_id, created_at, is_synced FROM object_index
-                    "#,
-                    None,
-                )
-                .await?;
+                        INSERT INTO object_index_v2 (o_id, o_type, o_size, repo_id, created_at, is_synced, object_format)
+                        SELECT o_id, o_type, o_size, repo_id, created_at, is_synced, object_format FROM object_index
+                    "#
+                } else {
+                    r#"
+                        INSERT INTO object_index_v2 (o_id, o_type, o_size, repo_id, created_at, is_synced, object_format)
+                        SELECT o_id, o_type, o_size, repo_id, created_at, is_synced, NULL FROM object_index
+                    "#
+                };
+                self.execute(copy_sql, None).await?;
 
                 self.execute("DROP TABLE object_index", None).await?;
                 self.execute("ALTER TABLE object_index_v2 RENAME TO object_index", None)
@@ -805,6 +813,16 @@ impl D1Client {
 
             self.execute(create_v2_sql, None).await?;
         }
+
+        // B3-09: additive nullable repository object-format column. Greenfield
+        // CREATE above already includes it; ensure-column converges older D1
+        // tables that were created without the column.
+        self.ensure_remote_column(
+            "object_index",
+            "object_format",
+            "ALTER TABLE object_index ADD COLUMN object_format TEXT",
+        )
+        .await?;
 
         self.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_d1_object_repo_oid ON object_index (repo_id, o_id)",
@@ -909,14 +927,29 @@ impl D1Client {
         repo_id: &str,
         created_at: i64,
     ) -> Result<(), D1Error> {
+        self.upsert_object_index_with_format(o_id, o_type, o_size, repo_id, created_at, None)
+            .await
+    }
+
+    /// Upsert an `object_index` row with an optional tagged repository format.
+    pub async fn upsert_object_index_with_format(
+        &self,
+        o_id: &str,
+        o_type: &str,
+        o_size: i64,
+        repo_id: &str,
+        created_at: i64,
+        object_format: Option<&str>,
+    ) -> Result<(), D1Error> {
         let sql = r#"
-            INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced)
-            VALUES (?1, ?2, ?3, ?4, ?5, 1)
+            INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced, object_format)
+            VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)
             ON CONFLICT(repo_id, o_id) DO UPDATE SET
                 o_type = excluded.o_type,
                 o_size = excluded.o_size,
                 created_at = excluded.created_at,
-                is_synced = 1
+                is_synced = 1,
+                object_format = COALESCE(excluded.object_format, object_index.object_format)
         "#;
         let params = vec![
             serde_json::json!(o_id),
@@ -924,6 +957,7 @@ impl D1Client {
             serde_json::json!(o_size),
             serde_json::json!(repo_id),
             serde_json::json!(created_at),
+            serde_json::json!(object_format),
         ];
         self.execute(sql, Some(params)).await?;
         Ok(())
@@ -987,7 +1021,7 @@ impl D1Client {
             return Ok((Vec::new(), 0));
         }
         let generation_fenced = self.object_index_catalog_generation_is_ready().await?;
-        let sql = "SELECT o_id, o_type, o_size, repo_id, created_at, is_synced
+        let sql = "SELECT o_id, o_type, o_size, repo_id, created_at, is_synced, object_format
                    FROM object_index
                    WHERE repo_id = ?1 AND o_id > ?3
                    ORDER BY o_id LIMIT ?2";
@@ -1169,10 +1203,18 @@ impl D1Client {
                 repo_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                object_format TEXT
             )
         "#;
         self.execute(sql, None).await?;
+        // B3-09: converge older D1 repositories tables that predate the column.
+        self.ensure_remote_column(
+            "repositories",
+            "object_format",
+            "ALTER TABLE repositories ADD COLUMN object_format TEXT",
+        )
+        .await?;
         Ok(())
     }
 
@@ -1199,21 +1241,34 @@ impl D1Client {
         repo_id: &str,
         name: &str,
     ) -> Result<RepositoryRow, D1Error> {
+        self.upsert_repository_with_format(repo_id, name, None)
+            .await
+    }
+
+    /// Upsert a repository row, optionally recording `object_format`.
+    pub async fn upsert_repository_with_format(
+        &self,
+        repo_id: &str,
+        name: &str,
+        object_format: Option<&str>,
+    ) -> Result<RepositoryRow, D1Error> {
         let now = chrono::Utc::now().timestamp();
         // Try to insert or update existing repo_id (renaming project)
         let sql = r#"
-            INSERT INTO repositories (repo_id, name, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4)
+            INSERT INTO repositories (repo_id, name, created_at, updated_at, object_format)
+            VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(repo_id) DO UPDATE SET
                 name = excluded.name,
-                updated_at = excluded.updated_at
-            RETURNING repo_id, name, created_at, updated_at
+                updated_at = excluded.updated_at,
+                object_format = COALESCE(excluded.object_format, repositories.object_format)
+            RETURNING repo_id, name, created_at, updated_at, object_format
         "#;
         let params = vec![
             serde_json::json!(repo_id),
             serde_json::json!(name),
             serde_json::json!(now),
             serde_json::json!(now),
+            serde_json::json!(object_format),
         ];
 
         match self.query(sql, Some(params)).await {
@@ -1228,7 +1283,7 @@ impl D1Client {
                     || e.message.contains("SQLITE_CONSTRAINT")
                 {
                     // Fetch the existing repository that owns this name
-                    let existing_sql = "SELECT repo_id, name, created_at, updated_at FROM repositories WHERE name = ?1";
+                    let existing_sql = "SELECT repo_id, name, created_at, updated_at, object_format FROM repositories WHERE name = ?1";
                     let existing_rows: Vec<RepositoryRow> = self
                         .query(existing_sql, Some(vec![serde_json::json!(name)]))
                         .await?;
@@ -1261,8 +1316,7 @@ impl D1Client {
     /// binding to verify that the backing backup metadata exists
     /// before it starts creating a local repository.
     pub async fn find_repository(&self, repo_id: &str) -> Result<Option<RepositoryRow>, D1Error> {
-        let sql =
-            "SELECT repo_id, name, created_at, updated_at FROM repositories WHERE repo_id = ?1";
+        let sql = "SELECT repo_id, name, created_at, updated_at, object_format FROM repositories WHERE repo_id = ?1";
         let rows: Vec<RepositoryRow> = self
             .query(sql, Some(vec![serde_json::json!(repo_id)]))
             .await?;
@@ -3451,8 +3505,9 @@ pub struct AgentCaptureGenerationManifest<'a> {
 
 /// One row of the `object_index` table.
 ///
-/// Mirrors the on-disk SQLite columns one-to-one so that local and remote rows can
-/// be diffed without translation.
+/// Mirrors the on-disk D1 columns. Local SQLite `object_index` remains
+/// algorithm-agnostic and does not carry `object_format` (B3-09 stores format
+/// only on the D1 side).
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ObjectIndexRow {
     pub o_id: String,
@@ -3462,6 +3517,10 @@ pub struct ObjectIndexRow {
     pub created_at: i64,
     /// `0` when only stored locally; `1` once synced to D1.
     pub is_synced: i32,
+    /// Repository object-format (`sha1` / `sha256` / `blake3`) when known.
+    /// `None` preserves the pre-B3-09 NULL read path for B3-14 consumers.
+    #[serde(default)]
+    pub object_format: Option<String>,
 }
 
 /// One row of the `repositories` table.
@@ -3471,6 +3530,9 @@ pub struct RepositoryRow {
     pub name: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Repository object-format (`sha1` / `sha256` / `blake3`) when known.
+    #[serde(default)]
+    pub object_format: Option<String>,
 }
 
 #[cfg(test)]
@@ -4524,5 +4586,429 @@ mod tests {
             "unexpected error: {}",
             err.message
         );
+    }
+
+    /// Deterministic Cloudflare D1 `/query` mock backed by an in-memory SQLite
+    /// database. Used by B3-09 migration tests so ensure-column paths never
+    /// touch live Cloudflare credentials.
+    struct MockD1 {
+        base_url: String,
+        fail_alter_object_format_once: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockD1 {
+        async fn spawn() -> Self {
+            use std::sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            };
+
+            use axum::{Json, Router, routing::post};
+            use sea_orm::{ConnectionTrait, Database, Statement};
+            use tokio::sync::Mutex;
+
+            // One connection owns the in-memory DB for the lifetime of the mock.
+            let db = Database::connect("sqlite::memory:")
+                .await
+                .expect("open mock D1 sqlite");
+            db.execute_raw(Statement::from_string(
+                db.get_database_backend(),
+                "SELECT 1".to_string(),
+            ))
+            .await
+            .expect("ping mock D1 sqlite");
+            let db = Arc::new(Mutex::new(db));
+            let fail_alter_object_format_once = Arc::new(AtomicBool::new(false));
+            let fail_flag = fail_alter_object_format_once.clone();
+            let db_for_handler = db.clone();
+
+            let app = Router::new().route(
+                "/client/v4/accounts/{account}/d1/database/{database}/query",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let db = db_for_handler.clone();
+                    let fail_flag = fail_flag.clone();
+                    async move {
+                        let sql = body
+                            .get("sql")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let params = body
+                            .get("params")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        if sql.contains("ADD COLUMN object_format")
+                            && fail_flag.swap(false, Ordering::SeqCst)
+                        {
+                            return Json(serde_json::json!({
+                                "success": false,
+                                "errors": [{
+                                    "code": 7500,
+                                    "message": "injected ALTER failure for object_format"
+                                }],
+                                "messages": [],
+                                "result": null
+                            }));
+                        }
+
+                        let rendered = substitute_d1_params(&sql, &params);
+                        let conn = db.lock().await;
+                        match run_mock_d1_sql(&conn, &rendered).await {
+                            Ok((rows, changes)) => Json(serde_json::json!({
+                                "success": true,
+                                "errors": [],
+                                "messages": [],
+                                "result": [{
+                                    "results": rows,
+                                    "success": true,
+                                    "meta": {
+                                        "changes": changes,
+                                        "duration": 0.0,
+                                        "last_row_id": 0,
+                                        "rows_read": rows.len() as i64,
+                                        "rows_written": changes
+                                    }
+                                }]
+                            })),
+                            Err(message) => Json(serde_json::json!({
+                                "success": false,
+                                "errors": [{ "code": 7501, "message": message }],
+                                "messages": [],
+                                "result": null
+                            })),
+                        }
+                    }
+                }),
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock D1");
+            let addr = listener.local_addr().expect("mock D1 addr");
+            let task = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve mock D1");
+            });
+
+            Self {
+                base_url: format!("http://{addr}/client/v4"),
+                fail_alter_object_format_once,
+                _task: task,
+            }
+        }
+
+        fn client(&self) -> D1Client {
+            D1Client::new_with_api_base_url(
+                "account".into(),
+                "token".into(),
+                "database".into(),
+                &self.base_url,
+            )
+            .expect("mock D1 client")
+        }
+
+        fn fail_next_object_format_alter(&self) {
+            self.fail_alter_object_format_once
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn substitute_d1_params(sql: &str, params: &[serde_json::Value]) -> String {
+        let mut out = sql.to_string();
+        for (index, value) in params.iter().enumerate().rev() {
+            let placeholder = format!("?{}", index + 1);
+            let literal = match value {
+                serde_json::Value::Null => "NULL".to_string(),
+                serde_json::Value::Bool(flag) => {
+                    if *flag {
+                        "1".to_string()
+                    } else {
+                        "0".to_string()
+                    }
+                }
+                serde_json::Value::Number(number) => number.to_string(),
+                serde_json::Value::String(text) => {
+                    format!("'{}'", text.replace('\'', "''"))
+                }
+                other => format!("'{}'", other.to_string().replace('\'', "''")),
+            };
+            out = out.replace(&placeholder, &literal);
+        }
+        out
+    }
+
+    async fn run_mock_d1_sql(
+        conn: &sea_orm::DatabaseConnection,
+        sql: &str,
+    ) -> Result<(Vec<serde_json::Value>, i64), String> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let trimmed = sql.trim_start();
+        let upper = trimmed.to_ascii_uppercase();
+        let returns_rows = upper.starts_with("SELECT")
+            || upper.starts_with("PRAGMA")
+            || upper.contains(" RETURNING ");
+
+        if returns_rows {
+            let rows = conn
+                .query_all_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    sql.to_string(),
+                ))
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                out.push(mock_d1_row_to_json(&row)?);
+            }
+            Ok((out, 0))
+        } else {
+            let result = conn
+                .execute_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    sql.to_string(),
+                ))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok((Vec::new(), result.rows_affected() as i64))
+        }
+    }
+
+    fn mock_d1_row_to_json(row: &sea_orm::QueryResult) -> Result<serde_json::Value, String> {
+        use sea_orm::sqlx::{Column, Row, TypeInfo, ValueRef};
+
+        let sqlx_row = row
+            .try_as_sqlite_row()
+            .ok_or_else(|| "mock D1 row is not a SqliteRow".to_string())?;
+        let mut map = serde_json::Map::new();
+        for column in sqlx_row.columns() {
+            let name = column.name();
+            let raw = sqlx_row
+                .try_get_raw(name)
+                .map_err(|error| error.to_string())?;
+            let value = if raw.is_null() {
+                serde_json::Value::Null
+            } else {
+                match column.type_info().name() {
+                    "TEXT" | "DATETIME" | "VARCHAR" => {
+                        let text: String =
+                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
+                        serde_json::Value::String(text)
+                    }
+                    "INTEGER" | "BIGINT" | "INT" => {
+                        let number: i64 =
+                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
+                        serde_json::json!(number)
+                    }
+                    "REAL" | "FLOAT" | "DOUBLE" => {
+                        let number: f64 =
+                            sqlx_row.try_get(name).map_err(|error| error.to_string())?;
+                        serde_json::json!(number)
+                    }
+                    _ => {
+                        if let Ok(text) = sqlx_row.try_get::<String, _>(name) {
+                            serde_json::Value::String(text)
+                        } else if let Ok(number) = sqlx_row.try_get::<i64, _>(name) {
+                            serde_json::json!(number)
+                        } else if let Ok(number) = sqlx_row.try_get::<f64, _>(name) {
+                            serde_json::json!(number)
+                        } else {
+                            serde_json::Value::Null
+                        }
+                    }
+                }
+            };
+            map.insert(name.to_string(), value);
+        }
+        Ok(serde_json::Value::Object(map))
+    }
+
+    async fn assert_remote_column(client: &D1Client, table: &str, column: &str) {
+        #[derive(Deserialize)]
+        struct Col {
+            name: String,
+        }
+        let rows: Vec<Col> = client
+            .query(&format!("PRAGMA table_info({table})"), None)
+            .await
+            .expect("pragma table_info");
+        assert!(
+            rows.iter().any(|row| row.name == column),
+            "{table}.{column} missing after ensure"
+        );
+    }
+
+    /// B3-09: D1 ensure-column for `object_format` is idempotent across
+    /// missing-column ALTER, retry-after-ALTER-failure, and the legacy
+    /// `object_index_v2` rebuild path — without destroying existing rows.
+    #[tokio::test]
+    async fn d1_object_format_migration_idempotent() {
+        let mock = MockD1::spawn().await;
+        let client = mock.client();
+
+        // --- Path A: composite-unique table missing the column (ALTER) ---
+        client
+            .execute(
+                r#"
+                CREATE TABLE object_index (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    o_id TEXT NOT NULL,
+                    o_type TEXT NOT NULL,
+                    o_size INTEGER NOT NULL,
+                    repo_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    is_synced INTEGER DEFAULT 0,
+                    UNIQUE(repo_id, o_id)
+                )
+                "#,
+                None,
+            )
+            .await
+            .expect("create legacy object_index");
+        client
+            .execute(
+                r#"
+                INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced)
+                VALUES ('deadbeef', 'blob', 42, 'repo-a', 100, 1)
+                "#,
+                None,
+            )
+            .await
+            .expect("seed object_index row");
+        client
+            .execute(
+                r#"
+                CREATE TABLE repositories (
+                    repo_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                "#,
+                None,
+            )
+            .await
+            .expect("create legacy repositories");
+        client
+            .execute(
+                r#"
+                INSERT INTO repositories (repo_id, name, created_at, updated_at)
+                VALUES ('repo-a', 'project-a', 1, 1)
+                "#,
+                None,
+            )
+            .await
+            .expect("seed repositories row");
+
+        // Inject a one-shot ALTER failure, then retry (predicate 3).
+        mock.fail_next_object_format_alter();
+        let first = client.ensure_object_index_table().await;
+        assert!(
+            first.is_err(),
+            "first ensure should surface the injected ALTER failure"
+        );
+        client
+            .ensure_object_index_table()
+            .await
+            .expect("retry ensure_object_index_table after ALTER failure");
+        client
+            .ensure_repositories_table()
+            .await
+            .expect("ensure_repositories_table");
+        client
+            .ensure_object_index_table()
+            .await
+            .expect("idempotent ensure_object_index_table");
+        client
+            .ensure_repositories_table()
+            .await
+            .expect("idempotent ensure_repositories_table");
+
+        assert_remote_column(&client, "object_index", "object_format").await;
+        assert_remote_column(&client, "repositories", "object_format").await;
+
+        let indexes = client
+            .get_object_indexes("repo-a")
+            .await
+            .expect("read object_index after ensure");
+        assert_eq!(indexes.len(), 1);
+        assert_eq!(indexes[0].o_id, "deadbeef");
+        assert_eq!(indexes[0].o_size, 42);
+        assert_eq!(indexes[0].object_format, None);
+
+        let repo = client
+            .find_repository("repo-a")
+            .await
+            .expect("read repositories")
+            .expect("repo-a present");
+        assert_eq!(repo.name, "project-a");
+        assert_eq!(repo.object_format, None);
+
+        // Persist a format through the new write API and confirm round-trip.
+        let upserted = client
+            .upsert_repository_with_format("repo-a", "project-a", Some("blake3"))
+            .await
+            .expect("upsert repository format");
+        assert_eq!(upserted.object_format.as_deref(), Some("blake3"));
+        client
+            .upsert_object_index_with_format("deadbeef", "blob", 42, "repo-a", 100, Some("blake3"))
+            .await
+            .expect("upsert object_index format");
+        let indexes = client
+            .get_object_indexes("repo-a")
+            .await
+            .expect("re-read object_index");
+        assert_eq!(indexes[0].object_format.as_deref(), Some("blake3"));
+
+        // --- Path B: legacy single-tenant UNIQUE rebuild carries the column ---
+        let mock_v2 = MockD1::spawn().await;
+        let client_v2 = mock_v2.client();
+        client_v2
+            .execute(
+                r#"
+                CREATE TABLE object_index (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    o_id TEXT NOT NULL UNIQUE,
+                    o_type TEXT NOT NULL,
+                    o_size INTEGER NOT NULL,
+                    repo_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    is_synced INTEGER DEFAULT 0
+                )
+                "#,
+                None,
+            )
+            .await
+            .expect("create legacy single-tenant object_index");
+        client_v2
+            .execute(
+                r#"
+                INSERT INTO object_index (o_id, o_type, o_size, repo_id, created_at, is_synced)
+                VALUES ('cafebabe', 'commit', 7, 'repo-b', 200, 0)
+                "#,
+                None,
+            )
+            .await
+            .expect("seed legacy v2 source row");
+        client_v2
+            .ensure_object_index_table()
+            .await
+            .expect("v2 rebuild ensure");
+        client_v2
+            .ensure_object_index_table()
+            .await
+            .expect("idempotent v2 rebuild ensure");
+        assert_remote_column(&client_v2, "object_index", "object_format").await;
+        let rebuilt = client_v2
+            .get_object_indexes("repo-b")
+            .await
+            .expect("read rebuilt object_index");
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].o_id, "cafebabe");
+        assert_eq!(rebuilt[0].o_type, "commit");
+        assert_eq!(rebuilt[0].o_size, 7);
+        assert_eq!(rebuilt[0].object_format, None);
     }
 }

@@ -11,7 +11,7 @@
 use std::io::{Read, Write};
 
 use clap::Parser;
-use git_internal::hash::{ObjectHash, get_hash_kind};
+use git_internal::hash::ObjectHash;
 
 use crate::{
     command::maintenance::parse_object_hash,
@@ -49,7 +49,7 @@ pub async fn execute_safe(args: PackObjectsArgs, output: &OutputConfig) -> CliRe
     // Confirm we are inside a repository before touching storage.
     util::try_get_storage_path(None).map_err(|_| CliError::repo_not_found())?;
     let storage = ClientStorage::init(path::objects());
-    let hash_kind = get_hash_kind();
+    let hash_kind = git_internal::hash::get_hash_kind();
 
     // Read object ids (one per line, whitespace-tolerant) from stdin.
     let mut input = String::new();

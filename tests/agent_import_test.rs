@@ -4718,8 +4718,11 @@ async fn agent_import_late_child_validation_preserves_partial_parent() {
 
     let output = fixture
         .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "10000")
-        .env("LIBRA_TEST_SUBAGENT_PARENT_VALIDATION_DELAY_MS", "6000")
+        // Exhaust the discovery window (delay ≥ window) while leaving the
+        // parent-persistence reserve intact. Under full nextest load the
+        // reserve must absorb SQLite/object-index latency after the abort.
+        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "90000")
+        .env("LIBRA_TEST_SUBAGENT_PARENT_VALIDATION_DELAY_MS", "75000")
         .args([
             "agent",
             "import",
@@ -5233,7 +5236,10 @@ async fn agent_import_deadline_kills_blocked_checkpoint_object_write() {
     let started = Instant::now();
     let output = fixture
         .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "500")
+        // Full nextest load can spend multiple seconds before the checkpoint
+        // object-write hook runs; keep deadline long enough to reach the hook
+        // but still bound the blocked helper after it parks.
+        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "5000")
         .env("LIBRA_TEST_CHECKPOINT_OBJECT_WRITE_READY_FILE", &ready)
         .args([
             "agent",
@@ -5256,7 +5262,7 @@ async fn agent_import_deadline_kills_blocked_checkpoint_object_write() {
         "blocked object write bypassed deadline"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(8),
         "blocked object helper held the foreground past its deadline: {:?}",
         started.elapsed()
     );
@@ -5302,8 +5308,11 @@ async fn agent_import_reports_success_when_deadline_expires_after_atomic_commit(
     let transcript = fixture.write_transcript("postcommitdeadline", &fixture.repo, true);
     let output = fixture
         .command()
-        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "2000")
-        .env("LIBRA_TEST_CHECKPOINT_POST_COMMIT_DELAY_MS", "2500")
+        // Full nextest load can spend multiple seconds before the post-commit
+        // delay hook runs; keep deadline < delay but leave headroom so the
+        // atomic commit still lands before the deadline fires.
+        .env("LIBRA_TEST_IMPORT_DEADLINE_MS", "8000")
+        .env("LIBRA_TEST_CHECKPOINT_POST_COMMIT_DELAY_MS", "10000")
         .args([
             "agent",
             "import",

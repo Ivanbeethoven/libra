@@ -2406,8 +2406,7 @@ fn format_branch_columns(entries: &[String], width: usize) -> String {
 /// between the sha and the subject for branches with a configured upstream.
 async fn branch_verbose_suffix(branch_name: &str, commit_hash: &str, verbose: u8) -> String {
     let short = short_display_hash(commit_hash);
-    let subject = commit_hash
-        .parse::<ObjectHash>()
+    let subject = crate::internal::object_format::parse_repo_oid(commit_hash)
         .ok()
         .and_then(|hash| load_object::<Commit>(&hash).ok())
         .map(|commit| {
@@ -2462,7 +2461,7 @@ async fn branch_upstream_segment(branch_name: &str, branch_commit: &str) -> Opti
 
     let counts = match (
         get_target_commit(&remote_ref).await,
-        branch_commit.parse::<ObjectHash>(),
+        crate::internal::object_format::parse_repo_oid(branch_commit),
     ) {
         (Ok(upstream_commit), Ok(local)) => {
             match super::status::upstream_ahead_behind(&local, &upstream_commit) {
@@ -3014,8 +3013,6 @@ fn sort_branch_entries(
     key: &str,
     ignore_case: bool,
 ) -> Result<(), BranchError> {
-    use std::str::FromStr;
-
     let (base, reverse) = match key.strip_prefix('-') {
         Some(rest) => (rest, true),
         None => (key, false),
@@ -3035,7 +3032,7 @@ fn sort_branch_entries(
             if map.contains_key(&entry.commit) {
                 continue;
             }
-            let ts = ObjectHash::from_str(&entry.commit)
+            let ts = crate::internal::object_format::parse_repo_oid(&entry.commit)
                 .ok()
                 .and_then(|hash| load_object::<Commit>(&hash).ok())
                 .map(|commit| {
@@ -3062,7 +3059,7 @@ fn sort_branch_entries(
             if map.contains_key(&entry.commit) {
                 continue;
             }
-            let size = ObjectHash::from_str(&entry.commit)
+            let size = crate::internal::object_format::parse_repo_oid(&entry.commit)
                 .ok()
                 .and_then(|hash| crate::utils::util::objects_storage().get(&hash).ok())
                 .map(|data| data.len() as i64)
@@ -3231,10 +3228,10 @@ pub fn is_valid_git_branch_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, str::FromStr};
+    use std::collections::HashSet;
 
     use clap::Parser;
-    use git_internal::hash::{ObjectHash, get_hash_kind};
+    use git_internal::hash::ObjectHash;
     use sea_orm::Database;
     use serial_test::serial;
 
@@ -3430,7 +3427,10 @@ mod tests {
     }
 
     fn any_hash() -> ObjectHash {
-        ObjectHash::from_str(&ObjectHash::zero_str(get_hash_kind())).unwrap()
+        crate::internal::object_format::parse_repo_oid(&ObjectHash::zero_str(
+            git_internal::hash::get_hash_kind(),
+        ))
+        .unwrap()
     }
 
     /// Pin the `Display` format for the static-message and direct-message
@@ -3548,9 +3548,11 @@ mod tests {
             remote: None,
         };
         let mut targets = HashSet::new();
+        let repo_kind = git_internal::hash::get_hash_kind();
         targets.insert(
-            ObjectHash::from_str(
-                "1111111111111111111111111111111111111111111111111111111111111111",
+            crate::internal::object_format::parse_hex_for_kind(
+                repo_kind,
+                &"1".repeat(repo_kind.hex_len()),
             )
             .unwrap(),
         );

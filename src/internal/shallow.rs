@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use git_internal::hash::{HashKind, ObjectHash, get_hash_kind};
+use git_internal::hash::{HashKind, ObjectHash};
 use thiserror::Error;
 
 use crate::utils::util;
@@ -74,7 +74,7 @@ impl ShallowSet {
     /// Load an explicit shallow file. A missing file is an empty set.
     /// The entries use the current repository's object format.
     pub fn load_at(path: &Path) -> Result<Self, ShallowError> {
-        Self::load_at_for_kind(path, get_hash_kind())
+        Self::load_at_for_kind(path, git_internal::hash::get_hash_kind())
     }
 
     /// Load an explicit shallow file with a known object format. Use SHA-1

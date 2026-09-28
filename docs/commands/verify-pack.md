@@ -23,10 +23,13 @@ decodes the corresponding pack file, and verifies that both files agree on:
 By default the pack path is derived by replacing each index file extension with
 `.pack`. Use `--pack <PACK_FILE>` with a single `<IDX_FILE>` when the pack
 archive lives elsewhere.
-The command does not require a Libra repository. When run inside a repository,
-it uses that repository's object format. Outside a repository, version 2 index
-files infer SHA-1 vs SHA-256 from the index layout; version 1 indexes are SHA-1
-only.
+
+When run inside a repository, `verify-pack` uses that repository's
+`core.objectformat` (`sha1`, `sha256`, or `blake3`) and never guesses the hash
+kind from index layout (sha256 and blake3 share a 32-byte OID width). Outside a
+repository, `--hash-kind <sha1|sha256|blake3>` is required; omitting it fails
+with `LBR-CLI-002` and a hint to run inside a repository or pass the flag.
+Version 1 indexes remain SHA-1 only.
 
 Compatibility note: multiple `<IDX_FILE>` values are verified in order. `--pack`
 cannot be combined with multiple indexes because Git's pack/index naming model
@@ -38,6 +41,7 @@ does not provide an unambiguous explicit pack for each index.
 |------|-------|-------------|---------|
 | `<IDX_FILE>...` | | Pack index file(s) to verify | Required |
 | `--pack <PATH>` | | Pack archive to verify against one index | `<IDX_FILE>` with `.pack` extension |
+| `--hash-kind <KIND>` | | Object format used to parse the index (`sha1`, `sha256`, or `blake3`). Required outside a repository; inside a repository must match `core.objectformat` when set | Repository `core.objectformat` when inside a repo |
 | `--verbose` | `-v` | Print each indexed object using Git-compatible verbose fields | Off |
 | `--stat-only` | `-s` | Print only Git-style non-delta and delta-chain statistics | Off |
 | `--json` | | Emit a structured JSON envelope | Off |
@@ -49,6 +53,7 @@ does not provide an unambiguous explicit pack for each index.
 libra verify-pack objects/pack/pack-abc123.idx
 libra verify-pack pack-a.idx pack-b.idx
 libra verify-pack --pack /tmp/pack-abc123.pack /tmp/pack-abc123.idx
+libra verify-pack --hash-kind blake3 /tmp/pack-blake3.idx
 libra verify-pack -v pack-abc123.idx
 libra verify-pack -s pack-abc123.idx
 libra verify-pack pack-abc123.idx --json

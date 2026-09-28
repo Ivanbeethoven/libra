@@ -386,6 +386,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | 本地路径不存在 | `LBR-REPO-001` | 128 | "use a valid libra repository path or a reachable remote URL" |
 | URL 格式错误或 scheme 不支持 | `LBR-CLI-003` | 129 | "check the clone URL or scheme" |
 | 认证 / 权限拒绝 | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
+| discovery 期间 SSH 公钥拒绝 | `LBR-AUTH-002` | 128 | 检查实际选择的密钥、SSH agent 与仓库权限；参阅 [SSH 设置指南](https://libra.tools/en/docs/getting-started/ssh) |
 | 网络不可达 | `LBR-NET-001` | 128 | "check the remote host, DNS, VPN/proxy, and network connectivity" |
 | pkt-line discovery / 传输帧错误 | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
 | 其他 discovery 协议错误 | `LBR-NET-002` | 128 | "the remote did not complete discovery successfully; retry and inspect server/protocol settings" |
@@ -396,6 +397,12 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | 检出写入失败 | `LBR-IO-002` | 128 | "files could not be written" |
 | 检出 LFS 下载失败 | `LBR-NET-001` | 128 | "LFS content transfer failed" |
 | 内部不变量 | `LBR-INTERNAL-001` | 128 | Issues URL |
+
+线格式为 capability-first：discovery 先读 `object-format`（缺省 `sha1`）再校验 OID 宽度；无 capability 的 64-hex 广告 fail-closed，不再按长度推断 sha256。Libra↔Libra blake3 clone 协商 `object-format=blake3`，并以 discovery kind 初始化目标仓。格式不匹配映射 `LBR-REPO-003`（退出码 128），任一侧为 blake3 时附带扩展提示。覆盖测试：`blake3_clone_round_trip`、`clone_sha256_libra_local_remote_succeeds`、`protocol_object_format_mismatch_error_contract`。
+
+**本地 Git sha256 拒绝门（B3-12）：** 本地路径 Git 源若 `extensions.objectformat=sha256`，在任何目标写入前拒绝（`LBR-CLI-002`，退出码 129）；SHA-256/BLAKE3 Libra 仓请用 `libra init --object-format` 新建。未知/损坏 `objectformat` → `LBR-REPO-002`；不可读 config → `LBR-IO-001`。网络 Git sha256 暂缓（DEFER-B3-10）。覆盖：`clone_rejects_sha256_git_source`、`clone_rejects_unknown_git_source_format`。
+
+**云备份恢复 kind（B3-14）：** `libra cloud restore` 只使用 D1 `repositories.object_format` 元数据（绝不按 `o_id` 长度推断）。见 [`cloud.md`](cloud.md#对象格式b3-09--b3-14)。
 
 Init 错误会通过 `InitError -> CliError` 透明转发。
 
@@ -467,15 +474,16 @@ SSH advertisement 长度 `0001` 至 `0003`、不完整标头（包括零字节 E
 payload 返回 `LBR-NET-002`。固定协议原因与 marker 保留，不插入捕获的 SSH
 stdout/stderr。
 
-必需标头不完整时有一项主机信任例外：本地 SSH 退出码为255，且 stderr 前64 KiB
-包含受识别的 host-key 诊断时，返回固定主机核验指引与 `LBR-NET-001`。这项分类
-本身不验证远端指纹。其它缺失广告（含认证失败）仍用 `LBR-NET-002`；能够观察到
-非零本地退出状态时，追加 `SSH exited with status N` 与固定连接、可信主机、
-ssh-agent 及仓库访问指引，不显示原始 SSH 诊断。
+discovery 的必需标头不完整时有两项按优先级处理的例外。受识别的 host-key 诊断与本地 SSH
+退出码255会返回固定主机核验指引及 `LBR-NET-001`，但不会验证远端指纹。完整的
+`Permission denied (<method-list>)` 若含精确的 `publickey` 方法、直接退出码255且
+stdout 为零字节，则返回固定公钥认证消息及 `LBR-AUTH-002`。stderr 可被伪造，
+所以该错误码不证明拒绝访问的具体原因。其它缺失广告仍用 `LBR-NET-002`，且不
+显示原始 SSH 诊断。
 
 必需标头不完整时最多用100毫秒观察 SSH 退出状态，再按需请求终止；其它读取
 错误立即请求终止。状态观察、直接子程序回收及输出收集共用两秒清理截止时间。
-协议错误与带类型的主机信任错误优先于次要清理警告。普通 IO/超时保留传输错误
+协议错误、带类型的主机信任错误和公钥认证错误优先于次要清理警告。普通 IO/超时保留传输错误
 分类，可追加固定本地清理警告。终止程序可能改变观察到的退出状态；这不承诺
 回收任意后代程序。
 
@@ -494,6 +502,15 @@ Clone 将主机核验指引放在结构化 hints 中；其它命令边界在 mes
 更新 `~/.ssh/known_hosts`；也可以单独建立交互 SSH 连接，核对显示的指纹后才
 接受。`ssh -T git@github.com` 是 GitHub 示例，请使用实际仓库 SSH 用户、主机
 和端口，不要接受未经核验的指纹。
+
+上述严格的 discovery 公钥拒绝使用固定 hint：检查
+`libra config list --ssh-keys`、SSH agent 与仓库权限，并链接
+[SSH 设置指南](https://libra.tools/en/docs/getting-started/ssh)。
+该 config 命令要求当前目录已有 Libra 仓库；clone 创建仓库前请直接检查 SSH
+配置与 agent。
+
+从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚），自动化应同时
+接受该 SSH discovery 失败的 `LBR-AUTH-002` 与旧 `LBR-NET-002`。
 
 `ssh.strictHostKeyChecking` 保留既有 `ask`、`yes`、`accept-new`、`no` 设置。
 `ask` 不向 SSH 传递该选项，由用户 SSH 配置决定；`BatchMode=yes` 仍禁止

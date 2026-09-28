@@ -145,7 +145,7 @@ fn top_level_dir(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use git_internal::{
-        hash::{ObjectHash, get_hash_kind},
+        hash::ObjectHash,
         internal::index::{Index, IndexEntry},
     };
 
@@ -153,9 +153,10 @@ mod tests {
 
     fn index_with_paths(paths: &[&str]) -> Index {
         let mut index = Index::new();
-        let hash_bytes = vec![1; get_hash_kind().size()];
-        let object_hash = ObjectHash::from_bytes(&hash_bytes)
-            .expect("test hash length matches the active hash kind");
+        let hash_bytes = vec![1; git_internal::hash::get_hash_kind().size()];
+        let object_hash =
+            ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &hash_bytes)
+                .expect("test hash length matches the active hash kind");
         for path in paths {
             index.add(IndexEntry::new_from_blob(
                 (*path).to_string(),

@@ -163,13 +163,35 @@ fn verify_pack_accepts_absolute_index_path_outside_repository() {
     let idx_path = build_index(repo.path(), &pack_path, "1");
     let outside = tempfile::tempdir().expect("create non-repo cwd");
 
-    let output = run_libra_command(
+    let missing = run_libra_command(
         &["verify-pack", idx_path.to_str().expect("idx path UTF-8")],
+        outside.path(),
+    );
+    assert_ne!(
+        missing.status.code(),
+        Some(0),
+        "outside a repo, verify-pack without --hash-kind must refuse"
+    );
+    let (_, report) = parse_cli_error_stderr(&missing.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("--hash-kind"),
+        "refusal must mention --hash-kind: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+
+    let output = run_libra_command(
+        &[
+            "verify-pack",
+            "--hash-kind",
+            "sha1",
+            idx_path.to_str().expect("idx path UTF-8"),
+        ],
         outside.path(),
     );
     assert_cli_success(
         &output,
-        "verify-pack should accept absolute index paths outside a repo",
+        "verify-pack should accept absolute index paths outside a repo with --hash-kind",
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -187,7 +209,7 @@ fn verify_pack_accepts_sha256_index_path_outside_repository() {
     let idx_path = build_index(repo.path(), &pack_path, "2");
     let outside = tempfile::tempdir().expect("create non-repo cwd");
 
-    let output = run_libra_command(
+    let missing = run_libra_command(
         &[
             "verify-pack",
             idx_path.to_str().expect("idx path UTF-8"),
@@ -195,9 +217,25 @@ fn verify_pack_accepts_sha256_index_path_outside_repository() {
         ],
         outside.path(),
     );
+    assert_ne!(
+        missing.status.code(),
+        Some(0),
+        "outside a repo, sha256 indexes require --hash-kind (no layout guessing)"
+    );
+
+    let output = run_libra_command(
+        &[
+            "verify-pack",
+            "--hash-kind",
+            "sha256",
+            idx_path.to_str().expect("idx path UTF-8"),
+            "--json",
+        ],
+        outside.path(),
+    );
     assert_cli_success(
         &output,
-        "verify-pack should infer sha256 index format outside a repo",
+        "verify-pack should accept sha256 indexes outside a repo with --hash-kind",
     );
 
     let json = parse_json_stdout(&output);
@@ -369,5 +407,161 @@ fn verify_pack_reports_missing_pack_as_read_error() {
     assert!(
         human.contains("could not open pack file"),
         "error should identify missing pack: {human}"
+    );
+}
+
+fn init_blake3_repo_via_cli(repo: &Path) {
+    fs::create_dir_all(repo).expect("create repo dir");
+    let output = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "blake3"],
+        repo,
+    );
+    assert_cli_success(&output, "failed to initialize blake3 repository");
+}
+
+fn create_committed_blake3_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().expect("blake3 repo");
+    init_blake3_repo_via_cli(repo.path());
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "Test User"], repo.path()),
+        "user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "test@example.com"], repo.path()),
+        "user.email",
+    );
+    fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("write tracked");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit",
+    );
+    repo
+}
+
+#[test]
+fn verify_pack_blake3_idx() {
+    let repo = create_committed_blake3_repo();
+    let bundle = repo.path().join("out.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "HEAD"],
+            repo.path(),
+        ),
+        "bundle create blake3",
+    );
+    let dest = tempfile::tempdir().expect("blake3 dest");
+    init_blake3_repo_via_cli(dest.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "unbundle", bundle.to_str().unwrap()],
+            dest.path(),
+        ),
+        "unbundle blake3",
+    );
+    let pack_dir = dest.path().join(".libra/objects/pack");
+    let idx_path = fs::read_dir(&pack_dir)
+        .expect("pack dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "idx"))
+        .expect("unbundle must install an idx");
+
+    let output = run_libra_command(
+        &[
+            "verify-pack",
+            idx_path.to_str().expect("idx utf8"),
+            "--json",
+        ],
+        dest.path(),
+    );
+    assert_cli_success(&output, "verify-pack blake3 idx in blake3 repo");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["index_version"], 2);
+    assert_eq!(
+        json["data"]["pack_hash"].as_str().expect("pack_hash").len(),
+        64
+    );
+    assert_eq!(json["data"]["verified"], true);
+
+    // Cross-kind: sha256 repo must reject the blake3 idx.
+    let sha256 = tempfile::tempdir().expect("sha256 repo");
+    init_sha256_repo_via_cli(sha256.path());
+    let cross = run_libra_command(
+        &["verify-pack", idx_path.to_str().expect("idx utf8")],
+        sha256.path(),
+    );
+    assert_ne!(
+        cross.status.code(),
+        Some(0),
+        "blake3 idx must fail in a sha256 repository"
+    );
+}
+
+#[test]
+fn bundle_blake3_verify_pack_roundtrip() {
+    let repo = create_committed_blake3_repo();
+    let bundle = repo.path().join("roundtrip.bundle");
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "create", bundle.to_str().unwrap(), "HEAD"],
+            repo.path(),
+        ),
+        "bundle create",
+    );
+    assert_cli_success(
+        &run_libra_command(&["bundle", "verify", bundle.to_str().unwrap()], repo.path()),
+        "bundle verify",
+    );
+
+    let dest = tempfile::tempdir().expect("dest");
+    init_blake3_repo_via_cli(dest.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["bundle", "unbundle", bundle.to_str().unwrap()],
+            dest.path(),
+        ),
+        "unbundle",
+    );
+    let pack_dir = dest.path().join(".libra/objects/pack");
+    let idx_path = fs::read_dir(&pack_dir)
+        .expect("pack dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "idx"))
+        .expect("idx after unbundle");
+
+    let output = run_libra_command(
+        &[
+            "verify-pack",
+            "--hash-kind",
+            "blake3",
+            idx_path.to_str().expect("idx utf8"),
+        ],
+        dest.path(),
+    );
+    assert_cli_success(&output, "explicit --hash-kind blake3 verify-pack");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(": ok"),
+        "roundtrip verify-pack: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let outside = tempfile::tempdir().expect("outside");
+    let outside_ok = run_libra_command(
+        &[
+            "verify-pack",
+            "--hash-kind",
+            "blake3",
+            idx_path.to_str().expect("idx utf8"),
+        ],
+        outside.path(),
+    );
+    assert_cli_success(
+        &outside_ok,
+        "outside-repo verify-pack with --hash-kind blake3",
     );
 }

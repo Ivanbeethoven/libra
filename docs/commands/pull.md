@@ -10,7 +10,7 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 ## Description
 
-`libra pull` combines `fetch` and the same merge engine used by `libra merge`. It downloads new objects, updates remote-tracking refs, and then integrates the selected upstream into the current branch. A remote URL that points at a Git v2 bundle is re-read on every pull, so replacing the bundle file can fast-forward the current branch.
+`libra pull` combines `fetch` and the same merge engine used by `libra merge`. It downloads new objects, updates remote-tracking refs, and then integrates the selected upstream into the current branch. A remote URL that points at a Git v2 bundle is re-read on every pull, so replacing the bundle file can fast-forward the current branch. The `<repository>` may be an anonymous local-path / `file://` URL spec, which is resolved as an unnamed remote and merges the brought-down ref (issues/480 HP-06).
 
 With `--rebase` (`-r`), the integration step instead replays local-only commits on top of the fetched upstream tip. This is equivalent to `libra fetch` followed by `libra rebase <upstream>`.
 
@@ -108,6 +108,7 @@ these modes warn and are not authorization for remote synchronization.
 | `--depth <n>` | Limit the fetch phase to a shallow history of `n` commits per tip. Conflicts with `--rebase`. Local Libra upstreams fail closed with `LBR-REPO-002` because they cannot advertise shallow boundaries (accepted end state, decision D20). | `libra pull --depth 1` |
 | `-r`, `--rebase` | After fetching, rebase the current branch onto the upstream tip instead of merging. | `libra pull --rebase` |
 | `--no-rebase` | Merge instead of rebasing, countermanding an earlier `--rebase`/`-r` and overriding `pull.rebase` for this invocation. | `libra pull --no-rebase` |
+| `--allow-unrelated-histories` | Allow merging histories that have no common ancestor (Git parity), forwarded to the merge phase. Without it, pulling unrelated histories is refused with a hint pointing at this flag. | `libra pull --allow-unrelated-histories origin main` |
 | `--json` | Emit structured JSON envelope to stdout (global flag). | `libra pull --json` |
 | `--machine` | Compact single-line JSON; suppresses progress (global flag). | `libra pull --machine` |
 | `--quiet` | Suppress all progress and merge summary output. | `libra pull --quiet` |
@@ -305,6 +306,7 @@ Every `PullError` variant maps to an explicit `StableErrorCode`. Fetch, merge, a
 | Fetch: network unreachable / timeout | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch: packet-read connection reset / non-protocol IO failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | Fetch: authentication failed | `LBR-AUTH-001` | 128 | "check SSH key or HTTP credentials" |
+| Fetch: SSH public-key rejection during discovery | `LBR-AUTH-002` | 128 | Check the selected key, SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
 | Fetch: pkt-line discovery / transfer setup error | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
 | Fetch: pkt-line truncation / sideband / checksum / pack protocol error | `LBR-NET-002` | 128 | No additional hint, except for an incomplete pack: "the connection dropped mid-transfer — retry the pull" |
 | Merge: non-squash conflicts, dirty worktree, or untracked overwrite | `LBR-CONFLICT-002` | 128 | "resolve conflicts, then run 'libra merge --continue'" |
@@ -332,6 +334,8 @@ lengths below four, and truncated payloads. A valid `0000` flush remains distinc
 from an absent response; a valid empty-repository advertisement is supported.
 An unsupported object-format capability reports the fixed message
 `Unsupported object format capability` without echoing its remote value.
+
+**Local Git sha256 reject (B3-12):** a local-path Git upstream with `objectformat=sha256` is refused in the fetch phase (`LBR-CLI-002`, exit 129) before merge/rebase. Unknown/corrupt → `LBR-REPO-002`; unreadable → `LBR-IO-001`. Network Git sha256 deferred (DEFER-B3-10). Covered by `pull_rejects_sha256_git_source`.
 Check that the URL points to a Git smart HTTP service and that a proxy has not
 truncated or replaced the response; then retry.
 
@@ -383,19 +387,20 @@ SSH advertisement lengths `0001` through `0003`, incomplete headers (including
 zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
 reason and marker are retained without captured SSH stdout/stderr.
 
-An incomplete required header has one host-trust exception: local SSH exit status
-255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
-returns fixed host-verification guidance and `LBR-NET-001`. This classification
-does not verify the remote fingerprint. Other missing advertisements, including
-authentication failures, still use `LBR-NET-002`; an available non-zero local exit
-status adds `SSH exited with status N` and fixed connectivity, trusted-host,
-ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+An incomplete required discovery header has two prioritized exceptions. A recognized host-key
+diagnostic with local SSH exit status 255 returns fixed verification guidance and
+`LBR-NET-001`; this does not verify the remote fingerprint. A complete
+`Permission denied (<method-list>)` diagnostic containing the exact `publickey`
+method, direct exit status 255 and no stdout bytes returns the fixed public-key
+message with `LBR-AUTH-002`. Because stderr can be forged, this code does not prove
+why access was denied. All other missing advertisements remain `LBR-NET-002`, and
+original SSH diagnostic text is hidden.
 
 After an incomplete required header, Libra allows up to 100 milliseconds to
 observe the SSH exit status, then requests termination if needed. Other read
 errors request termination immediately. The status window, direct-child reap and
-output collection share a two-second cleanup deadline. Protocol and typed
-host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+output collection share a two-second cleanup deadline. Protocol, typed host-trust,
+and public-key authentication errors take precedence over secondary cleanup warnings. Ordinary IO
 and timeout errors keep their transport classification and may include a fixed
 local cleanup warning. Termination can change the observed exit status. This
 does not promise cleanup of arbitrary descendant processes.
@@ -420,6 +425,15 @@ provider console or another trusted channel before manually updating
 and compare the displayed fingerprint before accepting it. For example,
 `ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
 port. Do not accept a fingerprint that has not been verified.
+
+For the strict discovery-only public-key rejection above, the fixed hint asks you
+to check `libra config list --ssh-keys`, your SSH agent and repository access, and
+links the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh).
+The config command must be run inside an existing Libra repository.
+
+For at least 30 days after v0.24.1 is released and through at least the next
+patch release, whichever is later, automation should accept both `LBR-AUTH-002`
+and the legacy `LBR-NET-002` for this SSH discovery failure.
 
 `ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
 `no` values. `ask` leaves that SSH option to the user's SSH configuration;

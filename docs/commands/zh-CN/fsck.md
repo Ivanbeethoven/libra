@@ -265,3 +265,7 @@ Libra 支持 SHA1 和 SHA256 哈希算法，由仓库配置决定。
 ### Reflog 行为
 
 默认情况下，reflogs 中提到的对象被视为可达，不会被报告为 dangling。使用 `--no-reflogs` 可将 reflog 条目排除在可达性分析之外。
+
+## Blake3 仓库
+
+当 `core.objectformat` 为 `blake3` 时，`fsck` 使用 BLAKE3 校验 loose 对象与 pack trailer。

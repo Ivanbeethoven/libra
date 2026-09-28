@@ -44,6 +44,22 @@ The command supports two invocation styles:
 
 When reading a value with `get`, Libra cascades through scopes in precedence order: local, then global, then system. The first match wins; an unreadable system database is skipped.
 
+### `core.objectformat` is fixed at init
+
+Local-scope writes cannot change `core.objectformat` after the repository is
+created (ADR-B3-01). Every mutating spelling refuses with `LBR-CLI-002`
+(exit 129): `set`, bare positional assignment, `--add`, `--unset`,
+`--unset-all`, `--remove-section core`, `--rename-section` involving `core`,
+and `import` when the imported Git config contains the key (case-insensitive
+variable match such as `core.ObjectFormat`). The refusal is atomic for
+import — no other keys from that import land.
+
+Recreate the repository with `libra init --object-format <sha1|sha256>` to
+choose a different format (`blake3` opens later). Init and reinit still write
+the key through the database layer; only the `config` command surface is
+gated. A `core.objectformat` row under **global** or **system** scope is not
+consumed by repository commands and is unchanged by this guard.
+
 ### Bare `libra config <key>`
 
 A single positional argument with no value is a **read**, matching `git config <key>`. It prints the stored value and exits 0, returns the **last** value of a multi-valued key, cascades local → global → system exactly as `get` does, and renders an encrypted value as `<REDACTED>` (use `config get --reveal` for the plaintext). A key that is not set exits **1** with `LBR-CLI-002`. `-z`/`--null` applies here exactly as it does to `get`, terminating the value with NUL instead of a newline.

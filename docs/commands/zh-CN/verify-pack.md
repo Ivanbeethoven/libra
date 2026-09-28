@@ -19,7 +19,9 @@ libra verify-pack [OPTIONS] <IDX_FILE>...
 - 对象数量、对象 ID 和偏移量
 - version 2 索引的 CRC32 值
 
-默认情况下，pack 路径通过将每个索引文件扩展名替换为 `.pack` 得出。当 pack 归档位于其他位置时，对单个 `<IDX_FILE>` 使用 `--pack <PACK_FILE>`。该命令不需要 Libra 仓库。在仓库内运行时，它使用该仓库的对象格式。在仓库外运行时，version 2 索引文件会从索引布局推断 SHA-1 或 SHA-256；version 1 索引仅支持 SHA-1。
+默认情况下，pack 路径通过将每个索引文件扩展名替换为 `.pack` 得出。当 pack 归档位于其他位置时，对单个 `<IDX_FILE>` 使用 `--pack <PACK_FILE>`。
+
+在仓库内运行时，使用该仓库的 `core.objectformat`（`sha1` / `sha256` / `blake3`），且**不会**从索引布局猜测 hash kind（sha256 与 blake3 同为 32 字节 OID）。在仓库外运行时必须提供 `--hash-kind <sha1|sha256|blake3>`；缺省则失败并返回 `LBR-CLI-002`，提示在仓库内运行或传入该参数。version 1 索引仅支持 SHA-1。
 
 兼容性说明：多个 `<IDX_FILE>` 会按输入顺序逐个验证。`--pack` 不能和多个索引同时使用，因为 Git 的 pack/index 命名模型无法为每个索引提供无歧义的显式 pack。
 
@@ -29,6 +31,7 @@ libra verify-pack [OPTIONS] <IDX_FILE>...
 |------|-------|-------------|---------|
 | `<IDX_FILE>...` | | 要验证的 pack 索引文件 | 必需 |
 | `--pack <PATH>` | | 对照单个索引验证的 pack 归档 | 扩展名替换为 `.pack` 的 `<IDX_FILE>` |
+| `--hash-kind <KIND>` | | 解析索引所用的对象格式（`sha1` / `sha256` / `blake3`）。仓库外必需；仓库内若提供则必须与 `core.objectformat` 一致 | 仓库内为 `core.objectformat` |
 | `--verbose` | `-v` | 使用 Git 兼容的 verbose 字段打印每个索引对象 | 关闭 |
 | `--stat-only` | `-s` | 只打印 Git 风格的 non-delta 和 delta 链统计 | 关闭 |
 | `--json` | | 输出结构化 JSON 信封 | 关闭 |
@@ -40,6 +43,7 @@ libra verify-pack [OPTIONS] <IDX_FILE>...
 libra verify-pack objects/pack/pack-abc123.idx
 libra verify-pack pack-a.idx pack-b.idx
 libra verify-pack --pack /tmp/pack-abc123.pack /tmp/pack-abc123.idx
+libra verify-pack --hash-kind blake3 /tmp/pack-blake3.idx
 libra verify-pack -v pack-abc123.idx
 libra verify-pack -s pack-abc123.idx
 libra verify-pack pack-abc123.idx --json

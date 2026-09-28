@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn client_tiered_alternate_pack_honors_preview_minimum_charge() {
-        use std::{path::Path, str::FromStr, sync::Arc};
+        use std::{path::Path, sync::Arc};
 
         use git_internal::hash::{HashKind, set_hash_kind_for_test};
 
@@ -841,8 +841,10 @@ mod tests {
         let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
         let tiered = TieredStorage::new(local, remote, 1 << 20, 1 << 20);
         let client = ClientStorage::from_test_storage(Arc::new(tiered), local_objects);
-        let tiny_blob = ObjectHash::from_str("035f9b742ebf552ed87f003d4944480bfea6ba99")
-            .expect("parse packed tiny-blob OID");
+        let tiny_blob = crate::internal::object_format::parse_repo_oid(
+            "035f9b742ebf552ed87f003d4944480bfea6ba99",
+        )
+        .expect("parse packed tiny-blob OID");
 
         let error = client
             .object_sizes_with_total_limit(&[tiny_blob], 4_095)
@@ -1256,14 +1258,14 @@ mod tests {
 
         let local_dir = tempdir().expect("tempdir");
         let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
-        let tree = ObjectHash::new(&[8; 20]);
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[8; 20]);
         let commit = Commit::from_tree_id(tree, vec![], "remote bounded commit");
         let data = commit.to_data().expect("serialize commit");
         remote
             .put(&commit.id, &data, ObjectType::Commit)
             .await
             .expect("seed valid remote commit");
-        let wrong_id = ObjectHash::new(&[9; 20]);
+        let wrong_id = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[9; 20]);
         remote
             .put(&wrong_id, &data, ObjectType::Commit)
             .await
@@ -1534,8 +1536,8 @@ mod tests {
         // against the exact per-entry overhead.
         let mut lru: LruCache<ObjectHash, CachedFile> = LruCache::new(1500);
 
-        let key_a = ObjectHash::new(&[1; 20]);
-        let key_b = ObjectHash::new(&[2; 20]);
+        let key_a = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]);
+        let key_b = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[2; 20]);
         let (path_a, cf_a) = cached_file(dir.path(), "a", 1000);
         let (path_b, cf_b) = cached_file(dir.path(), "b", 1000);
 

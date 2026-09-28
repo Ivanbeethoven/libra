@@ -20,7 +20,7 @@ use clap::Parser;
 use colored::Colorize;
 use git_internal::{
     Diff,
-    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
+    hash::{HashKind, ObjectHash, set_hash_kind},
     internal::{
         index::{Index, IndexEntry, Time},
         object::{
@@ -2419,7 +2419,7 @@ async fn run_diff(
         // threads start at the default (SHA-1). Capture the kind here and
         // re-seed it inside the task, or SHA-256 repositories would have
         // every stat-miss file re-hashed with the wrong algorithm.
-        let hash_kind = get_hash_kind();
+        let hash_kind = git_internal::hash::get_hash_kind();
         let shared_index = Arc::new(index);
         let mut scan_handle = {
             let index = Arc::clone(&shared_index);
@@ -2429,7 +2429,7 @@ async fn run_diff(
                 // wrong kind behind (mirrors `HashKindGuard`, which is
                 // test-only in git-internal).
                 let _kind_guard = SetHashKindGuard {
-                    previous: get_hash_kind(),
+                    previous: git_internal::hash::get_hash_kind(),
                 };
                 set_hash_kind(hash_kind);
                 resolve_worktree_side(&index, file_mode)

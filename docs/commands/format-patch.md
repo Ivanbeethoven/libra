@@ -160,3 +160,7 @@ stdout follows Libra's normal quiet BrokenPipe behavior.
 | Output directory creation failure | `LBR-IO-002` |
 | Config read failure | `LBR-IO-001` |
 | Invalid `format.signOff` / empty configured output directory | `LBR-CLI-003` |
+
+## Blake3 repositories
+
+When `core.objectformat` is `blake3`, `--base` prerequisite patch-ids are BLAKE3 digests (64 hex), not the SHA-1 Git-stable combiner used for SHA-1 repositories.

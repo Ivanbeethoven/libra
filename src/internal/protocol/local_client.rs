@@ -6,7 +6,6 @@ use std::{
     future::Future,
     io::Error as IoError,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::OnceLock,
 };
 
@@ -14,7 +13,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
+    hash::{HashKind, ObjectHash, set_hash_kind},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
@@ -130,7 +129,7 @@ struct HashKindRestoreGuard {
 
 impl HashKindRestoreGuard {
     fn switch_to(hash_kind: HashKind) -> Self {
-        let previous = get_hash_kind();
+        let previous = git_internal::hash::get_hash_kind();
         set_hash_kind(hash_kind);
         Self { previous }
     }
@@ -312,17 +311,18 @@ impl LocalClient {
                         let Some(blob_hash) = note.note_hash else {
                             continue;
                         };
-                        let blob_oid = match ObjectHash::from_str(&blob_hash) {
-                            Ok(oid) => oid,
-                            Err(e) => {
-                                warnings.push(format!(
-                                    "skipped source dependency note for {}: invalid blob id \
+                        let blob_oid =
+                            match crate::internal::object_format::parse_repo_oid(&blob_hash) {
+                                Ok(oid) => oid,
+                                Err(e) => {
+                                    warnings.push(format!(
+                                        "skipped source dependency note for {}: invalid blob id \
                                      {blob_hash}: {e}",
-                                    note.annotated_object
-                                ));
-                                continue;
-                            }
-                        };
+                                        note.annotated_object
+                                    ));
+                                    continue;
+                                }
+                            };
                         let bytes = match storage.get(&blob_oid) {
                             Ok(bytes) => bytes,
                             Err(e) => {
@@ -369,22 +369,19 @@ impl LocalClient {
             .map(|entry| entry.value)
             .unwrap_or_else(|| "sha1".to_string());
 
-        match object_format.as_str() {
-            "sha1" => Ok(HashKind::Sha1),
-            "sha256" => Ok(HashKind::Sha256),
-            "blake3" => Ok(HashKind::Blake3),
-            _ => Err(format!(
+        crate::internal::object_format::parse_config_value(&object_format).map_err(|_| {
+            format!(
                 "unsupported object format '{object_format}' in local repository '{}'",
                 db_path.display()
-            )),
-        }
+            )
+        })
     }
 
     pub async fn discovery_reference(
         &self,
         service: ServiceType,
     ) -> Result<DiscoveryResult, GitError> {
-        if service != ServiceType::UploadPack {
+        if !matches!(service, ServiceType::UploadPack | ServiceType::ReceivePack) {
             return Err(GitError::NetworkError(
                 "Unsupported service type for local protocol".to_string(),
             ));
@@ -393,7 +390,11 @@ impl LocalClient {
             RepoType::GitRepo => {
                 // In-process discovery: read the foreign Git repository's refs
                 // directly instead of spawning `git-upload-pack --advertise-refs`.
-                let hash_kind = git_repo_hash_kind(&self.repo_path);
+                // Primary reject gate for sha256/unknown/unreadable lives in
+                // `discover_remote_with_name` (FetchError); this path keeps the
+                // typed error as an `io::Error` cause for defense in depth.
+                let hash_kind = git_repo_hash_kind(&self.repo_path)
+                    .map_err(|error| GitError::IOError(IoError::other(error)))?;
                 let _hash_guard = HashKindRestoreGuard::switch_to(hash_kind);
                 let refs = read_git_repo_refs(&self.repo_path).map_err(|error| {
                     GitError::NetworkError(format!(
@@ -444,6 +445,15 @@ impl LocalClient {
                     for tag in tags {
                         tag_references.extend(tag_refs(tag).await?);
                     }
+                    // Advertise object-format for non-SHA-1 repos only (sha1
+                    // remains the protocol default and stays unadvertised).
+                    let mut capabilities = Vec::new();
+                    if !matches!(repo_hash_kind, HashKind::Sha1) {
+                        capabilities.push(format!(
+                            "object-format={}",
+                            crate::internal::object_format::as_str(repo_hash_kind)
+                        ));
+                    }
                     Ok(DiscoveryResult {
                         refs: local_branches
                             .into_iter()
@@ -455,7 +465,7 @@ impl LocalClient {
                                 _ref: reflog::HEAD.to_string(),
                             }))
                             .collect::<Vec<_>>(),
-                        capabilities: vec![],
+                        capabilities,
                         shallow_boundaries: Vec::new(),
                         hash_kind: repo_hash_kind,
                     })
@@ -478,7 +488,7 @@ impl LocalClient {
                 // repository's own object store instead of spawning
                 // `git-upload-pack --stateless-rpc`.
                 let _ = shallow; // requested-shallow negotiation is not honoured (matches LibraRepo)
-                let hash_kind = git_repo_hash_kind(&self.repo_path);
+                let hash_kind = git_repo_hash_kind(&self.repo_path).map_err(IoError::other)?;
                 // A strictly local store — never route a foreign repo's reads
                 // through cloud storage or write objects back into it.
                 let storage = ClientStorage::init_local(self.repo_path.join("objects"));
@@ -521,7 +531,8 @@ impl LocalClient {
                     let mut tag_entries: Vec<Entry> = Vec::new();
                     let mut commit_targets: Vec<String> = Vec::new();
                     for want_hash in want {
-                        let Ok(oid) = git_internal::hash::ObjectHash::from_str(want_hash) else {
+                        let Ok(oid) = crate::internal::object_format::parse_repo_oid(want_hash)
+                        else {
                             commit_targets.push(want_hash.clone());
                             continue;
                         };
@@ -624,18 +635,138 @@ impl LocalClient {
     }
 }
 
-/// Read `objectformat` from a foreign Git repository's `config`, defaulting to
-/// SHA-1 (the overwhelmingly common case for local Git remotes).
-pub(crate) fn git_repo_hash_kind(repo_path: &Path) -> HashKind {
-    if let Ok(text) = fs::read_to_string(repo_path.join("config")) {
-        for line in text.lines() {
-            let lower = line.to_ascii_lowercase();
-            if lower.contains("objectformat") && lower.contains("sha256") {
-                return HashKind::Sha256;
+/// Fail-closed discovery errors for a foreign Git repository's `config`
+/// (B3-12 / ADR-B3-01). Distinct from Convert's [`GitSourceObjectFormatError`]
+/// so clone/fetch/pull can map stable codes without folding into generic
+/// `GitError` / `LBR-NET-002`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GitSourceConfigError {
+    /// `objectformat` is unknown, corrupt, or set without
+    /// `core.repositoryformatversion = 1`.
+    #[error("local Git source config object format is unknown or corrupt: {detail}")]
+    UnknownOrCorrupt { detail: String },
+    /// The Git `config` file could not be read.
+    #[error("local Git source config is unreadable: {detail}")]
+    Unreadable { detail: String },
+}
+
+/// Read `objectformat` from a foreign Git repository's `config` with strict
+/// fail-closed semantics (B3-12).
+///
+/// Missing `objectformat` → [`HashKind::Sha1`]. Unknown/corrupt/unreadable
+/// values return [`GitSourceConfigError`] (never default to Sha1). Callers that
+/// must reject Git SHA-256 sources (clone/fetch/pull) check for
+/// [`HashKind::Sha256`] after a successful parse.
+pub(crate) fn git_repo_hash_kind(repo_path: &Path) -> Result<HashKind, GitSourceConfigError> {
+    read_git_source_objectformat(repo_path).map_err(|error| match error {
+        GitSourceObjectFormatError::Unreadable(detail) => {
+            GitSourceConfigError::Unreadable { detail }
+        }
+        GitSourceObjectFormatError::UnknownValue(value) => GitSourceConfigError::UnknownOrCorrupt {
+            detail: format!(
+                "source Git repository has unsupported extensions.objectformat '{value}'"
+            ),
+        },
+        GitSourceObjectFormatError::ExtensionWithoutV1 => GitSourceConfigError::UnknownOrCorrupt {
+            detail: "source Git repository sets extensions.objectformat without \
+                     core.repositoryformatversion=1"
+                .to_string(),
+        },
+        GitSourceObjectFormatError::Corrupt(detail) => {
+            GitSourceConfigError::UnknownOrCorrupt { detail }
+        }
+    })
+}
+
+/// Fail-closed Convert preflight errors for a foreign Git `config` text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitSourceObjectFormatError {
+    /// `[extensions] objectformat` present but `repositoryformatversion` is not 1.
+    ExtensionWithoutV1,
+    /// Value is not an exact lowercase `sha1` / `sha256` (Git has no blake3).
+    UnknownValue(String),
+    /// Config text could not be interpreted as Git config for this key.
+    Corrupt(String),
+    /// The Git `config` file could not be read.
+    Unreadable(String),
+}
+
+/// Strictly parse a foreign Git `config` blob for Convert object-format preflight.
+///
+/// Rules (ADR-B3-01 / B3-01; aligned with git `read_repository_format`):
+/// - does **not** follow `include` / `includeIf`;
+/// - `[extensions] objectformat` is only meaningful when
+///   `core.repositoryformatversion = 1`; if the key is present otherwise → error;
+/// - unknown values fail closed (never default to Sha1);
+/// - missing `objectformat` → [`HashKind::Sha1`].
+pub fn parse_git_source_objectformat(
+    config_text: &str,
+) -> Result<HashKind, GitSourceObjectFormatError> {
+    let mut section = String::new();
+    let mut repo_format_version: Option<String> = None;
+    let mut object_format: Option<String> = None;
+
+    for raw in config_text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let inner = &line[1..line.len() - 1];
+            // Strip subsection quotes: [extensions "foo"] → extensions
+            section = inner
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().trim_matches('"').to_string();
+        match (section.as_str(), key.as_str()) {
+            ("core", "repositoryformatversion") => {
+                repo_format_version = Some(value);
             }
+            ("extensions", "objectformat") => {
+                // Last value wins (Git).
+                object_format = Some(value.to_ascii_lowercase());
+            }
+            _ => {}
         }
     }
-    HashKind::Sha1
+
+    let Some(format) = object_format else {
+        return Ok(HashKind::Sha1);
+    };
+
+    let version = repo_format_version.as_deref().unwrap_or("");
+    if version != "1" {
+        return Err(GitSourceObjectFormatError::ExtensionWithoutV1);
+    }
+
+    // Git has no blake3 object format; accept only sha1/sha256 via the shared
+    // helper (eliminates independent `"sha256" =>` string arms — GC-B3-01 / B3-12).
+    let kind = crate::internal::object_format::parse_config_value(&format)
+        .map_err(|_| GitSourceObjectFormatError::UnknownValue(format.clone()))?;
+    if matches!(kind, HashKind::Blake3) {
+        return Err(GitSourceObjectFormatError::UnknownValue(format));
+    }
+    Ok(kind)
+}
+
+/// Read + strictly parse a foreign Git repository's object format for Convert.
+pub(crate) fn read_git_source_objectformat(
+    repo_path: &Path,
+) -> Result<HashKind, GitSourceObjectFormatError> {
+    let path = repo_path.join("config");
+    let text = fs::read_to_string(&path).map_err(|error| {
+        GitSourceObjectFormatError::Unreadable(format!("cannot read '{}': {error}", path.display()))
+    })?;
+    parse_git_source_objectformat(&text)
 }
 
 /// Read every ref a foreign Git repository advertises: loose `refs/**`,
@@ -723,7 +854,7 @@ fn read_git_repo_refs(repo_path: &Path) -> std::io::Result<Vec<DiscRef>> {
 /// object id, reading from a strictly local store. Returns `None` on any read
 /// failure so a malformed tag never breaks the whole advertisement.
 fn peel_tag(storage: &ClientStorage, oid: &str) -> Option<String> {
-    let mut current = ObjectHash::from_str(oid).ok()?;
+    let mut current = crate::internal::object_format::parse_repo_oid(oid).ok()?;
     for _ in 0..32 {
         match storage.get_object_type(&current) {
             Ok(ObjectType::Tag) => {
@@ -798,7 +929,7 @@ fn collect_git_repo_entries(
     // Resolve each want; peel annotated tags (emitting each tag object) down to
     // the commit they target.
     for spec in want {
-        let Ok(oid) = ObjectHash::from_str(spec) else {
+        let Ok(oid) = crate::internal::object_format::parse_repo_oid(spec) else {
             continue;
         };
         if matches!(storage.get_object_type(&oid), Ok(ObjectType::Tag)) {
@@ -897,9 +1028,11 @@ type DepthWalkResult = (
 
 /// Shortest distance from any want, truncated at `depth`.
 fn load_git_repo_shallow(repo_path: &Path) -> Result<ShallowSet, GitError> {
-    ShallowSet::load_at_for_kind(&repo_path.join("shallow"), git_repo_hash_kind(repo_path)).map_err(
-        |error| GitError::CustomError(format!("source shallow metadata is corrupt: {error}")),
-    )
+    let hash_kind =
+        git_repo_hash_kind(repo_path).map_err(|error| GitError::IOError(IoError::other(error)))?;
+    ShallowSet::load_at_for_kind(&repo_path.join("shallow"), hash_kind).map_err(|error| {
+        GitError::CustomError(format!("source shallow metadata is corrupt: {error}"))
+    })
 }
 
 fn walk_git_commits_for_depth(
@@ -1028,7 +1161,7 @@ fn include_reachable_tags(
         if !seen.contains(target) || have_set.contains(target) || seen.contains(&r._hash) {
             continue;
         }
-        if let Ok(oid) = ObjectHash::from_str(&r._hash)
+        if let Ok(oid) = crate::internal::object_format::parse_repo_oid(&r._hash)
             && matches!(storage.get_object_type(&oid), Ok(ObjectType::Tag))
         {
             let tag = Tag::from_bytes(&storage.get(&oid)?, oid)?;
@@ -1079,11 +1212,7 @@ async fn encode_pack_bytes(entries: Vec<Entry>, hash_kind: HashKind) -> Result<V
 
     let total_objects = entries.len();
     let encode_handle = tokio::spawn(async move {
-        // Set the hash kind BEFORE constructing the encoder: `PackEncoder::new`
-        // initializes the pack-trailer hasher from the thread-local, so it must
-        // see the repository's kind (not whatever this worker thread last had).
-        set_hash_kind(hash_kind);
-        let mut encoder = PackEncoder::new(total_objects, 0, stream_tx);
+        let mut encoder = PackEncoder::new_with_hash_kind(hash_kind, total_objects, 0, stream_tx);
         encoder.encode(entry_rx).await
     });
 
@@ -1775,7 +1904,7 @@ mod tests {
         want: &[&str],
         depth: Option<usize>,
     ) -> (Vec<String>, Vec<String>) {
-        let hash_kind = git_repo_hash_kind(&gdeep.git_dir);
+        let hash_kind = git_repo_hash_kind(&gdeep.git_dir).expect("gdeep fixture is sha1");
         let _hash_guard = HashKindRestoreGuard::switch_to(hash_kind);
         let storage = ClientStorage::init_local(gdeep.git_dir.join("objects"));
         let wants: Vec<String> = want.iter().map(|oid| (*oid).to_string()).collect();
@@ -1800,8 +1929,10 @@ mod tests {
                 HashKind::Sha1,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             ),
+            // B3-12: sha256 is only meaningful under repositoryformatversion=1
+            // (fail-closed; the old substring heuristic is gone).
             (
-                "[extensions]\nobjectFormat = sha256\n",
+                "[core]\nrepositoryformatversion = 1\n[extensions]\nobjectFormat = sha256\n",
                 HashKind::Sha256,
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             ),

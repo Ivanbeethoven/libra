@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::Write,
     path::Path,
-    str::FromStr,
     time::Duration,
 };
 
@@ -12,7 +11,7 @@ use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::{
@@ -44,10 +43,7 @@ use crate::{
         config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
-        protocol::{
-            ProtocolClient, get_wire_hash_kind, lfs_client::LFSClient, set_wire_hash_kind,
-            ssh_client::is_ssh_spec,
-        },
+        protocol::{ProtocolClient, get_wire_hash_kind, lfs_client::LFSClient, set_wire_hash_kind},
         reflog::{Reflog, ReflogAction, ReflogContext},
         tag,
     },
@@ -274,11 +270,17 @@ pub enum PushError {
     #[error("pushing to local file repositories is not supported")]
     UnsupportedLocalFileRemote,
 
+    #[error("local push failed: {0}")]
+    LocalPush(String),
+
     #[error("invalid remote URL '{url}': {detail}")]
     InvalidRemoteUrl { url: String, detail: String },
 
     #[error("authentication failed for '{url}'")]
     AuthenticationFailed { url: String },
+
+    #[error("SSH public-key authentication failed: Permission denied (publickey)")]
+    SshPublicKeyAuthenticationFailed,
 
     #[error("failed to discover references from '{url}': {detail}")]
     DiscoveryFailed { url: String, detail: String },
@@ -365,6 +367,13 @@ fn map_push_discovery_error(repo_url: &str, error: GitError) -> PushError {
         GitError::UnAuthorized(_) => PushError::AuthenticationFailed {
             url: repo_url.to_string(),
         },
+        GitError::IOError(error)
+            if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(
+                &error,
+            ) =>
+        {
+            PushError::SshPublicKeyAuthenticationFailed
+        }
         GitError::NetworkError(detail) if detail.starts_with(PKT_LINE_PROTOCOL_ERROR_PREFIX) => {
             PushError::Protocol { detail }
         }
@@ -432,8 +441,12 @@ impl From<PushError> for CliError {
             PushError::UnsupportedLocalFileRemote => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint(
-                    "use fetch/clone for local-path repositories; push currently supports network remotes only",
+                    "push to a local Libra repository is supported; a local Git target is tracked as issues/480 HP-08",
                 ),
+            PushError::LocalPush(detail) => {
+                CliError::fatal(format!("local push failed: {detail}"))
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+            }
             PushError::InvalidRemoteUrl { .. } => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("check the remote URL with 'libra remote get-url <name>'"),
@@ -441,6 +454,9 @@ impl From<PushError> for CliError {
                 .with_stable_code(StableErrorCode::AuthMissingCredentials)
                 .with_hint("check SSH key or HTTP credentials")
                 .with_hint("use 'libra config --list' to verify auth settings"),
+            PushError::SshPublicKeyAuthenticationFailed => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthPermissionDenied)
+                .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT),
             PushError::DiscoveryFailed { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
                 .with_hint("check the remote URL and network connectivity"),
@@ -457,8 +473,16 @@ impl From<PushError> for CliError {
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("pull and integrate remote changes first: 'libra pull'")
                 .with_hint("or use --force to overwrite (data loss risk)"),
-            PushError::HashKindMismatch { .. } => CliError::fatal(error.to_string())
-                .with_stable_code(StableErrorCode::NetworkProtocol),
+            PushError::HashKindMismatch { remote, local } => {
+                let mut err = CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::NetworkProtocol);
+                if remote == "blake3" || local == "blake3" {
+                    err = err.with_hint(
+                        "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                    );
+                }
+                err
+            }
             PushError::ObjectCollection(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::InternalInvariant)
                 .with_hint(format!("this is a bug; please report it at {ISSUE_URL}")),
@@ -922,11 +946,9 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         None => {
             let remote = ConfigKv::get_remote(&current_branch).await.ok().flatten();
             match remote {
-                Some(remote) if remote == "." => {
-                    return Err(PushError::LocalUpstream {
-                        branch: current_branch,
-                    });
-                }
+                // A local upstream (`branch.<b>.remote=.`) is treated as the
+                // current repository as an anonymous push target (issues/480
+                // HP-16), replacing the earlier fail-closed refusal.
                 Some(remote) => remote,
                 None => return Err(PushError::NoRemoteConfigured),
             }
@@ -936,24 +958,24 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     let repo_url = match ConfigKv::get_remote_url(&repository).await {
         Ok(url) => url,
         Err(_) => {
-            // Cross-Cutting F: fuzzy match for remote name suggestion
-            let suggestion = suggest_remote_name(&repository).await;
-            return Err(PushError::RemoteNotFound {
-                name: repository.clone(),
-                suggestion,
-            });
+            if crate::internal::protocol::repository_arg::is_anonymous_repository_spec(&repository)
+            {
+                // An anonymous local-path / URL remote is resolved directly;
+                // the local push target check below governs whether it is usable.
+                repository.clone()
+            } else {
+                // Cross-Cutting F: fuzzy match for remote name suggestion
+                let suggestion = suggest_remote_name(&repository).await;
+                return Err(PushError::RemoteNotFound {
+                    name: repository.clone(),
+                    suggestion,
+                });
+            }
         }
     };
 
     // Local file path remotes are not supported for push
-    if is_local_file_remote(&repo_url) {
-        return Err(PushError::UnsupportedLocalFileRemote);
-    }
-
     validate_local_refspecs(&args, &current_branch).await?;
-
-    // Determine transport: SSH or HTTPS
-    let is_ssh = is_ssh_spec(&repo_url);
 
     let remote_client = RemoteClient::from_spec_with_remote(&repo_url, Some(&repository))
         .await
@@ -976,7 +998,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     })?
     .map_err(|error| map_push_discovery_error(&repo_url, error))?;
 
-    let local_kind = get_hash_kind();
+    let local_kind = git_internal::hash::get_hash_kind();
     if discovery.hash_kind != local_kind {
         return Err(PushError::HashKindMismatch {
             remote: discovery.hash_kind.to_string(),
@@ -1059,7 +1081,9 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
             let pushed_tips: Vec<ObjectHash> = plans
                 .iter()
                 .filter(|plan| plan.update.kind == PushRefUpdateKind::Update)
-                .filter_map(|plan| ObjectHash::from_str(&plan.update.new_oid).ok())
+                .filter_map(|plan| {
+                    crate::internal::object_format::parse_repo_oid(&plan.update.new_oid).ok()
+                })
                 .collect();
             for tag_ref in collect_follow_tag_refs(&pushed_tips, &remote_refs).await? {
                 let remote_ref = tag_ref.full_ref.clone();
@@ -1156,8 +1180,10 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
 
     let mut data = BytesMut::new();
     let mut capabilities = vec!["report-status"];
-    if get_wire_hash_kind() == HashKind::Sha256 {
-        capabilities.push("object-format=sha256");
+    match get_wire_hash_kind() {
+        HashKind::Sha1 => {}
+        HashKind::Sha256 => capabilities.push("object-format=sha256"),
+        HashKind::Blake3 => capabilities.push("object-format=blake3"),
     }
     if use_atomic {
         capabilities.push("atomic");
@@ -1169,7 +1195,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         capabilities.push("push-cert");
     }
     let capability = capabilities.join(" ");
-    let zero_oid = ObjectHash::zero_str(get_hash_kind());
+    let zero_oid = ObjectHash::zero_str(git_internal::hash::get_hash_kind());
 
     // Build the `<old> <new> <ref>` command tuples shared by both wire forms.
     let commands: Vec<(String, String, String)> = plans
@@ -1225,7 +1251,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
 
     // Upload LFS files (only for HTTP remotes)
     let mut lfs_files_uploaded = 0;
-    if !is_ssh && !objs.is_empty() {
+    if matches!(&remote_client, RemoteClient::Http(_)) && !objs.is_empty() {
         let url = Url::parse(&repo_url).map_err(|e| PushError::InvalidRemoteUrl {
             url: repo_url.clone(),
             detail: e.to_string(),
@@ -1307,7 +1333,8 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1_000_000);
         let (stream_tx, mut stream_rx) = mpsc::channel(1_000_000);
 
-        let encoder = PackEncoder::new(objs.len(), 0, stream_tx);
+        let encoder =
+            PackEncoder::new_with_hash_kind(discovery.hash_kind, objs.len(), 0, stream_tx);
         encoder
             .encode_async(entry_rx)
             .await
@@ -1383,7 +1410,39 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
             })?;
             validate_receive_pack_response(data, &plans)?;
         }
-        _ => {
+        RemoteClient::Local(local_client) => {
+            // Local path push (issues/480 HP-07/HP-08): write objects and refs to
+            // the target repo BY PATH (no process cwd switch).
+            let target_path = local_client.repo_path().to_path_buf();
+            let updates = plans
+                .iter()
+                .map(|plan| plan.update.clone())
+                .collect::<Vec<_>>();
+            if local_client.is_libra_source() {
+                crate::internal::protocol::local_push::apply_local_push_to_libra(
+                    &target_path,
+                    discovery.hash_kind,
+                    &updates,
+                    &objs,
+                    args.dry_run,
+                    args.force,
+                )
+                .await
+                .map_err(|e| PushError::LocalPush(e.to_string()))?;
+            } else {
+                crate::internal::protocol::local_push_git::apply_local_push_to_git(
+                    &target_path,
+                    discovery.hash_kind,
+                    &updates,
+                    &objs,
+                    args.dry_run,
+                    args.force,
+                )
+                .await
+                .map_err(|e| PushError::LocalPush(e.to_string()))?;
+            }
+        }
+        RemoteClient::Git(_) | RemoteClient::Bundle(_) => {
             return Err(PushError::UnsupportedLocalFileRemote);
         }
     }
@@ -1625,7 +1684,7 @@ async fn resolve_local_ref(input: &str) -> Result<ResolvedLocalRef, PushError> {
         .map_err(|error| PushError::RepoState(error.to_string()))?
         .and_then(|reference| reference.target)
     {
-        let oid = ObjectHash::from_str(&target).map_err(|error| {
+        let oid = crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
             PushError::RepoState(format!("invalid tag target '{input}': {error}"))
         })?;
         return Ok(ResolvedLocalRef {
@@ -1658,7 +1717,7 @@ async fn resolve_tag_ref(short_name: &str, original: &str) -> Result<ResolvedLoc
         .map_err(|error| PushError::RepoState(error.to_string()))?
         .and_then(|reference| reference.target)
         .ok_or_else(|| PushError::SourceRefNotFound(original.to_string()))?;
-    let oid = ObjectHash::from_str(&target).map_err(|error| {
+    let oid = crate::internal::object_format::parse_repo_oid(&target).map_err(|error| {
         PushError::RepoState(format!("invalid tag target '{short_name}': {error}"))
     })?;
     Ok(ResolvedLocalRef {
@@ -1699,7 +1758,7 @@ async fn validate_force_if_includes(
         let Some(Some(tracking_oid)) = tracking.get(remote_ref) else {
             continue; // no tracking expectation — the lease already handled it
         };
-        let Ok(tip) = ObjectHash::from_str(tracking_oid) else {
+        let Ok(tip) = crate::internal::object_format::parse_repo_oid(tracking_oid) else {
             return Err(PushError::ForceIfIncludesRejected {
                 remote_ref: remote_ref.clone(),
                 tracking_oid: tracking_oid.clone(),
@@ -1729,7 +1788,7 @@ async fn validate_force_if_includes(
         let mut starts: Vec<ObjectHash> = Vec::new();
         for entry in &entries {
             for oid_text in [&entry.new_oid, &entry.old_oid] {
-                if let Ok(oid) = ObjectHash::from_str(oid_text) {
+                if let Ok(oid) = crate::internal::object_format::parse_repo_oid(oid_text) {
                     starts.push(oid);
                 }
             }
@@ -1913,8 +1972,8 @@ fn add_update_ref_plan(
     let remote_hash = remote_refs
         .get(&remote_ref)
         .cloned()
-        .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()));
-    let old_oid = ObjectHash::from_str(&remote_hash)
+        .unwrap_or_else(|| ObjectHash::zero_str(git_internal::hash::get_hash_kind()));
+    let old_oid = crate::internal::object_format::parse_repo_oid(&remote_hash)
         .map_err(|_| PushError::RepoState(format!("invalid remote hash: {remote_hash}")))?;
 
     let can_update = match local_ref.kind {
@@ -1979,7 +2038,7 @@ fn add_delete_ref_plan_named(
             name: display_name.to_string(),
         });
     };
-    let old_oid = ObjectHash::from_str(&remote_hash)
+    let old_oid = crate::internal::object_format::parse_repo_oid(&remote_hash)
         .map_err(|_| PushError::RepoState(format!("invalid remote hash: {remote_hash}")))?;
     plans.push(RefUpdatePlan {
         update: PushRefUpdate {
@@ -1987,7 +2046,7 @@ fn add_delete_ref_plan_named(
             local_ref: String::new(),
             remote_ref,
             old_oid: Some(remote_hash),
-            new_oid: ObjectHash::zero_str(get_hash_kind()),
+            new_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()),
             forced: false,
         },
         old_oid,
@@ -2171,7 +2230,7 @@ async fn collect_advertised_haves(refs: &[crate::internal::protocol::DiscRef]) -
     let mut commit_tips = HashSet::new();
 
     for reference in refs {
-        let Ok(oid) = ObjectHash::from_str(reference.hash()) else {
+        let Ok(oid) = crate::internal::object_format::parse_repo_oid(reference.hash()) else {
             continue;
         };
         let Ok(object) = tag::load_object_trait(&oid).await else {
@@ -2747,7 +2806,7 @@ async fn update_remote_tracking(
                 .map_err(|error| {
                     map_update_remote_tracking_branch_error(&remote_tracking_branch, error)
                 })?
-                .map_or(ObjectHash::zero_str(get_hash_kind()).to_string(), |b| {
+                .map_or(ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(), |b| {
                     b.commit.to_string()
                 });
 
@@ -2830,6 +2889,7 @@ fn map_update_remote_tracking_branch_error(
     }
 }
 
+#[allow(dead_code)]
 fn is_local_file_remote(spec: &str) -> bool {
     if let Ok(url) = Url::parse(spec) {
         if url.scheme() == "file" || url.scheme().len() == 1 {
@@ -3093,7 +3153,7 @@ fn incremental_objs_from_haves(
 }
 
 fn zero_object_hash() -> ObjectHash {
-    match get_hash_kind() {
+    match git_internal::hash::get_hash_kind() {
         HashKind::Sha1 => ObjectHash::Sha1([0; 20]),
         HashKind::Sha256 => ObjectHash::Sha256([0; 32]),
         HashKind::Blake3 => ObjectHash::Blake3([0; 32]),
@@ -3197,7 +3257,6 @@ fn diff_tree_objs(
 
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
 
     use git_internal::{
         hash::ObjectHash,
@@ -3255,7 +3314,7 @@ mod test {
         assert_eq!(sanitize_remote_ref_rejection(""), "");
         // The direct enum construction covers both algorithms without a
         // fallible conversion, allocation, or a production expect.
-        let previous = get_hash_kind();
+        let previous = git_internal::hash::get_hash_kind();
         for kind in [HashKind::Sha1, HashKind::Sha256] {
             git_internal::hash::set_hash_kind(kind);
             let oid = zero_object_hash();
@@ -4009,10 +4068,14 @@ mod test {
     }
 
     fn test_ref_update_plan(remote_ref: &str) -> RefUpdatePlan {
-        let old_oid = ObjectHash::from_str("1111111111111111111111111111111111111111")
-            .expect("test old oid should parse");
-        let new_oid = ObjectHash::from_str("2222222222222222222222222222222222222222")
-            .expect("test new oid should parse");
+        let old_oid = crate::internal::object_format::parse_repo_oid(
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("test old oid should parse");
+        let new_oid = crate::internal::object_format::parse_repo_oid(
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("test new oid should parse");
         RefUpdatePlan {
             update: PushRefUpdate {
                 kind: PushRefUpdateKind::Update,
@@ -4031,8 +4094,10 @@ mod test {
     /// A plan whose server-advertised OID (`update.old_oid`) is controllable, for
     /// force-with-lease unit tests.
     fn lease_plan(remote_ref: &str, server_oid: Option<&str>) -> RefUpdatePlan {
-        let placeholder = ObjectHash::from_str("3333333333333333333333333333333333333333")
-            .expect("placeholder oid should parse");
+        let placeholder = crate::internal::object_format::parse_repo_oid(
+            "3333333333333333333333333333333333333333",
+        )
+        .expect("placeholder oid should parse");
         RefUpdatePlan {
             update: PushRefUpdate {
                 kind: PushRefUpdateKind::Update,
@@ -4290,6 +4355,20 @@ mod test {
             sha256_pack[12..],
             <Sha256 as Sha256Digest>::digest(&sha256_pack[..12])[..]
         );
+
+        let blake3_pack = encode_empty_pack(HashKind::Blake3);
+        assert_eq!(&blake3_pack[..12], header);
+        assert_eq!(
+            blake3_pack.len(),
+            44,
+            "blake3 empty pack trailer is 32 bytes"
+        );
+        let mut hasher = git_internal::utils::HashAlgorithm::new_for_kind(HashKind::Blake3);
+        hasher.update(&blake3_pack[..12]);
+        assert_eq!(
+            blake3_pack[12..],
+            hasher.finalize_object_hash().as_ref()[..]
+        );
     }
 
     #[tokio::test]
@@ -4487,10 +4566,13 @@ mod test {
                 new_oid: "cccc000000000000000000000000000000000003".to_string(),
                 forced: false,
             },
-            old_oid: ObjectHash::from_str(full_oid).expect("full oid should parse"),
+            old_oid: crate::internal::object_format::parse_repo_oid(full_oid)
+                .expect("full oid should parse"),
             new_oid: Some(
-                ObjectHash::from_str("cccc000000000000000000000000000000000003")
-                    .expect("new oid should parse"),
+                crate::internal::object_format::parse_repo_oid(
+                    "cccc000000000000000000000000000000000003",
+                )
+                .expect("new oid should parse"),
             ),
             local_kind: Some(LocalRefKind::Branch),
         };
@@ -4656,6 +4738,10 @@ mod test {
             "authentication failed for 'https://example.com/repo'",
         );
         assert_eq!(
+            PushError::SshPublicKeyAuthenticationFailed.to_string(),
+            crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_MESSAGE,
+        );
+        assert_eq!(
             PushError::DiscoveryFailed {
                 url: "https://example.com/repo".to_string(),
                 detail: "timed out".to_string(),
@@ -4686,6 +4772,14 @@ mod test {
             }
             .to_string(),
             "remote object format 'sha1' does not match local 'sha256'",
+        );
+        assert_eq!(
+            PushError::HashKindMismatch {
+                remote: "sha1".to_string(),
+                local: "blake3".to_string(),
+            }
+            .to_string(),
+            "remote object format 'sha1' does not match local 'blake3'",
         );
         assert_eq!(
             PushError::RemoteUnpackFailed.to_string(),
@@ -5115,7 +5209,10 @@ old1 new1 refs/heads/main\n"
 
     #[test]
     fn test_is_ancestor() {
-        let commit_id = ObjectHash::from_str("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0").unwrap();
+        let commit_id = crate::internal::object_format::parse_repo_oid(
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        )
+        .unwrap();
         assert!(is_ancestor(&commit_id, &commit_id));
     }
 

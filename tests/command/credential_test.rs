@@ -222,3 +222,72 @@ fn credential_fill_outside_repository_is_empty() {
     );
     assert!(stdout(&fill).trim().is_empty());
 }
+
+#[test]
+fn credential_get_is_fill_alias_and_unknown_op_silent() {
+    let repo = init_repo();
+
+    // `get` is the Git helper protocol operation for a fill, aliased to `fill`.
+    let store = run_libra_command_with_stdin(&["credential", "store"], repo.path(), STORE_INPUT);
+    assert!(store.status.success(), "store: {}", stderr(&store));
+    let get = run_libra_command_with_stdin(&["credential", "get"], repo.path(), FILL_INPUT);
+    assert!(get.status.success(), "get: {}", stderr(&get));
+    let out = stdout(&get);
+    assert!(
+        out.contains("username=alice"),
+        "get should emit username: {out:?}"
+    );
+    assert!(
+        out.contains("password=s3cr3t-token"),
+        "get should emit password: {out:?}"
+    );
+
+    // An unknown operation is silently ignored (Git helper convention), exit 0.
+    let unknown = run_libra_command_with_stdin(&["credential", "reject"], repo.path(), FILL_INPUT);
+    assert!(
+        unknown.status.success(),
+        "unknown helper op must be silently ignored, got: {}",
+        stderr(&unknown)
+    );
+    assert!(stdout(&unknown).is_empty(), "unknown op produces no output");
+}
+
+#[test]
+fn credential_outside_repository_roundtrip() {
+    // A non-repository working directory: the helper must still store/fill/erase
+    // via the user-level (global) store (HP-14).
+    let outside = tempdir().unwrap();
+
+    let store = run_libra_command_with_stdin(&["credential", "store"], outside.path(), STORE_INPUT);
+    assert!(
+        store.status.success(),
+        "store outside repo: {}",
+        stderr(&store)
+    );
+
+    let get = run_libra_command_with_stdin(&["credential", "get"], outside.path(), FILL_INPUT);
+    assert!(get.status.success(), "get outside repo: {}", stderr(&get));
+    let out = stdout(&get);
+    assert!(
+        out.contains("username=alice"),
+        "get outside repo emits username: {out:?}"
+    );
+    assert!(
+        out.contains("password=s3cr3t-token"),
+        "get outside repo emits password: {out:?}"
+    );
+
+    let erase = run_libra_command_with_stdin(&["credential", "erase"], outside.path(), FILL_INPUT);
+    assert!(
+        erase.status.success(),
+        "erase outside repo: {}",
+        stderr(&erase)
+    );
+
+    let get2 = run_libra_command_with_stdin(&["credential", "get"], outside.path(), FILL_INPUT);
+    assert!(get2.status.success(), "get after erase: {}", stderr(&get2));
+    assert!(
+        !stdout(&get2).contains("username=alice"),
+        "erased credential should no longer fill"
+    );
+}

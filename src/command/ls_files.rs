@@ -3,10 +3,7 @@
 use std::{collections::HashSet, fs, io::Write, path::Path};
 
 use clap::Parser;
-use git_internal::{
-    hash::ObjectHash,
-    internal::{index::Index, object::blob::Blob},
-};
+use git_internal::internal::{index::Index, object::blob::Blob};
 use serde::Serialize;
 
 use crate::{
@@ -587,12 +584,10 @@ fn classify_eol(data: &[u8]) -> &'static str {
 /// The format (`i/%-5s w/%-5s attr/%-17s\t`) is byte-compatible with Git, and
 /// the caller inserts it immediately before the path (composing with `-t`/`-s`).
 fn eol_column(entry: &FileEntry, workdir: &Path) -> String {
-    use std::str::FromStr;
-
     let i_eol = match entry
         .hash
         .as_deref()
-        .and_then(|h| ObjectHash::from_str(h).ok())
+        .and_then(|h| crate::internal::object_format::parse_repo_oid(h).ok())
     {
         Some(hash) => match load_object::<Blob>(&hash) {
             Ok(blob) => classify_eol(&blob.data),

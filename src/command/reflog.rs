@@ -3,7 +3,6 @@
 use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
-    str::FromStr,
 };
 
 use clap::{Parser, Subcommand};
@@ -522,7 +521,7 @@ async fn handle_exists(ref_name: &str, output: &OutputConfig) -> CliResult<()> {
 /// when the OID does not load as a commit). A plain `fn` (captures nothing) so
 /// it satisfies the `Send + 'static` bound of [`expire_reflog`].
 fn load_commit_parents(oid: &str) -> Option<Vec<String>> {
-    let hash = ObjectHash::from_str(oid).ok()?;
+    let hash = crate::internal::object_format::parse_repo_oid(oid).ok()?;
     let commit = load_object::<Commit>(&hash).ok()?;
     Some(
         commit
@@ -535,7 +534,7 @@ fn load_commit_parents(oid: &str) -> Option<Vec<String>> {
 
 /// Production `--stale-fix` predicate: whether `oid` loads as a commit object.
 fn oid_is_commit(oid: &str) -> bool {
-    ObjectHash::from_str(oid)
+    crate::internal::object_format::parse_repo_oid(oid)
         .ok()
         .is_some_and(|hash| load_object::<Commit>(&hash).is_ok())
 }
@@ -1025,14 +1024,14 @@ impl Display for ReflogFormatter<'_> {
 // formatting is acceptable. The Result-returning sibling `find_commit_checked`
 // surfaces both failure modes as `RepoCorrupt` for callers that handle them.
 fn find_commit(commit_hash: &str) -> Commit {
-    let hash = ObjectHash::from_str(commit_hash)
+    let hash = crate::internal::object_format::parse_repo_oid(commit_hash)
         .expect("reflog commit hash is malformed (reflog object store may be corrupt)");
     load_object::<Commit>(&hash)
         .expect("reflog commit object is missing (reflog object store may be corrupt)")
 }
 
 fn find_commit_checked(commit_hash: &str) -> CliResult<Commit> {
-    let hash = ObjectHash::from_str(commit_hash).map_err(|e| {
+    let hash = crate::internal::object_format::parse_repo_oid(commit_hash).map_err(|e| {
         CliError::fatal(format!("invalid reflog object id '{commit_hash}': {e}"))
             .with_stable_code(StableErrorCode::RepoCorrupt)
     })?;
@@ -1086,7 +1085,7 @@ fn generate_diff_sync(commit: &Commit) -> Result<String, Box<dyn std::error::Err
     // old_blobs from first parent if exists
     let old_blobs: Vec<(std::path::PathBuf, ObjectHash)> = if !commit.parent_commit_ids.is_empty() {
         let parent = &commit.parent_commit_ids[0];
-        let parent_hash = ObjectHash::from_str(&parent.to_string())?;
+        let parent_hash = crate::internal::object_format::parse_repo_oid(&parent.to_string())?;
         let parent_commit = load_object::<Commit>(&parent_hash)?;
         let parent_tree = load_object::<Tree>(&parent_commit.tree_id)?;
         parent_tree.get_plain_items()
@@ -1134,7 +1133,7 @@ fn generate_stat_sync(commit: &Commit) -> Result<String, Box<dyn std::error::Err
     // old_blobs from first parent if exists
     let old_blobs: Vec<(std::path::PathBuf, ObjectHash)> = if !commit.parent_commit_ids.is_empty() {
         let parent = &commit.parent_commit_ids[0];
-        let parent_hash = ObjectHash::from_str(&parent.to_string())?;
+        let parent_hash = crate::internal::object_format::parse_repo_oid(&parent.to_string())?;
         let parent_commit = load_object::<Commit>(&parent_hash)?;
         let parent_tree = load_object::<Tree>(&parent_commit.tree_id)?;
         parent_tree.get_plain_items()

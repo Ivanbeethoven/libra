@@ -2,7 +2,7 @@
 //! `show`; `rewind --apply` restores the worktree and dispatches optional
 //! transcript truncation for agent kinds that implement `TranscriptTruncator`.
 
-use std::{path::Path, str::FromStr};
+use std::path::Path;
 
 use git_internal::{
     hash::ObjectHash,
@@ -327,15 +327,16 @@ async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<
     // Resolve the parent commit's tree and enumerate files that would be
     // restored. We use this both for dry-run output and for a "summary
     // before apply" line.
-    let parent_oid = ObjectHash::from_str(&parent_commit).map_err(|e| {
-        // A0-03: a malformed parent_commit in the catalog is a checkpoint
-        // store inconsistency (the writer only records valid OIDs).
-        CliError::fatal(format!(
-            "checkpoint '{}' has invalid parent_commit '{parent_commit}': {e}",
-            args.checkpoint_id
-        ))
-        .with_stable_code(StableErrorCode::AgentCheckpointStoreInconsistent)
-    })?;
+    let parent_oid =
+        crate::internal::object_format::parse_repo_oid(&parent_commit).map_err(|e| {
+            // A0-03: a malformed parent_commit in the catalog is a checkpoint
+            // store inconsistency (the writer only records valid OIDs).
+            CliError::fatal(format!(
+                "checkpoint '{}' has invalid parent_commit '{parent_commit}': {e}",
+                args.checkpoint_id
+            ))
+            .with_stable_code(StableErrorCode::AgentCheckpointStoreInconsistent)
+        })?;
     // Codex Phase-2-followups round-1 P1 #2: dry-run was previously
     // emitting only the additions/modifications side, leaving users
     // surprised when `--apply` also DELETED tracked files that were absent
@@ -1013,7 +1014,7 @@ fn summarize_e4_libra(
     inner: &Tree,
     manifest_oid: &str,
 ) -> Result<CheckpointLayoutSummary, String> {
-    let manifest_hash = ObjectHash::from_str(manifest_oid)
+    let manifest_hash = crate::internal::object_format::parse_repo_oid(manifest_oid)
         .map_err(|e| format!("invalid manifest.json oid '{manifest_oid}': {e}"))?;
     let (manifest_bytes, manifest_truncated) =
         read_git_object_bounded(storage, &manifest_hash, CHECKPOINT_METADATA_READ_MAX_BYTES)
@@ -1224,7 +1225,7 @@ fn transcript_availability(storage: &Path, parts: &[TranscriptPartSummary]) -> &
         let Some(oid) = part.oid.as_deref() else {
             return TRANSCRIPT_UNKNOWN;
         };
-        if ObjectHash::from_str(oid).is_err() {
+        if crate::internal::object_format::parse_repo_oid(oid).is_err() {
             return TRANSCRIPT_UNKNOWN;
         }
         let object_path = storage.join("objects").join(&oid[..2]).join(&oid[2..]);
@@ -1247,7 +1248,7 @@ fn transcript_availability(storage: &Path, parts: &[TranscriptPartSummary]) -> &
 const CHECKPOINT_METADATA_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 fn read_tree_object(storage: &Path, oid_str: &str) -> Result<Tree, String> {
-    let oid = ObjectHash::from_str(oid_str)
+    let oid = crate::internal::object_format::parse_repo_oid(oid_str)
         .map_err(|e| format!("invalid tree oid '{oid_str}' in the checkpoint catalog: {e}"))?;
     let (body, truncated) =
         read_git_object_bounded(storage, &oid, CHECKPOINT_METADATA_READ_MAX_BYTES).map_err(
@@ -1375,7 +1376,7 @@ pub(crate) async fn resolve_checkpoint_input_spec(
     // behind for the user to clean up.
     let mut total: u64 = 0;
     for file in &files {
-        let oid = ObjectHash::from_str(&file.oid)
+        let oid = crate::internal::object_format::parse_repo_oid(&file.oid)
             .map_err(|e| scoped(format!("invalid blob oid '{}': {e}", file.oid)))?;
         let (bytes, truncated) = read_git_object_bounded(
             &storage,
@@ -1641,7 +1642,7 @@ pub(super) fn load_checkpoint_transcript_bytes_from_storage(
             truncated = true;
             break;
         }
-        let hash = ObjectHash::from_str(&oid)
+        let hash = crate::internal::object_format::parse_repo_oid(&oid)
             .map_err(|e| CliError::fatal(format!("invalid transcript oid '{oid}': {e}")))?;
         // Bounded read: never decompress more than `remaining` content
         // bytes into memory, so a hostile/corrupt blob whose inflated size
@@ -1697,7 +1698,7 @@ async fn write_export_audit(
 }
 
 pub(super) fn load_metadata_blob(oid: &str) -> Result<String, CliError> {
-    let hash = ObjectHash::from_str(oid)
+    let hash = crate::internal::object_format::parse_repo_oid(oid)
         .map_err(|e| CliError::fatal(format!("invalid metadata_blob_oid '{oid}': {e}")))?;
     let storage = util::try_get_storage_path(None)
         .map_err(|e| CliError::fatal(format!("not in a libra repository: {e}")))?;

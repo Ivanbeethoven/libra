@@ -18,6 +18,8 @@ use libra::{
     internal::{
         branch::Branch,
         config::{ConfigKv, RemoteConfig},
+        head::Head,
+        tag,
     },
     utils::{
         output::OutputConfig,
@@ -46,6 +48,32 @@ fn libra_command(cwd: &Path) -> Command {
         .env("USERPROFILE", &home)
         .env("LIBRA_TEST", "1");
     cmd
+}
+
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_fetch_ssh_publickey_auth_diagnostic() {
+    use super::{
+        SSH_PUBLICKEY_AUTH_OUTPUT_MODES, assert_repo_refs_unchanged,
+        assert_ssh_publickey_auth_failure, create_ssh_publickey_auth_failure_script,
+        snapshot_repo_refs,
+    };
+
+    let repo = create_committed_repo_via_cli();
+    let ssh = create_ssh_publickey_auth_failure_script(repo.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", "git@fixture.invalid:repo"],
+            repo.path(),
+        ),
+        "add SSH fixture remote",
+    );
+    let refs = snapshot_repo_refs(repo.path());
+    for mode in SSH_PUBLICKEY_AUTH_OUTPUT_MODES {
+        assert_ssh_publickey_auth_failure(&["fetch", "origin"], repo.path(), &ssh, mode);
+        assert_repo_refs_unchanged(&refs, repo.path(), mode);
+    }
 }
 
 fn libra_tokio_command(cwd: &Path) -> TokioCommand {
@@ -1876,6 +1904,13 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         force: false,
         tags: false,
         no_tags: false,
+        set_upstream: false,
+        update_head_ok: false,
+        refmap: None,
+        atomic: false,
+        prune_tags: false,
+        negotiation_tip: vec![],
+        unshallow: false,
         no_auto_gc: false,
         no_progress: true,
         prune,
@@ -2023,105 +2058,21 @@ fn setup_local_upstream_current_branch() -> (tempfile::TempDir, String) {
     (repo, "alpha".to_string())
 }
 
-fn branch_config_snapshot(repo: &Path) -> String {
-    let output = run_libra_command(&["config", "--get-regexp", r"^branch\."], repo);
-    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    lines.sort();
-    lines.join("\n")
-}
-
-fn refs_snapshot(repo: &Path) -> String {
-    let output = run_libra_command(&["show-ref"], repo);
-    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(ToString::to_string)
-        .collect();
-    lines.sort();
-    lines.join("\n")
-}
-
-fn fetch_head_snapshot(repo: &Path) -> String {
-    fs::read_to_string(repo.join(".libra/FETCH_HEAD")).unwrap_or_default()
-}
-
-fn assert_local_upstream_network_refusal(cmd: &[&str], verb: &str, branch: &str, repo: &Path) {
-    let refs_before = refs_snapshot(repo);
-    let cfg_before = branch_config_snapshot(repo);
-    let fetch_before = fetch_head_snapshot(repo);
-
-    let output = run_libra_command(cmd, repo);
-    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
-    assert_eq!(output.status.code(), Some(129), "{stderr}");
-    assert_eq!(report.error_code, "LBR-CLI-003");
-    assert!(
-        stderr.contains(&format!("cannot {verb}")) && stderr.contains("local upstream"),
-        "human stderr should name the local-upstream refusal: {stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("branch '{branch}'"))
-            && stderr.contains("issues/480")
-            && stderr.contains("HP-16"),
-        "human stderr should name the branch and HP-16: {stderr}"
-    );
-
-    let mut json_cmd = vec!["--json"];
-    json_cmd.extend_from_slice(cmd);
-    let json_out = run_libra_command(&json_cmd, repo);
-    let (_json_human, json_report) = parse_cli_error_stderr(&json_out.stderr);
-    assert_eq!(json_out.status.code(), Some(129));
-    assert_eq!(json_report.error_code, "LBR-CLI-003");
-    assert!(
-        json_report.message.contains("local upstream")
-            && json_report.message.contains("issues/480 HP-16"),
-        "json envelope should carry the refusal: {}",
-        json_report.message
-    );
-    assert_eq!(
-        json_report.details.get("remote").and_then(|v| v.as_str()),
-        Some(".")
-    );
-    assert_eq!(
-        json_report
-            .details
-            .get("upstream_kind")
-            .and_then(|v| v.as_str()),
-        Some("local")
-    );
-
-    assert_eq!(refs_snapshot(repo), refs_before, "refs must stay unchanged");
-    assert_eq!(
-        branch_config_snapshot(repo),
-        cfg_before,
-        "branch.* config must stay unchanged"
-    );
-    assert_eq!(
-        fetch_head_snapshot(repo),
-        fetch_before,
-        "FETCH_HEAD must stay unchanged"
-    );
-}
-
 /// M-UPSTREAM P8 (#477 HF-30): `fetch` refuses a configured local upstream
 /// before any network or FETCH_HEAD write.
 #[test]
 fn test_fetch_refuses_local_upstream() {
-    let (repo, branch) = setup_local_upstream_current_branch();
+    let (repo, _branch) = setup_local_upstream_current_branch();
     let p = repo.path();
-    assert_local_upstream_network_refusal(&["fetch"], "fetch", &branch, p);
 
+    // A local upstream is no longer refused (issues/480 HP-16): plain `fetch`
+    // reads the current repository as an anonymous source.
+    let out = run_libra_command(&["fetch"], p);
+    assert_cli_success(&out, "fetch with local upstream");
+
+    // `fetch .` is an anonymous local-path fetch.
     let explicit = run_libra_command(&["fetch", "."], p);
-    let (stderr, report) = parse_cli_error_stderr(&explicit.stderr);
-    assert_eq!(explicit.status.code(), Some(129));
-    assert_eq!(report.error_code, "LBR-CLI-003");
-    assert!(
-        report.message.contains("remote '.' not found") || stderr.contains("remote '.' not found"),
-        "explicit '.' must keep the existing remote-not-found path: {stderr} / {}",
-        report.message
-    );
+    assert_cli_success(&explicit, "fetch .");
 }
 
 /// M-BOUND via fetch: a local Git remote honors `--depth` on an explicit want.
@@ -2387,4 +2338,795 @@ fn test_fetch_into_mirror_updates_and_prunes_all_refs() {
         extra,
         "Q4 non-mirror fetch still updates tracking"
     );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_set_upstream_writes_branch_config() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // U1: `fetch --set-upstream origin <branch>` records the current branch's
+    // upstream after a successful single-branch fetch.
+    let out = run_libra_command(
+        &["fetch", "--set-upstream", "origin", current_branch.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "fetch --set-upstream origin main");
+
+    let current = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "main".to_string(),
+    };
+    let remote = ConfigKv::get(&format!("branch.{current}.remote"))
+        .await
+        .expect("read branch remote")
+        .map(|e| e.value);
+    assert_eq!(
+        remote.as_deref(),
+        Some("origin"),
+        "U1: branch.{current}.remote = origin"
+    );
+    let merge = ConfigKv::get(&format!("branch.{current}.merge"))
+        .await
+        .expect("read branch merge")
+        .map(|e| e.value);
+    let expected_merge = format!("refs/heads/{current_branch}");
+    assert_eq!(
+        merge.as_deref(),
+        Some(expected_merge.as_str()),
+        "U1: branch.{current}.merge = source branch"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_set_upstream_no_branch_and_colon_forms() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // No branch argument: `--set-upstream` writes nothing.
+    let no_branch = run_libra_command(&["fetch", "--set-upstream", "origin"], &repo_dir);
+    assert_cli_success(&no_branch, "fetch --set-upstream origin");
+    let current = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "main".to_string(),
+    };
+    assert!(
+        ConfigKv::get(&format!("branch.{current}.remote"))
+            .await
+            .expect("read branch remote")
+            .is_none(),
+        "no-branch --set-upstream writes no remote"
+    );
+
+    // Colon refspec `src:dst` has no single source branch: Git warns and writes
+    // nothing for the branch config.
+    let colon = run_libra_command(
+        &[
+            "fetch",
+            "--set-upstream",
+            "origin",
+            &format!("refs/heads/{current_branch}:refs/heads/other2"),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&colon, "fetch --set-upstream origin main:other2");
+    let stderr = String::from_utf8_lossy(&colon.stderr);
+    assert!(
+        stderr.contains("specify exactly one branch"),
+        "colon refspec warns: {stderr}"
+    );
+    assert!(
+        ConfigKv::get(&format!("branch.{current}.remote"))
+            .await
+            .expect("read branch remote")
+            .is_none(),
+        "colon refspec writes no remote"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_refmap_with_cli_refspec() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // U4: `--refmap=` (empty) suppresses tracking-ref updates; only FETCH_HEAD
+    // is written for the command-line refspec.
+    let from_scratch = run_libra_command(
+        &["fetch", "--refmap=", "origin", current_branch.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&from_scratch, "fetch --refmap= origin main");
+    assert!(
+        Branch::find_branch_result(
+            &format!("refs/remotes/origin/{current_branch}"),
+            Some("origin"),
+        )
+        .await
+        .expect("query origin tracking")
+        .is_none(),
+        "U4: --refmap= creates no remote-tracking ref"
+    );
+
+    // A non-empty `--refmap=<spec>` drives the tracking destination instead of
+    // the configured mapping.
+    let refmap_spec = format!("+refs/heads/{current_branch}:refs/remotes/origin/other");
+    let mapped = run_libra_command(
+        &[
+            "fetch",
+            &format!("--refmap={refmap_spec}"),
+            "origin",
+            current_branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&mapped, "fetch --refmap spec origin main");
+    assert!(
+        Branch::find_branch_result("refs/remotes/origin/other", Some("origin"))
+            .await
+            .expect("query origin/other")
+            .is_some(),
+        "U4: --refmap spec drives the tracking destination"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_refmap_requires_refspec() {
+    let (_temp, repo_dir, _branch, _oid) = setup_local_fetch_cli_fixture().await;
+
+    // `--refmap` without a command-line refspec is a usage error.
+    let out = run_libra_command(&["fetch", "--refmap", "origin"], &repo_dir);
+    assert!(
+        !out.status.success(),
+        "--refmap without refspec must fail: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_update_head_ok_allows_fetch_into_checked_out_branch() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    let current = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => panic!("expected a checked-out branch"),
+    };
+
+    // Build a local Git remote carrying the same branch name (content is
+    // irrelevant: the checked-out-branch rejection fires on the destination,
+    // not on the commit, matching the existing guarded behaviour).
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    fs::write(work_dir.join("README.md"), "hello").expect("write README");
+    git(&["add", "README.md"], Some(&work_dir));
+    git(&["commit", "-m", "init"], Some(&work_dir));
+    git(&["branch", "-M", current.as_str()], Some(&work_dir));
+    git(
+        &["push", remote_dir.to_str().unwrap(), current.as_str()],
+        Some(&work_dir),
+    );
+
+    ConfigKv::set("remote.origin.url", remote_dir.to_str().unwrap(), false)
+        .await
+        .expect("set remote url");
+    let full = format!("+refs/heads/{current}:refs/heads/{current}");
+
+    // Without `--update-head-ok`, fetching into the checked-out branch is
+    // refused (existing guarded behaviour).
+    let rejected = run_libra_command(&["fetch", "origin", full.as_str()], &repo_dir);
+    assert!(
+        !rejected.status.success(),
+        "fetch into checked-out branch without --update-head-ok must be rejected: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("checked-out"),
+        "rejection should mention the checked-out branch"
+    );
+
+    // With `--update-head-ok` the same fetch succeeds.
+    let ok = run_libra_command(
+        &["fetch", "--update-head-ok", "origin", full.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&ok, "fetch --update-head-ok into checked-out branch");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_prune_tags_matrix() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    // Build a local Git remote carrying a branch and an annotated tag.
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    fs::write(work_dir.join("README.md"), "hello").expect("write README");
+    git(&["add", "README.md"], Some(&work_dir));
+    git(&["commit", "-m", "init"], Some(&work_dir));
+    git(&["branch", "-M", "main"], Some(&work_dir));
+    git(&["tag", "-a", "v1", "-m", "v1"], Some(&work_dir));
+    git(
+        &["push", remote_dir.to_str().unwrap(), "main"],
+        Some(&work_dir),
+    );
+    git(
+        &["push", remote_dir.to_str().unwrap(), "--tags"],
+        Some(&work_dir),
+    );
+
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    ConfigKv::set("remote.origin.url", remote_dir.to_str().unwrap(), false)
+        .await
+        .expect("set remote url");
+
+    // Initial fetch auto-follows the reachable annotated tag into refs/tags/v1.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], &repo_dir),
+        "fetch origin",
+    );
+    assert!(
+        tag::find_tag_ref("v1").await.expect("query v1").is_some(),
+        "v1 tag should exist after auto-follow fetch"
+    );
+
+    // Delete the tag on the remote, then `--prune-tags` alone does nothing.
+    git(
+        &["push", remote_dir.to_str().unwrap(), ":refs/tags/v1"],
+        Some(&work_dir),
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--prune-tags", "origin"], &repo_dir),
+        "fetch --prune-tags origin",
+    );
+    assert!(
+        tag::find_tag_ref("v1").await.expect("query v1").is_some(),
+        "T5: --prune-tags alone does not prune (needs --prune)"
+    );
+
+    // `--prune --prune-tags` prunes the no-longer-advertised tag.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--prune", "--prune-tags", "origin"], &repo_dir),
+        "fetch --prune --prune-tags origin",
+    );
+    assert!(
+        tag::find_tag_ref("v1").await.expect("query v1").is_none(),
+        "T5: --prune --prune-tags deletes the stale tag"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_atomic_all_or_nothing_on_non_fast_forward() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    fs::write(work_dir.join("README.md"), "hello").expect("write README");
+    git(&["add", "README.md"], Some(&work_dir));
+    git(&["commit", "-m", "init"], Some(&work_dir));
+    git(&["branch", "-M", "main"], Some(&work_dir));
+    git(
+        &["push", remote_dir.to_str().unwrap(), "main"],
+        Some(&work_dir),
+    );
+
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    ConfigKv::set("remote.origin.url", remote_dir.to_str().unwrap(), false)
+        .await
+        .expect("set remote url");
+    // Establish refs/remotes/origin/main so non-fast-forward detection works.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], &repo_dir),
+        "fetch origin",
+    );
+
+    // Commit a divergent history on a new orphan branch, then force-push it to
+    // the remote's `main` so the fetched source is unrelated to origin/main.
+    git(&["checkout", "--orphan", "orphan"], Some(&work_dir));
+    git(&["rm", "-rf", "."], Some(&work_dir));
+    fs::write(work_dir.join("other.txt"), "other").expect("write other");
+    git(&["add", "."], Some(&work_dir));
+    git(&["commit", "-m", "divergent"], Some(&work_dir));
+    git(
+        &[
+            "push",
+            "--force",
+            remote_dir.to_str().unwrap(),
+            "orphan:main",
+        ],
+        Some(&work_dir),
+    );
+
+    // `--atomic` with a non-fast-forward (unforced) update rejects; the fetch
+    // fails closed (no partial tracking-ref update).
+    let out = run_libra_command(
+        &["fetch", "--atomic", "origin", "refs/heads/main"],
+        &repo_dir,
+    );
+    // Without `+`/`--force`, the non-fast-forward update is refused.
+    assert!(
+        !out.status.success(),
+        "non-fast-forward fetch without force must fail: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_unshallow_from_local_git_source() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    for (i, name) in ["c1", "c2", "c3"].iter().enumerate() {
+        fs::write(work_dir.join(format!("{name}.txt")), name).expect("write");
+        git(&["add", "."], Some(&work_dir));
+        git(&["commit", "-m", name], Some(&work_dir));
+        if i == 0 {
+            git(&["branch", "-M", "main"], Some(&work_dir));
+        }
+    }
+    git(
+        &["push", remote_dir.to_str().unwrap(), "main"],
+        Some(&work_dir),
+    );
+
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    ConfigKv::set("remote.origin.url", remote_dir.to_str().unwrap(), false)
+        .await
+        .expect("set remote url");
+
+    // Shallow fetch: `--depth 1` records a shallow boundary.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--depth", "1", "origin", "main"], &repo_dir),
+        "fetch --depth 1 origin main",
+    );
+    assert!(
+        !libra::internal::shallow::boundary_oids()
+            .expect("read shallow boundaries")
+            .is_empty(),
+        "G2: --depth 1 records a shallow boundary"
+    );
+
+    // `--unshallow` completes the history and clears the shallow records.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--unshallow", "origin", "main"], &repo_dir),
+        "fetch --unshallow origin main",
+    );
+    assert!(
+        libra::internal::shallow::boundary_oids()
+            .expect("read shallow boundaries")
+            .is_empty(),
+        "G2: --unshallow clears the shallow boundary records"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_unshallow_non_shallow_errors() {
+    let (_temp, repo_dir, current_branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // A repository without shallow history refuses `--unshallow`.
+    let out = run_libra_command(
+        &["fetch", "--unshallow", "origin", current_branch.as_str()],
+        &repo_dir,
+    );
+    assert!(
+        !out.status.success(),
+        "G3: --unshallow on a non-shallow repo must fail: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("shallow"),
+        "G3: error should mention shallow"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_negotiation_tip_accepts_commit_and_rejects_missing() {
+    let (_temp, repo_dir, current_branch, oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    // Establish a tracking ref / local commit so a negotiation-tip can resolve.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], &repo_dir),
+        "fetch origin",
+    );
+
+    // A commit-hash tip is accepted (have-set narrowing is an optimization).
+    let ok = run_libra_command(
+        &[
+            "fetch",
+            "--negotiation-tip",
+            oid.as_str(),
+            "origin",
+            current_branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&ok, "fetch --negotiation-tip <oid> origin <branch>");
+
+    // A missing tip errors.
+    let missing = run_libra_command(
+        &[
+            "fetch",
+            "--negotiation-tip",
+            "0000000000000000000000000000000000000000",
+            "origin",
+            current_branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert!(
+        !missing.status.success(),
+        "G1: an unresolvable --negotiation-tip must fail: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_repository_path_and_url_matrix() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    let git = |args: &[&str], cwd: Option<&Path>| {
+        let mut cmd = Command::new("git");
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        assert!(
+            cmd.args(args).status().expect("git failed").success(),
+            "git {args:?}"
+        );
+    };
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], None);
+    git(&["init", work_dir.to_str().unwrap()], None);
+    git(&["config", "user.name", "Libra Tester"], Some(&work_dir));
+    git(
+        &["config", "user.email", "tester@example.com"],
+        Some(&work_dir),
+    );
+    fs::write(work_dir.join("README.md"), "hello").expect("write README");
+    git(&["add", "README.md"], Some(&work_dir));
+    git(&["commit", "-m", "init"], Some(&work_dir));
+    git(&["branch", "-M", "main"], Some(&work_dir));
+    git(
+        &["push", remote_dir.to_str().unwrap(), "main"],
+        Some(&work_dir),
+    );
+
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // V1/V5: an anonymous local path fetches successfully and writes no tracking
+    // ref for the path (matching `git fetch <path> <branch>` FETCH_HEAD-only).
+    let out = run_libra_command(&["fetch", remote_dir.to_str().unwrap(), "main"], &repo_dir);
+    assert_cli_success(&out, "fetch <path> main");
+    let basename = remote_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        Branch::find_branch_result(&format!("refs/remotes/{basename}/main"), Some(&basename),)
+            .await
+            .expect("query tracking ref")
+            .is_none(),
+        "V1: anonymous fetch writes no refs/remotes/<name>/* tracking ref"
+    );
+    // FETCH_HEAD was written.
+    assert!(
+        repo_dir.join(".libra").join("FETCH_HEAD").exists(),
+        "V1: anonymous fetch writes FETCH_HEAD"
+    );
+
+    // V1: a `file://` URL form works the same way.
+    let file_url = format!("file://{}", remote_dir.to_str().unwrap());
+    let out2 = run_libra_command(&["fetch", file_url.as_str(), "main"], &repo_dir);
+    assert_cli_success(&out2, "fetch file://<path> main");
+
+    // V3: a non-repository path fails cleanly.
+    let missing = run_libra_command(&["fetch", "/tmp/definitely-not-a-repo", "main"], &repo_dir);
+    assert!(
+        !missing.status.success(),
+        "V3: fetching from a missing path must fail: {}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_missing_remote_ref_diagnostic() {
+    let (_temp, repo_dir, _branch, _oid) = setup_local_fetch_cli_fixture().await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    let out = run_libra_command(&["fetch", "origin", "nosuchbranch"], &repo_dir);
+    let (stderr, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(out.status.code(), Some(129));
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("couldn't find remote ref nosuchbranch"),
+        "M2: fetch diagnostic, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_fetch_dot_reads_local_refs() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // `fetch . <branch>` reads the current repository as an anonymous source and
+    // writes FETCH_HEAD (D2 / M-DOT).
+    let out = run_libra_command(&["fetch", ".", branch.as_str()], &repo_dir);
+    assert_cli_success(&out, "fetch . <branch>");
+    assert!(
+        repo_dir.join(".libra").join("FETCH_HEAD").exists(),
+        "D2: fetch . writes FETCH_HEAD"
+    );
+}
+
+#[test]
+#[serial(cwd)]
+fn blake3_fetch_round_trip() {
+    let remote = super::create_committed_repo_with_format("blake3");
+    // Advance the remote so fetch has something new to retrieve.
+    fs::write(remote.path().join("tracked.txt"), "tracked-v2\n").expect("update remote file");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], remote.path()),
+        "remote add v2",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "v2", "--no-verify"], remote.path()),
+        "remote commit v2",
+    );
+
+    let local = super::create_committed_repo_with_format("blake3");
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+            local.path(),
+        ),
+        "add blake3 origin",
+    );
+    let out = run_libra_command(&["fetch", "origin"], local.path());
+    assert_cli_success(&out, "blake3 fetch round-trip");
+    let show = run_libra_command(&["rev-parse", "refs/remotes/origin/main"], local.path());
+    assert_cli_success(&show, "origin/main after blake3 fetch");
+}
+
+#[test]
+#[serial(cwd)]
+fn protocol_object_format_mismatch_error_contract() {
+    // Local blake3 vs remote sha1: parameterized across fetch/pull/clone/remote/push.
+    let remote = create_committed_repo_via_cli(); // sha1
+    let local = super::create_committed_repo_with_format("blake3");
+
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", remote.path().to_str().unwrap()],
+            local.path(),
+        ),
+        "add mismatched origin",
+    );
+
+    // fetch → LBR-REPO-003 / 128
+    let fetch = run_libra_command(&["--json", "fetch", "origin"], local.path());
+    let (_fetch_human, fetch_report) = parse_cli_error_stderr(&fetch.stderr);
+    assert_eq!(fetch.status.code(), Some(128), "fetch exit");
+    assert_eq!(fetch_report.exit_code, 128);
+    assert_eq!(fetch_report.error_code, "LBR-REPO-003");
+    assert!(
+        fetch_report.message.contains("does not match local"),
+        "fetch mismatch text: {}",
+        fetch_report.message
+    );
+    assert!(
+        fetch_report.message.to_lowercase().contains("blake3")
+            || fetch_report
+                .hints
+                .iter()
+                .any(|hint| hint.to_lowercase().contains("blake3")),
+        "fetch hint/body should mention blake3 extension: message={} hints={:?}",
+        fetch_report.message,
+        fetch_report.hints
+    );
+
+    // pull → LBR-REPO-003 / 128
+    let pull = run_libra_command(&["--json", "pull", "origin"], local.path());
+    let (_pull_human, pull_report) = parse_cli_error_stderr(&pull.stderr);
+    assert_eq!(pull.status.code(), Some(128), "pull exit");
+    assert_eq!(pull_report.exit_code, 128);
+    assert_eq!(pull_report.error_code, "LBR-REPO-003");
+
+    // remote prune → LBR-REPO-003 / 128 (ObjectFormatMismatch mapping point)
+    let remote_prune = run_libra_command(&["--json", "remote", "prune", "origin"], local.path());
+    let (_remote_human, remote_report) = parse_cli_error_stderr(&remote_prune.stderr);
+    assert_eq!(remote_prune.status.code(), Some(128), "remote prune exit");
+    assert_eq!(remote_report.exit_code, 128);
+    assert_eq!(remote_report.error_code, "LBR-REPO-003");
+
+    // push → LBR-NET-002 / 128
+    let push = run_libra_command(&["--json", "push", "origin", "main"], local.path());
+    let (_push_human, push_report) = parse_cli_error_stderr(&push.stderr);
+    assert_eq!(push.status.code(), Some(128), "push exit");
+    assert_eq!(push_report.exit_code, 128);
+    assert_eq!(push_report.error_code, "LBR-NET-002");
+
+    // clone maps ObjectFormatMismatch through map_fetch_error (LBR-REPO-003);
+    // that mapping is pinned in `clone::tests::object_format_mismatch_maps_to_repo_state_invalid_with_blake3_hint`.
+    // Fresh-path clone of the sha1 remote still succeeds (positive control).
+    let dest_root = tempdir().expect("mismatch clone root");
+    let dest = dest_root.path().join("sha1-clone");
+    let clone_ok = run_libra_command(
+        &[
+            "--json",
+            "clone",
+            remote.path().to_str().unwrap(),
+            dest.to_str().unwrap(),
+        ],
+        dest_root.path(),
+    );
+    assert_cli_success(&clone_ok, "sha1 clone still works");
+}
+
+/// B3-12: rewrite a local Git repo's config to advertise `objectformat`.
+fn force_git_source_objectformat(repo: &Path, value: &str) {
+    let git_config = repo.join(".git").join("config");
+    let mut text = fs::read_to_string(&git_config).expect("read git config");
+    if text.contains("repositoryformatversion = 0") {
+        text = text.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    } else if !text.contains("repositoryformatversion = 1") {
+        text.push_str("\n[core]\n\trepositoryformatversion = 1\n");
+    }
+    text.push_str(&format!("\n[extensions]\n\tobjectformat = {value}\n"));
+    fs::write(&git_config, text).expect("write git config");
+}
+
+#[test]
+#[serial(cwd)]
+fn fetch_rejects_sha256_git_source() {
+    use super::{
+        assert_cli_success, create_linear_git_repo, init_repo_via_cli, parse_cli_error_stderr,
+        run_libra_command,
+    };
+
+    let (git_src, _) = create_linear_git_repo(1);
+    force_git_source_objectformat(git_src.path(), "sha256");
+
+    let dest = tempdir().expect("fetch reject dest");
+    init_repo_via_cli(dest.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", git_src.path().to_str().unwrap()],
+            dest.path(),
+        ),
+        "remote add",
+    );
+
+    let before_refs = dest.path().join(".libra").join("refs").join("remotes");
+    let before_exists = before_refs.exists();
+
+    let out = run_libra_command(&["--json", "fetch", "origin"], dest.path());
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "{report:?}");
+    assert!(
+        report.hints.iter().any(|h| h.contains("fresh")
+            || h.contains("libra init --object-format")
+            || h.contains("SHA-256/BLAKE3")),
+        "hint must point at fresh init: {:?}",
+        report.hints
+    );
+    assert_eq!(
+        before_refs.exists(),
+        before_exists,
+        "fetch must not write remote-tracking refs"
+    );
+    if before_refs.exists() {
+        assert!(
+            fs::read_dir(&before_refs).map(|d| d.count()).unwrap_or(0) == 0
+                || !before_refs.join("origin").exists(),
+            "no origin tracking refs after reject"
+        );
+    }
 }

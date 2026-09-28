@@ -1445,6 +1445,35 @@ fn rename_empty_file_exact_pair_only() {
 /// GC-02 hash-kind neutrality: rename detection (exact and inexact) works
 /// identically in a SHA-256 repository.
 #[test]
+fn status_blake3_repo_smoke() {
+    let repo = tempdir().expect("temp repo");
+    fs::create_dir_all(repo.path()).unwrap();
+    let init = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "blake3"],
+        repo.path(),
+    );
+    assert_cli_success(&init, "init blake3 repo");
+    configure_identity_via_cli(repo.path());
+    fs::write(repo.path().join("tracked.txt"), "blake3 status\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], repo.path()),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tip", "--no-verify"], repo.path()),
+        "commit",
+    );
+    fs::write(repo.path().join("tracked.txt"), "blake3 status edited\n").unwrap();
+    let out = status_stdout(repo.path(), &["status"]);
+    assert!(
+        out.contains("modified:") || out.contains("tracked.txt"),
+        "blake3 status must report the dirty file without 20-byte index misread: {out}"
+    );
+}
+
+/// GC-02 hash-kind neutrality: rename detection (exact and inexact) works
+/// identically in a SHA-256 repository.
+#[test]
 fn rename_sha256_repo_detected() {
     let repo = tempdir().expect("temp repo");
     fs::create_dir_all(repo.path()).unwrap();
@@ -6020,8 +6049,18 @@ fn ref_with_mismatched_hash_kind_fails_closed() {
     };
     assert_eq!(head_oid.len(), 40, "the fixture is a SHA-1 repository");
 
-    let flip = run_libra_command(&["config", "core.objectformat", "sha256"], repo.path());
-    assert_cli_success(&flip, "declare the repository sha256");
+    // B3-11: `config` refuses `core.objectformat` writes. Seed the mismatched
+    // declaration through ConfigKv (init/reinit path), preserving this test's
+    // read-boundary intent.
+    {
+        let _guard = libra::utils::test::ChangeDirGuard::new(repo.path());
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            libra::internal::config::ConfigKv::set("core.objectformat", "sha256", false)
+                .await
+                .expect("declare the repository sha256 via ConfigKv");
+        });
+    }
 
     // Every read path must now refuse the stored SHA-1 id.
     for flags in [

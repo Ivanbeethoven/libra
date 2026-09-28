@@ -1204,12 +1204,16 @@ fn build_runner() -> MigrationRunner {
 }
 
 async fn connect_with_busy_timeout(url: &str) -> DatabaseConnection {
+    connect_with_busy_timeout_secs(url, 5).await
+}
+
+async fn connect_with_busy_timeout_secs(url: &str, secs: u64) -> DatabaseConnection {
     use std::time::Duration;
     let mut opts = ConnectOptions::new(url.to_string());
     opts.sqlx_logging(false);
     // Match the production busy-timeout path so the test exercises the
     // realistic concurrency model.
-    opts.map_sqlx_sqlite_opts(move |sqlx_opts| sqlx_opts.busy_timeout(Duration::from_secs(5)));
+    opts.map_sqlx_sqlite_opts(move |sqlx_opts| sqlx_opts.busy_timeout(Duration::from_secs(secs)));
     Database::connect(opts).await.expect("connect")
 }
 
@@ -2829,8 +2833,12 @@ async fn bisect_state_migration_keeps_newest_row_per_scope() {
 async fn concurrent_run_pending_applies_each_migration_exactly_once() {
     for round in 0..3 {
         let (_dir, url, _path) = fresh_db_url();
-        let conn_a = connect(&url).await;
-        let conn_b = connect(&url).await;
+        // Contended claims need a long busy-timeout: under full-suite load a
+        // winning racer can hold the write lock for >>5s while applying the
+        // full registry. Plain `connect` (and a short busy) surfaces
+        // SQLITE_BUSY (code 5) before the loser can wait out the winner.
+        let conn_a = connect_with_busy_timeout_secs(&url, 60).await;
+        let conn_b = connect_with_busy_timeout_secs(&url, 60).await;
         let runner_a = builtin_runner().expect("builtin runner A");
         let runner_b = builtin_runner().expect("builtin runner B");
 

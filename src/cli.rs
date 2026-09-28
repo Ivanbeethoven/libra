@@ -216,23 +216,8 @@ async fn read_schema_free_object_format(
 }
 
 fn set_hash_kind_from_object_format(object_format: String) -> CliResult<()> {
-    let hash_kind = match object_format.as_str() {
-        "sha1" => HashKind::Sha1,
-        "sha256" => HashKind::Sha256,
-        // Explicit reject until B3-01 opens `init --object-format blake3`.
-        // Keeping a dedicated arm closes the preflight bypass window that a
-        // wildcard `_` would leave if a later edit added a soft fallback.
-        "blake3" => {
-            return Err(CliError::fatal(
-                "unsupported object format: 'blake3'".to_string(),
-            ));
-        }
-        _ => {
-            return Err(CliError::fatal(format!(
-                "unsupported object format: '{object_format}'"
-            )));
-        }
-    };
+    let hash_kind = crate::internal::object_format::parse_config_value(&object_format)
+        .map_err(|_| CliError::fatal(format!("unsupported object format: '{object_format}'")))?;
     set_hash_kind(hash_kind);
     Ok(())
 }
@@ -2332,11 +2317,21 @@ async fn repair_pending_object_index_updates_before_command(
         ))
         .with_stable_code(utils::error::StableErrorCode::IoWriteFailed)
         .with_hint("rerun the command until the bounded repair queue is empty; if it does not shrink, inspect the repository database and repair-marker directory.")),
-        Ok(Some(outcome)) if outcome.remaining => {
+        // Only warn when this preflight made forward progress. A no-progress
+        // remaining queue is retried by the next command; warning on silent
+        // status exits (e.g. grep exit 1) would corrupt Git-compatible stderr.
+        Ok(Some(outcome)) if outcome.remaining && outcome.repaired > 0 => {
             utils::error::emit_warning(format!(
                 "replayed {} durable cloud object-index repair marker(s), but more remain for the next repository command; cloud operations and destructive agent cleanup stay fail-closed until the queue is empty",
                 outcome.repaired
             ));
+            Ok(())
+        }
+        Ok(Some(outcome)) if outcome.remaining => {
+            tracing::debug!(
+                repaired = outcome.repaired,
+                "object-index repair queue still pending after a no-progress preflight"
+            );
             Ok(())
         }
         Ok(Some(_)) => Ok(()),

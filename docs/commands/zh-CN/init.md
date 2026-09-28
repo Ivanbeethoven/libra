@@ -16,7 +16,7 @@ libra init [OPTIONS] [DIRECTORY]
 
 提供 `--from-git-repository` 时，会从源 Git 仓库导入对象和 refs，并配置 `origin` 指向源分支布局。转换后的仓库会把源仓库实际 `HEAD` 分支报告为 `initial_branch`；不会使用 `init.defaultBranch` 重命名或错误报告导入分支。在源工作树或已 checkout 导入中发现的任何 `.gitignore` 文件都会复制为匹配的 `.libraignore` 文件。
 
-在已初始化的仓库中再次运行 `libra init` 是安全的：与 `git init` 一致，它会就地重新初始化，打印 `Reinitialized existing Libra repository in <path>`，补齐缺失的标准布局（模板、目录）并重新应用 `--shared`，同时保留现有仓库数据——配置、`HEAD`、refs、对象、vault 与仓库 id 均不受影响。打开数据库仍可能应用 schema 迁移；保留数据不等于保留旧数据库结构。当 `--initial-branch`/`--object-format` 与现有仓库不一致时会被忽略（并给出警告）；`--from-git-repository` 在已初始化的仓库上会被拒绝。
+在已初始化的仓库中再次运行 `libra init` 是安全的：与 `git init` 一致，它会就地重新初始化，打印 `Reinitialized existing Libra repository in <path>`，补齐缺失的标准布局（模板、目录）并重新应用 `--shared`，同时保留现有仓库数据——配置、`HEAD`、refs、对象、vault 与仓库 id 均不受影响。打开数据库仍可能应用 schema 迁移；保留数据不等于保留旧数据库结构。当 `--initial-branch` 与现有 HEAD 不一致时会被忽略（并给出警告）；若 `--object-format` 与已存值不同，则在任何布局/数据库副作用前以 `LBR-CLI-002` 拒绝。`--from-git-repository` 在已初始化的仓库上会被拒绝。
 
 不能把用户级 Libra home（`LIBRA_HOME`，默认 `~/.libra`）或全局配置目录（`<XDG_CONFIG_HOME 或 ~/.config>/libra`）内的路径作为仓库存储根。该目录保存用户状态；全局配置保存在 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在自动迁移前仍是回退，或 `LIBRA_CONFIG_GLOBAL_DB` 指定的位置）。检查同样适用于尚不存在的目录、路径别名和 linked worktree 的 `commondir` 目标。
 
@@ -67,11 +67,14 @@ libra init --initial-branch trunk
 
 ### `--object-format <FORMAT>`
 
-设置对象哈希算法。可接受值为 `sha1`（默认）和 `sha256`。
+设置**新建**仓库的对象哈希算法。可接受值为 `sha1`（默认）、`sha256`，以及 Libra 扩展 `blake3`（不是 Git 对象格式）。
 
 ```bash
 libra init --object-format sha256
+libra init --object-format blake3
 ```
+
+Convert（`--from-git-repository`）仅允许 SHA-1 Git → SHA-1 Libra。与 Convert 同时传入 `--object-format sha256`/`blake3`，或转换 SHA-256 Git 源，都会在任何目标写盘前以 `LBR-CLI-002` fail-closed。对已有仓库再次 `init` 时，若 `--object-format` 与已存值不同，同样以 `LBR-CLI-002` 拒绝；请改用新建仓库。
 
 ### `--from-git-repository <PATH>`
 

@@ -27,12 +27,11 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read},
     path::PathBuf,
-    str::FromStr,
 };
 
 use clap::Parser;
 use git_internal::{
-    hash::{ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::object::{
         ObjectTrait,
         commit::Commit,
@@ -189,7 +188,7 @@ impl<R: BufRead> Importer<R> {
             max_input,
             objects: 0,
             max_objects,
-            hash_hex_len: get_hash_kind().hex_len(),
+            hash_hex_len: git_internal::hash::get_hash_kind().hex_len(),
             marks: HashMap::new(),
             pending_refs: HashMap::new(),
             pending_notes: HashMap::new(),
@@ -577,9 +576,10 @@ impl<R: BufRead> Importer<R> {
                     self.hash_hex_len
                 )));
             }
-            let object = ObjectHash::from_str(&object_text).map_err(|error| {
-                self.fatal(&format!("invalid notes object path '{path}': {error}"))
-            })?;
+            let object =
+                crate::internal::object_format::parse_repo_oid(&object_text).map_err(|error| {
+                    self.fatal(&format!("invalid notes object path '{path}': {error}"))
+                })?;
             let object_type = util::objects_storage()
                 .get_object_type(blob)
                 .map_err(|error| {
@@ -735,11 +735,12 @@ impl<R: BufRead> Importer<R> {
             if blob.is_none() {
                 continue;
             }
-            let object_id = ObjectHash::from_str(object).map_err(|error| {
-                self.fatal(&format!(
-                    "invalid noted object '{object}' in {notes_ref}: {error}"
-                ))
-            })?;
+            let object_id =
+                crate::internal::object_format::parse_repo_oid(object).map_err(|error| {
+                    self.fatal(&format!(
+                        "invalid noted object '{object}' in {notes_ref}: {error}"
+                    ))
+                })?;
             storage.get_object_type(&object_id).map_err(|error| {
                 self.fatal(&format!(
                     "noted object {object_id} in {notes_ref} is unavailable: {error}"
@@ -948,7 +949,8 @@ impl<R: BufRead> Importer<R> {
                 "object id '{spec}' does not match the repository hash format"
             )));
         }
-        ObjectHash::from_str(spec).map_err(|_| self.fatal(&format!("invalid object id '{spec}'")))
+        crate::internal::object_format::parse_repo_oid(spec)
+            .map_err(|_| self.fatal(&format!("invalid object id '{spec}'")))
     }
 
     /// Load a commit's tree into the flat path → (mode, id) state map.

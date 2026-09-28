@@ -31,7 +31,7 @@
 //! blob (the E4-libra `redaction_report.json` is already aggregate-only and
 //! content-hash-covered), so the checkpoint tree is not touched by this window.
 
-use std::{collections::HashSet, fs, path::Path, str::FromStr, sync::Arc};
+use std::{collections::HashSet, fs, path::Path, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
@@ -960,7 +960,7 @@ async fn reclaim_findings_objects(
 
     let mut pruned = 0u64;
     for oid in &oids {
-        let Ok(hash) = git_internal::hash::ObjectHash::from_str(oid) else {
+        let Ok(hash) = crate::internal::object_format::parse_repo_oid(oid) else {
             continue; // a manifest we cannot parse is not a licence to delete
         };
         if reachable.contains(&hash) {

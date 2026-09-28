@@ -1,6 +1,6 @@
 //! Tag operations that resolve target objects, build annotated or lightweight tags, persist refs in the database, and write tag objects to storage.
 
-use std::{io, str::FromStr};
+use std::io;
 
 use git_internal::{
     errors::GitError,
@@ -277,8 +277,8 @@ pub async fn verify(name: &str) -> Result<bool, VerifyTagError> {
     let target = tag_ref
         .target
         .ok_or_else(|| VerifyTagError::NotFound(name.to_string()))?;
-    let object_id =
-        ObjectHash::from_str(&target).map_err(|e| VerifyTagError::LoadObject(e.to_string()))?;
+    let object_id = crate::internal::object_format::parse_repo_oid(&target)
+        .map_err(|e| VerifyTagError::LoadObject(e.to_string()))?;
     let tag = load_object::<git_internalTag>(&object_id)
         .map_err(|_| VerifyTagError::NotAnnotated(name.to_string()))?;
 
@@ -351,9 +351,11 @@ pub async fn list() -> Result<Vec<Tag>, ListTagError> {
                 name: display_name.clone(),
             })?;
         let object_id =
-            ObjectHash::from_str(commit_str).map_err(|e| ListTagError::InvalidObjectHash {
-                name: display_name.clone(),
-                detail: e.to_string(),
+            crate::internal::object_format::parse_repo_oid(commit_str).map_err(|e| {
+                ListTagError::InvalidObjectHash {
+                    name: display_name.clone(),
+                    detail: e.to_string(),
+                }
             })?;
         let object = load_object_trait(&object_id)
             .await
@@ -423,7 +425,7 @@ pub async fn find_tag_and_commit(name: &str) -> Result<Option<(TagObject, Commit
             .commit
             .as_ref()
             .ok_or_else(|| GitError::CustomError("Tag is missing commit field".to_string()))?;
-        let target_id = ObjectHash::from_str(commit_str)
+        let target_id = crate::internal::object_format::parse_repo_oid(commit_str)
             .map_err(|_| GitError::InvalidHashValue(commit_str.to_string()))?;
         let ref_object = load_object_trait(&target_id).await?;
 

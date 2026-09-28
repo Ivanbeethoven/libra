@@ -26,6 +26,46 @@ use super::*;
 
 mod write_transactions;
 
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_remote_ssh_publickey_auth_diagnostic() {
+    let repo = create_committed_repo_via_cli();
+    let ssh = create_ssh_publickey_auth_failure_script(repo.path());
+    let remote_url = "git@fixture.invalid:repo";
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", remote_url], repo.path()),
+        "add SSH fixture remote",
+    );
+    let refs = snapshot_repo_refs(repo.path());
+
+    for args in [
+        vec!["remote", "show", "origin"],
+        vec!["remote", "update", "origin"],
+        vec!["remote", "prune", "origin"],
+        vec!["remote", "set-head", "origin", "--auto"],
+    ] {
+        for mode in SSH_PUBLICKEY_AUTH_OUTPUT_MODES {
+            assert_ssh_publickey_auth_failure(&args, repo.path(), &ssh, mode);
+            assert_repo_refs_unchanged(&refs, repo.path(), mode);
+        }
+    }
+
+    for (index, mode) in SSH_PUBLICKEY_AUTH_OUTPUT_MODES.into_iter().enumerate() {
+        let name = format!("added-{index}");
+        assert_ssh_publickey_auth_failure(
+            &["remote", "add", "-f", name.as_str(), remote_url],
+            repo.path(),
+            &ssh,
+            mode,
+        );
+        let get_url = run_libra_command(&["remote", "get-url", name.as_str()], repo.path());
+        assert_cli_success(&get_url, "remote add -f must retain the registered remote");
+        assert_eq!(String::from_utf8_lossy(&get_url.stdout).trim(), remote_url);
+        assert_repo_refs_unchanged(&refs, repo.path(), mode);
+    }
+}
+
 #[tokio::test]
 #[serial(cwd)]
 async fn test_remote_add_creates_entry() {
@@ -41,7 +81,7 @@ async fn test_remote_add_creates_entry() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
 
@@ -67,7 +107,7 @@ async fn test_remote_add_duplicate_name_returns_error() {
             master: None,
             tags: false,
             no_tags: false,
-            mirror: false,
+            mirror: None,
         },
         &OutputConfig::default(),
     )
@@ -83,7 +123,7 @@ async fn test_remote_add_duplicate_name_returns_error() {
             master: None,
             tags: false,
             no_tags: false,
-            mirror: false,
+            mirror: None,
         },
         &OutputConfig::default(),
     )
@@ -166,8 +206,8 @@ async fn test_remote_add_cold_config_flags() {
         .expect("query remote HEAD");
     assert!(head_row.is_some(), "-m writes refs/remotes/origin/HEAD");
 
-    // --no-tags records the opposite preference; with no -t, no fetch refspec
-    // is written (the default wildcard remains implicit, as for a plain add).
+    // --no-tags records the opposite preference; with no `-t`, the default
+    // `+refs/heads/*:refs/remotes/<name>/*` fetch refspec is written (Git parity).
     assert_cli_success(
         &run_libra_command(
             &[
@@ -186,12 +226,16 @@ async fn test_remote_add_cold_config_flags() {
         .expect("read up tagOpt")
         .map(|e| e.value);
     assert_eq!(up_tagopt.as_deref(), Some("--no-tags"));
-    assert!(
-        ConfigKv::get_all("remote.up.fetch")
-            .await
-            .expect("read up fetch")
-            .is_empty(),
-        "plain add (no -t) writes no fetch refspec"
+    let up_fetch = ConfigKv::get_all("remote.up.fetch")
+        .await
+        .expect("read up fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        up_fetch,
+        vec!["+refs/heads/*:refs/remotes/up/*"],
+        "plain add (no -t) writes the default fetch refspec"
     );
 
     // --tags and --no-tags are mutually exclusive (clap usage error, exit 129).
@@ -267,7 +311,7 @@ async fn test_remote_remove_deletes_entry() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
 
@@ -296,7 +340,7 @@ async fn test_remote_remove_deletes_vault_ssh_keys() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
     ConfigKv::set("vault.ssh.origin.pubkey", "ssh-rsa origin", false)
@@ -346,7 +390,7 @@ async fn test_remote_rename_updates_branch_tracking() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
 
@@ -409,7 +453,7 @@ async fn test_remote_rename_cascades_vault_ssh_keys() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
     ConfigKv::set("vault.ssh.origin.pubkey", "ssh-rsa origin", false)
@@ -476,7 +520,7 @@ async fn test_remote_rename_refuses_existing_target_vault_ssh_namespace() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
     ConfigKv::set("vault.ssh.origin.pubkey", "ssh-rsa origin", false)
@@ -623,7 +667,7 @@ async fn test_remote_rename_conflict_returns_error() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
     remote::execute(RemoteCmds::Add {
@@ -634,7 +678,7 @@ async fn test_remote_rename_conflict_returns_error() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
 
@@ -659,7 +703,7 @@ async fn test_remote_set_url_add_appends_fetch_url() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
 
@@ -700,7 +744,7 @@ async fn test_remote_set_url_delete_removes_matching_url() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
     remote::execute(RemoteCmds::SetUrl {
@@ -749,7 +793,7 @@ async fn test_remote_set_url_push_and_get_pushurl_entries() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
 
@@ -802,7 +846,7 @@ async fn test_remote_set_url_all_replaces_all_fetch_urls() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
     remote::execute(RemoteCmds::SetUrl {
@@ -1518,7 +1562,7 @@ async fn test_remote_set_url_delete_no_match_returns_error() {
             master: None,
             tags: false,
             no_tags: false,
-            mirror: false,
+            mirror: None,
         },
         &OutputConfig::default(),
     )
@@ -1646,7 +1690,7 @@ async fn test_remote_remove_works_after_deleting_last_url() {
             master: None,
             tags: false,
             no_tags: false,
-            mirror: false,
+            mirror: None,
         },
         &OutputConfig::default(),
     )
@@ -1952,7 +1996,7 @@ async fn add_origin() {
         master: None,
         tags: false,
         no_tags: false,
-        mirror: false,
+        mirror: None,
     })
     .await;
 }
@@ -2624,61 +2668,532 @@ async fn remote_update_prune_removes_stale_tracking_branches() {
 
 #[tokio::test]
 #[serial(cwd)]
-async fn test_remote_add_mirror_writes_marker_and_conflicts_with_track() {
+async fn test_remote_add_default_refspec_and_mirror_matrix() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
     let _guard = test::ChangeDirGuard::new(repo_dir.path());
     let p = repo_dir.path();
 
-    // `--mirror` records the informational marker `remote.<name>.mirror=true`.
-    assert_cli_success(
-        &run_libra_command(
-            &[
-                "remote",
-                "add",
-                "--mirror",
-                "backup",
-                "https://example.com/r.git",
-            ],
-            p,
-        ),
-        "remote add --mirror",
+    // A1: default `remote add` with no `-t` writes the default fetch refspec
+    // `+refs/heads/*:refs/remotes/<name>/*` (Git parity; previously implicit).
+    remote::execute_safe(
+        RemoteCmds::Add {
+            name: "f1".into(),
+            url: "https://example.com/r.git".into(),
+            fetch: false,
+            track: vec![],
+            master: None,
+            tags: false,
+            no_tags: false,
+            mirror: None,
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .expect("add default remote");
+    let f1_fetch = ConfigKv::get_all("remote.f1.fetch")
+        .await
+        .expect("read f1 fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        f1_fetch,
+        vec!["+refs/heads/*:refs/remotes/f1/*"],
+        "A1: default remote add writes the wildcard fetch refspec"
     );
-    let marker = ConfigKv::get("remote.backup.mirror")
-        .await
-        .expect("read mirror marker")
-        .map(|e| e.value);
-    assert_eq!(marker.as_deref(), Some("true"), "mirror marker is written");
 
-    // NARROWING: no `+refs/*:refs/*` fetch refspec is written (fetch is not
-    // mirror-aware), matching `clone --mirror`.
-    let fetch = ConfigKv::get_all("remote.backup.fetch")
+    // A3: `-t <branch> -m <branch>` writes only that branch's refspec (regression)
+    // and keeps the non-mirror `refs/heads/<b>:refs/remotes/<n>/<b>` form.
+    remote::execute_safe(
+        RemoteCmds::Add {
+            name: "f2".into(),
+            url: "https://example.com/r2.git".into(),
+            fetch: false,
+            track: vec!["dev".into()],
+            master: Some("dev".into()),
+            tags: false,
+            no_tags: false,
+            mirror: None,
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .expect("add tracked remote");
+    let f2_fetch = ConfigKv::get_all("remote.f2.fetch")
         .await
-        .expect("read fetch")
+        .expect("read f2 fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        f2_fetch,
+        vec!["+refs/heads/dev:refs/remotes/f2/dev"],
+        "A3: -t writes the specific branch refspec only"
+    );
+
+    // A4: `--mirror=fetch` writes the mirror `+refs/*:refs/*` but does NOT persist
+    // `mirror=true` (matches Git 2.55; the bare form is the one that records it).
+    remote::execute_safe(
+        RemoteCmds::Add {
+            name: "mf".into(),
+            url: "https://example.com/mf.git".into(),
+            fetch: false,
+            track: vec![],
+            master: None,
+            tags: false,
+            no_tags: false,
+            mirror: Some(Some(remote::RemoteMirrorMode::Fetch)),
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .expect("add fetch mirror");
+    let mf_fetch = ConfigKv::get_all("remote.mf.fetch")
+        .await
+        .expect("read mf fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mf_fetch,
+        vec!["+refs/*:refs/*"],
+        "A4: --mirror=fetch writes +refs/*:refs/*"
+    );
+    let mf_marker = ConfigKv::get("remote.mf.mirror")
+        .await
+        .expect("read mf mirror")
+        .map(|e| e.value);
+    assert_eq!(
+        mf_marker, None,
+        "A4: --mirror=fetch does not persist the mirror marker"
+    );
+
+    // A5: `--mirror=push` writes only the `mirror=true` marker, no fetch refspec.
+    remote::execute_safe(
+        RemoteCmds::Add {
+            name: "mp".into(),
+            url: "https://example.com/mp.git".into(),
+            fetch: false,
+            track: vec![],
+            master: None,
+            tags: false,
+            no_tags: false,
+            mirror: Some(Some(remote::RemoteMirrorMode::Push)),
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .expect("add push mirror");
+    let mp_fetch = ConfigKv::get_all("remote.mp.fetch")
+        .await
+        .expect("read mp fetch")
         .into_iter()
         .map(|e| e.value)
         .collect::<Vec<_>>();
     assert!(
-        fetch.is_empty(),
-        "remote add --mirror writes no fetch refspec: {fetch:?}"
+        mp_fetch.is_empty(),
+        "A5: --mirror=push writes no fetch refspec"
+    );
+    let mp_marker = ConfigKv::get("remote.mp.mirror")
+        .await
+        .expect("read mp mirror")
+        .map(|e| e.value);
+    assert_eq!(
+        mp_marker.as_deref(),
+        Some("true"),
+        "A5: --mirror=push marker"
     );
 
-    // `--mirror` is incompatible with `-t`/`--track` (clap conflict → usage error).
-    let conflict = run_libra_command(
+    // A6: bare `--mirror` writes `+refs/*:refs/*` AND the `mirror=true` marker, and
+    // emits Git's deprecation warning on stderr.
+    let bare_out = run_libra_command(
         &[
             "remote",
             "add",
             "--mirror",
-            "-t",
+            "m0",
+            "https://example.com/r.git",
+        ],
+        p,
+    );
+    assert_cli_success(&bare_out, "remote add --mirror (bare)");
+    let bare_stderr = String::from_utf8_lossy(&bare_out.stderr).to_lowercase();
+    assert!(
+        bare_stderr.contains("deprecated") && bare_stderr.contains("mirror"),
+        "A6: bare --mirror emits a deprecation warning, got: {bare_stderr}"
+    );
+    let m0_fetch = ConfigKv::get_all("remote.m0.fetch")
+        .await
+        .expect("read m0 fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(m0_fetch, vec!["+refs/*:refs/*"], "A6: bare mirror refspec");
+    let m0_marker = ConfigKv::get("remote.m0.mirror")
+        .await
+        .expect("read m0 mirror")
+        .map(|e| e.value);
+    assert_eq!(m0_marker.as_deref(), Some("true"), "A6: bare mirror marker");
+
+    // A7: combination limits and unknown-value handling match Git's exit codes.
+    // `--mirror` + `-m` is a hard runtime error (Git exit 128).
+    let m_ma = run_libra_command(
+        &[
+            "remote",
+            "add",
+            "--mirror",
+            "--master",
             "main",
-            "m2",
+            "cma",
             "https://example.com/r.git",
         ],
         p,
     );
     assert!(
-        !conflict.status.success(),
-        "--mirror with -t must be rejected: {}",
-        String::from_utf8_lossy(&conflict.stderr)
+        !m_ma.status.success(),
+        "--mirror --master must be rejected (Git 128): {}",
+        String::from_utf8_lossy(&m_ma.stderr)
     );
+    // `--mirror=push` + `-t` is a hard runtime error (Git exit 128).
+    let m_tr = run_libra_command(
+        &[
+            "remote",
+            "add",
+            "--mirror=push",
+            "-t",
+            "dev",
+            "ctr",
+            "https://example.com/r.git",
+        ],
+        p,
+    );
+    assert!(
+        !m_tr.status.success(),
+        "--mirror=push -t must be rejected (Git 128): {}",
+        String::from_utf8_lossy(&m_tr.stderr)
+    );
+    // An unknown `--mirror` value is a usage error (Git exit 129).
+    let m_bogus = run_libra_command(
+        &[
+            "remote",
+            "add",
+            "--mirror=bogus",
+            "cb",
+            "https://example.com/r.git",
+        ],
+        p,
+    );
+    assert!(
+        !m_bogus.status.success(),
+        "--mirror=bogus is a usage error (Git 129): {}",
+        String::from_utf8_lossy(&m_bogus.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_remote_add_mirror_fetch_track_allowed() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+
+    // Git permits `--mirror=fetch -t <b>` and writes the mirror-style refspec
+    // `+refs/<b>:refs/<b>` (source namespace preserved) rather than the
+    // non-mirror `refs/heads/<b>:refs/remotes/<n>/<b>` form.
+    remote::execute_safe(
+        RemoteCmds::Add {
+            name: "ctf".into(),
+            url: "https://example.com/r.git".into(),
+            fetch: false,
+            track: vec!["dev".into()],
+            master: None,
+            tags: false,
+            no_tags: false,
+            mirror: Some(Some(remote::RemoteMirrorMode::Fetch)),
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .expect("add fetch mirror with track");
+    let ctf_fetch = ConfigKv::get_all("remote.ctf.fetch")
+        .await
+        .expect("read ctf fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ctf_fetch,
+        vec!["+refs/dev:refs/dev"],
+        "--mirror=fetch -t dev writes +refs/dev:refs/dev"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_t5505_add_another_remote() {
+    use std::process::Command;
+
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    let repo_dir = temp_root.path().join("libra_repo");
+
+    // Build a local Git source with `main` and `dev` branches (setup only; the
+    // assertions below exercise `libra remote add` and `libra fetch`).
+    let git_ok = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .current_dir(&work_dir)
+                .args(args)
+                .status()
+                .expect("run git")
+                .success(),
+            "git {args:?} failed"
+        );
+    };
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["init", work_dir.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    git_ok(&["config", "user.name", "Libra Tester"]);
+    git_ok(&["config", "user.email", "tester@example.com"]);
+    fs::write(work_dir.join("README.md"), "hello").unwrap();
+    git_ok(&["add", "README.md"]);
+    git_ok(&["commit", "-m", "init"]);
+    git_ok(&["branch", "-M", "main"]);
+    git_ok(&["push", remote_dir.to_str().unwrap(), "main"]);
+    git_ok(&["checkout", "-b", "dev"]);
+    fs::write(work_dir.join("dev.txt"), "dev").unwrap();
+    git_ok(&["add", "dev.txt"]);
+    git_ok(&["commit", "-m", "dev"]);
+    git_ok(&["push", remote_dir.to_str().unwrap(), "dev"]);
+
+    fs::create_dir_all(&repo_dir).unwrap();
+    test::setup_with_new_libra_in(&repo_dir).await;
+    let _guard = test::ChangeDirGuard::new(&repo_dir);
+    let remote_path_str = remote_dir.to_str().unwrap().to_string();
+
+    // A9 (t5505:93): `remote add -f <name> <path>` registers the remote, writes
+    // the default fetch refspec, and immediately fetches.
+    let add_out = run_libra_command(
+        &["remote", "add", "-f", "origin", remote_path_str.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&add_out, "remote add -f origin <path>");
+    let origin_fetch = ConfigKv::get_all("remote.origin.fetch")
+        .await
+        .expect("read origin fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        origin_fetch,
+        vec!["+refs/heads/*:refs/remotes/origin/*"],
+        "A9: -f add writes the default fetch refspec"
+    );
+    // The fetch from `-f` populated the tracking refs for every advertised head.
+    assert!(
+        Branch::find_branch_result("refs/remotes/origin/main", Some("origin"))
+            .await
+            .expect("query origin/main")
+            .is_some(),
+        "A9: -f fetch created refs/remotes/origin/main"
+    );
+
+    // A2: append a custom refspec and fetch again. The default refspec is no
+    // longer replaced, so fetch updates BOTH the default mapping and the custom
+    // one (Git keeps the default and the appended custom refspec).
+    ConfigKv::add(
+        "remote.origin.fetch",
+        "+refs/heads/dev:refs/remotes/origin/onlydev",
+        false,
+    )
+    .await
+    .expect("append custom refspec");
+    let fetch_out = run_libra_command(&["fetch", "origin"], &repo_dir);
+    assert_cli_success(&fetch_out, "fetch origin after appending refspec");
+    for (suffix, track) in [("main", true), ("dev", true), ("onlydev", true)] {
+        assert_eq!(
+            Branch::find_branch_result(&format!("refs/remotes/origin/{suffix}"), Some("origin"))
+                .await
+                .expect("query tracking ref")
+                .is_some(),
+            track,
+            "A2: refs/remotes/origin/{suffix} presence"
+        );
+    }
+
+    // A8: a remote created without any fetch config (old-style) continues to
+    // fetch via the implicit default mapping and is NOT rewritten by fetch.
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "legacy", remote_path_str.as_str()],
+            &repo_dir,
+        ),
+        "remote add legacy",
+    );
+    ConfigKv::unset_all("remote.legacy.fetch")
+        .await
+        .expect("drop legacy fetch config");
+    assert!(
+        ConfigKv::get_all("remote.legacy.fetch")
+            .await
+            .expect("read legacy fetch")
+            .is_empty(),
+        "legacy remote has no fetch config before fetch"
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "legacy"], &repo_dir),
+        "fetch legacy with no fetch config",
+    );
+    assert!(
+        Branch::find_branch_result("refs/remotes/legacy/main", Some("legacy"))
+            .await
+            .expect("query legacy/main")
+            .is_some(),
+        "A8: legacy fetch used the implicit default mapping"
+    );
+    assert!(
+        ConfigKv::get_all("remote.legacy.fetch")
+            .await
+            .expect("read legacy fetch")
+            .is_empty(),
+        "A8: fetch did not rewrite the legacy remote's config"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_remote_rename_push_targets_matrix() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    let p = repo_dir.path();
+
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "old", "https://example.com/r.git"], p),
+        "remote add old",
+    );
+    // R5: a non-default fetch refspec (destination is rewritten on rename, as
+    // Git does, while the source is preserved).
+    ConfigKv::add(
+        "remote.old.fetch",
+        "+refs/heads/dev:refs/remotes/old/dev",
+        false,
+    )
+    .await
+    .expect("add custom fetch refspec");
+
+    // R1: repository-scoped `remote.pushDefault` names the old remote.
+    ConfigKv::set("remote.pushDefault", "old", false)
+        .await
+        .expect("set repo pushDefault");
+    // R3: branch `main` pushRemote names the old remote.
+    ConfigKv::set("branch.main.pushRemote", "old", false)
+        .await
+        .expect("set branch pushRemote");
+
+    assert_cli_success(
+        &run_libra_command(&["remote", "rename", "old", "new"], p),
+        "remote rename old new",
+    );
+
+    // R1: the repository-scoped pushDefault is rewritten to the new name.
+    let push_default = ConfigKv::get_var_case_insensitive("remote.", "pushDefault")
+        .await
+        .expect("read pushDefault")
+        .map(|e| e.value);
+    assert_eq!(
+        push_default.as_deref(),
+        Some("new"),
+        "R1: pushDefault rewritten"
+    );
+
+    // R3: branch.pushRemote is rewritten to the new name.
+    let branch_push = ConfigKv::get_var_case_insensitive("branch.main.", "pushRemote")
+        .await
+        .expect("read branch pushRemote")
+        .map(|e| e.value);
+    assert_eq!(
+        branch_push.as_deref(),
+        Some("new"),
+        "R3: branch.main.pushRemote rewritten"
+    );
+
+    // R5: both the default and the non-default fetch refspec destinations are
+    // rewritten to the new name while sources are preserved.
+    let fetch_specs = ConfigKv::get_all("remote.new.fetch")
+        .await
+        .expect("read new fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fetch_specs,
+        vec![
+            "+refs/heads/*:refs/remotes/new/*",
+            "+refs/heads/dev:refs/remotes/new/dev",
+        ],
+        "R5: refspec destinations rewritten, sources preserved"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_remote_rename_global_push_default_warns_and_is_unchanged() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    let p = repo_dir.path();
+
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "old", "https://example.com/r.git"], p),
+        "remote add old",
+    );
+
+    // R2: only a global-scope pushDefault names the old remote; the repo has no
+    // local pushDefault. Git leaves the global value unchanged and warns. The
+    // global value is set in the subprocess's isolated global DB so the rename
+    // subprocess shares it.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "--global", "remote.pushDefault", "old"],
+            p,
+        ),
+        "set global pushDefault",
+    );
+
+    let rename_out = run_libra_command(&["remote", "rename", "old", "new"], p);
+    assert_cli_success(&rename_out, "remote rename old new");
+    let stderr = String::from_utf8_lossy(&rename_out.stderr);
+    assert!(
+        stderr.contains("pushDefault") && stderr.contains("non-existent remote 'old'"),
+        "R2: global pushDefault warning emitted: {stderr}"
+    );
+
+    // The global value is unchanged (still names the old remote).
+    let global_pd = run_libra_command(&["config", "get", "--global", "remote.pushDefault"], p);
+    assert_cli_success(&global_pd, "read global pushDefault");
+    assert_eq!(
+        String::from_utf8_lossy(&global_pd.stdout).trim(),
+        "old",
+        "R2: global pushDefault unchanged"
+    );
+    // The repo has no local pushDefault introduced by the rename.
+    let local_pd = ConfigKv::get_var_case_insensitive("remote.", "pushDefault")
+        .await
+        .expect("read local pushDefault")
+        .map(|e| e.value);
+    assert!(local_pd.is_none(), "R2: no local pushDefault created");
 }

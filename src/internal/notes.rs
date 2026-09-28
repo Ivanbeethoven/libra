@@ -4,8 +4,6 @@
 //! SQLite `notes` table. Each row maps a (`notes_ref`, `object`) pair to a blob
 //! hash. The default notes ref is `refs/notes/commits`.
 
-use std::str::FromStr;
-
 use git_internal::{errors::GitError, hash::ObjectHash, internal::object::ObjectTrait};
 use sea_orm::{ConnectionTrait, DbErr, Statement};
 
@@ -312,8 +310,8 @@ pub async fn show(
         })?;
 
     // Load the blob to get the text
-    let blob_hash_parsed = ObjectHash::from_str(&blob_hash)
-        .map_err(|e| NotesError::InvalidObject(blob_hash.clone(), e))?;
+    let blob_hash_parsed = crate::internal::object_format::parse_repo_oid(&blob_hash)
+        .map_err(|e| NotesError::InvalidObject(blob_hash.clone(), e.to_string()))?;
     let storage = crate::utils::client_storage::ClientStorage::init(crate::utils::path::objects());
     let data = storage.get(&blob_hash_parsed).map_err(|e| {
         NotesError::InvalidObject(blob_hash.clone(), format!("failed to read blob: {e}"))
@@ -409,7 +407,8 @@ pub async fn prune(notes_ref: &str, dry_run: bool) -> Result<Vec<String>, NotesE
         // (`ObjectNotFound`) or its id is malformed and can never name an object.
         // Any other read error (transient/corrupt/tiered-storage failure) must
         // abort rather than risk deleting a note for a still-valid object.
-        let missing = match ObjectHash::from_str(&entry.annotated_object) {
+        let missing = match crate::internal::object_format::parse_repo_oid(&entry.annotated_object)
+        {
             Err(_) => true,
             Ok(hash) => match storage.get(&hash) {
                 Ok(_) => false,
@@ -608,8 +607,8 @@ pub async fn merge(
 
 /// Load a note blob's content as text (for the `union`/`cat_sort_uniq` strategies).
 fn load_blob_text(blob_hash: &str) -> Result<String, NotesError> {
-    let parsed = ObjectHash::from_str(blob_hash)
-        .map_err(|e| NotesError::InvalidObject(blob_hash.to_string(), e))?;
+    let parsed = crate::internal::object_format::parse_repo_oid(blob_hash)
+        .map_err(|e| NotesError::InvalidObject(blob_hash.to_string(), e.to_string()))?;
     let storage = crate::utils::client_storage::ClientStorage::init(crate::utils::path::objects());
     let data = storage.get(&parsed).map_err(|e| {
         NotesError::InvalidObject(blob_hash.to_string(), format!("failed to read blob: {e}"))

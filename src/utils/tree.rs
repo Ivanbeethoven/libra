@@ -104,14 +104,18 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, mode: u32) -> IndexEntry {
-        let mut e = IndexEntry::new_from_blob(name.to_string(), ObjectHash::new(&[1; 20]), 0);
+        let mut e = IndexEntry::new_from_blob(
+            name.to_string(),
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            0,
+        );
         e.mode = mode;
         e
     }
 
     #[test]
     fn sort_tree_items_for_git_orders_names_and_directories() {
-        let hash = ObjectHash::new(&[1; 20]);
+        let hash = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]);
         let mut items = vec![
             TreeItem::new(TreeItemMode::Blob, hash, "z.txt".to_string()),
             TreeItem::new(TreeItemMode::Tree, hash, "foo".to_string()),

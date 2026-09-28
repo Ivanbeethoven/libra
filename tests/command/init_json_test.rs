@@ -111,3 +111,27 @@ fn bare_json_init_reports_repo_root_path() {
         "bare init path should point at the repo root, got: {path}"
     );
 }
+
+#[test]
+fn init_json_blake3_object_format() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    let output = run_libra_command(
+        &[
+            "--json",
+            "init",
+            "--vault",
+            "false",
+            "--object-format",
+            "blake3",
+        ],
+        &repo,
+    );
+    assert_cli_success(&output, "json init blake3");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json init stdout");
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["data"]["object_format"].as_str(), Some("blake3"));
+}

@@ -6259,7 +6259,7 @@ async fn recover_pending_intents(
                     // it, which is not ours to delete (journal kept).
                     match spec["start"]
                         .as_str()
-                        .and_then(|raw| raw.parse::<git_internal::hash::ObjectHash>().ok())
+                        .and_then(|raw| crate::internal::object_format::parse_repo_oid(raw).ok())
                     {
                         Some(start) => {
                             // FAIL CLOSED on lock failure: without the
@@ -6598,7 +6598,7 @@ async fn recover_pending_intents(
                 let path = PathBuf::from(payload["path"].as_str().unwrap_or_default());
                 let head = payload["head"]
                     .as_str()
-                    .and_then(|raw| raw.parse::<git_internal::hash::ObjectHash>().ok());
+                    .and_then(|raw| crate::internal::object_format::parse_repo_oid(raw).ok());
                 let gitdir = path.join(util::ROOT_DIR);
                 let prepared = path.join(format!(".libra.migrate-{id}"));
                 let backup = path.join(format!(".libra.legacy-backup-{id}"));

@@ -11,7 +11,7 @@ use std::{
 
 use clap::Parser;
 use git_internal::{
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::ObjectHash,
     internal::{
         index::Index,
         object::{
@@ -25,7 +25,6 @@ use git_internal::{
     },
 };
 use hex;
-use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY, SHA256};
 use sea_orm::EntityTrait;
 use serde::Serialize;
 
@@ -232,7 +231,8 @@ where
 {
     let mut set = HashSet::new();
     for oid in oids {
-        let Ok(hash) = ObjectHash::from_hex_for_kind(get_hash_kind(), oid) else {
+        let Ok(hash) = ObjectHash::from_hex_for_kind(git_internal::hash::get_hash_kind(), oid)
+        else {
             return Err(CliError::fatal(format!(
                 "shallow metadata cannot be trusted: invalid object id '{oid}'"
             ))
@@ -968,7 +968,7 @@ fn parse_object_hash(hex_str: &str) -> Option<ObjectHash> {
         return None;
     }
     // Use from_bytes to create ObjectHash directly from bytes, not hash them again
-    ObjectHash::from_bytes(&bytes).ok()
+    ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes).ok()
 }
 
 /// Try to parse a loose object file path into an ObjectHash.
@@ -2318,20 +2318,15 @@ async fn verify_object(
 
     let size = data.len();
 
-    // Verify hash integrity using ring crate.
-    // Git/Libra computes hash as: SHAx(type + ' ' + size + '\0' + content)
-    // The algorithm is determined by the repo's core.objectformat config.
-    let mut ctx = Context::new(match get_hash_kind() {
-        HashKind::Sha256 => &SHA256,
-        _ => &SHA1_FOR_LEGACY_USE_ONLY,
-    });
-
-    // Add header: "<type> <size>\0"
+    // Verify hash integrity: type + ' ' + size + '\0' + content under the
+    // repository kind (sha1 / sha256 / blake3) via `object_format::digest`.
+    let kind = git_internal::hash::get_hash_kind();
     let header = format!("{} {}\0", obj_type.to_string().to_lowercase(), size);
-    ctx.update(header.as_bytes());
-    ctx.update(&data);
-    let computed_hash = ctx.finish();
-    let computed_bytes = computed_hash.as_ref();
+    let mut payload = Vec::with_capacity(header.len() + data.len());
+    payload.extend_from_slice(header.as_bytes());
+    payload.extend_from_slice(&data);
+    let computed = crate::internal::object_format::digest(kind, &payload);
+    let computed_bytes = computed.as_ref();
 
     // Compare with stored hash
     let hash_bytes = hash.as_ref();
@@ -2849,7 +2844,7 @@ fn validate_index_entry(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, str::FromStr};
+    use std::collections::HashSet;
 
     use git_internal::{
         hash::{HashKind, ObjectHash, set_hash_kind_for_test},
@@ -2861,7 +2856,7 @@ mod tests {
     };
 
     fn test_oid(hex40: &str) -> ObjectHash {
-        ObjectHash::from_str(hex40).expect("object hash")
+        crate::internal::object_format::parse_repo_oid(hex40).expect("object hash")
     }
 
     #[test]

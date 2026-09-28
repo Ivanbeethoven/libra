@@ -8,14 +8,10 @@
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use clap::Parser;
-use git_internal::{
-    errors::GitError,
-    hash::{ObjectHash, get_hash_kind},
-};
+use git_internal::{errors::GitError, hash::ObjectHash};
 use sea_orm::DatabaseTransaction;
 use serde::Serialize;
 
@@ -352,12 +348,15 @@ fn uses_local_clone_semantics(args: &CloneArgs, remote_client: &fetch::RemoteCli
 }
 
 fn git_source_is_shallow(repo_path: &Path) -> bool {
-    ShallowSet::load_at_for_kind(
-        &repo_path.join("shallow"),
-        crate::internal::protocol::local_client::git_repo_hash_kind(repo_path),
-    )
-    .map(|set| !set.oids().is_empty())
-    .unwrap_or(true)
+    let Ok(hash_kind) = crate::internal::protocol::local_client::git_repo_hash_kind(repo_path)
+    else {
+        // Unknown/unreadable source config is rejected at discovery; treat as
+        // shallow here so local-clone shortcuts stay disabled.
+        return true;
+    };
+    ShallowSet::load_at_for_kind(&repo_path.join("shallow"), hash_kind)
+        .map(|set| !set.oids().is_empty())
+        .unwrap_or(true)
 }
 
 fn inspect_local_git_shallow(
@@ -365,10 +364,14 @@ fn inspect_local_git_shallow(
 ) -> Result<ShallowSet, ShallowError> {
     match remote_client {
         fetch::RemoteClient::Local(client) if !client.is_libra_source() => {
-            ShallowSet::load_at_for_kind(
-                &client.repo_path().join("shallow"),
-                crate::internal::protocol::local_client::git_repo_hash_kind(client.repo_path()),
-            )
+            let config_path = client.repo_path().join("config");
+            let hash_kind =
+                crate::internal::protocol::local_client::git_repo_hash_kind(client.repo_path())
+                    .map_err(|error| ShallowError::Read {
+                        path: config_path.clone(),
+                        source: std::io::Error::other(error.to_string()),
+                    })?;
+            ShallowSet::load_at_for_kind(&client.repo_path().join("shallow"), hash_kind)
         }
         _ => Ok(ShallowSet::empty()),
     }
@@ -495,7 +498,7 @@ pub struct CloneOutput {
     pub remote_name: String,
     /// Actual checked-out branch; `None` for empty remotes.
     pub branch: Option<String>,
-    /// `sha1` or `sha256` (from `InitOutput.object_format`).
+    /// `sha1` / `sha256` / `blake3` (from `InitOutput.object_format`).
     pub object_format: String,
     /// From `InitOutput.repo_id`.
     pub repo_id: String,
@@ -530,6 +533,9 @@ pub struct CloudCloneSiteOutput {
     pub site_id: String,
     pub slug: String,
     pub repo_id: String,
+    /// Authoritative repository object-format from D1 backup metadata when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_format: Option<String>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub ref_name: Option<String>,
     pub revision: String,
@@ -678,9 +684,18 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
                     )
             }
         },
+        fetch::FetchError::UnsupportedLocalGitSha256 => fetch::map_unsupported_local_git_sha256(),
+        fetch::FetchError::GitSourceConfig(error) => fetch::map_git_source_config_error(error),
         fetch::FetchError::Discovery {
             source: git_error, ..
         } => match git_error {
+            GitError::IOError(io_error)
+                if let Some(config_error) = io_error.get_ref().and_then(|inner| {
+                    inner.downcast_ref::<crate::internal::protocol::local_client::GitSourceConfigError>()
+                }) =>
+            {
+                fetch::map_git_source_config_error(config_error)
+            }
             GitError::UnAuthorized(_) => {
                 CliError::fatal(format!("remote discovery failed: {source}"))
                     .with_stable_code(StableErrorCode::AuthPermissionDenied)
@@ -690,6 +705,13 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
                 CliError::fatal(format!("remote discovery failed: {source}"))
                     .with_stable_code(StableErrorCode::NetworkProtocol)
                     .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+            }
+            GitError::IOError(error)
+                if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error) =>
+            {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::AuthPermissionDenied)
+                    .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
             }
             GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
                 CliError::fatal(format!("remote discovery failed: {source}"))
@@ -735,9 +757,19 @@ fn map_discover_remote_error(source: fetch::FetchError) -> CliError {
 /// Map a `FetchError` from the fetch phase into a `CliError`.
 fn map_fetch_error(source: fetch::FetchError) -> CliError {
     match &source {
-        fetch::FetchError::ObjectFormatMismatch { .. } => CliError::fatal(source.to_string())
-            .with_stable_code(StableErrorCode::RepoStateInvalid)
-            .with_hint("the remote and local repository use different object formats"),
+        fetch::FetchError::ObjectFormatMismatch { remote, local } => {
+            let mut err = CliError::fatal(source.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("the remote and local repository use different object formats");
+            if matches!(local, git_internal::hash::HashKind::Blake3)
+                || matches!(remote, git_internal::hash::HashKind::Blake3)
+            {
+                err = err.with_hint(
+                    "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                );
+            }
+            err
+        }
         fetch::FetchError::FetchObjects { source: error, .. }
             if crate::internal::protocol::is_missing_shallow_capability(error) =>
         {
@@ -791,6 +823,8 @@ fn map_fetch_error(source: fetch::FetchError) -> CliError {
                      shallow boundaries",
                 )
         }
+        fetch::FetchError::UnsupportedLocalGitSha256 => fetch::map_unsupported_local_git_sha256(),
+        fetch::FetchError::GitSourceConfig(error) => fetch::map_git_source_config_error(error),
         fetch::FetchError::RemoteBranchNotFound { .. } => CliError::fatal(source.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("the specified branch does not exist on the remote"),
@@ -1504,11 +1538,7 @@ async fn clone_into_destination(
         source,
     })?;
 
-    let object_format = match discovery.hash_kind {
-        git_internal::hash::HashKind::Sha1 => "sha1".to_string(),
-        git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
-        git_internal::hash::HashKind::Blake3 => "blake3".to_string(),
-    };
+    let object_format = crate::internal::object_format::as_str(discovery.hash_kind).to_string();
 
     // --- Step 4: Initialize repository ---
     if !output.quiet && !output.is_json() {
@@ -1593,10 +1623,16 @@ async fn clone_into_destination(
         false,
         // A fresh clone has no remote-tracking refs to prune.
         false,
+        // A fresh clone has no tags to prune.
+        false,
         // `--deps-of` needs the dependency graph to compute the closure, so it
         // implies `--notes`; a plain clone never fetches notes (Git parity).
         !args.deps_of.is_empty(),
         &child_output,
+        false,
+        None,
+        &[],
+        false,
     )
     .await
     .map_err(|source| CloneError::FetchFailed { source })?;
@@ -1791,14 +1827,14 @@ async fn setup_mirror_repository(
             Head::Branch(name)
         }
         (Some(advertised), _) => {
-            let oid = ObjectHash::from_str(&advertised._hash).map_err(|error| {
-                CloneError::SetupFailed {
+            let oid = crate::internal::object_format::parse_repo_oid(&advertised._hash).map_err(
+                |error| CloneError::SetupFailed {
                     message: format!(
                         "mirror HEAD '{}' is not a valid object id: {error}",
                         advertised._hash
                     ),
-                }
-            })?;
+                },
+            )?;
             Head::Detached(oid)
         }
         _ => {
@@ -1922,7 +1958,7 @@ pub(crate) async fn setup_repository(
             from: remote_config.url.clone(),
         };
         let context = ReflogContext {
-            old_oid: ObjectHash::zero_str(get_hash_kind()).to_string(),
+            old_oid: ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string(),
             new_oid: origin_branch.commit.to_string(),
             action,
         };
@@ -2177,6 +2213,24 @@ mod tests {
     }
 
     #[test]
+    fn object_format_mismatch_maps_to_repo_state_invalid_with_blake3_hint() {
+        let cli = map_fetch_error(fetch::FetchError::ObjectFormatMismatch {
+            remote: git_internal::hash::HashKind::Sha1,
+            local: git_internal::hash::HashKind::Blake3,
+        });
+        assert_eq!(cli.stable_code(), StableErrorCode::RepoStateInvalid);
+        assert_eq!(cli.stable_code().as_str(), "LBR-REPO-003");
+        assert_eq!(cli.exit_code(), 128);
+        assert!(
+            cli.hints()
+                .iter()
+                .any(|hint| hint.as_str().contains("blake3")),
+            "clone map_fetch_error must surface blake3 extension hint: {:?}",
+            cli.hints()
+        );
+    }
+
+    #[test]
     fn shallow_fetch_protocol_errors_map_to_network_protocol() {
         use crate::internal::protocol::{ChangedShallowAdvertisement, MissingShallowCapability};
 
@@ -2404,7 +2458,7 @@ mod tests {
         let _cwd = ChangeDirGuard::new(repo.path());
 
         let db = get_db_conn_instance().await;
-        let hash = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let hash = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
 
         // Simulate a post-fetch state: two remote-tracking branches plus the
         // cached remote HEAD (a `Head` row, not a `Branch` row).

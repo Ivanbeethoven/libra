@@ -890,3 +890,173 @@ async fn init_refuses_to_initialize_inside_the_global_config_dir() {
         "no repository layout may be written into the global config directory"
     );
 }
+
+#[test]
+fn init_object_format_blake3_succeeds() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    let output = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "blake3"],
+        &repo,
+    );
+    assert_cli_success(&output, "init --object-format blake3");
+    let got = run_libra_command(&["config", "--local", "--get", "core.objectformat"], &repo);
+    assert_cli_success(&got, "get core.objectformat");
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout).trim(),
+        "blake3",
+        "blake3 init must persist core.objectformat=blake3"
+    );
+}
+
+#[test]
+fn init_object_format_sha256_succeeds() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    let output = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "sha256"],
+        &repo,
+    );
+    assert_cli_success(&output, "init --object-format sha256");
+    let got = run_libra_command(&["config", "--local", "--get", "core.objectformat"], &repo);
+    assert_cli_success(&got, "get core.objectformat");
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "sha256");
+}
+
+#[test]
+fn reinit_rejects_object_format_change() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], &repo),
+        "initial sha1 init",
+    );
+    let pre_commit = repo.join(".libra/hooks/pre-commit.sh");
+    if pre_commit.exists() {
+        fs::remove_file(&pre_commit).unwrap();
+    }
+
+    let output = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "sha256"],
+        &repo,
+    );
+    assert_eq!(output.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LBR-CLI-002") && stderr.contains("cannot change object format"),
+        "reinit format change must be LBR-CLI-002: {stderr}"
+    );
+    assert!(
+        !pre_commit.exists(),
+        "reinit format change must not top up layout"
+    );
+    let got = run_libra_command(&["config", "--local", "--get", "core.objectformat"], &repo);
+    assert_eq!(String::from_utf8_lossy(&got.stdout).trim(), "sha1");
+}
+
+#[test]
+fn reinit_same_object_format_tops_up() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--vault", "false", "--object-format", "sha256"],
+            &repo,
+        ),
+        "initial sha256 init",
+    );
+    let pre_commit = repo.join(".libra/hooks/pre-commit.sh");
+    if pre_commit.exists() {
+        fs::remove_file(&pre_commit).unwrap();
+    }
+    let output = run_libra_command(
+        &["init", "--vault", "false", "--object-format", "sha256"],
+        &repo,
+    );
+    assert_cli_success(&output, "same-format reinit");
+    assert!(
+        pre_commit.exists(),
+        "same-format reinit must top up missing templates"
+    );
+}
+
+#[test]
+fn reinit_unknown_stored_format_errors() {
+    use sea_orm::{ConnectionTrait, Database};
+
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], &repo),
+        "initial init",
+    );
+
+    let db_path = repo.join(".libra/libra.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let db = Database::connect(&url).await.expect("connect");
+        db.execute_unprepared(
+            "UPDATE config_kv SET value='not-a-real-format' WHERE key='core.objectformat'",
+        )
+        .await
+        .expect("poison objectformat");
+        db.close().await.ok();
+    });
+
+    let pre_commit = repo.join(".libra/hooks/pre-commit.sh");
+    if pre_commit.exists() {
+        fs::remove_file(&pre_commit).unwrap();
+    }
+    // Invoke from the parent so CLI preflight does not open the poisoned
+    // repository before `init`'s reinit inspect path can return LBR-REPO-002.
+    let output = run_libra_command(&["init", "--vault", "false", "repo"], temp.path());
+    assert_eq!(output.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("LBR-REPO-002") && stderr.contains("unknown core.objectformat"),
+        "unknown stored format must be LBR-REPO-002: {stderr}"
+    );
+    assert!(
+        !pre_commit.exists(),
+        "unknown format must not top up layout"
+    );
+}
+
+#[test]
+fn init_machine_blake3_object_format() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    let output = run_libra_command(
+        &[
+            "--machine",
+            "init",
+            "--vault",
+            "false",
+            "--object-format",
+            "blake3",
+        ],
+        &repo,
+    );
+    assert_cli_success(&output, "machine init blake3");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("machine output line");
+    let parsed: serde_json::Value = serde_json::from_str(line).expect("machine JSON");
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(parsed["data"]["object_format"].as_str(), Some("blake3"));
+}

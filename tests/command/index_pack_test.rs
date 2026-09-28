@@ -12,7 +12,7 @@ use std::{
 
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind, set_hash_kind_for_test},
+    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind_for_test},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::blob::Blob,
@@ -418,12 +418,9 @@ async fn encode_entries_to_pack_bytes(entries: Vec<Entry>) -> Result<Vec<u8>, Gi
     assert!(!entries.is_empty(), "encode requires at least one entry");
     let (pack_tx, mut pack_rx) = mpsc::channel::<Vec<u8>>(128);
     let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(entries.len());
-    let mut encoder = PackEncoder::new(entries.len(), 0, pack_tx);
     let kind = get_hash_kind();
-    let encode_handle = tokio::spawn(async move {
-        set_hash_kind(kind);
-        encoder.encode(entry_rx).await
-    });
+    let mut encoder = PackEncoder::new_with_hash_kind(kind, entries.len(), 0, pack_tx);
+    let encode_handle = tokio::spawn(async move { encoder.encode(entry_rx).await });
 
     for entry in entries {
         entry_tx
@@ -647,4 +644,50 @@ fn build_index_v1_rejects_sha256_hash_kind() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
+}
+
+#[test]
+fn index_pack_blake3_v2() -> Result<(), GitError> {
+    let _guard = set_hash_kind_for_test(HashKind::Blake3);
+    let entries = vec![
+        Entry::from(Blob::from_content("blake3-alpha")),
+        Entry::from(Blob::from_content("blake3-beta")),
+        Entry::from(Blob::from_content("blake3-gamma")),
+    ];
+
+    let pack_bytes = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(encode_entries_to_pack_bytes(entries))?
+    };
+    assert!(!pack_bytes.is_empty(), "encoded blake3 pack is empty");
+    assert!(
+        pack_bytes.len() >= 12 + 32,
+        "blake3 pack must include a 32-byte trailer"
+    );
+
+    let tmp_dir = tempdir()?;
+    let pack_path = tmp_dir.path().join("encode-blake3-small.pack");
+    fs::write(&pack_path, &pack_bytes)?;
+    let index_path = tmp_dir.path().join("encode-blake3-small.idx");
+    build_index_v2(
+        pack_path.to_str().expect("pack path should be valid"),
+        index_path.to_str().expect("idx path should be valid"),
+    )?;
+
+    let idx_bytes = fs::read(&index_path)?;
+    assert_eq!(&idx_bytes[0..4], &[0xFF, 0x74, 0x4F, 0x63], "idx magic");
+    assert_eq!(
+        u32::from_be_bytes(idx_bytes[4..8].try_into().unwrap()),
+        2,
+        "blake3 pack indexes are v2"
+    );
+
+    assert_index_v2_matches_pack(
+        &pack_path,
+        &index_path,
+        HashKind::Blake3,
+        "encode-blake3-small",
+    )
 }

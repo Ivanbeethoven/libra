@@ -8,7 +8,7 @@ use std::{
 use byteorder::{BigEndian, WriteBytesExt};
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     internal::{
         metadata::{EntryMeta, MetaAttached},
         object::types::ObjectType,
@@ -42,7 +42,7 @@ fn build_index_v1_inner(
     index_file: &str,
     collect_edges: bool,
 ) -> Result<Option<PackCommitEdges>, GitError> {
-    if get_hash_kind() != HashKind::Sha1 {
+    if git_internal::hash::get_hash_kind() != HashKind::Sha1 {
         return Err(GitError::InvalidPackFile(
             "Index version 1 only supports SHA-1 hash".to_string(),
         ));
@@ -67,7 +67,8 @@ fn build_index_v1_inner(
         .transpose()?
         .map(|spool| Arc::new(Mutex::new(spool)));
     let commit_edges_c = commit_edges.clone();
-    let mut pack = Pack::new(
+    let mut pack = Pack::new_with_hash_kind(
+        HashKind::Sha1,
         Some(8),
         Some(1024 * 1024 * 1024),
         Some(tmp_path.to_path_buf()),

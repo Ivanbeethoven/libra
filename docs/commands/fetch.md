@@ -22,6 +22,13 @@ one source ref and may map it to an exact local destination (`<src>:<dst>`). Whe
 explicit refspec is given, `remote.<name>.fetch` entries are honored; if none exist,
 all advertised branches use the default `refs/remotes/<name>/*` mapping.
 
+A `<repository>` may also be an anonymous local repository spec — a `file://` URL,
+absolute path, or a relative path such as `.` — which fetches into `FETCH_HEAD`
+only (no tracking ref, no `remote.*` config), matching Git's unnamed-remote
+transport. A configured remote name always wins over a same-named directory. A
+requested remote ref that does not exist reports `couldn't find remote ref
+<name>`, matching Git.
+
 Fetch supports SSH, HTTPS, local file, Git v2 bundle files, and `git://`
 transports. A remote URL that points at a bundle is re-read on every fetch
 (including `--prune` and `--dry-run`). When `remote.<name>.fetch` is
@@ -120,16 +127,23 @@ libra config remote.origin.prune false  # but never for origin
 | `<refspec>` | Source ref or exact `<src>:<dst>` mapping. Requires `<repository>`. When omitted, `remote.<name>.fetch` mappings are used, falling back to all remote branches. | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | Fetch from every configured remote. Conflicts with `<repository>`. | `libra fetch --all` |
 | `--depth <N>` | Limit fetching to the specified number of commits from the tip of each remote branch (shallow fetch). Network Git (`git://`), HTTP(S), and SSH servers must advertise the `shallow` capability; an in-process local Git path supports `--depth` without such an advertisement. Local Libra remotes fail closed with `LBR-REPO-002` — the accepted end state (decision D20), since that transport cannot provide shallow metadata. | `libra fetch origin --depth 1` |
+| `--unshallow` | Convert a shallow repository to a complete one: fetch the full history and drop the shallow boundary records. A repository without shallow history errors, and a local Libra source is refused (D20). | `libra fetch --unshallow origin main` |
+| `--negotiation-tip <commit>` | Restrict the negotiation `have` set to commits reachable from the given commit or ref (repeatable). Accepted by the local transport, which computes the object difference from the narrowed set. A missing/unresolvable tip errors. | `libra fetch --negotiation-tip <oid> origin main` |
 | `--tags` | Fetch every tag from the remote into the local `refs/tags/*` (overrides the default auto-follow and `remote.<name>.tagOpt`). | `libra fetch origin --tags` |
 | `--no-tags` | Fetch no tags at all, not even tags reachable from fetched commits (overrides the default auto-follow). | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | Do not run a repacking/gc pass after fetching. Accepted no-op for Git parity: Libra's fetch never triggers an automatic gc, so there is nothing to disable. | `libra fetch origin --no-auto-gc` |
 | `--no-progress` | Do not show the progress meter (the "Receiving objects" spinner / remote progress) on stderr, matching `git fetch --no-progress`. | `libra fetch origin --no-progress` |
 | `-p`, `--prune` | After the fetch, delete remote-tracking refs under `refs/remotes/<remote>/*` that are not live destinations of the effective configured refspec mapping. On a `--mirror` remote (`+refs/*:refs/*`), delete mirrored refs the source no longer advertises (locked short names such as `main` are skipped). A one-off explicit refspec retains the configured mapped destinations, ordinary advertised scope, and its selected destination. Deletions plus an audit reflog entry run in one transaction. Local branches, tags, `refs/remotes/<remote>/HEAD`, and other remotes are never touched on a non-mirror fetch. With `--dry-run`, stale refs are reported but not deleted. Overrides the `remote.<name>.prune` / `fetch.prune` config defaults. | `libra fetch origin -p` |
+| `-P`, `--prune-tags` | Prune local tags the remote no longer advertises. Only effective together with `--prune` (or `--mirror`) and ignored when an explicit refspec is given; `--prune-tags` alone does nothing (Git parity). Honors `remote.<name>.pruneTags` / `fetch.pruneTags` config defaults when `--prune-tags` is not given. | `libra fetch origin --prune --prune-tags` |
+| `--atomic` | Update all fetched refs atomically: any rejected (non-fast-forward) update rolls back every ref, reflog, and `FETCH_HEAD` write. Libra's fetch already updates refs in a single transaction, so this is accepted for Git parity and asserts the all-or-nothing behaviour. | `libra fetch --atomic origin` |
 | `--no-prune` | Do not prune remote-tracking refs, overriding the `remote.<name>.prune` / `fetch.prune` config defaults (the built-in default is no pruning). `--prune`/`--no-prune` form a last-one-wins toggle: when both are given, the last on the command line wins (Git semantics). | `libra fetch origin --no-prune` |
 | `--notes` | Also import the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from the remote over a dedicated side-channel. Default OFF (Git never auto-fetches notes). v1 travels notes only from a **local Libra source**; a network or plain-Git remote emits an honest "not supported yet" warning and imports no graph (deferred, D17). Import union-merges into any local edges and re-validates every endpoint, and is per-note fault-tolerant (a malformed note, or one whose commit is absent locally, is skipped with a warning, never aborting the fetch). Persist the opt-in per remote with `remote.<name>.fetchNotesDeps=true`. | `libra fetch origin --notes` |
 | `-f`, `--force` | Allow non-fast-forward updates and overwrite (clobber) a local tag that points elsewhere. Forced updates are marked `+` in `--porcelain` / `(forced update)` in human output. | `libra fetch origin --tags --force` |
 | `--dry-run` | Preview the remote-tracking ref updates the fetch would produce without downloading any objects or writing refs, reflog, or `FETCH_HEAD`. | `libra fetch origin --dry-run` |
 | `--append` | Append fetched ref records to `.libra/FETCH_HEAD` instead of overwriting it. (`-a` is reserved for `--all`.) | `libra fetch origin --append` |
+| `--set-upstream` | After a successful single-branch fetch from a named remote, record the current branch's upstream (`branch.<name>.remote` / `branch.<name>.merge`). A colon refspec (`src:dst`) or no branch argument writes nothing (Git warns for the colon form). | `libra fetch --set-upstream origin main` |
+| `--update-head-ok` | Allow an explicit refspec to update the currently checked-out branch (with `+` as needed for non-fast-forward). Without it, fetching into the checked-out branch is refused. | `libra fetch --update-head-ok origin master:master` |
+| `--refmap=<spec>` | Replace the configured `remote.<name>.fetch` mapping used to derive the tracking destination for a command-line refspec. An empty value (`--refmap=`) updates no tracking ref (FETCH_HEAD only). Requires a command-line refspec. | `libra fetch --refmap= origin main` |
 | `-v`, `--verbose` | Announce the remote being contacted on stderr; the stdout result contract is unchanged. | `libra fetch origin -v` |
 | `--porcelain` | Print a machine-readable `<flag> <old-oid> <new-oid> <local-ref>` line per ref update. Mutually exclusive with `--json`. | `libra fetch origin --porcelain` |
 | `--json` | Emit structured JSON envelope to stdout (global flag). | `libra --json fetch origin` |
@@ -443,6 +457,7 @@ by default for maximum script friendliness.
 | Checked-out destination / non-fast-forward without force | `LBR-CONFLICT-002` | 128 | Change the destination, add `+`, or use `--force` intentionally |
 | Invalid remote spec (missing repo, malformed URL, unsupported scheme) | `LBR-CLI-003` or `LBR-REPO-001` | 129 / 128 | Varies by cause |
 | Authentication failure during discovery | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
+| SSH public-key rejection during discovery | `LBR-AUTH-002` | 128 | Check the selected key, SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
 | Network timeout / transport failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | pkt-line discovery / transfer setup error / empty advertisement | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
 | Packet-read connection reset / non-protocol IO failure | `LBR-NET-001` | 128 | "check network connectivity and retry" |
@@ -482,6 +497,10 @@ An unsupported object-format capability reports the fixed message
 `Unsupported object format capability` without echoing its remote value.
 Check that the URL points to a Git smart HTTP service and that a proxy has not
 truncated or replaced the response; then retry.
+
+Wire kind is capability-first (`object-format`, default sha1); OID length is never used to choose the algorithm. Blake3 remotes advertise `object-format=blake3` (Libra extension). Duplicate or conflicting `object-format` capabilities fail closed. Local blake3 vs remote sha1/sha256 fetch returns `LBR-REPO-003` / exit 128. Covered by `parse_discovery_does_not_infer_sha256_from_64_hex`, `blake3_fetch_round_trip`, and `protocol_object_format_mismatch_error_contract`.
+
+**Local Git sha256 reject (B3-12):** a local-path Git remote with `objectformat=sha256` is refused before any fetch write (`LBR-CLI-002`, exit 129). Unknown/corrupt → `LBR-REPO-002`; unreadable → `LBR-IO-001`. Network Git sha256 deferred (DEFER-B3-10). Covered by `fetch_rejects_sha256_git_source`.
 
 Fetch discovery reports `LBR-NET-002` for an empty advertisement or malformed
 pkt-line response, without echoing its header or payload bytes. Ordinary network
@@ -535,19 +554,20 @@ SSH advertisement lengths `0001` through `0003`, incomplete headers (including
 zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
 reason and marker are retained without captured SSH stdout/stderr.
 
-An incomplete required header has one host-trust exception: local SSH exit status
-255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
-returns fixed host-verification guidance and `LBR-NET-001`. This classification
-does not verify the remote fingerprint. Other missing advertisements, including
-authentication failures, still use `LBR-NET-002`; an available non-zero local exit
-status adds `SSH exited with status N` and fixed connectivity, trusted-host,
-ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+An incomplete required discovery header has two prioritized exceptions. A recognized host-key
+diagnostic with local SSH exit status 255 returns fixed verification guidance and
+`LBR-NET-001`; this does not verify the remote fingerprint. A complete
+`Permission denied (<method-list>)` diagnostic containing the exact `publickey`
+method, direct exit status 255 and no stdout bytes returns the fixed public-key
+message with `LBR-AUTH-002`. Because stderr can be forged, this code does not prove
+why access was denied. All other missing advertisements remain `LBR-NET-002`, and
+original SSH diagnostic text is hidden.
 
 After an incomplete required header, Libra allows up to 100 milliseconds to
 observe the SSH exit status, then requests termination if needed. Other read
 errors request termination immediately. The status window, direct-child reap and
-output collection share a two-second cleanup deadline. Protocol and typed
-host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+output collection share a two-second cleanup deadline. Protocol, typed host-trust,
+and public-key authentication errors take precedence over secondary cleanup warnings. Ordinary IO
 and timeout errors keep their transport classification and may include a fixed
 local cleanup warning. Termination can change the observed exit status. This
 does not promise cleanup of arbitrary descendant processes.
@@ -572,6 +592,15 @@ provider console or another trusted channel before manually updating
 and compare the displayed fingerprint before accepting it. For example,
 `ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
 port. Do not accept a fingerprint that has not been verified.
+
+For the strict discovery-only public-key rejection above, the fixed hint asks you
+to check `libra config list --ssh-keys`, your SSH agent and repository access, and
+links the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh).
+The config command must be run inside an existing Libra repository.
+
+For at least 30 days after v0.24.1 is released and through at least the next
+patch release, whichever is later, automation should accept both `LBR-AUTH-002`
+and the legacy `LBR-NET-002` for this SSH discovery failure.
 
 `ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
 `no` values. `ask` leaves that SSH option to the user's SSH configuration;

@@ -1,4 +1,6 @@
 # `libra agent` 开发设计
+> **B3-10:** repository commit references are Libra tagged `repo-commit:<kind>:<kind-native hex>` (stored on `ai_index_task_run.base_commit_ref`); agent-bridge/traces/checkpoint OID parsers accept tagged or bare kind-native hex under the repository kind. git-internal `IntegrityHash` stays SHA-256-only.
+
 
 > 本文件是 `libra agent`（外部 Agent 捕获子系统）的**公共 CLI/行为事实源**，已从 [`docs/development/internal/code-agent-runtime.md`](../internal/code-agent-runtime.md) 拆入 external-agent 捕获需要的 entireio/cli 对齐契约、AG-16~AG-24a 任务卡、E1–E10 wire contract、checkpoint/export、review/investigate 与验收命令。`docs/development/internal/code-agent-runtime.md` 继续负责内部 AgentRuntime、Web-only 迁移、MCP/control-plane 边界和 Gate 8 的总览追踪；两份文档任一处修改 public surface、E 契约、AG-16~AG-24a 或有意差异时，必须同一 PR 同步。
 

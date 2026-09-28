@@ -10,7 +10,6 @@ use std::{
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -560,7 +559,8 @@ impl WorkspaceSnapshotter {
         if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
             return Err(ScanError::Unstable(relative.to_path_buf()));
         }
-        ObjectHash::from_str(&hex).map_err(|error| ScanError::Worker(error.to_string()))
+        crate::internal::object_format::parse_repo_oid(&hex)
+            .map_err(|error| ScanError::Worker(error.to_string()))
     }
     fn list_visible_files(
         &self,
@@ -894,8 +894,7 @@ async fn read_head(scope: &PinnedRequestScope) -> Result<HeadState, SnapshotErro
         .map_err(|error| {
             let kind = match &error {
                 BranchStoreError::Corrupt { .. } => io::ErrorKind::InvalidData,
-                _ => io::ErrorKind::Other,
-            };
+                _ => io::ErrorKind::Other};
             io::Error::new(kind, format!(
                 "cannot read authoritative HEAD for worktree '{}' from repository database '{}': {error}",
                 scope.worktree_root.display(), path.display()
@@ -1022,7 +1021,10 @@ mod tests {
     fn untracked_manifest_is_deterministic() {
         let manifest = UntrackedManifest {
             schema_version: 1,
-            files: BTreeMap::from([("a".into(), ObjectHash::new(&[1; 20]))]),
+            files: BTreeMap::from([(
+                "a".into(),
+                ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            )]),
         };
         let bytes = serde_json::to_vec(&manifest).expect("manifest serializes");
         let again = serde_json::to_vec(&manifest).expect("manifest serializes twice");

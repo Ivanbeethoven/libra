@@ -50,16 +50,23 @@ libra config set --add remote.origin.fetch \
 | `<refspec>` | 源引用或精确 `<src>:<dst>` 映射。需要 `<repository>`。省略时使用 `remote.<name>.fetch`，再回退为所有远程分支。 | `libra fetch origin refs/heads/main:refs/remotes/origin/release` |
 | `-a`, `--all` | 从每个已配置远程获取。与 `<repository>` 冲突。 | `libra fetch --all` |
 | `--depth <N>` | 将获取限制为每个远程分支 tip 起的指定提交数量（shallow fetch）。网络 Git（`git://`）、HTTP(S) 和 SSH 服务端须通告 `shallow` 能力；进程内本地 Git 路径无需能力通告也支持 `--depth`。本地 Libra 远程以 `LBR-REPO-002` fail-closed（已决终态，D20）。 | `libra fetch origin --depth 1` |
+| `--unshallow` | 将浅仓库转换为完整仓库：抓取完整历史并删除浅边界记录。没有浅历史的仓库会报错，本地 Libra 源被拒绝（D20）。 | `libra fetch --unshallow origin main` |
+| `--negotiation-tip <commit>` | 把协商 `have` 集限制为从给定提交或 ref 可达的提交（可重复）。本地传输同样生效（以限定集计算可达对象差集）。缺失/无法解析的 tip 会报错。 | `libra fetch --negotiation-tip <oid> origin main` |
 | `--tags` | 从远程获取每个标签到本地 `refs/tags/*`（覆盖默认的 auto-follow 和 `remote.<name>.tagOpt`）。 | `libra fetch origin --tags` |
 | `--no-tags` | 完全不获取标签，连从已获取提交可达的标签也不获取（覆盖默认的 auto-follow）。 | `libra fetch origin --no-tags` |
 | `--no-auto-gc` | fetch 后不运行 repack/gc。为对齐 Git 而接受的 no-op：Libra 的 fetch 从不触发自动 gc，故无可禁用。 | `libra fetch origin --no-auto-gc` |
 | `--no-progress` | 不在 stderr 显示进度条（“Receiving objects” spinner / 远端进度），对齐 `git fetch --no-progress`。 | `libra fetch origin --no-progress` |
 | `-p`, `--prune` | fetch 之后，删除不再是有效配置 refspec 映射目标的 `refs/remotes/<remote>/*` 远程跟踪引用；在 `--mirror` 远程（`+refs/*:refs/*`）上则删除源已不再通告的镜像 ref（锁定短名如 `main` 会跳过）。一次性显式 refspec 会保留当前配置映射的 destination、普通全远程范围以及本次选中目标。删除加一条审计 reflog 条目在同一个事务中执行。非 mirror fetch 下本地分支、标签、`refs/remotes/<remote>/HEAD` 和其他远程永远不会被触碰。带 `--dry-run` 时只报告陈旧引用而不删除。未传标志时，`fetch.prune` / `remote.<name>.prune` 配置可把修剪设为默认开启（见上文《抓取相关的 config 默认值》）；CLI 标志始终优先。 | `libra fetch origin -p` |
+| `-P`, `--prune-tags` | 删除远程已不再通告的本地标签。仅在与 `--prune`（或 `--mirror`）同时启用时生效，给出显式 refspec 时被忽略；单独 `--prune-tags` 不修剪（Git parity）。未传标志时遵循 `remote.<name>.pruneTags` / `fetch.pruneTags` 配置默认。 | `libra fetch origin --prune --prune-tags` |
+| `--atomic` | 原子更新所有抓取的 ref：任意被拒绝（非快进）的更新会使所有 ref、reflog 与 `FETCH_HEAD` 写入回滚。Libra 的 fetch 本就在单个事务中更新 ref，因此为 Git parity 接受该参数并断言全有或全无行为。 | `libra fetch --atomic origin` |
 | `--no-prune` | 不修剪远程跟踪引用（默认）。`--prune`/`--no-prune` 构成 last-wins 切换：两者同时给出时，命令行最后一个生效（Git 语义）。显式 `--no-prune` 同时覆盖 `fetch.prune` / `remote.<name>.prune` 配置默认值。 | `libra fetch origin --no-prune` |
 | `--notes` | 另外通过专用旁路通道从远程导入文件依赖图（`refs/notes/deps`，lore.md 3.2）。默认关闭（Git 从不自动 fetch notes）。v1 仅从**本地 Libra 源**传输 notes；网络或普通 Git 远程会发出诚实的 “not supported yet” 告警且不导入任何图（推迟，D17）。导入会与本地已有边做并集合并（union-merge）并重新校验每个端点，且按 note 容错（格式错误的 note、或其 commit 在本地缺失的 note，会带告警跳过，绝不中止 fetch）。用 `remote.<name>.fetchNotesDeps=true` 按远程持久化该 opt-in。 | `libra fetch origin --notes` |
 | `-f`, `--force` | 允许非快进更新，并覆盖（clobber）指向别处的本地标签。强制更新在 `--porcelain` 中标记为 `+`，在人类输出中标记为 `(forced update)`。 | `libra fetch origin --tags --force` |
 | `--dry-run` | 预览本次 fetch 将产生的远程跟踪引用更新，而不下载任何对象，也不写引用、reflog 或 `FETCH_HEAD`。 | `libra fetch origin --dry-run` |
 | `--append` | 将获取到的引用记录追加到 `.libra/FETCH_HEAD`，而不是覆盖它。（`-a` 保留给 `--all`。） | `libra fetch origin --append` |
+| `--set-upstream` | 成功从命名远端单分支 fetch 后，把当前分支的 upstream 记录为 `branch.<name>.remote` / `branch.<name>.merge`。带冒号的 refspec（`src:dst`）或不带分支参数时不写入（冒号形式 Git 会告警）。 | `libra fetch --set-upstream origin main` |
+| `--update-head-ok` | 允许显式 refspec 更新当前检出的分支（非快进时需 `+`）。不带它时，fetch 到检出分支会被拒绝。 | `libra fetch --update-head-ok origin master:master` |
+| `--refmap=<spec>` | 用给定映射替换用于推导命令行 refspec 跟踪目标的 `remote.<name>.fetch`。空值（`--refmap=`）不更新任何跟踪 ref（只写 FETCH_HEAD）。要求有命令行 refspec。 | `libra fetch --refmap= origin main` |
 | `-v`, `--verbose` | 在 stderr 上宣告正在联系的远程；stdout 的结果契约不变。 | `libra fetch origin -v` |
 | `--porcelain` | 对每个引用更新打印一行机器可读的 `<flag> <old-oid> <new-oid> <local-ref>`。与 `--json` 互斥。 | `libra fetch origin --porcelain` |
 | `--json` | 向 stdout 输出结构化 JSON 信封（全局标志）。 | `libra --json fetch origin` |
@@ -297,6 +304,7 @@ Shallow fetch 会引入通常的 Git “shallow boundary” 注意事项（blame
 | 当前 checkout 目标 / 未放行的非快进 | `LBR-CONFLICT-002` | 128 | 修改目标，或有意添加 `+` / `--force` |
 | 无效远程 spec（缺少 repo、URL 格式错误、不支持的 scheme） | `LBR-CLI-003` 或 `LBR-REPO-001` | 129 / 128 | 因原因而异 |
 | 发现期间认证失败 | `LBR-AUTH-002` | 128 | "check SSH key / HTTP credentials and repository access rights" |
+| discovery 期间 SSH 公钥拒绝 | `LBR-AUTH-002` | 128 | 检查实际选择的密钥、SSH agent 与仓库权限；参阅 [SSH 设置指南](https://libra.tools/en/docs/getting-started/ssh) |
 | 网络超时 / 传输失败 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | pkt-line discovery / 传输建立错误 / 广告为空 | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
 | 封包读取连接重置 / 非协议 IO 错误 | `LBR-NET-001` | 128 | "check network connectivity and retry" |
@@ -331,6 +339,10 @@ pkt-line 帧，包括不完整或非十六进制标头、小于四的帧长度�
 不支持的 object-format capability 使用固定错误消息
 `Unsupported object format capability`，不回显远端提供的值。
 请确认 URL 指向 Git smart HTTP 服务，并检查代理是否截断或替换了响应，然后重试。
+
+线格式为 capability-first（`object-format`，缺省 sha1）；OID 长度不决定算法。blake3 远端广告 `object-format=blake3`（Libra 扩展）。重复/冲突的 `object-format` capability fail-closed。本地 blake3 对远端 sha1/sha256 的 fetch 返回 `LBR-REPO-003` / 退出码 128。覆盖测试：`parse_discovery_does_not_infer_sha256_from_64_hex`、`blake3_fetch_round_trip`、`protocol_object_format_mismatch_error_contract`。
+
+**本地 Git sha256 拒绝门（B3-12）：** 本地路径 Git 远端若 `objectformat=sha256`，在任何 fetch 写入前拒绝（`LBR-CLI-002`，退出码 129）。未知/损坏 → `LBR-REPO-002`；不可读 → `LBR-IO-001`。网络 Git sha256 暂缓（DEFER-B3-10）。覆盖：`fetch_rejects_sha256_git_source`。
 
 fetch discovery 对空广告或畸形 pkt-line 响应返回 `LBR-NET-002`，不回显标头或
 payload 字节。普通网络故障仍返回 `LBR-NET-001`；遇到协议错误时，请先检查 Git
@@ -376,15 +388,16 @@ SSH advertisement 长度 `0001` 至 `0003`、不完整标头（包括零字节 E
 payload 返回 `LBR-NET-002`。固定协议原因与 marker 保留，不插入捕获的 SSH
 stdout/stderr。
 
-必需标头不完整时有一项主机信任例外：本地 SSH 退出码为255，且 stderr 前64 KiB
-包含受识别的 host-key 诊断时，返回固定主机核验指引与 `LBR-NET-001`。这项分类
-本身不验证远端指纹。其它缺失广告（含认证失败）仍用 `LBR-NET-002`；能够观察到
-非零本地退出状态时，追加 `SSH exited with status N` 与固定连接、可信主机、
-ssh-agent 及仓库访问指引，不显示原始 SSH 诊断。
+discovery 的必需标头不完整时有两项按优先级处理的例外。受识别的 host-key 诊断与本地 SSH
+退出码255会返回固定主机核验指引及 `LBR-NET-001`，但不会验证远端指纹。完整的
+`Permission denied (<method-list>)` 若含精确的 `publickey` 方法、直接退出码255且
+stdout 为零字节，则返回固定公钥认证消息及 `LBR-AUTH-002`。stderr 可被伪造，
+所以该错误码不证明拒绝访问的具体原因。其它缺失广告仍用 `LBR-NET-002`，且不
+显示原始 SSH 诊断。
 
 必需标头不完整时最多用100毫秒观察 SSH 退出状态，再按需请求终止；其它读取
 错误立即请求终止。状态观察、直接子程序回收及输出收集共用两秒清理截止时间。
-协议错误与带类型的主机信任错误优先于次要清理警告。普通 IO/超时保留传输错误
+协议错误、带类型的主机信任错误和公钥认证错误优先于次要清理警告。普通 IO/超时保留传输错误
 分类，可追加固定本地清理警告。终止程序可能改变观察到的退出状态；这不承诺
 回收任意后代程序。
 
@@ -403,6 +416,14 @@ Clone 将主机核验指引放在结构化 hints 中；其它命令边界在 mes
 更新 `~/.ssh/known_hosts`；也可以单独建立交互 SSH 连接，核对显示的指纹后才
 接受。`ssh -T git@github.com` 是 GitHub 示例，请使用实际仓库 SSH 用户、主机
 和端口，不要接受未经核验的指纹。
+
+上述严格的 discovery 公钥拒绝使用固定 hint：检查
+`libra config list --ssh-keys`、SSH agent 与仓库权限，并链接
+[SSH 设置指南](https://libra.tools/en/docs/getting-started/ssh)。
+该 config 命令必须在已有 Libra 仓库内运行。
+
+从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚），自动化应同时
+接受该 SSH discovery 失败的 `LBR-AUTH-002` 与旧 `LBR-NET-002`。
 
 `ssh.strictHostKeyChecking` 保留既有 `ask`、`yes`、`accept-new`、`no` 设置。
 `ask` 不向 SSH 传递该选项，由用户 SSH 配置决定；`BatchMode=yes` 仍禁止

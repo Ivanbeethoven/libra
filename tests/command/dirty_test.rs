@@ -462,13 +462,16 @@ fn json_check_dirty_concurrent_invalidate_warning() {
     assert_cli_success(&run_libra_command(&["status", "--scan"], p), "seed scan");
 
     let child = base_libra_command(&["--json", "status", "--check-dirty"], p)
-        .env("LIBRA_TEST_CACHE_READ_PAUSE_MS", "1500")
+        // Full `cargo test --all` load can delay process start past the seam;
+        // keep the pause wide and delay the concurrent add until the child is
+        // likely already inside the mid-read window (not before it opens).
+        .env("LIBRA_TEST_CACHE_READ_PAUSE_MS", "10000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn paused check-dirty");
-    // Land an index write inside the widened window.
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    // Land an index write inside the widened window (after slow spawn under load).
+    std::thread::sleep(std::time::Duration::from_millis(2500));
     fs::write(p.join("f.txt"), "concurrent\n").unwrap();
     assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "concurrent add");
     let out = child.wait_with_output().expect("wait check-dirty");

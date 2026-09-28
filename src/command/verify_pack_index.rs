@@ -1,7 +1,7 @@
-use git_internal::hash::{HashKind, ObjectHash, get_hash_kind};
+use git_internal::hash::{HashKind, ObjectHash};
 use sha1::{Digest, Sha1};
 
-pub(crate) use super::verify_pack_index_v2::infer_idx_v2_hash_kind;
+pub(crate) use super::verify_pack_index_v2::idx_v2_matches_hash_kind;
 use super::{
     verify_pack_index_common::{
         FANOUT_LEN, IDX_MAGIC, parse_fanout, validate_fanout_matches_entries,
@@ -24,7 +24,7 @@ fn parse_idx_v1(bytes: &[u8]) -> Result<ParsedIndex, String> {
     const ENTRY_LEN: usize = 4 + HASH_LEN;
     const TRAILER_LEN: usize = HASH_LEN * 2;
 
-    if get_hash_kind() != HashKind::Sha1 {
+    if git_internal::hash::get_hash_kind() != HashKind::Sha1 {
         return Err("pack index v1 only supports sha1 repositories".to_string());
     }
     if bytes.len() < FANOUT_LEN + TRAILER_LEN {
@@ -53,8 +53,11 @@ fn parse_idx_v1(bytes: &[u8]) -> Result<ParsedIndex, String> {
                 .try_into()
                 .map_err(|_| "truncated v1 offset".to_string())?,
         ) as u64;
-        let hash = ObjectHash::from_bytes(&bytes[start + 4..start + ENTRY_LEN])
-            .map_err(|error| format!("invalid v1 object hash: {error}"))?;
+        let hash = ObjectHash::from_bytes_for_kind(
+            git_internal::hash::get_hash_kind(),
+            &bytes[start + 4..start + ENTRY_LEN],
+        )
+        .map_err(|error| format!("invalid v1 object hash: {error}"))?;
         entries.push(ParsedIndexEntry {
             hash,
             offset,
@@ -65,8 +68,11 @@ fn parse_idx_v1(bytes: &[u8]) -> Result<ParsedIndex, String> {
     validate_sorted_entries(&entries)?;
     validate_fanout_matches_entries(&fanout, &entries)?;
 
-    let pack_hash = ObjectHash::from_bytes(&bytes[entries_end..entries_end + HASH_LEN])
-        .map_err(|error| format!("invalid v1 pack hash: {error}"))?;
+    let pack_hash = ObjectHash::from_bytes_for_kind(
+        git_internal::hash::get_hash_kind(),
+        &bytes[entries_end..entries_end + HASH_LEN],
+    )
+    .map_err(|error| format!("invalid v1 pack hash: {error}"))?;
     let index_hash = bytes[entries_end + HASH_LEN..expected_len].to_vec();
     let computed_hash: [u8; HASH_LEN] = Sha1::digest(&bytes[..expected_len - HASH_LEN]).into();
     if index_hash != computed_hash {

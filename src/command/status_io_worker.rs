@@ -59,11 +59,7 @@ pub fn run_worker() -> i32 {
 }
 
 fn current_hash_kind() -> String {
-    match git_internal::hash::get_hash_kind() {
-        git_internal::hash::HashKind::Sha1 => "sha1".to_string(),
-        git_internal::hash::HashKind::Sha256 => "sha256".to_string(),
-        git_internal::hash::HashKind::Blake3 => "blake3".to_string(),
-    }
+    crate::internal::object_format::as_str(git_internal::hash::get_hash_kind()).to_string()
 }
 
 pub(crate) fn deadline_stat(path: &Path) -> Result<io::Result<CapturedStat>, ()> {
@@ -274,7 +270,7 @@ pub(crate) fn deadline_file_blob_hash(
     for event in events {
         if let IoEvent::DoneHash { hex } = event {
             return Ok(unwrap_wire(hex).and_then(|hex| {
-                hex.parse::<git_internal::hash::ObjectHash>()
+                crate::internal::object_format::parse_repo_oid(&hex)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
             }));
         }

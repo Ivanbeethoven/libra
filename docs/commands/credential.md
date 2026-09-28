@@ -7,20 +7,23 @@ repository vault — so credentials are never written to disk in clear text.
 ## Synopsis
 
 ```
-libra credential fill
+libra credential get
 libra credential store
 libra credential erase
 ```
 
-Each subcommand reads Git credential attributes (`key=value` lines, terminated
-by a blank line) from stdin.
+`get` is the Git helper protocol operation for a fill; `fill` is accepted as a
+legacy alias. Each subcommand reads Git credential attributes (`key=value`
+lines, terminated by a blank line) from stdin. An unknown operation is silently
+ignored (Git helper convention).
 
 ## Description
 
-- **`fill`** — print the stored `username`/`password` for the requested
-  `protocol`/`host`/`path`, or nothing. A miss (no entry, expired entry, wrong
-  username, or no vault) and a hit both exit 0 and look identical apart from the
-  output, so the exit code never reveals whether a credential exists.
+- **`get`** (alias **`fill`**) — print the stored `username`/`password` for the
+  requested `protocol`/`host`/`path`, or nothing. A miss (no entry, expired
+  entry, wrong username, or no vault) and a hit both exit 0 and look identical
+  apart from the output, so the exit code never reveals whether a credential
+  exists.
 - **`store`** — encrypt and persist the `username`/`password` from stdin. An
   optional `password_expiry_utc` is honoured; without one, the entry expires
   after 30 days. An already-expired `password_expiry_utc` is rejected.
@@ -73,8 +76,10 @@ printf 'protocol=https\nhost=example.com\n' | libra credential erase
 | Erase | `libra credential erase` | `git credential-store erase` |
 
 Differences: storage is vault-encrypted (not the plaintext `~/.git-credentials`)
-and **repository-scoped** (the vault unseal key is per repository), entries carry
-an expiry (default 30 days), and there is one credential per
-`protocol/host/path`. Not exposed: `credential-cache`, multiple usernames per
-host, and the consumer-side `credential.helper` chain (Libra *is* a helper; it
-does not invoke external helpers).
+and entries carry an expiry (default 30 days) and one credential per
+`protocol/host/path`. Inside a repository the credential is repository-scoped;
+outside a repository (or when the repo is absent) `store`/`get`/`erase` use a
+user-level encrypted store in the global config (issues/480 HP-14), so the
+helper is usable as a global `credential.helper`. Not exposed: `credential-cache`,
+multiple usernames per host, and the consumer-side `credential.helper` chain
+(Libra *is* a helper; it does not invoke external helpers).

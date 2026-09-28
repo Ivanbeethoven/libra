@@ -5,7 +5,6 @@ use std::{
     fs,
     io::IsTerminal,
     path::{Path, PathBuf},
-    str::FromStr,
 };
 
 use clap::Parser;
@@ -3153,9 +3152,9 @@ impl CherryPickState {
     /// Rebuild from a unified sequencer row, re-validating the OIDs and the
     /// todo cap through the existing parser.
     fn from_sequence(state: SequenceState) -> Result<Self, String> {
-        let head_orig = ObjectHash::from_str(state.head_orig.trim())
+        let head_orig = crate::internal::object_format::parse_repo_oid(state.head_orig.trim())
             .map_err(|e| format!("invalid head_orig hash: {e}"))?;
-        let current_oid = ObjectHash::from_str(state.current_oid.trim())
+        let current_oid = crate::internal::object_format::parse_repo_oid(state.current_oid.trim())
             .map_err(|e| format!("invalid current_oid hash: {e}"))?;
         // #477 HF-01: the external-conclusion marker rides in the options, so
         // the row itself stays valid for binaries that predate it.
@@ -3220,7 +3219,7 @@ impl CherryPickState {
                     "cherry_pick_state todo exceeds {CHERRY_PICK_TODO_CAP} entries"
                 ));
             }
-            let oid = ObjectHash::from_str(trimmed)
+            let oid = crate::internal::object_format::parse_repo_oid(trimmed)
                 .map_err(|e| format!("invalid todo OID '{trimmed}': {e}"))?;
             out.push(oid);
         }
@@ -3571,7 +3570,9 @@ mod tests {
     /// the `ff_landing` marker (#477 HF-31).
     #[test]
     fn sequence_advance_points_at_next_commit_or_clears() {
-        let oid = |c: char| ObjectHash::from_str(&c.to_string().repeat(40)).unwrap();
+        let oid = |c: char| {
+            crate::internal::object_format::parse_repo_oid(&c.to_string().repeat(40)).unwrap()
+        };
         let args = CherryPickArgs::try_parse_from(["cherry-pick", "abc"]).unwrap();
         let mut opts = CherryPickOpts::from_args(&args);
         opts.stopped_on_conflict = true;

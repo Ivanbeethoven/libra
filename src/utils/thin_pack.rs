@@ -192,7 +192,7 @@ pub fn encode_thin_pack(entries: &[ThinPackEntry]) -> std::io::Result<Vec<u8>> {
         }
     }
     // Trailer: content hash of everything so far, in the active wire kind.
-    let digest = ObjectHash::new(&pack);
+    let digest = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &pack);
     pack.extend_from_slice(&digest.to_data());
     Ok(pack)
 }

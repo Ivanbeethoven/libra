@@ -3250,13 +3250,17 @@ async fn expected_index_repair_oid_len(db_conn: &DatabaseConnection) -> Result<u
         })?
         .map(|entry| entry.value)
         .unwrap_or_else(|| "sha1".to_string());
-    match object_format.trim() {
-        "sha1" => Ok(40),
-        "sha256" => Ok(64),
-        other => Err(format!(
-            "unsupported core.objectformat '{other}' while validating object-index repair markers"
-        )),
-    }
+    let kind = crate::internal::object_format::parse_config_value(object_format.trim()).map_err(
+        |_| {
+            format!(
+                "unsupported core.objectformat '{object_format}' while validating object-index repair markers"
+            )
+        },
+    )?;
+    Ok(match kind {
+        git_internal::hash::HashKind::Sha1 => 40,
+        git_internal::hash::HashKind::Sha256 | git_internal::hash::HashKind::Blake3 => 64,
+    })
 }
 
 /// Apply one loaded replay page to the object index, retiring each durable
@@ -3856,7 +3860,7 @@ mod tests {
 
     use git_internal::{
         errors::GitError,
-        hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind, set_hash_kind_for_test},
+        hash::{HashKind, ObjectHash, set_hash_kind_for_test},
         internal::{
             metadata::{EntryMeta, MetaAttached},
             object::{ObjectTrait, blob::Blob, types::ObjectType},
@@ -3946,7 +3950,9 @@ mod tests {
 
     #[test]
     fn checked_batch_deduplicates_and_bounds_concurrency() {
-        let hashes: Vec<ObjectHash> = (0..40).map(|byte| ObjectHash::new(&[byte; 20])).collect();
+        let hashes: Vec<ObjectHash> = (0..40)
+            .map(|byte| ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[byte; 20]))
+            .collect();
         let backend = Arc::new(CheckedProbeStorage::new(hashes[3], None));
         let client = ClientStorage::from_test_storage(backend.clone(), PathBuf::new());
 
@@ -3967,9 +3973,9 @@ mod tests {
 
     #[test]
     fn checked_batch_reports_failing_oid() {
-        let failed = ObjectHash::new(&[9; 20]);
+        let failed = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[9; 20]);
         let backend = Arc::new(CheckedProbeStorage::new(
-            ObjectHash::new(&[1; 20]),
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
             Some(failed),
         ));
         let client = ClientStorage::from_test_storage(backend, PathBuf::new());
@@ -3985,7 +3991,7 @@ mod tests {
     fn commit_parent_batch_reads_raw_commits_and_reports_missing_oid() {
         let dir = tempdir().expect("temporary object directory");
         let client = ClientStorage::init_local(dir.path().join("objects"));
-        let tree = ObjectHash::new(&[3; 20]);
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[3; 20]);
         let root = Commit::from_tree_id(tree, vec![], "root");
         let tip = Commit::from_tree_id(tree, vec![root.id], "tip");
         for commit in [&root, &tip] {
@@ -4005,7 +4011,7 @@ mod tests {
         assert!(parents[&root.id].is_empty());
         assert_eq!(parents[&tip.id], vec![root.id]);
 
-        let absent = ObjectHash::new(&[4; 20]);
+        let absent = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[4; 20]);
         let error = client
             .commit_parents_many(&[absent])
             .expect_err("missing commit must be an error");
@@ -4016,7 +4022,7 @@ mod tests {
     fn commit_parent_batch_rejects_wrong_type_and_oversized_payload() {
         let dir = tempdir().expect("temporary object directory");
         let client = ClientStorage::init_local(dir.path().join("objects"));
-        let tree = ObjectHash::new(&[5; 20]);
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[5; 20]);
         let wrong_type = Commit::from_tree_id(tree, vec![], "content shaped like a commit");
         let wrong_type_data = wrong_type.to_data().expect("serialize fixture");
         let wrong_type_id = ObjectHash::from_type_and_data_for_kind(
@@ -4053,7 +4059,7 @@ mod tests {
         let _kind = set_hash_kind_for_test(HashKind::Sha1);
         let dir = tempdir().expect("temporary object directory");
         let client = ClientStorage::init_local(dir.path().join("objects"));
-        let tree = ObjectHash::new(&[5; 20]);
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[5; 20]);
         let actual = Commit::from_tree_id(tree, vec![], "actual contents");
         let requested = Commit::from_tree_id(tree, vec![], "requested contents");
         client
@@ -4076,7 +4082,7 @@ mod tests {
         let _kind = set_hash_kind_for_test(HashKind::Sha1);
         let dir = tempdir().expect("temporary object directory");
         let client = ClientStorage::init_local(dir.path().join("objects"));
-        let tree = ObjectHash::new(&[6; 20]);
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[6; 20]);
         let mut hashes = Vec::new();
         let mut commit_bytes = 0u64;
         for message in *b"abc" {
@@ -4114,8 +4120,8 @@ mod tests {
     fn commit_parent_batch_caps_total_parents() {
         let dir = tempdir().expect("temporary object directory");
         let client = ClientStorage::init_local(dir.path().join("objects"));
-        let tree = ObjectHash::new(&[6; 20]);
-        let parent = ObjectHash::new(&[7; 20]);
+        let tree = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[6; 20]);
+        let parent = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[7; 20]);
         let mut commits = Vec::new();
         for index in 0..4 {
             let commit =
@@ -4321,12 +4327,9 @@ mod tests {
         assert!(!entries.is_empty(), "encode requires at least one entry");
         let (pack_tx, mut pack_rx) = mpsc::channel::<Vec<u8>>(128);
         let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(entries.len());
-        let mut encoder = PackEncoder::new(entries.len(), 0, pack_tx);
-        let kind = get_hash_kind();
-        let encode_handle = tokio::spawn(async move {
-            set_hash_kind(kind);
-            encoder.encode(entry_rx).await
-        });
+        let kind = git_internal::hash::get_hash_kind();
+        let mut encoder = PackEncoder::new_with_hash_kind(kind, entries.len(), 0, pack_tx);
+        let encode_handle = tokio::spawn(async move { encoder.encode(entry_rx).await });
 
         for entry in entries {
             entry_tx
@@ -6265,6 +6268,48 @@ mod tests {
             .expect_err("global config connection failure should surface");
         assert!(
             err.contains("failed to connect to global config"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// B3-14: object-index repair OID width follows stored `core.objectformat`
+    /// via `object_format::parse_config_value` (blake3 → 64; unknown fail-closed).
+    #[tokio::test]
+    #[serial(cwd, env)]
+    async fn object_index_repair_uses_stored_object_format() {
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        let db = db::get_db_conn_instance().await;
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "blake3", false)
+            .await
+            .expect("set blake3");
+        assert_eq!(
+            super::expected_index_repair_oid_len(&db)
+                .await
+                .expect("blake3 width"),
+            64
+        );
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "sha1", false)
+            .await
+            .expect("set sha1");
+        assert_eq!(
+            super::expected_index_repair_oid_len(&db)
+                .await
+                .expect("sha1 width"),
+            40
+        );
+
+        ConfigKv::set_with_conn(&db, "core.objectformat", "not-a-format", false)
+            .await
+            .expect("set illegal");
+        let err = super::expected_index_repair_oid_len(&db)
+            .await
+            .expect_err("unknown format");
+        assert!(
+            err.contains("unsupported core.objectformat"),
             "unexpected error: {err}"
         );
     }

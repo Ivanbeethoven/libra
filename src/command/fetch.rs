@@ -7,9 +7,8 @@ mod shallow_response_validation;
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
-    io::{self, Error as IoError, Read, Write},
+    io::{self, Error as IoError, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -18,7 +17,7 @@ use clap::Parser;
 use futures_util::FutureExt;
 use git_internal::{
     errors::GitError,
-    hash::{HashKind, ObjectHash, get_hash_kind, set_hash_kind},
+    hash::{HashKind, ObjectHash, set_hash_kind},
     internal::object::commit::Commit,
 };
 use indicatif::ProgressBar;
@@ -53,8 +52,8 @@ use crate::{
             git_client::GitClient,
             https_client::HttpsClient,
             is_missing_shallow_capability, is_shallow_advertisement_changed,
-            local_client::LocalClient,
-            set_wire_hash_kind,
+            local_client::{GitSourceConfigError, LocalClient, git_repo_hash_kind},
+            repository_arg, set_wire_hash_kind,
             ssh_client::{SshClient, is_ssh_spec},
         },
         reflog::{HEAD, Reflog, ReflogAction, ReflogContext},
@@ -62,7 +61,7 @@ use crate::{
         vault::{decrypt_token, load_unseal_key},
     },
     utils::{
-        error::{CliError, CliResult, StableErrorCode},
+        error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{
             OutputConfig, ProgressMode, ProgressPreference, ProgressReporter, emit_json_data,
         },
@@ -675,6 +674,50 @@ pub struct FetchArgs {
     #[clap(long, overrides_with = "no_tags")]
     pub tags: bool,
 
+    /// After a successful fetch of a single branch source from a named remote,
+    /// set the current branch's upstream (`branch.<name>.remote` /
+    /// `branch.<name>.merge`) to that remote and branch. The remote is written
+    /// as the configured name, or as the URL when the remote was given as a URL.
+    #[clap(long = "set-upstream")]
+    pub set_upstream: bool,
+
+    /// Allow an explicit refspec to update the currently checked-out branch
+    /// (`fetch <remote> <src>:<head>`), matching Git's `--update-head-ok`.
+    #[clap(long = "update-head-ok")]
+    pub update_head_ok: bool,
+
+    /// Replace the configured `remote.<name>.fetch` mapping used to derive the
+    /// tracking destination for a command-line refspec. An empty value
+    /// (`--refmap=`) updates no tracking ref (FETCH_HEAD only). Requires a
+    /// command-line refspec.
+    #[clap(long = "refmap", value_name = "REFSPEC")]
+    pub refmap: Option<String>,
+
+    /// Atomically update all fetched refs: any rejected (non-fast-forward)
+    /// update rolls back every ref, reflog, and FETCH_HEAD write. Libra's fetch
+    /// already updates refs in a single transaction, so this is accepted for
+    /// git parity and asserts the all-or-nothing behaviour.
+    #[clap(long = "atomic")]
+    pub atomic: bool,
+
+    /// Prune local tags that the remote no longer advertises. Only effective
+    /// together with `--prune` (or the `fetch.prune` / `remote.<name>.prune`
+    /// config defaults); ignored when an explicit refspec is given.
+    #[clap(long = "prune-tags", short = 'P')]
+    pub prune_tags: bool,
+
+    /// Restrict the negotiation `have` set to commits reachable from the given
+    /// commit or ref (repeatable). Avoids sending irrelevant have refs; the
+    /// local transport computes the object difference from the narrowed set.
+    #[clap(long = "negotiation-tip", value_name = "COMMIT")]
+    pub negotiation_tip: Vec<String>,
+
+    /// Convert a shallow repository to a complete one: fetch the full history
+    /// and drop the shallow boundary records. A local Libra source is refused
+    /// (D20); a repository without shallow history errors (Git parity).
+    #[clap(long = "unshallow")]
+    pub unshallow: bool,
+
     /// Do not fetch any tags (not even tags reachable from fetched commits).
     /// Overrides the default auto-follow and an earlier `--tags`.
     #[clap(long = "no-tags", overrides_with = "tags")]
@@ -880,7 +923,7 @@ pub enum FetchError {
     IncompleteFetchedHistory { message: String },
     #[error("remote object format '{remote}' does not match local '{local}'")]
     ObjectFormatMismatch { remote: HashKind, local: HashKind },
-    #[error("remote branch {branch} not found in upstream {remote}")]
+    #[error("couldn't find remote ref {branch}")]
     RemoteBranchNotFound { branch: String, remote: String },
     #[error("invalid fetch refspec '{refspec}': {reason}")]
     InvalidRefspec { refspec: String, reason: String },
@@ -918,6 +961,12 @@ pub enum FetchError {
     UnsupportedShallowLocalLibra,
     #[error("failed to inspect local repository state: {message}")]
     LocalState { message: String },
+    /// Local-path Git source advertises `objectformat=sha256` (ADR-B3-01 / B3-12).
+    #[error("local Git repositories with objectformat=sha256 are not supported")]
+    UnsupportedLocalGitSha256,
+    /// Local-path Git `config` objectformat unknown/corrupt or unreadable (B3-12).
+    #[error("{0}")]
+    GitSourceConfig(GitSourceConfigError),
 }
 
 impl From<FetchError> for CliError {
@@ -931,8 +980,7 @@ impl From<FetchError> for CliError {
                 | RemoteSpecErrorKind::MalformedUrl
                 | RemoteSpecErrorKind::UnsupportedScheme => CliError::command_usage(reason.clone())
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
-                    .with_hint("check the remote URL with 'libra remote get-url <name>'"),
-            },
+                    .with_hint("check the remote URL with 'libra remote get-url <name>'")},
             FetchError::Discovery { source, .. } => {
                 map_fetch_discovery_error(error.to_string(), source)
             }
@@ -991,8 +1039,16 @@ impl From<FetchError> for CliError {
                 ),
             FetchError::ConfigRead { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::IoReadFailed),
-            FetchError::ObjectFormatMismatch { .. } => CliError::fatal(error.to_string())
-                .with_stable_code(StableErrorCode::RepoStateInvalid),
+            FetchError::ObjectFormatMismatch { remote, local } => {
+                let mut err = CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::RepoStateInvalid);
+                if matches!(local, HashKind::Blake3) || matches!(remote, HashKind::Blake3) {
+                    err = err.with_hint(
+                        "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                    );
+                }
+                err
+            }
             FetchError::IncompletePack { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("the connection dropped mid-transfer — retry the fetch"),
@@ -1023,7 +1079,34 @@ impl From<FetchError> for CliError {
             FetchError::LocalState { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
             }
+            FetchError::UnsupportedLocalGitSha256 => map_unsupported_local_git_sha256(),
+            FetchError::GitSourceConfig(source) => map_git_source_config_error(source),
         }
+    }
+}
+
+/// Shared hint for ADR-B3-01 local Git sha256 reject (clone/fetch/pull).
+pub(crate) const LOCAL_GIT_SHA256_FRESH_INIT_HINT: &str = "SHA-256/BLAKE3 Libra repositories can only be created with a fresh \
+     `libra init --object-format <format>` (local Git sha256 sources cannot be \
+     cloned, fetched, or pulled)";
+
+pub(crate) fn map_unsupported_local_git_sha256() -> CliError {
+    CliError::command_usage("local Git repositories with objectformat=sha256 are not supported")
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint(LOCAL_GIT_SHA256_FRESH_INIT_HINT)
+}
+
+pub(crate) fn map_git_source_config_error(error: &GitSourceConfigError) -> CliError {
+    match error {
+        // Align with Convert's UnknownObjectFormat → LBR-REPO-002 (RepoCorrupt).
+        GitSourceConfigError::UnknownOrCorrupt { detail } => CliError::fatal(detail.clone())
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint(
+                "fix the source Git repository's config objectformat, or use a SHA-1 Git source",
+            ),
+        GitSourceConfigError::Unreadable { detail } => CliError::fatal(detail.clone())
+            .with_stable_code(StableErrorCode::IoReadFailed)
+            .with_hint("check filesystem permissions on the source Git repository config"),
     }
 }
 
@@ -1037,6 +1120,20 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
         }
+        GitError::IOError(error)
+            if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error) =>
+        {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthPermissionDenied)
+                .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
+        }
+        GitError::IOError(error)
+            if let Some(config_error) = error.get_ref().and_then(|inner| {
+                inner.downcast_ref::<GitSourceConfigError>()
+            }) =>
+        {
+            map_git_source_config_error(config_error)
+        }
         GitError::NetworkError(_) => CliError::fatal(message)
             .with_stable_code(StableErrorCode::NetworkUnavailable)
             .with_hint("check network connectivity and retry"),
@@ -1044,8 +1141,7 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
             map_fetch_io_error(message, error, StableErrorCode::NetworkUnavailable)
                 .with_hint("check network connectivity and retry")
         }
-        _ => CliError::fatal(message).with_stable_code(StableErrorCode::NetworkProtocol),
-    }
+        _ => CliError::fatal(message).with_stable_code(StableErrorCode::NetworkProtocol)}
 }
 
 // Keep existing command callers on the shared bounded protocol classifier.
@@ -1101,6 +1197,14 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     if args.porcelain && output.is_json() {
         return Err(
             CliError::command_usage("--porcelain and --json are mutually exclusive")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    // `--refmap` overrides the mapping for a command-line refspec; without one
+    // it is meaningless (Git errors).
+    if args.refmap.is_some() && args.refspec.is_none() {
+        return Err(
+            CliError::command_usage("--refmap requires a command-line refspec")
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
         );
     }
@@ -1171,10 +1275,9 @@ fn format_fetch_porcelain(result: &FetchOutput) -> String {
         // back to the hash-kind-correct zero id (40 hex for SHA-1, 64 for
         // SHA-256); the new-oid zero always matches the old-oid width.
         for entry in &remote.pruned {
-            let old_oid = entry
-                .old_oid
-                .clone()
-                .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
+            let old_oid = entry.old_oid.clone().unwrap_or_else(|| {
+                ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()
+            });
             let zero = "0".repeat(old_oid.len());
             lines.push(format!("- {old_oid} {zero} {}", entry.remote_ref));
         }
@@ -1182,16 +1285,60 @@ fn format_fetch_porcelain(result: &FetchOutput) -> String {
     lines.join("\n")
 }
 
-fn local_upstream_network_error(branch: &str) -> CliError {
-    CliError::command_usage(format!(
-        "cannot fetch: branch '{branch}' tracks a local upstream; \
-         network commands do not operate on local upstreams (issues/480 HP-16)"
-    ))
-    .with_stable_code(StableErrorCode::CliInvalidTarget)
-    .with_detail("remote", ".")
-    .with_detail("upstream_kind", "local")
-    .with_hint("use 'libra branch --unset-upstream' to clear the local upstream")
-    .with_hint("local-upstream network operations are tracked as issues/480 HP-16")
+/// Git parity for `fetch --set-upstream <remote> <branch>`: after a successful
+/// single-branch fetch from a named remote, record the current branch's
+/// upstream (`branch.<name>.remote` / `branch.<name>.merge`). A colon refspec
+/// (`src:dst`) has no single source branch, so Git warns and writes nothing;
+/// omitting the branch writes nothing.
+async fn apply_fetch_set_upstream(
+    remote: &str,
+    refspec: Option<&str>,
+    _output: &OutputConfig,
+) -> CliResult<()> {
+    let Some(raw) = refspec else {
+        // No branch argument: Git does not set an upstream.
+        return Ok(());
+    };
+    if raw.contains(':') {
+        emit_warning(
+            "no source branch found; you need to specify exactly one branch with the --set-upstream option",
+        );
+        return Ok(());
+    }
+    let branch = match Head::current().await {
+        Head::Branch(name) => name,
+        // Detached HEAD has no branch to point upstream.
+        Head::Detached(_) => return Ok(()),
+    };
+    let merge = format!("refs/heads/{raw}");
+    ConfigKv::set(&format!("branch.{branch}.remote"), remote, false)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to set branch.{branch}.remote: {error}"))
+        })?;
+    ConfigKv::set(&format!("branch.{branch}.merge"), &merge, false)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to set branch.{branch}.merge: {error}"))
+        })?;
+
+    // Match git's status text, but keep stderr-clean under structured output.
+    if !crate::utils::output::structured_output_active() {
+        eprintln!(
+            "branch '{}' set up to track '{}'.",
+            branch,
+            format_remote_tracking(remote, raw)
+        );
+    }
+    Ok(())
+}
+
+fn format_remote_tracking(remote: &str, branch: &str) -> String {
+    if remote == "." {
+        branch.to_string()
+    } else {
+        format!("{remote}/{branch}")
+    }
 }
 
 /// Force progress reporting off when `--no-progress` is set (mirroring
@@ -1225,6 +1372,13 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         force,
         tags,
         no_tags,
+        set_upstream,
+        update_head_ok,
+        refmap,
+        atomic: _,
+        prune_tags,
+        negotiation_tip,
+        unshallow,
         no_auto_gc: _,
         no_progress,
         prune,
@@ -1290,7 +1444,22 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                 );
             }
             let fetched = fetch_repository_with_result_reusing(
-                remote, None, false, depth, dry_run, tag_cli, force, prune, notes, output, &results,
+                remote,
+                None,
+                false,
+                depth,
+                dry_run,
+                tag_cli,
+                force,
+                prune,
+                prune_tags,
+                notes,
+                output,
+                update_head_ok,
+                refmap.as_deref(),
+                &negotiation_tip,
+                unshallow,
+                &results,
             )
             .await
             .map_err(CliError::from)?;
@@ -1308,17 +1477,9 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     let remote = match repository {
         Some(remote) => remote,
         None => match ConfigKv::get_current_remote().await {
-            Ok(Some(remote)) if remote == "." => {
-                let branch = match Head::current().await {
-                    Head::Branch(name) => name,
-                    Head::Detached(_) => {
-                        return Err(CliError::fatal("HEAD is detached")
-                            .with_stable_code(StableErrorCode::RepoStateInvalid)
-                            .with_hint("switch to a branch before fetching its upstream"));
-                    }
-                };
-                return Err(local_upstream_network_error(&branch));
-            }
+            // A local upstream (`branch.<b>.remote=.`) is treated as the
+            // current repository as an anonymous fetch source (issues/480
+            // HP-16), replacing the earlier fail-closed refusal.
             Ok(Some(remote)) => remote,
             Ok(None) => {
                 return Err(
@@ -1335,21 +1496,41 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         },
     };
 
-    let remote_config = ConfigKv::remote_config(&remote)
-        .await
-        .map_err(|error| {
-            CliError::fatal(format!("failed to read remote configuration: {error}"))
-                .with_stable_code(StableErrorCode::IoReadFailed)
-        })?
-        .ok_or_else(|| {
-            CliError::fatal(format!("remote '{remote}' not found"))
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-                .with_hint("use 'libra remote -v' to inspect configured remotes")
-        })?;
+    let configured_remote = ConfigKv::remote_config(&remote).await.map_err(|error| {
+        CliError::fatal(format!("failed to read remote configuration: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    // `fetch <path|file://url> <branch>` (or a local upstream `.`): an anonymous
+    // local-repo spec that is not a configured remote. It negotiates directly
+    // against the target, writes only `FETCH_HEAD` (no tracking ref), and
+    // records no `remote.*` config.
+    let anonymous =
+        configured_remote.is_none() && repository_arg::is_anonymous_repository_spec(&remote);
+    let remote_config = if let Some(cfg) = configured_remote {
+        cfg
+    } else if anonymous {
+        RemoteConfig {
+            name: repository_arg::anonymous_remote_name(&remote),
+            url: remote.clone(),
+        }
+    } else {
+        return Err(CliError::fatal(format!("remote '{remote}' not found"))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("use 'libra remote -v' to inspect configured remotes"));
+    };
+    // For an anonymous spec we suppress tracking-ref updates (matching
+    // `--refmap=`), so only `FETCH_HEAD` is written.
+    let effective_refmap = if anonymous && refmap.is_none() {
+        Some(String::new())
+    } else {
+        refmap
+    };
 
     if let Some(requested) = refspec.as_deref() {
         parse_fetch_refspec(requested, &remote_config.name).map_err(CliError::from)?;
-    } else {
+    } else if !effective_refmap.as_ref().is_some_and(|m| m.is_empty()) {
+        // For anonymous no-refspec fetches we do not validate a configured
+        // refset; the implicit default mapping applies.
         validate_configured_fetch_refspecs(&remote_config.name)
             .await
             .map_err(CliError::from)?;
@@ -1364,6 +1545,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     }
 
     let prune = resolve_prune_mode(&remote_config.name, prune_cli).await?;
+    let remote_name_for_set_upstream = remote_config.name.clone();
     let result = fetch_repository_with_result(
         remote_config,
         refspec.clone(),
@@ -1373,11 +1555,23 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         tag_cli,
         force,
         prune,
+        prune_tags,
         notes,
         output,
+        update_head_ok,
+        effective_refmap.as_deref(),
+        &negotiation_tip,
+        unshallow,
     )
     .await
     .map_err(CliError::from)?;
+
+    // `--set-upstream`: after a successful single-branch fetch from a named
+    // remote, record the current branch's upstream, matching Git's
+    // `fetch --set-upstream`. Writes are suppressed under `--dry-run`.
+    if set_upstream && !dry_run {
+        apply_fetch_set_upstream(&remote_name_for_set_upstream, refspec.as_deref(), output).await?;
+    }
 
     Ok(FetchOutput {
         all: false,
@@ -1504,6 +1698,17 @@ pub(crate) async fn discover_remote_with_name(
             reason,
         }
     })?;
+    // B3-12: reject local-path Git sha256 / unknown / unreadable config before
+    // discovery mutates anything. Network Git sha256 remains DEFER-B3-10.
+    if let RemoteClient::Local(client) = &remote_client
+        && !client.is_libra_source()
+    {
+        match git_repo_hash_kind(client.repo_path()) {
+            Ok(HashKind::Sha256) => return Err(FetchError::UnsupportedLocalGitSha256),
+            Ok(_) => {}
+            Err(error) => return Err(FetchError::GitSourceConfig(error)),
+        }
+    }
     let discovery = remote_client
         .discovery_reference(UploadPack)
         .await
@@ -1574,6 +1779,12 @@ pub(crate) fn normalize_branch_ref(branch: &str) -> String {
     }
 }
 
+/// Strip a `refs/heads/` prefix for a missing-remote-ref diagnostic, matching
+/// Git's `couldn't find remote ref <name>` phrasing.
+fn short_remote_ref(branch: &str) -> &str {
+    branch.strip_prefix("refs/heads/").unwrap_or(branch)
+}
+
 fn refspec_ref_is_valid(value: &str) -> bool {
     let wildcard_count = value.matches('*').count();
     wildcard_count <= 1 && util::is_valid_refname(&value.replace('*', "wildcard"))
@@ -1626,8 +1837,7 @@ fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), Fe
     } else {
         Err(FetchError::InvalidRefspec {
             refspec: refspec.to_string(),
-            reason: "destination must be under refs/heads/* or refs/remotes/<remote>/* and must not be a reserved HEAD ref".to_string(),
-        })
+            reason: "destination must be under refs/heads/* or refs/remotes/<remote>/* and must not be a reserved HEAD ref".to_string()})
     }
 }
 
@@ -1774,7 +1984,7 @@ fn expand_refspec(
         });
     } else {
         return Err(FetchError::RemoteBranchNotFound {
-            branch: spec.source.clone(),
+            branch: short_remote_ref(&spec.source).to_string(),
             remote: remote.to_string(),
         });
     }
@@ -1786,9 +1996,10 @@ async fn build_fetch_ref_plans(
     refs: &[DiscRef],
     branch: Option<&str>,
     single_branch: bool,
+    refmap: Option<&str>,
 ) -> Result<Vec<FetchRefPlan>, FetchError> {
     if single_branch {
-        return single_branch_fetch_plans(remote, refs, branch).await;
+        return single_branch_fetch_plans(remote, refs, branch, refmap).await;
     }
     let specs = if branch.is_some() {
         Vec::new()
@@ -1828,17 +2039,41 @@ async fn single_branch_fetch_plans(
     remote: &str,
     refs: &[DiscRef],
     branch: Option<&str>,
+    refmap: Option<&str>,
 ) -> Result<Vec<FetchRefPlan>, FetchError> {
     let Some(raw) = branch else {
         return Ok(Vec::new());
     };
     let parsed = parse_fetch_refspec(raw, remote)?;
+    // `--refmap=` (empty) explicitly suppresses any tracking-ref update
+    // (FETCH_HEAD only), overriding the configured mapping.
+    let suppress_tracking = refmap == Some("");
     if raw.contains(':') {
-        return expand_refspec(&parsed, refs, remote);
+        let mut plans = expand_refspec(&parsed, refs, remote)?;
+        if suppress_tracking {
+            for plan in &mut plans {
+                plan.update_tracking = false;
+            }
+        }
+        return Ok(plans);
     }
-    let configured = configured_fetch_refspecs(remote).await?;
+    // `--refmap=<spec>` replaces the configured mapping used to derive the
+    // tracking destination for a command-line refspec. An empty value means no
+    // configured mapping (FETCH_HEAD only). Without `--refmap`, fall back to the
+    // configured `remote.<name>.fetch`.
+    let configured = match refmap {
+        Some(mapping) if !mapping.is_empty() => vec![parse_fetch_refspec(mapping, remote)?],
+        Some(_) => Vec::new(),
+        None => configured_fetch_refspecs(remote).await?,
+    };
     if configured.is_empty() {
-        return expand_refspec(&parsed, refs, remote);
+        let mut plans = expand_refspec(&parsed, refs, remote)?;
+        if suppress_tracking {
+            for plan in &mut plans {
+                plan.update_tracking = false;
+            }
+        }
+        return Ok(plans);
     }
     let Some(reference) = refs
         .iter()
@@ -1846,7 +2081,7 @@ async fn single_branch_fetch_plans(
         .cloned()
     else {
         return Err(FetchError::RemoteBranchNotFound {
-            branch: parsed.source,
+            branch: short_remote_ref(&parsed.source).to_string(),
             remote: remote.to_string(),
         });
     };
@@ -1990,7 +2225,12 @@ pub async fn fetch_repository_safe(
         false,
         false,
         false,
+        false,
         output,
+        false,
+        None,
+        &[],
+        false,
     )
     .await
     .map(|result| {
@@ -2012,8 +2252,13 @@ pub(crate) async fn fetch_repository_with_result(
     tag_cli: Option<TagFetchMode>,
     force: bool,
     prune: bool,
+    prune_tags: bool,
     notes: bool,
     output: &OutputConfig,
+    update_head_ok: bool,
+    refmap: Option<&str>,
+    negotiation_tip: &[String],
+    unshallow: bool,
 ) -> Result<FetchRepositoryResult, FetchError> {
     fetch_repository_with_result_reusing(
         remote_config,
@@ -2024,8 +2269,13 @@ pub(crate) async fn fetch_repository_with_result(
         tag_cli,
         force,
         prune,
+        prune_tags,
         notes,
         output,
+        update_head_ok,
+        refmap,
+        negotiation_tip,
+        unshallow,
         &[],
     )
     .await
@@ -2041,8 +2291,13 @@ async fn fetch_repository_with_result_reusing(
     tag_cli: Option<TagFetchMode>,
     force: bool,
     prune: bool,
+    prune_tags: bool,
     notes: bool,
     output: &OutputConfig,
+    update_head_ok: bool,
+    refmap: Option<&str>,
+    negotiation_tip: &[String],
+    unshallow: bool,
     prior_results: &[FetchRepositoryResult],
 ) -> Result<FetchRepositoryResult, FetchError> {
     if single_branch {
@@ -2058,12 +2313,12 @@ async fn fetch_repository_with_result_reusing(
     // prevent secret leakage in both human and JSON output.
     let normalized_url =
         redact_url_credentials(&normalize_remote_url(&remote_config.url, &remote_client));
-    if depth.is_some()
+    if (depth.is_some() || unshallow)
         && matches!(&remote_client, RemoteClient::Local(client) if client.is_libra_source())
     {
         return Err(FetchError::UnsupportedShallowLocalLibra);
     }
-    let local_kind = get_hash_kind();
+    let local_kind = git_internal::hash::get_hash_kind();
     if discovery.hash_kind != local_kind {
         return Err(FetchError::ObjectFormatMismatch {
             remote: discovery.hash_kind,
@@ -2106,6 +2361,7 @@ async fn fetch_repository_with_result_reusing(
         &discovery.refs,
         branch.as_deref(),
         single_branch,
+        refmap,
     )
     .await?;
     let mut prune_branch_names =
@@ -2154,7 +2410,8 @@ async fn fetch_repository_with_result_reusing(
     // anything (no `.pack`/`.idx`, no shallow update, no ref/reflog writes, no
     // FETCH_HEAD).
     if dry_run {
-        let mut refs_updated = compute_fetch_ref_preview(&remote_config, &ref_plans, force).await?;
+        let mut refs_updated =
+            compute_fetch_ref_preview(&remote_config, &ref_plans, force, update_head_ok).await?;
         if tag_mode == TagFetchMode::All {
             for reference in &discovered_tags {
                 let Some(tag_name) = reference._ref.strip_prefix("refs/tags/") else {
@@ -2214,6 +2471,7 @@ async fn fetch_repository_with_result_reusing(
             branch,
             discovery.capabilities.clone(),
             force,
+            update_head_ok,
         )
         .await?;
         let pruned = if prune {
@@ -2247,14 +2505,24 @@ async fn fetch_repository_with_result_reusing(
     want.sort();
     want.dedup();
     let have = current_have_safe(discovery.hash_kind).await?;
+    let have = narrow_have_by_negotiation_tips(have, negotiation_tip, discovery.hash_kind).await?;
     let shallow_boundaries = read_shallow_boundaries_for_kind(discovery.hash_kind)?;
+    // `--unshallow` requests the complete history: force a full (unlimited)
+    // depth, and refuse when the repository is not actually shallow.
+    if unshallow && shallow_boundaries.is_empty() {
+        return Err(FetchError::LocalState {
+            message: "--unshallow requires a shallow repository; no shallow history is recorded"
+                .to_string(),
+        });
+    }
+    let effective_depth = if unshallow { None } else { depth };
     let shallow = shallow_boundaries.iter().cloned().collect::<Vec<_>>();
     let mut result_stream = remote_client
         .fetch_objects(
             &have,
             &want,
             &shallow,
-            depth,
+            effective_depth,
             &discovery.capabilities,
             &discovery.shallow_boundaries,
         )
@@ -2402,8 +2670,7 @@ async fn fetch_repository_with_result_reusing(
                 .ok_or_else(|| FetchError::LocalState {
                     message: format!(
                         "missing presence result for parent '{parent}' of advertised shallow commit '{boundary}'"
-                    ),
-                })?;
+                    )})?;
             missing_parent |= !present;
         }
         if missing_parent {
@@ -2426,7 +2693,10 @@ async fn fetch_repository_with_result_reusing(
             discovery.hash_kind,
         )?;
     }
-    if !shallow_updates.is_empty() || !fetch_data.unshallow.is_empty() {
+    if unshallow {
+        // `--unshallow` drops the shallow boundary records entirely.
+        write_shallow_boundaries(&BTreeSet::new())?;
+    } else if !shallow_updates.is_empty() || !fetch_data.unshallow.is_empty() {
         write_shallow_boundaries(&final_boundaries)?;
     }
 
@@ -2435,9 +2705,10 @@ async fn fetch_repository_with_result_reusing(
         &ref_plans,
         &ref_heads,
         remote_head,
-        branch,
+        branch.clone(),
         discovery.capabilities.clone(),
         force,
+        update_head_ok,
     )
     .await?;
 
@@ -2453,7 +2724,7 @@ async fn fetch_repository_with_result_reusing(
             discovered_tags
                 .into_iter()
                 .filter(|tag| {
-                    ObjectHash::from_str(&tag._hash)
+                    crate::internal::object_format::parse_repo_oid(&tag._hash)
                         .map(|oid| storage.exist(&oid))
                         .unwrap_or(false)
                 })
@@ -2504,6 +2775,21 @@ async fn fetch_repository_with_result_reusing(
     } else {
         Vec::new()
     };
+
+    // `--prune-tags`/`-P`: delete local tags the remote no longer advertises.
+    // Only effective when tracking prune is on (or enabled via
+    // `fetch.pruneTags` / `remote.<name>.pruneTags`) and no explicit refspec is
+    // given (Git parity).
+    let config_prune_tags = fetch_prune_tags_configured(&remote_config.name).await?;
+    let effective_prune_tags = (prune_tags || config_prune_tags) && prune && branch.is_none();
+    if effective_prune_tags {
+        let pruned_tags = prune_stale_tags(&remote_config.name, &discovery.refs, dry_run).await?;
+        if !pruned_tags.is_empty() && !crate::utils::output::structured_output_active() {
+            for name in &pruned_tags {
+                eprintln!(" - [deleted]         (none)     -> tag '{name}'");
+            }
+        }
+    }
 
     let new_sentinel = pack_pin.into_path();
     let (pack_keep_lock, keep_sentinel) = match keep_lock {
@@ -2991,7 +3277,13 @@ async fn read_fetch_stream(
     output: &OutputConfig,
     task: &str,
 ) -> Result<FetchStreamData, FetchError> {
-    read_fetch_stream_for_kind(result_stream, output, task, get_hash_kind()).await
+    read_fetch_stream_for_kind(
+        result_stream,
+        output,
+        task,
+        git_internal::hash::get_hash_kind(),
+    )
+    .await
 }
 
 /// Strip a leading `ERR ` / `FATAL ` marker from a side-band channel-3 message so
@@ -3320,6 +3612,15 @@ fn existing_sha1_index_is_v2(path: &Path) -> Result<bool, FetchError> {
             path.display()
         ),
     })?;
+    let file_len =
+        file.metadata()
+            .map(|meta| meta.len())
+            .map_err(|source| FetchError::LocalState {
+                message: format!(
+                    "failed to inspect existing pack index '{}': {source}",
+                    path.display()
+                ),
+            })?;
     let mut header = [0_u8; 8];
     file.read_exact(&mut header)
         .map_err(|source| FetchError::LocalState {
@@ -3328,18 +3629,55 @@ fn existing_sha1_index_is_v2(path: &Path) -> Result<bool, FetchError> {
                 path.display()
             ),
         })?;
-    if header[..4] != [0xff, b't', b'O', b'c'] {
-        return Ok(false);
+    if header[..4] == [0xff, b't', b'O', b'c'] {
+        if header[4..] != 2_u32.to_be_bytes() {
+            return Err(FetchError::LocalState {
+                message: format!(
+                    "existing pack index '{}' uses an unsupported version; repair the object store before retrying",
+                    path.display()
+                ),
+            });
+        }
+        return Ok(true);
     }
-    if header[4..] != 2_u32.to_be_bytes() {
-        return Err(FetchError::LocalState {
-            message: format!(
-                "existing pack index '{}' uses an unsupported version; repair the object store before retrying",
-                path.display()
-            ),
-        });
+    // No v2 magic: it must be a well-formed legacy v1 index (256*4 fanout,
+    // `n` 24-byte `offset+sha1` entries, then the 40-byte trailer). Anything
+    // else is a damaged index; fail closed with `LocalState` so the caller
+    // reports a repairable object store instead of taking the v1 build path,
+    // where git-internal's `Pack::decode` dependency scan would read this same
+    // damaged file as a v1 index and abort with a misleading `InvalidPackFile`
+    // ("pack index v1 fanout table is not monotonic").
+    const FANOUT_BYTES: u64 = 256 * 4;
+    const V1_ENTRY_BYTES: u64 = 4 + 20;
+    const TRAILER_BYTES: u64 = 20 + 20;
+    if file_len >= FANOUT_BYTES + TRAILER_BYTES {
+        // `fanout[255]` (the object count) sits at the end of the fanout table.
+        file.seek(SeekFrom::Start(FANOUT_BYTES - 4))
+            .map_err(|source| FetchError::LocalState {
+                message: format!(
+                    "failed to inspect existing pack index '{}': {source}",
+                    path.display()
+                ),
+            })?;
+        let mut count = [0_u8; 4];
+        file.read_exact(&mut count)
+            .map_err(|source| FetchError::LocalState {
+                message: format!(
+                    "failed to read existing pack index '{}': {source}",
+                    path.display()
+                ),
+            })?;
+        let object_count = u32::from_be_bytes(count) as u64;
+        if file_len == FANOUT_BYTES + object_count * V1_ENTRY_BYTES + TRAILER_BYTES {
+            return Ok(false);
+        }
     }
-    Ok(true)
+    Err(FetchError::LocalState {
+        message: format!(
+            "existing pack index '{}' is corrupt or unreadable; repair the object store before retrying",
+            path.display()
+        ),
+    })
 }
 
 async fn write_pack_and_index(
@@ -3544,7 +3882,7 @@ fn index_received_pack(
     // A SHA-1 pack may already have a valid v2 index created by Git or by
     // `libra index-pack --index-version 2`. Build the same format before the
     // byte comparison, since v1 and v2 represent the same pack differently.
-    let use_v2_index = hash_kind != HashKind::Sha1
+    let use_v2_index = crate::internal::object_format::pack_index_is_v2(hash_kind)
         || (index_file.exists() && existing_sha1_index_is_v2(&index_file)?);
     let index_dir = index_file.parent().ok_or_else(|| FetchError::LocalState {
         message: format!(
@@ -3872,6 +4210,7 @@ async fn compute_fetch_ref_preview(
     remote_config: &RemoteConfig,
     plans: &[FetchRefPlan],
     force_override: bool,
+    update_head_ok: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let mut updates = Vec::new();
     let db = crate::internal::sequencer::request_db_checked()
@@ -3898,7 +4237,12 @@ async fn compute_fetch_ref_preview(
             })?
             .map(|branch| branch.commit.to_string());
 
-        reject_checked_out_destination(plan, remote_scope.as_deref(), &checked_out_branches)?;
+        reject_checked_out_destination(
+            plan,
+            remote_scope.as_deref(),
+            &checked_out_branches,
+            update_head_ok,
+        )?;
         if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
             continue;
         }
@@ -3956,7 +4300,11 @@ fn reject_checked_out_destination(
     plan: &FetchRefPlan,
     remote_scope: Option<&str>,
     checked_out_branches: &HashSet<String>,
+    update_head_ok: bool,
 ) -> Result<(), FetchError> {
+    if update_head_ok {
+        return Ok(());
+    }
     if remote_scope.is_none()
         && let Some(local_branch) = plan.destination.strip_prefix("refs/heads/")
         && checked_out_branches.contains(local_branch)
@@ -3994,8 +4342,7 @@ fn fetch_destination_storage(
     }
     Err(FetchError::InvalidRefspec {
         refspec: destination.to_string(),
-        reason: "destination must be under refs/heads/*, refs/remotes/<remote>/*, or another refs/* name".to_string(),
-    })
+        reason: "destination must be under refs/heads/*, refs/remotes/<remote>/*, or another refs/* name".to_string()})
 }
 
 fn fetch_head_path() -> Result<PathBuf, FetchError> {
@@ -4178,7 +4525,7 @@ async fn prune_stale_remote_refs(
         .map_err(|message| FetchError::LocalState { message })?;
     let remote_owned = remote_name.to_string();
     let to_delete = pruned.clone();
-    let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
     // Reads the refs it is about to move/delete before writing them, so the
     // write lock is taken up front (`db::begin_write_transaction`).
     crate::internal::db::write_transaction(&db, |txn| {
@@ -4287,7 +4634,7 @@ async fn prune_stale_mirror_refs(
         .await
         .map_err(|message| FetchError::LocalState { message })?;
     let to_delete = pruned.clone();
-    let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+    let zero = ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string();
     crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             for entry in &to_delete {
@@ -4326,6 +4673,7 @@ async fn prune_stale_mirror_refs(
     Ok(pruned)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_references(
     remote_config: &RemoteConfig,
     plans: &[FetchRefPlan],
@@ -4334,6 +4682,7 @@ async fn update_references(
     branch: Option<String>,
     capabilities: Vec<String>,
     force_override: bool,
+    update_head_ok: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     let db = crate::internal::sequencer::request_db_checked()
         .await
@@ -4366,14 +4715,14 @@ async fn update_references(
                     message: format!(
                         "failed to inspect fetch destination '{}': {error}",
                         plan.destination
-                    ),
-                })?
+                    )})?
                 .map(|branch| branch.commit.to_string());
 
                 reject_checked_out_destination(
                     plan,
                     remote_scope.as_deref(),
                     &checked_out_branches,
+                    update_head_ok,
                 )?;
                 if old_oid.as_deref() == Some(plan.reference._hash.as_str()) {
                     continue;
@@ -4386,8 +4735,7 @@ async fn update_references(
                         message: format!(
                             "non-fast-forward update to '{}' requires '+' in the refspec or --force",
                             plan.destination
-                        ),
-                    });
+                        )});
                 }
 
                 Branch::update_branch_with_conn(
@@ -4401,30 +4749,26 @@ async fn update_references(
                     message: format!(
                         "failed to persist fetch destination '{}': {source}",
                         plan.destination
-                    ),
-                })?;
+                    )})?;
 
                 let context = ReflogContext {
                     old_oid: old_oid
                         .clone()
-                        .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string()),
+                        .unwrap_or_else(|| ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string()),
                     new_oid: plan.reference._hash.clone(),
-                    action: ReflogAction::Fetch,
-                };
+                    action: ReflogAction::Fetch};
                 Reflog::insert_single_entry(txn, &context, &plan.destination)
                     .await
                     .map_err(|source| FetchError::UpdateRefs {
                         message: format!(
                             "failed to record reflog for fetch destination '{}': {source}",
                             plan.destination
-                        ),
-                    })?;
+                        )})?;
                 updates.push(FetchRefUpdate {
                     remote_ref: plan.destination.clone(),
                     forced,
                     old_oid,
-                    new_oid: plan.reference._hash.clone(),
-                });
+                    new_oid: plan.reference._hash.clone()});
             }
 
             // Update the cached remote HEAD to the branch it points at, resolved
@@ -4454,8 +4798,7 @@ async fn update_references(
                     message: format!(
                         "failed to update refs/remotes/{}/HEAD: {error}",
                         remote_config.name
-                    ),
-                })?;
+                    )})?;
             } else if branch.is_none() {
                 ref_model::Entity::delete_many()
                     .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
@@ -4466,8 +4809,7 @@ async fn update_references(
                         message: format!(
                             "failed to remove stale refs/remotes/{}/HEAD: {error}",
                             remote_config.name
-                        ),
-                    })?;
+                        )})?;
             }
             if remote_default_branch.is_none() && branch.is_none() && remote_head.is_some() {
                 tracing::debug!("remote HEAD does not point to a branch ref");
@@ -4479,10 +4821,8 @@ async fn update_references(
     .await
     .map_err(|source| match source {
         TransactionError::Connection(error) => FetchError::UpdateRefs {
-            message: error.to_string(),
-        },
-        TransactionError::Transaction(error) => error,
-    })
+            message: error.to_string()},
+        TransactionError::Transaction(error) => error})
 }
 
 /// Whether `new_oid` updating `old_oid` is a forced (non-fast-forward) change.
@@ -4500,7 +4840,10 @@ fn fetch_update_force_status(old_oid: Option<&str>, new_oid: &str) -> Option<boo
     let Some(old_str) = old_oid else {
         return Some(false);
     };
-    let (Ok(old), Ok(new)) = (ObjectHash::from_str(old_str), ObjectHash::from_str(new_oid)) else {
+    let (Ok(old), Ok(new)) = (
+        crate::internal::object_format::parse_repo_oid(old_str),
+        crate::internal::object_format::parse_repo_oid(new_oid),
+    ) else {
         return None;
     };
     if old == new {
@@ -4547,6 +4890,77 @@ async fn resolve_prune_mode(remote_name: &str, prune_cli: Option<bool>) -> Resul
         return Ok(explicit);
     }
     Ok(configured_fetch_prune(remote_name).await?.unwrap_or(false))
+}
+
+/// Resolve the effective `--prune-tags` mode for a remote: the CLI flag wins;
+/// otherwise fall back to `remote.<name>.pruneTags`, then `fetch.pruneTags`
+/// (Git precedence). It is only ever consulted when tracking prune is also on.
+async fn fetch_prune_tags_configured(remote_name: &str) -> Result<bool, FetchError> {
+    for (prefix, variable) in [
+        (format!("remote.{remote_name}."), "pruneTags".to_string()),
+        ("fetch.".to_string(), "pruneTags".to_string()),
+    ] {
+        let entries = ConfigKv::get_var_all_case_insensitive(&prefix, &variable)
+            .await
+            .map_err(|e| FetchError::ConfigRead {
+                key: format!("{prefix}{variable}"),
+                message: e.to_string(),
+            })?;
+        if let Some(entry) = entries.into_iter().next() {
+            let v = entry.value.to_ascii_lowercase();
+            match v.as_str() {
+                "true" | "yes" | "on" | "1" => return Ok(true),
+                "false" | "no" | "off" | "0" => return Ok(false),
+                other => {
+                    return Err(FetchError::ConfigRead {
+                        key: format!("{prefix}{variable}"),
+                        message: format!("expected bool, got '{other}'"),
+                    });
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Prune local tags that the remote no longer advertises. Only invoked when
+/// tracking prune is on AND `--prune-tags` (or `fetch.pruneTags` /
+/// `remote.<name>.pruneTags`) is effective AND no explicit refspec is given
+/// (matching Git). Returns the pruned tag names for reporting.
+async fn prune_stale_tags(
+    _remote_name: &str,
+    discovery_refs: &[DiscRef],
+    dry_run: bool,
+) -> Result<Vec<String>, FetchError> {
+    let advertised: HashSet<String> = discovery_refs
+        .iter()
+        .filter(|r| r._ref.starts_with("refs/tags/") && !r._ref.ends_with("^{}"))
+        .map(|r| {
+            r._ref
+                .strip_prefix("refs/tags/")
+                .unwrap_or(&r._ref)
+                .to_string()
+        })
+        .collect();
+    let local = tag::list().await.map_err(|e| FetchError::UpdateRefs {
+        message: format!("failed to list tags for --prune-tags: {e}"),
+    })?;
+    let stale = local
+        .into_iter()
+        .filter(|t| !advertised.contains(&t.name))
+        .map(|t| t.name)
+        .collect::<Vec<_>>();
+    if dry_run {
+        return Ok(stale);
+    }
+    for name in &stale {
+        tag::delete(name)
+            .await
+            .map_err(|e| FetchError::UpdateRefs {
+                message: format!("failed to prune tag '{name}': {e}"),
+            })?;
+    }
+    Ok(stale)
 }
 
 /// Read the first configured value among `remote.<name>.prune` and
@@ -4630,8 +5044,7 @@ async fn persist_fetched_tags(
                     .one(txn)
                     .await
                     .map_err(|error| FetchError::UpdateRefs {
-                        message: format!("failed to inspect existing tag '{}': {error}", tag._ref),
-                    })?;
+                        message: format!("failed to inspect existing tag '{}': {error}", tag._ref)})?;
                 match existing {
                     Some(row) if row.commit.as_deref() == Some(tag._hash.as_str()) => {
                         // Already up to date — nothing to report.
@@ -4647,14 +5060,12 @@ async fn persist_fetched_tags(
                                 message: format!(
                                     "failed to force-update tag '{}': {source}",
                                     tag._ref
-                                ),
-                            })?;
+                                )})?;
                         updates.push(FetchRefUpdate {
                             remote_ref: tag._ref.clone(),
                             old_oid: old,
                             new_oid: tag._hash.clone(),
-                            forced: true,
-                        });
+                            forced: true});
                     }
                     Some(_) => {
                         tracing::warn!(
@@ -4673,14 +5084,12 @@ async fn persist_fetched_tags(
                             .insert(txn)
                             .await
                             .map_err(|source| FetchError::UpdateRefs {
-                                message: format!("failed to persist tag '{}': {source}", tag._ref),
-                            })?;
+                                message: format!("failed to persist tag '{}': {source}", tag._ref)})?;
                         updates.push(FetchRefUpdate {
                             remote_ref: tag._ref.clone(),
                             old_oid: None,
                             new_oid: tag._hash.clone(),
-                            forced: false,
-                        });
+                            forced: false});
                     }
                 }
             }
@@ -4691,9 +5100,7 @@ async fn persist_fetched_tags(
     .map_err(|source| FetchError::UpdateRefs {
         message: match source {
             TransactionError::Connection(error) => error.to_string(),
-            TransactionError::Transaction(error) => error.to_string(),
-        },
-    })
+            TransactionError::Transaction(error) => error.to_string()}})
 }
 
 /// Soft cap on the number of commits we walk back from each branch tip when
@@ -4706,6 +5113,72 @@ const HAVE_HISTORY_LIMIT: usize = 256;
 /// Maximum chain length when peeling a (possibly tag-of-tag) annotated tag to
 /// its target while building the `have` set. Bounds runaway/cyclic tag chains.
 const MAX_TAG_PEEL_DEPTH: usize = 32;
+
+/// Restrict a computed `have` set to commits reachable from the given
+/// `--negotiation-tip` commits/refs (Git parity). Resolves each tip to a
+/// commit, walks its ancestors (bounded by `HAVE_HISTORY_LIMIT`), and returns
+/// only the `have` entries that are in that reachable set. A missing/unusable
+/// tip is an error; an empty tip set returns `have` unchanged.
+async fn narrow_have_by_negotiation_tips(
+    have: Vec<String>,
+    tips: &[String],
+    hash_kind: HashKind,
+) -> Result<Vec<String>, FetchError> {
+    if tips.is_empty() {
+        return Ok(have);
+    }
+    let mut reachable: HashSet<String> = HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    for tip in tips {
+        let oid = resolve_negotiation_tip(tip, hash_kind).await?;
+        if reachable.insert(oid.to_string()) {
+            queue.push_back(oid);
+        }
+    }
+    while let Some(oid) = queue.pop_front() {
+        if queue.len() > HAVE_HISTORY_LIMIT * 4 {
+            break;
+        }
+        let commit: Commit = load_object(&oid).map_err(|source| FetchError::LocalState {
+            message: format!(
+                "failed to load commit '{oid}' while narrowing --negotiation-tip: {source}"
+            ),
+        })?;
+        for parent in &commit.parent_commit_ids {
+            if reachable.insert(parent.to_string()) {
+                queue.push_back(*parent);
+            }
+        }
+    }
+    Ok(have.into_iter().filter(|h| reachable.contains(h)).collect())
+}
+
+/// Resolve a `--negotiation-tip` argument to a commit object id. Accepts a raw
+/// object id, a full/abbreviated ref, or a branch name. Errors when the tip
+/// cannot be resolved to a local commit.
+async fn resolve_negotiation_tip(
+    tip: &str,
+    _hash_kind: HashKind,
+) -> Result<ObjectHash, FetchError> {
+    // Try as a full object id first.
+    if let Ok(oid) = crate::internal::object_format::parse_repo_oid(tip) {
+        return Ok(oid);
+    }
+    // Try as a ref (full or branch short name).
+    let ref_candidates = [
+        tip.to_string(),
+        format!("refs/heads/{tip}"),
+        format!("refs/tags/{tip}"),
+    ];
+    for candidate in ref_candidates {
+        if let Ok(Some(branch)) = Branch::find_branch_result(&candidate, None).await {
+            return Ok(branch.commit);
+        }
+    }
+    Err(FetchError::LocalState {
+        message: format!("--negotiation-tip '{tip}' does not resolve to a local commit"),
+    })
+}
 
 async fn current_have_safe(hash_kind: HashKind) -> Result<Vec<String>, FetchError> {
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -5699,7 +6172,7 @@ mod tests {
             FetchError::InvalidRemoteSpec {
                 spec: "/missing/repo".to_string(),
                 kind: RemoteSpecErrorKind::MissingLocalRepo,
-                reason: "local path does not exist".to_string(),
+                reason: "local path does not exist".to_string()
             }
             .to_string(),
             "local path does not exist",
@@ -5707,23 +6180,31 @@ mod tests {
         assert_eq!(
             FetchError::ObjectFormatMismatch {
                 remote: git_internal::hash::HashKind::Sha1,
-                local: git_internal::hash::HashKind::Sha256,
+                local: git_internal::hash::HashKind::Sha256
             }
             .to_string(),
             "remote object format 'sha1' does not match local 'sha256'",
         );
         assert_eq!(
-            FetchError::RemoteBranchNotFound {
-                branch: "feature".to_string(),
-                remote: "origin".to_string(),
+            FetchError::ObjectFormatMismatch {
+                remote: git_internal::hash::HashKind::Sha1,
+                local: git_internal::hash::HashKind::Blake3
             }
             .to_string(),
-            "remote branch feature not found in upstream origin",
+            "remote object format 'sha1' does not match local 'blake3'",
+        );
+        assert_eq!(
+            FetchError::RemoteBranchNotFound {
+                branch: "feature".to_string(),
+                remote: "origin".to_string()
+            }
+            .to_string(),
+            "couldn't find remote ref feature",
         );
         assert_eq!(
             FetchError::InvalidRefspec {
                 refspec: "refs/heads/main:HEAD".to_string(),
-                reason: "unsupported destination".to_string(),
+                reason: "unsupported destination".to_string()
             }
             .to_string(),
             "invalid fetch refspec 'refs/heads/main:HEAD': unsupported destination",
@@ -5731,7 +6212,7 @@ mod tests {
         assert_eq!(
             FetchError::ConfigRead {
                 key: "remote.origin.fetch".to_string(),
-                message: "database is locked".to_string(),
+                message: "database is locked".to_string()
             }
             .to_string(),
             "failed to read fetch configuration 'remote.origin.fetch': database is locked",
@@ -5781,14 +6262,14 @@ mod tests {
         );
         assert_eq!(
             FetchError::InvalidPktHeader {
-                header: "zzzz".to_string(),
+                header: "zzzz".to_string()
             }
             .to_string(),
             "invalid packet line header 'zzzz'",
         );
         assert_eq!(
             FetchError::RemoteSideband {
-                message: "access denied".to_string(),
+                message: "access denied".to_string()
             }
             .to_string(),
             "remote reported an error: access denied",
@@ -5799,21 +6280,21 @@ mod tests {
         );
         assert_eq!(
             FetchError::UpdateRefs {
-                message: "ref database is read-only".to_string(),
+                message: "ref database is read-only".to_string()
             }
             .to_string(),
             "failed to update references after fetch: ref database is read-only",
         );
         assert_eq!(
             FetchError::RefUpdateRejected {
-                message: "destination is checked out".to_string(),
+                message: "destination is checked out".to_string()
             }
             .to_string(),
             "fetch destination update rejected: destination is checked out",
         );
         assert_eq!(
             FetchError::LocalState {
-                message: "missing object directory".to_string(),
+                message: "missing object directory".to_string()
             }
             .to_string(),
             "failed to inspect local repository state: missing object directory",
@@ -5879,7 +6360,7 @@ mod tests {
         pack.extend_from_slice(b"PACK");
         pack.extend_from_slice(&2_u32.to_be_bytes());
         pack.extend_from_slice(&0_u32.to_be_bytes());
-        let checksum = ObjectHash::new(&pack);
+        let checksum = ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &pack);
         pack.extend_from_slice(checksum.as_ref());
         pack
     }
@@ -7080,7 +7561,7 @@ mod tests {
                 "failed to inspect existing remote-tracking ref 'refs/remotes/origin/main': {}",
                 crate::internal::branch::BranchStoreError::Corrupt {
                     name: "refs/remotes/origin/main".to_string(),
-                    detail: "invalid object id".to_string(),
+                    detail: "invalid object id".to_string()
                 }
             ),
         };

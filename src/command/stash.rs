@@ -8,7 +8,6 @@ use std::{
     fs,
     io::{BufRead, BufReader},
     path::{Component, Path, PathBuf},
-    str::FromStr,
 };
 
 use git_internal::{
@@ -989,8 +988,8 @@ async fn run_pop(stash: Option<String>, restore_index: bool) -> Result<StashOutp
     // than once on the stack; reflog lines chain the previous tip, so a
     // line identifies exactly one entry).
     let (index, stash_id, raw_line) = resolve_stash_to_commit_hash(stash)?;
-    let stash_commit_hash =
-        ObjectHash::from_str(&stash_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_commit_hash = crate::internal::object_format::parse_repo_oid(&stash_id)
+        .map_err(|e| StashError::ReadObject(e.to_string()))?;
     apply_stash_commit_inner(&stash_commit_hash, restore_index).await?;
     let branch = match Head::current().await {
         Head::Branch(name) => name,
@@ -1058,7 +1057,8 @@ pub(crate) async fn autostash_pop_by_entry(
              inspect `libra stash list`"
         ));
     }
-    let hash = ObjectHash::from_str(expected_id).map_err(|e| e.to_string())?;
+    let hash =
+        crate::internal::object_format::parse_repo_oid(expected_id).map_err(|e| e.to_string())?;
     apply_stash_commit(&hash).await.map_err(|e| e.to_string())?;
     match do_drop(None, Some(expected_line)) {
         Ok(_) => Ok(()),
@@ -1132,8 +1132,8 @@ async fn run_show(
     let (index, stash_id_str, _raw_line) = resolve_stash_to_commit_hash(stash)?;
     let git_dir = util::request_storage_path();
 
-    let stash_hash =
-        ObjectHash::from_str(&stash_id_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_hash = crate::internal::object_format::parse_repo_oid(&stash_id_str)
+        .map_err(|e| StashError::ReadObject(e.to_string()))?;
     let stash_commit: Commit =
         load_object(&stash_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
@@ -1315,7 +1315,7 @@ impl StashBranchJournal {
         }
         self.prior_detached
             .as_deref()
-            .and_then(|oid| ObjectHash::from_str(oid).ok())
+            .and_then(|oid| crate::internal::object_format::parse_repo_oid(oid).ok())
             .map(Head::Detached)
     }
 }
@@ -1420,7 +1420,7 @@ async fn recover_stash_branch_journal() -> Result<(), StashError> {
     // the user recreated — and a missing provenance row proves the create
     // never committed. A transient store error keeps the journal so the next
     // invocation retries.
-    let base = ObjectHash::from_str(&journal.base).map_err(|error| {
+    let base = crate::internal::object_format::parse_repo_oid(&journal.base).map_err(|error| {
         StashError::Other(format!(
             "the rollback journal's base '{}' is not a valid object id ({error}); \
              inspect and remove '{}' manually",
@@ -1467,8 +1467,8 @@ async fn run_branch(branch_name: String, stash: Option<String>) -> Result<StashO
     // Resolve stash & metadata for the new branch base. The raw reflog line
     // is the unambiguous entry identity for the post-apply CAS delete.
     let (index, stash_id_str, raw_line) = resolve_stash_to_commit_hash(stash)?;
-    let stash_hash =
-        ObjectHash::from_str(&stash_id_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_hash = crate::internal::object_format::parse_repo_oid(&stash_id_str)
+        .map_err(|e| StashError::ReadObject(e.to_string()))?;
     let stash_commit: Commit =
         load_object(&stash_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
     let base_hash = *stash_commit
@@ -1782,8 +1782,8 @@ fn render_stash_output(result: &StashOutput, output: &OutputConfig) -> CliResult
 
 async fn do_apply(stash: Option<String>, restore_index: bool) -> Result<StashOutput, StashError> {
     let (index, hash_str, _raw_line) = resolve_stash_to_commit_hash(stash)?;
-    let stash_commit_hash =
-        ObjectHash::from_str(&hash_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let stash_commit_hash = crate::internal::object_format::parse_repo_oid(&hash_str)
+        .map_err(|e| StashError::ReadObject(e.to_string()))?;
     apply_stash_commit_inner(&stash_commit_hash, restore_index).await?;
 
     let branch = match Head::current().await {
@@ -2456,7 +2456,8 @@ async fn has_changes() -> bool {
             let header = format!("blob {}\0", content.len());
             let mut full_content = header.into_bytes();
             full_content.extend_from_slice(&content);
-            let current_hash = ObjectHash::new(&full_content);
+            let current_hash =
+                ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &full_content);
 
             if current_hash != entry.hash {
                 return true;
@@ -2586,7 +2587,7 @@ fn parse_stash_log_entries(lines: Vec<String>) -> Result<Vec<StashLogEntry>, Sta
                 line_index + 1
             ))
         })?;
-        let stash_id = ObjectHash::from_str(stash_id).map_err(|_| {
+        let stash_id = crate::internal::object_format::parse_repo_oid(stash_id).map_err(|_| {
             StashError::ReadObject(format!(
                 "corrupted stash log entry at line {}: invalid stash commit hash '{}'",
                 line_index + 1,
@@ -2630,12 +2631,14 @@ pub(crate) fn gc_roots(storage: &Path) -> Result<Vec<ObjectHash>, StashError> {
     let stash_ref_path = storage.join("refs/stash");
     match fs::read_to_string(&stash_ref_path) {
         Ok(raw_oid) => {
-            let oid = ObjectHash::from_str(raw_oid.trim()).map_err(|error| {
-                StashError::ReadObject(format!(
-                    "stash ref '{}' contains an invalid object id: {error}",
-                    stash_ref_path.display()
-                ))
-            })?;
+            let oid = crate::internal::object_format::parse_repo_oid(raw_oid.trim()).map_err(
+                |error| {
+                    StashError::ReadObject(format!(
+                        "stash ref '{}' contains an invalid object id: {error}",
+                        stash_ref_path.display()
+                    ))
+                },
+            )?;
             roots.insert(oid);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2652,13 +2655,15 @@ pub(crate) fn gc_roots(storage: &Path) -> Result<Vec<ObjectHash>, StashError> {
         Ok(metadata) if metadata.is_file() => {
             let entries = parse_stash_log_entries(read_stash_log_lines(&stash_log_path)?)?;
             for entry in entries {
-                let oid = ObjectHash::from_str(&entry.stash_id).map_err(|error| {
-                    StashError::ReadObject(format!(
-                        "stash log '{}' contains an invalid object id '{}': {error}",
-                        stash_log_path.display(),
-                        entry.stash_id
-                    ))
-                })?;
+                let oid = crate::internal::object_format::parse_repo_oid(&entry.stash_id).map_err(
+                    |error| {
+                        StashError::ReadObject(format!(
+                            "stash log '{}' contains an invalid object id '{}': {error}",
+                            stash_log_path.display(),
+                            entry.stash_id
+                        ))
+                    },
+                )?;
                 roots.insert(oid);
             }
         }
@@ -2750,7 +2755,7 @@ fn update_stash_ref(
 
     let old_hash = if stash_ref_path.exists() {
         let content = fs::read_to_string(&stash_ref_path)?;
-        ObjectHash::from_str(content.trim())
+        crate::internal::object_format::parse_repo_oid(content.trim())
             .map_err(|_| GitError::InvalidHashValue(content.trim().to_string()))?
     } else {
         ObjectHash::default()
@@ -3506,7 +3511,10 @@ mod tests {
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
         crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
         let storage = util::storage_path();
-        let hash = ObjectHash::from_str("00000000000000000000000000000000000000cc").expect("hash");
+        let hash = crate::internal::object_format::parse_repo_oid(
+            "00000000000000000000000000000000000000cc",
+        )
+        .expect("hash");
         let committer = Signature::from_data(
             "committer T <t@x> 1700000000 +0000"
                 .to_string()
@@ -3552,7 +3560,10 @@ mod tests {
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
         crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
         let storage = util::storage_path();
-        let hash = ObjectHash::from_str("00000000000000000000000000000000000000bb").expect("hash");
+        let hash = crate::internal::object_format::parse_repo_oid(
+            "00000000000000000000000000000000000000bb",
+        )
+        .expect("hash");
         let committer = Signature::from_data(
             "committer T <t@x> 1700000000 +0000"
                 .to_string()
@@ -3581,8 +3592,10 @@ mod tests {
         let _guard = crate::utils::test::ChangeDirGuard::new(tmp.path());
         crate::utils::test::setup_with_new_libra_in(tmp.path()).await;
         // Point HEAD at a commit that does not exist in the object store.
-        let bogus =
-            ObjectHash::from_str("00000000000000000000000000000000000000aa").expect("bogus hash");
+        let bogus = crate::internal::object_format::parse_repo_oid(
+            "00000000000000000000000000000000000000aa",
+        )
+        .expect("bogus hash");
         Head::update_result(Head::Detached(bogus), None)
             .await
             .expect("detach onto bogus commit");

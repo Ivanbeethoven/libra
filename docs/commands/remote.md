@@ -8,7 +8,7 @@ Manage configured remotes: list, add, remove, rename, inspect and mutate URLs, a
 libra remote <subcommand> [OPTIONS] [ARGS]
 libra remote show
 libra remote -v
-libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror] <name> <url>
+libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror[=fetch|push]] <name> <url>
 libra remote remove <name>
 libra remote rename <old> <new>
 libra remote get-url [--push] [--all] <name>
@@ -72,11 +72,11 @@ Register a new remote.
 | `<url>` | Fetch URL for the remote | `https://example.com/repo.git` |
 | `-f`, `--fetch` | Fetch from the new remote immediately after adding it | |
 | `-t`, `--track <branch>` | Track only the given branch — writes a specific `remote.<name>.fetch` refspec instead of the default wildcard. Repeatable. | `-t main -t dev` |
-| `-m`, `--master <branch>` | Point the remote's HEAD (`refs/remotes/<name>/HEAD`) at `<branch>` (written even before the tracking ref exists, like Git) | `-m main` |
+| `-m`, `--master <branch>` | Point the remote's HEAD (`refs/remotes/<name>/HEAD`) at `<branch>` (written even before the tracking ref exists, like Git); rejected with every `--mirror` form | `-m main` |
 | `--tags` / `--no-tags` | Set `remote.<name>.tagOpt` to fetch all / no tags (mutually exclusive) | |
-| `--mirror` | Mark the remote as a mirror — writes the `remote.<name>.mirror=true` marker (like Git's `remote add --mirror=fetch`). Incompatible with `-t`/`--track`. | `--mirror` |
+| `--mirror[=fetch\|push]` | Register a mirror. Bare `--mirror` writes `+refs/*:refs/*` and `remote.<name>.mirror=true` and emits a deprecation warning; `--mirror=fetch` writes only `+refs/*:refs/*`; `--mirror=push` writes only the `remote.<name>.mirror=true` marker. `-t` is allowed for fetch mirrors but rejected for push mirrors (exit 128). | `--mirror=push` |
 
-The `--mirror` marker is informational: Libra does **not** write a `+refs/*:refs/*` fetch refspec because `libra fetch` is not yet mirror-aware (matching `libra clone --mirror`).
+Without `-t`, `remote add` writes the default fetch refspec `+refs/heads/*:refs/remotes/<name>/*` (Git parity). A fetch mirror writes `+refs/*:refs/*` instead; a push mirror writes no fetch refspec, only the `mirror=true` marker. Git's deprecation warning accompanies the bare form, matching Git 2.55.
 
 ### Subcommand: `remove`
 
@@ -91,9 +91,13 @@ Delete a remote and all its configuration keys.
 Rename an existing remote. The operation atomically migrates `remote.<old>.*`
 configuration (including fetch-refspec destinations), `branch.*.remote` values,
 the SSH key namespace, every `refs/remotes/<old>/*` tracking ref, the remote HEAD,
-and matching tracking-ref reflogs. A conflicting target namespace fails without
-leaving a partial rename. Remote and SSH subsections are matched by exact remote
-name, so renaming `corp` cannot capture a separate `corp.prod` remote.
+and matching tracking-ref reflogs. It also rewrites a repository-scoped
+`remote.pushDefault` and every `branch.<branch>.pushRemote` that names the old
+remote to the new name. A global/system-scoped `remote.pushDefault` naming the
+old remote is left unchanged and warned about (matching Git). A conflicting
+target namespace fails without leaving a partial rename. Remote and SSH
+subsections are matched by exact remote name, so renaming `corp` cannot capture
+a separate `corp.prod` remote.
 
 | Argument | Description | Example |
 |----------|-------------|---------|
@@ -382,3 +386,20 @@ for both fetch and push, matching Git's behavior.
 | Failed to prune remote-tracking branch | `LBR-IO-002` | 128 | -- |
 | Remote object format mismatch during prune | `LBR-REPO-003` | 128 | "remote uses a different hash algorithm" |
 | Remote discovery / auth / network failure during prune | fetch-aligned network/auth codes | 128 | See `libra fetch` error table |
+| SSH public-key rejection during online `show`, `update`, `prune`, `set-head --auto`, or `add -f` discovery | `LBR-AUTH-002` | 128 | Check `libra config list --ssh-keys`, the SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
+
+Prune contacts the remote and fail-closes on object-format mismatch with `LBR-REPO-003` / exit 128. Wire kind comes from the `object-format` capability (not OID length). Covered by `protocol_object_format_mismatch_error_contract`.
+
+The SSH classification requires a zero-byte first-header EOF, direct exit status
+255, no stdout and a complete `Permission denied (<method-list>)` diagnostic with
+an exact `publickey` method. Host-key failures keep priority. The message and hint
+are fixed and never expose raw stderr; since stderr can be forged, the code does
+not establish the underlying reason access was denied. Other malformed or missing
+advertisements retain their network/protocol codes. Failed `remote add -f` keeps
+the remote configuration that was added before its fetch began.
+The config command in the fixed hint must be run inside an existing Libra repository.
+
+For at least 30 days after v0.24.1 is released and through at least the next
+patch release, whichever is later, automation should accept `LBR-AUTH-002` plus
+the legacy code for this SSH discovery failure: `LBR-NET-001` for online `show`
+and `set-head --auto`, or `LBR-NET-002` for `update`, `prune`, and `add -f`.

@@ -11,7 +11,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
-    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -1076,9 +1075,10 @@ impl RestoreEngine {
                     "target refs facet has no commit for branch {branch:?}"
                 ))
             })?;
-        let commit_oid = ObjectHash::from_str(commit).map_err(|error| {
-            RestoreError::Storage(format!("invalid branch commit oid: {error}"))
-        })?;
+        let commit_oid =
+            crate::internal::object_format::parse_repo_oid(commit).map_err(|error| {
+                RestoreError::Storage(format!("invalid branch commit oid: {error}"))
+            })?;
         self.store
             .load_object(&commit_oid)
             .map_err(|error| RestoreError::Object {
@@ -1254,11 +1254,12 @@ impl RestoreEngine {
                 _ => unreachable!(),
             }
             if let Some(commit) = commit {
-                let oid = ObjectHash::from_str(commit).map_err(|error| {
-                    RestoreError::Storage(format!(
-                        "refs facet contains invalid commit oid: {error}"
-                    ))
-                })?;
+                let oid =
+                    crate::internal::object_format::parse_repo_oid(commit).map_err(|error| {
+                        RestoreError::Storage(format!(
+                            "refs facet contains invalid commit oid: {error}"
+                        ))
+                    })?;
                 self.store
                     .load_object(&oid)
                     .map_err(|error| RestoreError::Object {
@@ -2323,7 +2324,7 @@ fn validate_restore_manifest(manifest: &RestoreTransactionManifest) -> Result<()
                 entry.path
             )));
         }
-        if ObjectHash::from_str(&entry.object_oid).is_err() {
+        if crate::internal::object_format::parse_repo_oid(&entry.object_oid).is_err() {
             return Err(RestoreError::Storage(format!(
                 "invalid object id in restore manifest for {}",
                 entry.path

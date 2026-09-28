@@ -29,7 +29,7 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use git_internal::{
-    hash::{HashKind, ObjectHash, get_hash_kind},
+    hash::{HashKind, ObjectHash},
     internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
 };
 use sea_orm::EntityTrait;
@@ -1121,27 +1121,31 @@ async fn run_loose_objects(
         .filter_map(|(hash_str, _)| parse_object_hash(hash_str))
         .collect();
 
-    let publication =
-        match pack_writer::write_pack_with_index(&storage, &hashes, &pack_dir, get_hash_kind())
-            .await
-        {
-            Ok(Some(publication)) => publication,
-            Ok(None) => {
-                return Ok(TaskResult {
-                    task: "loose-objects".to_string(),
-                    success: true,
-                    objects_removed: 0,
-                    objects_packed: 0,
-                    refs_packed: 0,
-                    packs_repacked: 0,
-                    object_index_rows_removed: 0,
-                    message: "no old loose objects to pack".to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(CliError::fatal(format!("failed to create pack file: {e}")));
-            }
-        };
+    let publication = match pack_writer::write_pack_with_index(
+        &storage,
+        &hashes,
+        &pack_dir,
+        git_internal::hash::get_hash_kind(),
+    )
+    .await
+    {
+        Ok(Some(publication)) => publication,
+        Ok(None) => {
+            return Ok(TaskResult {
+                task: "loose-objects".to_string(),
+                success: true,
+                objects_removed: 0,
+                objects_packed: 0,
+                refs_packed: 0,
+                packs_repacked: 0,
+                object_index_rows_removed: 0,
+                message: "no old loose objects to pack".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(CliError::fatal(format!("failed to create pack file: {e}")));
+        }
+    };
 
     // §C.4.3 writer-vs-deleter: the pack is published, so the shared hold
     // ends and the UNLINKS take the exclusive one. A shared hold cannot be
@@ -1486,29 +1490,33 @@ async fn run_incremental_repack(
         .into_iter()
         .collect();
 
-    let new_publication =
-        match pack_writer::write_pack_with_index(&storage, &all_hashes, &pack_dir, get_hash_kind())
-            .await
-        {
-            Ok(Some(publication)) => publication,
-            Ok(None) => {
-                return Ok(TaskResult {
-                    task: "incremental-repack".to_string(),
-                    success: true,
-                    objects_removed: 0,
-                    objects_packed: 0,
-                    refs_packed: 0,
-                    packs_repacked: 0,
-                    object_index_rows_removed: 0,
-                    message: "no objects to repack".to_string(),
-                });
-            }
-            Err(e) => {
-                return Err(CliError::fatal(format!(
-                    "failed to create consolidated pack: {e}"
-                )));
-            }
-        };
+    let new_publication = match pack_writer::write_pack_with_index(
+        &storage,
+        &all_hashes,
+        &pack_dir,
+        git_internal::hash::get_hash_kind(),
+    )
+    .await
+    {
+        Ok(Some(publication)) => publication,
+        Ok(None) => {
+            return Ok(TaskResult {
+                task: "incremental-repack".to_string(),
+                success: true,
+                objects_removed: 0,
+                objects_packed: 0,
+                refs_packed: 0,
+                packs_repacked: 0,
+                object_index_rows_removed: 0,
+                message: "no objects to repack".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(CliError::fatal(format!(
+                "failed to create consolidated pack: {e}"
+            )));
+        }
+    };
 
     // Pre-delete RE-VERIFICATION (W2 §C.4.3 race hardening): the pack list
     // was captured BEFORE the root walk (a pack arriving later is never
@@ -1720,6 +1728,25 @@ async fn run_commit_graph(
         message: msg.to_string(),
     };
 
+    // Git's commit-graph format has no blake3 hash_version. Skip rather than
+    // writing a non-interoperable CGPH; history walks fall back to object walk.
+    if git_internal::hash::get_hash_kind() == HashKind::Blake3 {
+        let info_dir = path::objects().join("info");
+        let stale = ["commit-graph", "commit-graph.graph", "commit-graphs"]
+            .iter()
+            .any(|name| info_dir.join(name).exists());
+        let msg = if stale {
+            "blake3 repository: skipped commit-graph (Git CGPH has no blake3 hash_version); \
+             ignoring existing commit-graph file(s); history walks use object traversal"
+        } else {
+            "blake3 repository: skipped commit-graph (Git CGPH has no blake3 hash_version); \
+             history walks use object traversal"
+        };
+        eprintln!("warning: {msg}");
+        crate::utils::output::record_warning_message(msg.to_string());
+        return Ok(skip(msg));
+    }
+
     // Collect every commit reachable from a local branch tip.
     let branches = Branch::list_branches_result(None)
         .await
@@ -1794,6 +1821,7 @@ fn compute_generations(commits: &HashMap<ObjectHash, Commit>) -> HashMap<ObjectH
 /// EDGE chunk when any commit has more than two parents (octopus merges) — and a
 /// trailing checksum, matching Git's format. The OID width, header hash version,
 /// and trailer digest follow the repository's hash kind (SHA-1 or SHA-256).
+/// Blake3 returns `None` — there is no Git-compatible blake3 CGPH hash_version.
 fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> {
     /// Sentinel parent slot meaning "no parent" (GRAPH_PARENT_NONE).
     const GRAPH_PARENT_NONE: u32 = 0x7000_0000;
@@ -1808,6 +1836,10 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
 
     let mut oids: Vec<ObjectHash> = commits.keys().copied().collect();
     oids.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    // Defense in depth: blake3 is skipped in `run_commit_graph` before encode.
+    if matches!(oids[0].kind(), HashKind::Blake3) {
+        return None;
+    }
     let pos: HashMap<ObjectHash, u32> = oids
         .iter()
         .enumerate()
@@ -1880,11 +1912,11 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
     };
 
     // Hash version: 1 for SHA-1, 2 for SHA-256 (matches the OID width already
-    // used by the OIDL/CDAT chunks via `hash_len`).
-    let hash_version: u8 = if oids[0].kind() == HashKind::Sha256 {
-        2
-    } else {
-        1
+    // used by the OIDL/CDAT chunks via `hash_len`). Blake3 is rejected above.
+    let hash_version: u8 = match oids[0].kind() {
+        HashKind::Sha1 => 1,
+        HashKind::Sha256 => 2,
+        HashKind::Blake3 => return None,
     };
 
     let mut buf: Vec<u8> = Vec::with_capacity(trailer_off as usize + hash_len);
@@ -4409,19 +4441,12 @@ pub(crate) fn list_loose_objects(repo_path: &Path) -> io::Result<Vec<(String, Pa
     Ok(result)
 }
 
-/// Parse a hex string into an ObjectHash.
+/// Parse a hex string into an ObjectHash using the process/repository hash kind.
 ///
-/// The hash kind is inferred from the decoded byte length (20 → SHA-1, 32 →
-/// SHA-256) rather than from `ObjectHash::from_bytes`, which reads the
-/// thread-local hash kind and would reject a SHA-256 id (or misread it) if this
-/// runs on a Tokio worker thread that never had the repository's kind set.
-pub(crate) fn parse_object_hash(hex_str: &str) -> Option<ObjectHash> {
-    let bytes = hex::decode(hex_str).ok()?;
-    match bytes.len() {
-        20 => Some(ObjectHash::Sha1(bytes.try_into().ok()?)),
-        32 => Some(ObjectHash::Sha256(bytes.try_into().ok()?)),
-        _ => None,
-    }
+/// Width-based inference (20 → SHA-1 / 32 → SHA-256) is forbidden under
+/// plan-20260907 B3-08 / GC-B3-02 — blake3 OIDs are also 32 bytes.
+pub fn parse_object_hash(hex_str: &str) -> Option<ObjectHash> {
+    crate::internal::object_format::parse_repo_oid(hex_str).ok()
 }
 
 /// Remove empty directories under the given path.
@@ -4644,13 +4669,14 @@ mod tests {
     #[test]
     #[serial_test::serial(hash_kind)]
     fn commit_graph_build_roundtrip() {
-        use std::str::FromStr;
-
         use git_internal::internal::object::signature::Signature;
 
         git_internal::hash::set_hash_kind(HashKind::Sha1);
 
-        let tree = ObjectHash::from_str("1111111111111111111111111111111111111111").unwrap();
+        let tree = crate::internal::object_format::parse_repo_oid(
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
         let sig =
             Signature::from_data(b"committer t <t@example.com> 1000000000 +0000".to_vec()).unwrap();
         let root = Commit::new(sig.clone(), sig.clone(), tree, vec![], "root");
@@ -4708,13 +4734,14 @@ mod tests {
     #[test]
     #[serial_test::serial(hash_kind)]
     fn commit_graph_build_writes_octopus_edge_chunk() {
-        use std::str::FromStr;
-
         use git_internal::internal::object::signature::Signature;
 
         git_internal::hash::set_hash_kind(HashKind::Sha1);
 
-        let tree = ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap();
+        let tree = crate::internal::object_format::parse_repo_oid(
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
         let sig =
             Signature::from_data(b"committer t <t@example.com> 1000000000 +0000".to_vec()).unwrap();
         // Three distinct roots (distinct messages → distinct ids) and a merge
@@ -4877,6 +4904,14 @@ mod tests {
             (
                 "HEAD",
                 "the HEAD pointer file (dual-layout compatibility); ref OIDs are inventoried in the DB half (reference)",
+            ),
+            (
+                "libra.db",
+                "the repository SQLite database; ref/object inventory lives in its tables, not in on-disk object files",
+            ),
+            (
+                "refs",
+                "foreign Git-target ref directory (issues/480 HP-08); ref OIDs live outside the Libra object store and are never a Libra GC root",
             ),
             (
                 "operation-v2.lock",

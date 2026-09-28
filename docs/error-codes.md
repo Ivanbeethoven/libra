@@ -111,7 +111,7 @@ structured report is always present.
 | `128` | `LBR-NET-001` | `network` | Remote unreachable or transport unavailable | DNS, timeout, TLS, connection refused |
 | `128` | `LBR-NET-002` | `network` | Protocol, negotiation, or pack failure | detected packet-line framing / empty discovery response, sideband, unpack/ref update protocol errors, unexpected receive-pack status lines / missing status-report flush |
 | `128` | `LBR-AUTH-001` | `auth` | Missing identity, token, or credentials | missing commit identity, missing API key, missing SSH material |
-| `128` | `LBR-AUTH-002` | `auth` | Credential present but permission denied | forbidden push, insufficient scope |
+| `128` | `LBR-AUTH-002` | `auth` | Remote rejected authentication or authorization; exact cause not established | SSH public-key rejection, forbidden push, insufficient scope |
 | `128` | `LBR-IO-001` | `io` | Read/open/load failure | failed to open pack, failed to read index |
 | `128` | `LBR-IO-002` | `io` | Write/save/update/remove failure | failed to write index, failed to remove file, failed to register its cloud object-index repair marker |
 | `128` | `LBR-INTERNAL-001` | `internal` | Unexpected internal invariant failure | invariant break, unclassified internal failure |
@@ -184,7 +184,7 @@ structured report is always present.
 | Stable code | Meaning |
 | --- | --- |
 | `LBR-REPO-001` | Not inside a Libra repository |
-| `LBR-REPO-002` | Repository metadata is corrupt or incompatible |
+| `LBR-REPO-002` | Repository metadata is corrupt or incompatible. Includes opening a repository whose `schema_versions` tip is newer than this binary (`UnsupportedFuture` — refuse before SeaORM SELECT). **Minimum client for `ai_index_task_run.base_commit_ref` (B3-16):** Libra ≥ 0.27.1. **Minimum client for cloud `object_format` metadata restore (REL-B3-02 / B3-14):** Libra ≥ 0.28.0. |
 | `LBR-REPO-003` | Repository state blocks the operation |
 | `LBR-WORKTREE-001` | The pagination cursor is malformed or expired; drop it and re-read the first page |
 | `LBR-WORKTREE-002` | A worktree/workspace scope is corrupt or unreadable; repair it before trusting any diagnostic report |
@@ -239,7 +239,7 @@ evidence on uncertainty. See [repair recovery](commands/config.md#confirmed-lega
 | Stable code | Meaning |
 | --- | --- |
 | `LBR-AUTH-001` | Missing identity, token, or credential material |
-| `LBR-AUTH-002` | Credential present but permission denied |
+| `LBR-AUTH-002` | Remote rejected authentication or authorization; exact cause not established |
 
 ### I/O
 
@@ -492,19 +492,25 @@ SSH advertisement lengths `0001` through `0003`, incomplete headers (including
 zero-byte EOF), and truncated payloads return `LBR-NET-002`. The fixed protocol
 reason and marker are retained without captured SSH stdout/stderr.
 
-An incomplete required header has one host-trust exception: local SSH exit status
-255 together with a recognized host-key diagnostic in the first 64 KiB of stderr
-returns fixed host-verification guidance and `LBR-NET-001`. This classification
-does not verify the remote fingerprint. Other missing advertisements, including
-authentication failures, still use `LBR-NET-002`; an available non-zero local exit
-status adds `SSH exited with status N` and fixed connectivity, trusted-host,
-ssh-agent and repository-access guidance. Original SSH diagnostic text is hidden.
+An incomplete required discovery header has two prioritized exceptions. A recognized host-key
+diagnostic with local SSH exit status 255 returns fixed verification guidance and
+`LBR-NET-001`; this does not verify the remote fingerprint. A complete
+`Permission denied (<method-list>)` diagnostic containing the exact `publickey`
+method, direct exit status 255 and no stdout bytes returns the fixed public-key
+message with `LBR-AUTH-002`. Because stderr can be forged, this code does not prove
+why access was denied. All other missing advertisements remain `LBR-NET-002`, and
+original SSH diagnostic text is hidden.
+
+For at least 30 days after v0.24.1 is released and through at least the next
+patch release, whichever is later, automation should accept `LBR-AUTH-002` plus
+legacy `LBR-NET-001` for online `remote show`/`set-head --auto` or legacy
+`LBR-NET-002` for the other affected command surfaces.
 
 After an incomplete required header, Libra allows up to 100 milliseconds to
 observe the SSH exit status, then requests termination if needed. Other read
 errors request termination immediately. The status window, direct-child reap and
-output collection share a two-second cleanup deadline. Protocol and typed
-host-trust errors take precedence over secondary cleanup warnings. Ordinary IO
+output collection share a two-second cleanup deadline. Protocol, typed host-trust
+and public-key authentication errors take precedence over secondary cleanup warnings. Ordinary IO
 and timeout errors keep their transport classification and may include a fixed
 local cleanup warning. Termination can change the observed exit status. This
 does not promise cleanup of arbitrary descendant processes.

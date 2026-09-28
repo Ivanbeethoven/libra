@@ -817,9 +817,15 @@ async fn ensure_agent_capture_objects_remote(
         let bytes = hex::decode(oid).map_err(|error| {
             CloudError::Generic(format!("invalid required agent-capture oid {oid}: {error}"))
         })?;
-        hashes.push(ObjectHash::from_bytes(&bytes).map_err(|error| {
-            CloudError::Generic(format!("invalid required agent-capture oid {oid}: {error}"))
-        })?);
+        hashes.push(
+            ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes).map_err(
+                |error| {
+                    CloudError::Generic(format!(
+                        "invalid required agent-capture oid {oid}: {error}"
+                    ))
+                },
+            )?,
+        );
     }
 
     let remote_rows = d1_client
@@ -859,13 +865,16 @@ async fn ensure_agent_capture_objects_remote(
                 publish_validated_agent_capture_object(local_storage, r2_storage, oid, hash)
                     .await?;
                 if !remote_index_matches {
+                    let object_format =
+                        crate::internal::object_format::as_str(git_internal::hash::get_hash_kind());
                     d1_client
-                        .upsert_object_index(
+                        .upsert_object_index_with_format(
                             &local.o_id,
                             &local.o_type,
                             local.o_size,
                             &local.repo_id,
                             local.created_at,
+                            Some(object_format),
                         )
                         .await
                         .map_err(|error| {
@@ -991,12 +1000,15 @@ async fn load_full_remote_object_manifest(
                     row.o_id
                 ))
             })?;
-            hashes.push(ObjectHash::from_bytes(&bytes).map_err(|error| {
-                CloudError::Generic(format!(
-                    "invalid retained remote object id {}: {error}",
-                    row.o_id
-                ))
-            })?);
+            hashes.push(
+                ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes)
+                    .map_err(|error| {
+                        CloudError::Generic(format!(
+                            "invalid retained remote object id {}: {error}",
+                            row.o_id
+                        ))
+                    })?,
+            );
         }
         let exists = r2_storage.exist_batch(&hashes).await;
         if let Some((missing, _)) = page.iter().zip(exists).find(|(_, exists)| !*exists) {
@@ -1030,6 +1042,7 @@ pub(super) async fn project_agent_capture_object_indexes(
             repo_id: local.repo_id.clone(),
             created_at: local.created_at,
             is_synced: 1,
+            object_format: None,
         };
         projected.push(row);
     }

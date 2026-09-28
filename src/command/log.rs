@@ -9,7 +9,6 @@ use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
     rc::Rc,
-    str::FromStr,
 };
 
 use clap::Parser;
@@ -790,8 +789,8 @@ pub async fn get_reachable_commits(
     let shallow = load_walk_shallow()?;
 
     // Push the initial commit with depth 0
-    let initial_hash =
-        ObjectHash::from_str(&commit_hash).map_err(|_| log_invalid_object_error(&commit_hash))?;
+    let initial_hash = crate::internal::object_format::parse_repo_oid(&commit_hash)
+        .map_err(|_| log_invalid_object_error(&commit_hash))?;
     queue.push_back((initial_hash, 0)); // (commit_id, current_depth)
 
     while let Some((commit_id, current_depth)) = queue.pop_front() {
@@ -2884,7 +2883,11 @@ mod tests {
                 "add beta\n\nBody Needle\n\nTicket: 42\n",
                 Some(&signature),
             );
-            let commit = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &message);
+            let commit = Commit::from_tree_id(
+                ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+                Vec::new(),
+                &message,
+            );
             for (pattern, ignore_case, invert, expected) in [
                 ("OnlySignatureToken", false, false, false),
                 ("onlysignaturetoken", true, false, false),
@@ -2931,7 +2934,11 @@ mod tests {
                 "\n-----END PGP SIGNATURE-----",
             ] {
                 let stored = crate::common_utils::format_commit_msg(body, signature);
-                let commit = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &stored);
+                let commit = Commit::from_tree_id(
+                    ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+                    Vec::new(),
+                    &stored,
+                );
                 for invert in [false, true] {
                     let filter = CommitFilter::new(
                         None,
@@ -2958,7 +2965,11 @@ mod tests {
             "gpgsig -----BEGIN PGP SIGNATURE-----\n literal body\n -----END PGP SIGNATURE-----",
             None,
         );
-        let unsigned = Commit::from_tree_id(ObjectHash::new(&[1; 20]), Vec::new(), &literal);
+        let unsigned = Commit::from_tree_id(
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            Vec::new(),
+            &literal,
+        );
         let filter = CommitFilter::new(
             None,
             None,
@@ -3129,11 +3140,19 @@ mod tests {
     #[test]
     fn test_sort_commits_newest_first_author_vs_committer() {
         // A: author OLD (100), committer NEW (400).
-        let mut a = Commit::from_tree_id(ObjectHash::new(&[1; 20]), vec![], "A");
+        let mut a = Commit::from_tree_id(
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            vec![],
+            "A",
+        );
         a.author.timestamp = 100;
         a.committer.timestamp = 400;
         // B: author NEW (200), committer OLD (300).
-        let mut b = Commit::from_tree_id(ObjectHash::new(&[2; 20]), vec![], "B");
+        let mut b = Commit::from_tree_id(
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[2; 20]),
+            vec![],
+            "B",
+        );
         b.author.timestamp = 200;
         b.committer.timestamp = 300;
 
@@ -3215,7 +3234,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_filter_author_and_time() {
-        let mut commit = Commit::from_tree_id(ObjectHash::new(&[1; 20]), vec![], "msg");
+        let mut commit = Commit::from_tree_id(
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            vec![],
+            "msg",
+        );
         commit.author.name = "lvy".into();
         commit.author.email = "lvy@test.com".into();
         commit.committer.timestamp = 1_766_102_400; // 2025-12-19 00:00:00 UTC
@@ -3239,8 +3262,11 @@ mod tests {
     async fn test_commit_filter_merges_and_committer() {
         // A merge commit (two parents) committed by alice.
         let mut merge = Commit::from_tree_id(
-            ObjectHash::new(&[1; 20]),
-            vec![ObjectHash::new(&[2; 20]), ObjectHash::new(&[3; 20])],
+            ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[1; 20]),
+            vec![
+                ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[2; 20]),
+                ObjectHash::new_for_kind(git_internal::hash::get_hash_kind(), &[3; 20]),
+            ],
             "merge",
         );
         merge.committer.name = "alice".into();

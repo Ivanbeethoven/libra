@@ -6,8 +6,7 @@ use std::{
     io::{self, Write},
 };
 
-use clap::Subcommand;
-use git_internal::hash::get_hash_kind;
+use clap::{Subcommand, ValueEnum};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter,
     TransactionTrait,
@@ -15,7 +14,10 @@ use sea_orm::{
 use serde::Serialize;
 
 use crate::{
-    command::fetch,
+    command::{
+        config::{ConfigScope, ScopedConfig},
+        fetch,
+    },
     internal::{
         branch::{Branch, BranchStoreError},
         config::ConfigKv,
@@ -25,7 +27,7 @@ use crate::{
         protocol::{DiscRef, set_wire_hash_kind},
     },
     utils::{
-        error::{CliError, CliResult, StableErrorCode},
+        error::{CliError, CliResult, StableErrorCode, emit_warning},
         output::{OutputConfig, emit_json_data},
     },
 };
@@ -54,6 +56,19 @@ pub enum SetUrlMode {
     Add,
     Delete,
     Set,
+}
+
+/// Value accepted by `remote add --mirror[=MODE]`. `--mirror` may be given
+/// bare (treated as fetch+push and emitting Git's deprecation warning) or with
+/// an explicit mode. The enum only carries the explicit mode; the bare form is
+/// represented by the outer `Option` being `None` (see `Add.mirror`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteMirrorMode {
+    /// Fetch mirror: write a `+refs/*:refs/*` fetch refspec.
+    Fetch,
+    /// Push mirror: mark the remote as push-only, no fetch refspec.
+    Push,
 }
 
 impl std::fmt::Display for SetUrlMode {
@@ -85,7 +100,11 @@ EXAMPLES:
     libra remote add -t main --tags origin git@example.com:org/repo.git
                                                    Track only main and fetch all tags
     libra remote add --mirror backup git@example.com:org/repo.git
-                                                   Register a mirror remote (writes remote.<name>.mirror=true)
+                                                   Register a mirror remote (bare --mirror; also writes +refs/*:refs/*)
+    libra remote add --mirror=fetch mirror git@example.com:org/repo.git
+                                                   Register a fetch mirror (writes +refs/*:refs/*)
+    libra remote add --mirror=push mirror git@example.com:org/repo.git
+                                                   Register a push mirror (writes remote.<name>.mirror=true)
     libra remote rename origin upstream            Rename an existing remote
     libra remote remove upstream                   Drop a remote and its tracking refs
     libra remote get-url --all origin              Print every URL configured for origin
@@ -126,13 +145,20 @@ pub enum RemoteCmds {
         /// Configure `remote.<name>.tagOpt = --no-tags` (fetch no tags).
         #[clap(long = "no-tags")]
         no_tags: bool,
-        /// Mark the remote as a mirror: write the `remote.<name>.mirror=true`
-        /// marker (like Git's `remote add --mirror=fetch`). Incompatible with
-        /// `-t`/`--track`. NARROWING vs Git: the marker is informational —
-        /// Libra does not write a `+refs/*:refs/*` refspec because `libra fetch`
-        /// is not yet mirror-aware (matching `libra clone --mirror`).
-        #[clap(long = "mirror", conflicts_with = "track")]
-        mirror: bool,
+        /// Mark the remote as a mirror. Optional mode: `--mirror` (bare, emits
+        /// a deprecation warning), `--mirror=fetch`, or `--mirror=push`. A fetch
+        /// mirror writes a `+refs/*:refs/*` refspec; a push mirror writes only
+        /// the `remote.<name>.mirror=true` marker. `-t`/`--track` is allowed for
+        /// fetch mirrors but rejected for push mirrors; `-m`/`--master` is
+        /// rejected for every mirror (matching Git).
+        #[clap(
+            long = "mirror",
+            value_enum,
+            num_args(0..=1),
+            require_equals = true,
+            value_name = "MODE"
+        )]
+        mirror: Option<Option<RemoteMirrorMode>>,
     },
     /// Remove a remote
     Remove {
@@ -294,11 +320,20 @@ enum RemoteError {
     #[error("no such remote-tracking branch '{remote}/{branch}'")]
     RemoteTrackingBranchNotFound { remote: String, branch: String },
 
-    #[error("failed to query remote '{remote}': {detail}")]
-    Discovery { remote: String, detail: String },
+    #[error("failed to query remote '{remote}': {source}")]
+    Discovery {
+        remote: String,
+        source: fetch::FetchError,
+    },
 
     #[error("could not determine the default branch for remote '{remote}'")]
     NoRemoteHead { remote: String },
+
+    #[error("specifying a master branch makes no sense with --mirror")]
+    MirrorWithMaster,
+
+    #[error("specifying branches to track makes sense only with fetch mirrors")]
+    MirrorWithTrack,
 
     #[error(transparent)]
     Fetch(#[from] fetch::FetchError),
@@ -356,21 +391,40 @@ impl From<RemoteError> for CliError {
                 "failed to prune remote-tracking branch '{name}': {detail}"
             ))
             .with_stable_code(StableErrorCode::IoWriteFailed),
-            RemoteError::ObjectFormatMismatch { remote, local } => CliError::fatal(format!(
-                "remote object format '{remote}' does not match local '{local}'"
-            ))
-            .with_stable_code(StableErrorCode::RepoStateInvalid),
+            RemoteError::ObjectFormatMismatch { remote, local } => {
+                let mut err = CliError::fatal(format!(
+                    "remote object format '{remote}' does not match local '{local}'"
+                ))
+                .with_stable_code(StableErrorCode::RepoStateInvalid);
+                if remote == "blake3" || local == "blake3" {
+                    err = err.with_hint(
+                        "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                    );
+                }
+                err
+            }
             RemoteError::RemoteTrackingBranchNotFound { remote, branch } => {
                 CliError::fatal(format!("no such remote-tracking branch '{remote}/{branch}'"))
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
                     .with_hint("fetch the remote first, or run 'libra remote -v' to inspect remotes")
             }
-            RemoteError::Discovery { remote, detail } => {
-                CliError::fatal(format!("failed to query remote '{remote}': {detail}"))
-                    .with_stable_code(StableErrorCode::NetworkUnavailable)
-                    .with_hint(format!(
-                        "ensure the remote is reachable, or run 'libra remote show --no-query {remote}' to show cached data"
-                    ))
+            RemoteError::Discovery { remote, source } => {
+                let is_ssh_auth = matches!(
+                    &source,
+                    fetch::FetchError::Discovery {
+                        source: git_internal::errors::GitError::IOError(error),
+                        ..
+                    } if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error)
+                );
+                if is_ssh_auth {
+                    CliError::from(source)
+                } else {
+                    CliError::fatal(format!("failed to query remote '{remote}': {source}"))
+                        .with_stable_code(StableErrorCode::NetworkUnavailable)
+                        .with_hint(format!(
+                            "ensure the remote is reachable, or run 'libra remote show --no-query {remote}' to show cached data"
+                        ))
+                }
             }
             RemoteError::NoRemoteHead { remote } => {
                 CliError::fatal(format!(
@@ -379,6 +433,14 @@ impl From<RemoteError> for CliError {
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("the remote advertised no branches; specify a branch explicitly with 'libra remote set-head <name> <branch>'")
             }
+            RemoteError::MirrorWithMaster => CliError::fatal(
+                "specifying a master branch makes no sense with --mirror",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
+            RemoteError::MirrorWithTrack => CliError::fatal(
+                "specifying branches to track makes sense only with fetch mirrors",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
             RemoteError::Fetch(source) => CliError::from(source),
         }
     }
@@ -627,7 +689,7 @@ struct AddRemoteArgs {
     master: Option<String>,
     tags: bool,
     no_tags: bool,
-    mirror: bool,
+    mirror: Option<Option<RemoteMirrorMode>>,
 }
 
 async fn run_add_remote(
@@ -657,24 +719,92 @@ async fn run_add_remote(
         .await
         .map_err(write_err)?;
 
-    // `--mirror`: record the informational `remote.<name>.mirror=true` marker
-    // (matching Git's `remote add --mirror=fetch` and `libra clone --mirror`).
-    // We deliberately do NOT write a `+refs/*:refs/*` fetch refspec: Libra's
-    // fetch is not yet mirror-aware, so the marker is informational only.
-    if mirror {
-        ConfigKv::set(&format!("remote.{name}.mirror"), "true", false)
-            .await
-            .map_err(write_err)?;
+    // Determine the mirror mode. The outer `Option` is `Some` only when
+    // `--mirror` was given; the inner `Option` carries the explicit mode
+    // (`None` means the bare `--mirror` form).
+    #[derive(Clone, Copy)]
+    enum MirrorKind {
+        Bare,
+        Fetch,
+        Push,
+    }
+    let mirror_kind = match mirror {
+        None => None,
+        Some(None) => Some(MirrorKind::Bare),
+        Some(Some(RemoteMirrorMode::Fetch)) => Some(MirrorKind::Fetch),
+        Some(Some(RemoteMirrorMode::Push)) => Some(MirrorKind::Push),
+    };
+
+    // Git parity: every `--mirror` rejects `-m`/`--master`; `-t`/`--track` is
+    // rejected only for push mirrors (bare and fetch mirrors allow it). Git
+    // emits the deprecation warning for the bare form before validating, and
+    // both combination failures are hard runtime errors (exit 128), not usage
+    // errors.
+    if let Some(kind) = mirror_kind {
+        if master.is_some() {
+            return Err(RemoteError::MirrorWithMaster);
+        }
+        if matches!(kind, MirrorKind::Push) && !track.is_empty() {
+            return Err(RemoteError::MirrorWithTrack);
+        }
+        if matches!(kind, MirrorKind::Bare) {
+            emit_warning(
+                "`--mirror` is dangerous and deprecated; please use `--mirror=fetch` or `--mirror=push` instead",
+            );
+        }
     }
 
-    // `-t <branch>`: track only the named branch(es) by writing a specific fetch
-    // refspec per branch instead of the default wildcard (same format as
-    // `remote set-branches`).
-    for branch in &track {
-        let spec = format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}");
-        ConfigKv::add(&format!("remote.{name}.fetch"), &spec, false)
-            .await
-            .map_err(write_err)?;
+    // Write the fetch mapping.
+    //
+    //   * Non-mirror, no `-t`: the default `+refs/heads/*:refs/remotes/<name>/*`
+    //     (Git parity; previously Libra left it implicit).
+    //   * Non-mirror, `-t`: a specific refspec per branch.
+    //   * Fetch/bare mirror, no `-t`: the mirror `+refs/*:refs/*`.
+    //   * Fetch/bare mirror, `-t`: a `+refs/<branch>:refs/<branch>` spec per
+    //     branch (mirror refs mirror their source namespace).
+    //   * Push mirror: no fetch refspec, only the `mirror=true` marker below.
+    match mirror_kind {
+        Some(MirrorKind::Bare) | Some(MirrorKind::Fetch) => {
+            if track.is_empty() {
+                ConfigKv::set(&format!("remote.{name}.fetch"), "+refs/*:refs/*", false)
+                    .await
+                    .map_err(write_err)?;
+            } else {
+                for branch in &track {
+                    let spec = format!("+refs/{branch}:refs/{branch}");
+                    ConfigKv::add(&format!("remote.{name}.fetch"), &spec, false)
+                        .await
+                        .map_err(write_err)?;
+                }
+            }
+            // The bare form additionally records the informational marker
+            // (Git's `--mirror=fetch` does not persist `mirror=true`).
+            if matches!(mirror_kind, Some(MirrorKind::Bare)) {
+                ConfigKv::set(&format!("remote.{name}.mirror"), "true", false)
+                    .await
+                    .map_err(write_err)?;
+            }
+        }
+        Some(MirrorKind::Push) => {
+            ConfigKv::set(&format!("remote.{name}.mirror"), "true", false)
+                .await
+                .map_err(write_err)?;
+        }
+        None => {
+            if track.is_empty() {
+                let spec = format!("+refs/heads/*:refs/remotes/{name}/*");
+                ConfigKv::set(&format!("remote.{name}.fetch"), &spec, false)
+                    .await
+                    .map_err(write_err)?;
+            } else {
+                for branch in &track {
+                    let spec = format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}");
+                    ConfigKv::add(&format!("remote.{name}.fetch"), &spec, false)
+                        .await
+                        .map_err(write_err)?;
+                }
+            }
+        }
     }
 
     // `--tags`/`--no-tags`: record the tag-fetch preference as `remote.<name>.tagOpt`
@@ -734,6 +864,18 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
     if ssh_key_namespace_exists(&new).await? {
         return Err(RemoteError::SshKeyNamespaceExists { name: new });
     }
+
+    // Capture whether the repo-local `pushDefault` references the old remote
+    // BEFORE the transaction rewrites it: Git decides whether to warn based on
+    // the scope of the matching value prior to rewriting (a local value that
+    // names the old remote is rewritten and shadows any dangling global value).
+    let local_push_default_was_old = ConfigKv::get_var_case_insensitive("remote.", "pushDefault")
+        .await
+        .map_err(|e| RemoteError::ConfigRead {
+            detail: e.to_string(),
+        })?
+        .map(|e| e.value == old)
+        .unwrap_or(false);
 
     let db = get_db_conn_instance().await;
     let old_for_txn = old.clone();
@@ -797,10 +939,42 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
             RemoteError::ConfigWrite { detail }
         }
     })?;
+
+    // Git parity: a global/system-scoped `remote.pushDefault` that names the
+    // renamed remote is left unchanged and warned about; only a local-scope
+    // value was rewritten above. This mirrors Git `handle_push_default`.
+    if !local_push_default_was_old {
+        warn_if_global_push_default_dangles(&old).await?;
+    }
+
     Ok(RemoteOutput::Rename {
         old_name: old,
         new_name: new,
     })
+}
+
+/// Warn (Git parity) when a global/system-scoped `remote.pushDefault` names a
+/// just-renamed remote that no longer exists. The global value is left
+/// unchanged; only the message is emitted, matching Git `handle_push_default`.
+async fn warn_if_global_push_default_dangles(old: &str) -> Result<(), RemoteError> {
+    let global_db = match ScopedConfig::get_connection(ConfigScope::Global).await {
+        Ok(db) => db,
+        // No global configuration database (or it is unreadable): nothing
+        // to warn about.
+        Err(_) => return Ok(()),
+    };
+    let global_pd =
+        ConfigKv::get_var_case_insensitive_with_conn(&global_db, "remote.", "pushDefault")
+            .await
+            .map_err(|e| RemoteError::ConfigRead {
+                detail: e.to_string(),
+            })?;
+    if global_pd.as_ref().map(|e| e.value.as_str()) == Some(old) {
+        emit_warning(format!(
+            "the global configuration remote.pushDefault now names the non-existent remote '{old}'"
+        ));
+    }
+    Ok(())
 }
 
 async fn run_list_remotes(verbose: bool) -> Result<RemoteOutput, RemoteError> {
@@ -1134,7 +1308,7 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
     let (_remote_client, discovery) =
         fetch::discover_remote_with_name(&remote_config.url, Some(&remote_config.name)).await?;
 
-    let local_kind = get_hash_kind();
+    let local_kind = git_internal::hash::get_hash_kind();
     if discovery.hash_kind != local_kind {
         return Err(RemoteError::ObjectFormatMismatch {
             remote: discovery.hash_kind.to_string(),
@@ -1308,7 +1482,7 @@ async fn discover_remote_refs(
         .await
         .map_err(|error| RemoteError::Discovery {
             remote: name.to_string(),
-            detail: error.to_string(),
+            source: error,
         })?;
     let ref_heads = discovery
         .refs
@@ -2076,6 +2250,14 @@ mod tests {
             }
             .to_string(),
             "remote object format 'sha1' does not match local 'sha256'",
+        );
+        assert_eq!(
+            RemoteError::ObjectFormatMismatch {
+                remote: "sha1".to_string(),
+                local: "blake3".to_string(),
+            }
+            .to_string(),
+            "remote object format 'sha1' does not match local 'blake3'",
         );
         assert_eq!(
             RemoteError::RemoteTrackingBranchNotFound {

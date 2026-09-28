@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use clap::Parser;
-use git_internal::hash::{ObjectHash, get_hash_kind};
+use git_internal::hash::ObjectHash;
 use serde::Serialize;
 
 use crate::{
@@ -69,7 +69,7 @@ pub async fn execute_safe(args: RepackArgs, output: &OutputConfig) -> CliResult<
     let repo_path = util::try_get_storage_path(None)
         .map_err(|e| CliError::repo_not_found().with_hint(e.to_string()))?;
     let storage = ClientStorage::init(path::objects());
-    let hash_kind = get_hash_kind();
+    let hash_kind = git_internal::hash::get_hash_kind();
 
     // §C.4.3 writer-vs-deleter: `repack` PUBLISHES (a new pack becomes the
     // only home of objects it consolidates) and, under `-d`, DELETES. It

@@ -7,8 +7,6 @@
 //! mandatory durable audit record (§7.8), and a refusal to touch packed-only
 //! objects (no pack surgery — that is history-rewrite territory, declined).
 
-use std::str::FromStr;
-
 use clap::{Parser, Subcommand};
 use git_internal::hash::ObjectHash;
 
@@ -163,7 +161,7 @@ async fn run_obliterate(
         e.with_hint("resolve the interrupted obliteration ('libra file obliterate --recover')")
     })?;
 
-    let hash = ObjectHash::from_str(oid.trim()).map_err(|_| {
+    let hash = crate::internal::object_format::parse_repo_oid(oid.trim()).map_err(|_| {
         CliError::fatal(format!("'{oid}' is not a valid object id"))
             .with_stable_code(StableErrorCode::ObliterateNotFound)
     })?;

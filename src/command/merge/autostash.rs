@@ -1,6 +1,6 @@
 //! Held merge autostash sidecar and recovery lifecycle.
 
-use std::{fs, path::PathBuf, str::FromStr};
+use std::{fs, path::PathBuf};
 
 use git_internal::hash::ObjectHash;
 use serde::{Deserialize, Serialize};
@@ -289,7 +289,8 @@ pub(crate) async fn conclude_stopped_merge(snapshot: StoppedMerge) -> Result<Vec
         if merge_reset_promote_fail_injected() {
             return Err(merge_autostash_promote_warning("test-injected failure"));
         }
-        let oid = ObjectHash::from_str(&autostash.sidecar.stash_commit).map_err(|error| {
+        let oid = crate::internal::object_format::parse_repo_oid(&autostash.sidecar.stash_commit)
+            .map_err(|error| {
             merge_autostash_promote_warning(&format!("invalid stash OID ({error})"))
         })?;
         crate::command::stash::store_stash_commit(&oid, "autostash")
@@ -431,7 +432,7 @@ pub(super) async fn resolve_pending_autostash_with(
         crate::utils::error::emit_warning(format!("{reason}; leaving it in place"));
         return Some("kept".to_string());
     }
-    let oid = match ObjectHash::from_str(&sidecar.stash_commit) {
+    let oid = match crate::internal::object_format::parse_repo_oid(&sidecar.stash_commit) {
         Ok(oid) => oid,
         Err(error) => {
             crate::utils::error::emit_warning(format!(
@@ -533,7 +534,7 @@ pub(super) async fn prepare_merge_autostash(
         let sidecar = &snapshot.sidecar;
         verify_autostash_ownership(snapshot.recorded_owner.as_deref())
             .map_err(PullMergeError::Autostash)?;
-        if let Ok(oid) = ObjectHash::from_str(&sidecar.stash_commit) {
+        if let Ok(oid) = crate::internal::object_format::parse_repo_oid(&sidecar.stash_commit) {
             crate::command::stash::store_stash_commit(&oid, "autostash")
                 .await
                 .map_err(|error| {

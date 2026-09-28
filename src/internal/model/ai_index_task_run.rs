@@ -11,6 +11,9 @@ pub struct Model {
     pub run_id: String,
     pub is_latest: bool,
     pub created_at: i64,
+    /// Tagged `repo-commit:<kind>:<hex>` when known; NULL keeps the legacy
+    /// bare-anchor read path for B3-10 consumers.
+    pub base_commit_ref: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

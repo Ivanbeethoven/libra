@@ -431,8 +431,7 @@ async fn execute_with_output_contract(args: CatFileArgs, output: &OutputConfig) 
                 "cat-file",
                 &serde_json::json!({
                     "mode": "ai_list_types",
-                    "types": types,
-                }),
+                    "types": types}),
                 output,
             )?;
         }
@@ -448,8 +447,7 @@ async fn execute_with_output_contract(args: CatFileArgs, output: &OutputConfig) 
                     "mode": "ai_list",
                     "object_type": type_name,
                     "entries": objects,
-                    "total": objects.len(),
-                }),
+                    "total": objects.len()}),
                 output,
             )?;
         }
@@ -471,8 +469,7 @@ async fn execute_with_output_contract(args: CatFileArgs, output: &OutputConfig) 
                 "cat-file",
                 &serde_json::json!({
                     "mode": "ai_type",
-                    "object_type": object_type,
-                }),
+                    "object_type": object_type}),
                 output,
             )?;
         }
@@ -500,8 +497,7 @@ async fn execute_with_output_contract(args: CatFileArgs, output: &OutputConfig) 
             &serde_json::json!({
                 "mode": "exists",
                 "object": object_ref,
-                "exists": exists,
-            }),
+                "exists": exists}),
             output,
         )?;
         if !exists {
@@ -530,8 +526,7 @@ async fn execute_with_output_contract(args: CatFileArgs, output: &OutputConfig) 
                     "mode": "type",
                     "object": object_ref,
                     "hash": hash.to_string(),
-                    "object_type": obj_type.to_string(),
-                }),
+                    "object_type": obj_type.to_string()}),
                 output,
             )?;
         }
@@ -550,8 +545,7 @@ async fn execute_with_output_contract(args: CatFileArgs, output: &OutputConfig) 
                     "mode": "size",
                     "object": object_ref,
                     "hash": hash.to_string(),
-                    "size": data.len(),
-                }),
+                    "size": data.len()}),
                 output,
             )?;
         }
@@ -743,7 +737,8 @@ fn collect_all_object_ids(storage: &ClientStorage) -> CliResult<Vec<ObjectHash>>
                 continue;
             };
             if let Ok(bytes) = hex::decode(format!("{dir_name}{file_name}"))
-                && let Ok(hash) = ObjectHash::from_bytes(&bytes)
+                && let Ok(hash) =
+                    ObjectHash::from_bytes_for_kind(git_internal::hash::get_hash_kind(), &bytes)
             {
                 set.insert(hash);
             }
@@ -936,8 +931,7 @@ fn emit_pretty_print_json(
                         "object": object_ref,
                         "hash": hash.to_string(),
                         "object_type": "blob",
-                        "content": content,
-                    }),
+                        "content": content}),
                     output,
                 )?;
             }
@@ -957,11 +951,9 @@ fn emit_pretty_print_json(
                             "mode": format!("{:06o}", item.mode as u32),
                             "object_type": match item.mode {
                                 git_internal::internal::object::tree::TreeItemMode::Tree => "tree",
-                                _ => "blob",
-                            },
+                                _ => "blob"},
                             "hash": item.id.to_string(),
-                            "name": item.name,
-                        })
+                            "name": item.name})
                     })
                     .collect();
                 emit_json_data(
@@ -971,8 +963,7 @@ fn emit_pretty_print_json(
                         "object": object_ref,
                         "hash": hash.to_string(),
                         "object_type": "tree",
-                        "entries": entries,
-                    }),
+                        "entries": entries}),
                     output,
                 )?;
             }
@@ -1002,16 +993,13 @@ fn emit_pretty_print_json(
                             "name": commit.author.name.trim(),
                             "email": commit.author.email.trim(),
                             "timestamp": commit.author.timestamp,
-                            "timezone": commit.author.timezone,
-                        },
+                            "timezone": commit.author.timezone},
                         "committer": {
                             "name": commit.committer.name.trim(),
                             "email": commit.committer.email.trim(),
                             "timestamp": commit.committer.timestamp,
-                            "timezone": commit.committer.timezone,
-                        },
-                        "message": message.trim(),
-                    }),
+                            "timezone": commit.committer.timezone},
+                        "message": message.trim()}),
                     output,
                 )?;
             }
@@ -1037,8 +1025,7 @@ fn emit_pretty_print_json(
                         "object": object_ref,
                         "hash": hash.to_string(),
                         "object_type": "tag",
-                        "content": content,
-                    }),
+                        "content": content}),
                     output,
                 )?;
             }
@@ -1065,8 +1052,7 @@ async fn ai_list_types_data() -> CliResult<Vec<serde_json::Value>> {
         if !objects.is_empty() {
             types.push(serde_json::json!({
                 "object_type": type_name,
-                "count": objects.len(),
-            }));
+                "count": objects.len()}));
         }
     }
     Ok(types)
@@ -1086,8 +1072,7 @@ async fn ai_list_objects_data(type_name: &str) -> CliResult<Vec<serde_json::Valu
         .map(|(id, hash)| {
             serde_json::json!({
                 "id": id,
-                "hash": hash.to_string(),
-            })
+                "hash": hash.to_string()})
         })
         .collect())
 }
@@ -1120,8 +1105,7 @@ async fn ai_pretty_print_data(uuid: &str) -> CliResult<serde_json::Value> {
         "object_type": type_name,
         "hash": hash.to_string(),
         "summary": summary,
-        "value": parsed,
-    }))
+        "value": parsed}))
 }
 
 async fn ai_show_type_data(uuid: &str) -> CliResult<String> {

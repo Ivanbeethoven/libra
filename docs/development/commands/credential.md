@@ -2,19 +2,19 @@
 
 ## 命令实现目标
 
-`libra credential fill|store|erase` 是 vault 支撑的 Git 凭证助手：讲 Git 凭证 key/value 协议，凭证经 vault AES-256-GCM 加密存储，绝不明文落盘、绝不泄露到日志/错误/trace。
+`libra credential get|store|erase`（`fill` 为 `get` 的 legacy 别名；未知操作静默忽略）是 vault 支撑的 Git 凭证助手：讲 Git 凭证 key/value 协议，凭证经 vault AES-256-GCM 加密存储，绝不明文落盘、绝不泄露到日志/错误/trace。
 
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。
-- 已支持：`fill`/`store`/`erase` 的 Git 凭证 stdin/stdout 协议；`url=` 展开为 protocol/host/path；`password_expiry_utc` 过期（默认 30 天）；vault 加密存储。
+- 已支持：`get`（`fill` 别名）/`store`/`erase` 的 Git 凭证 stdin/stdout 协议；未知操作静默忽略（Git helper 约定，exit 0 无输出）；`url=` 展开为 protocol/host/path；`password_expiry_utc` 过期（默认 30 天）；vault 加密存储。
 - 退出码：0（fill 命中或空；store/erase 完成）；128（store 缺 username/password、过期时间戳、vault 未初始化，或请求不可读）。
 - **有意差异**：存储为 vault 加密（非明文 `~/.git-credentials`）且**仓库范围**（unseal key 按 repo-id）；每个 `protocol/host/path` 仅一条凭证。
 - 未公开（延后）：`credential-cache`；每 host 多用户名；**消费侧 `credential.helper` 链校验（拒绝 `!cmd`/相对路径）—— 那属于 fetch/push 调用助手的路径，本命令是「助手本身」，不调用外部助手，故有意不在此实现**。
 
 ## 设计方案
 
-- 入口与分发：`src/cli.rs::Commands::Credential` → `command::credential::execute_safe`。**加入 `command_preflight` 的 `none()` 组**：跳过 hash-kind preflight，`fill` 在仓库外也能干净未命中（exit 0 空），vault 延迟解析。
+- 入口与分发：`src/cli.rs::Commands::Credential` → `command::credential::execute_safe`。**加入 `command_preflight` 的 `none()` 组**：跳过 hash-kind preflight，`store`/`get`/`erase` 在仓库外也走用户级（global config）加密存储（HP-14），vault 延迟解析。
 - 源码分层：`src/command/credential.rs`：`CredentialArgs`（子命令 fill/store/erase）、`CredentialAttrs`（protocol/host/path/username/password/password_expiry_utc）、`StoredCredential`（serde，加密前的 {username,password,expires_at}）、`read_attrs`（key=value，空行终止；`url=` 展开，显式字段覆盖）。
 - 存储：`credential_key` = `credential.{sha256(v1\0protocol\0host\0path)}`（不可逆，config 不含明文 host/user）。值 = `hex(vault::encrypt_token(unseal_key, json))`，经 `ConfigKv::set(key, hex, false)`（预加密、按原样存，与 vault root token 一致）。`vault::load_unseal_key()` 取 key。
 - fill：load_unseal_key → ConfigKv::get（`.ok().flatten()`，缺仓库/缺条目=未命中）→ hex decode → decrypt_token（解密失败=轮换→未命中）→ serde → 过期检查 → username 匹配 → 输出 protocol/host/path/username/password/password_expiry_utc。**全路径任何分支都 exit 0**（无侧信道）。
@@ -30,7 +30,7 @@
 ## 当前状态
 
 - 公开状态：已公开（`Commands::Credential`）。
-- 测试：`tests/command/credential_test.rs`（store→fill round-trip、未知 host 空+exit0、erase、用户名不符未命中、过期时间戳拒绝 128、缺密码错误不泄露、`RUST_LOG=debug` 下密码不入 stderr、仓库外 fill 空）+ `credential.rs` 单测（url 解析、显式覆盖、key 哈希稳定且不含明文、空密码视为缺省）。
+- 测试：`tests/command/credential_test.rs`（store→get round-trip、get=fill 别名且未知操作静默、未知 host 空+exit0、erase、用户名不符未命中、过期时间戳拒绝 128、缺密码错误不泄露、`RUST_LOG=debug` 下密码不入 stderr、仓库外 store/get/erase round-trip）+ `credential.rs` 单测（url 解析、显式覆盖、key 哈希稳定且不含明文、空密码视为缺省）。
 - 用户文档：`docs/commands/credential.md`（EN + zh-CN）。
 
 ## 还未实现的功能

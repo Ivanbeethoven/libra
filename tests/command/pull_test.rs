@@ -34,6 +34,37 @@ fn git(args: &[&str], cwd: &Path) {
     );
 }
 
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_pull_ssh_publickey_auth_diagnostic() {
+    use super::{
+        SSH_PUBLICKEY_AUTH_OUTPUT_MODES, assert_repo_refs_unchanged,
+        assert_ssh_publickey_auth_failure, create_ssh_publickey_auth_failure_script,
+        snapshot_repo_refs,
+    };
+
+    let repo = create_committed_repo_via_cli();
+    let ssh = create_ssh_publickey_auth_failure_script(repo.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", "git@fixture.invalid:repo"],
+            repo.path(),
+        ),
+        "add SSH fixture remote",
+    );
+    let refs = snapshot_repo_refs(repo.path());
+    for mode in SSH_PUBLICKEY_AUTH_OUTPUT_MODES {
+        assert_ssh_publickey_auth_failure(
+            &["pull", "--ff-only", "origin", "main"],
+            repo.path(),
+            &ssh,
+            mode,
+        );
+        assert_repo_refs_unchanged(&refs, repo.path(), mode);
+    }
+}
+
 fn git_stdout(args: &[&str], cwd: &Path) -> String {
     let output = Command::new("git")
         .current_dir(cwd)
@@ -1584,105 +1615,21 @@ fn setup_local_upstream_current_branch() -> (TempDir, String) {
     (repo, "alpha".to_string())
 }
 
-fn branch_config_snapshot(repo: &Path) -> String {
-    let output = run_libra_command(&["config", "--get-regexp", r"^branch\."], repo);
-    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    lines.sort();
-    lines.join("\n")
-}
-
-fn refs_snapshot(repo: &Path) -> String {
-    let output = run_libra_command(&["show-ref"], repo);
-    let mut lines: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(ToString::to_string)
-        .collect();
-    lines.sort();
-    lines.join("\n")
-}
-
-fn fetch_head_snapshot(repo: &Path) -> String {
-    fs::read_to_string(repo.join(".libra/FETCH_HEAD")).unwrap_or_default()
-}
-
-fn assert_local_upstream_network_refusal(cmd: &[&str], verb: &str, branch: &str, repo: &Path) {
-    let refs_before = refs_snapshot(repo);
-    let cfg_before = branch_config_snapshot(repo);
-    let fetch_before = fetch_head_snapshot(repo);
-
-    let output = run_libra_command(cmd, repo);
-    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
-    assert_eq!(output.status.code(), Some(129), "{stderr}");
-    assert_eq!(report.error_code, "LBR-CLI-003");
-    assert!(
-        stderr.contains(&format!("cannot {verb}")) && stderr.contains("local upstream"),
-        "human stderr should name the local-upstream refusal: {stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("branch '{branch}'"))
-            && stderr.contains("issues/480")
-            && stderr.contains("HP-16"),
-        "human stderr should name the branch and HP-16: {stderr}"
-    );
-
-    let mut json_cmd = vec!["--json"];
-    json_cmd.extend_from_slice(cmd);
-    let json_out = run_libra_command(&json_cmd, repo);
-    let (_json_human, json_report) = parse_cli_error_stderr(&json_out.stderr);
-    assert_eq!(json_out.status.code(), Some(129));
-    assert_eq!(json_report.error_code, "LBR-CLI-003");
-    assert!(
-        json_report.message.contains("local upstream")
-            && json_report.message.contains("issues/480 HP-16"),
-        "json envelope should carry the refusal: {}",
-        json_report.message
-    );
-    assert_eq!(
-        json_report.details.get("remote").and_then(|v| v.as_str()),
-        Some(".")
-    );
-    assert_eq!(
-        json_report
-            .details
-            .get("upstream_kind")
-            .and_then(|v| v.as_str()),
-        Some("local")
-    );
-
-    assert_eq!(refs_snapshot(repo), refs_before, "refs must stay unchanged");
-    assert_eq!(
-        branch_config_snapshot(repo),
-        cfg_before,
-        "branch.* config must stay unchanged"
-    );
-    assert_eq!(
-        fetch_head_snapshot(repo),
-        fetch_before,
-        "FETCH_HEAD must stay unchanged"
-    );
-}
-
 /// M-UPSTREAM P8 (#477 HF-30): `pull` refuses a configured local upstream
 /// before any network or FETCH_HEAD write.
 #[test]
 fn test_pull_refuses_local_upstream() {
-    let (repo, branch) = setup_local_upstream_current_branch();
+    let (repo, _branch) = setup_local_upstream_current_branch();
     let p = repo.path();
-    assert_local_upstream_network_refusal(&["pull"], "pull", &branch, p);
 
+    // A local upstream is no longer refused (issues/480 HP-16): pulling merges
+    // the local branch instead.
+    let out = run_libra_command(&["pull"], p);
+    assert_cli_success(&out, "pull with local upstream");
+
+    // `pull .` (no refspec) is now an anonymous local-path pull, which succeeds.
     let explicit = run_libra_command(&["pull", "."], p);
-    let (stderr, report) = parse_cli_error_stderr(&explicit.stderr);
-    assert_eq!(explicit.status.code(), Some(129));
-    assert_eq!(report.error_code, "LBR-CLI-003");
-    assert!(
-        stderr.contains("remote '.' not found") || report.message.contains("remote '.' not found"),
-        "explicit '.' must keep the existing remote-not-found path: {stderr} / {}",
-        report.message
-    );
+    assert_cli_success(&explicit, "pull .");
 }
 
 /// FM-01 (M-MAT T7): pulling a fast-forward commit materializes its
@@ -1781,4 +1728,260 @@ fn test_pull_from_bundle_remote_fast_forward() {
     assert_ne!(got, old, "H2 pull must move HEAD");
     assert_eq!(got, expected, "H2 pull must fast-forward to the new tip");
     assert!(dest.join("next.txt").exists(), "H2 pull restores new file");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_unrelated_histories_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // Build a remote whose history is unrelated to the local repo's commit.
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], &repo_dir);
+    git(
+        &["init", "-b", "main", work_dir.to_str().unwrap()],
+        &remote_dir,
+    );
+    git(&["config", "user.name", "Libra Tester"], &work_dir);
+    git(&["config", "user.email", "tester@example.com"], &work_dir);
+    fs::write(work_dir.join("remote.txt"), "remote").expect("write remote file");
+    git(&["add", "remote.txt"], &work_dir);
+    git(&["commit", "-m", "remote root"], &work_dir);
+    git(&["push", remote_dir.to_str().unwrap(), "main"], &work_dir);
+
+    // Configure the remote URL and attempt a merge of unrelated histories.
+    libra::internal::config::ConfigKv::set(
+        "remote.origin.url",
+        remote_dir.to_str().unwrap(),
+        false,
+    )
+    .await
+    .expect("set remote url");
+
+    // N1: without --allow-unrelated-histories, pull refuses and adds the hint.
+    let refused = run_libra_command(&["pull", "--no-rebase", "origin", "main"], &repo_dir);
+    assert!(
+        !refused.status.success(),
+        "pulling unrelated histories must be refused: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert!(
+        stderr.contains("unrelated histories"),
+        "N1: refusal mentions unrelated histories: {stderr}"
+    );
+    assert!(
+        stderr.contains("--allow-unrelated-histories"),
+        "N1: refusal carries the --allow-unrelated-histories hint: {stderr}"
+    );
+
+    // N2: with the flag, pull creates a merge commit.
+    let ok = run_libra_command(
+        &[
+            "pull",
+            "--no-rebase",
+            "--allow-unrelated-histories",
+            "origin",
+            "main",
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&ok, "pull --allow-unrelated-histories origin main");
+    let head = Head::current_commit_result()
+        .await
+        .expect("read HEAD commit")
+        .expect("HEAD should point at a commit");
+    let commit: Commit = load_object(&head).expect("load HEAD commit");
+    assert_eq!(
+        commit.parent_commit_ids.len(),
+        2,
+        "N2: the unrelated-histories pull produces a merge commit with two parents"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_repository_path_merges() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], &repo_dir);
+    git(
+        &["init", "-b", "main", work_dir.to_str().unwrap()],
+        &remote_dir,
+    );
+    git(&["config", "user.name", "Libra Tester"], &work_dir);
+    git(&["config", "user.email", "tester@example.com"], &work_dir);
+    fs::write(work_dir.join("remote.txt"), "remote").expect("write remote file");
+    git(&["add", "remote.txt"], &work_dir);
+    git(&["commit", "-m", "remote root"], &work_dir);
+    git(&["push", remote_dir.to_str().unwrap(), "main"], &work_dir);
+
+    // V2: an anonymous local-path pull merges the brought-down ref (unrelated
+    // histories, so it must be allowed explicitly).
+    let ok = run_libra_command(
+        &[
+            "pull",
+            "--allow-unrelated-histories",
+            remote_dir.to_str().unwrap(),
+            "main",
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&ok, "pull --allow-unrelated-histories <path> main");
+    let head = Head::current_commit_result()
+        .await
+        .expect("read HEAD commit")
+        .expect("HEAD should be a commit after pull");
+    let commit: Commit = load_object(&head).expect("load HEAD commit");
+    assert_eq!(
+        commit.parent_commit_ids.len(),
+        2,
+        "V2: the anonymous-path pull produces a merge commit"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_missing_remote_ref_diagnostic() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    // Configure a remote pointing at a bare local repository so the fetch phase
+    // runs; requesting a nonexistent branch must stop in the fetch phase with a
+    // git-parity diagnostic rather than reaching the merge phase.
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+    git(&["init", "--bare", remote_dir.to_str().unwrap()], &repo_dir);
+    git(
+        &["init", "-b", "main", work_dir.to_str().unwrap()],
+        &remote_dir,
+    );
+    git(&["config", "user.name", "Libra Tester"], &work_dir);
+    git(&["config", "user.email", "tester@example.com"], &work_dir);
+    fs::write(work_dir.join("README.md"), "x").expect("write");
+    git(&["add", "."], &work_dir);
+    git(&["commit", "-m", "init"], &work_dir);
+    git(&["push", remote_dir.to_str().unwrap(), "main"], &work_dir);
+    libra::internal::config::ConfigKv::set(
+        "remote.origin.url",
+        remote_dir.to_str().unwrap(),
+        false,
+    )
+    .await
+    .expect("set remote url");
+
+    let out = run_libra_command(&["pull", "origin", "nosuchbranch"], &repo_dir);
+    let (stderr, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(out.status.code(), Some(129));
+    assert_eq!(report.error_code, "LBR-CLI-003");
+    assert!(
+        stderr.contains("couldn't find remote ref nosuchbranch"),
+        "M1: pull diagnostic, got: {stderr}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_with_local_upstream_remote_dot() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let _guard = ChangeDirGuard::new(p);
+    let cur = run_libra_command(&["branch", "--show-current"], p);
+    assert_cli_success(&cur, "show current branch");
+    let cur = String::from_utf8_lossy(&cur.stdout).trim().to_string();
+
+    // Create t1 tracking the local branch `cur` (branch.<t1>.remote=.).
+    assert_cli_success(
+        &run_libra_command(&["branch", "--track", "t1", cur.as_str()], p),
+        "track t1 -> cur",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "t1"], p), "switch to t1");
+
+    // `pull` on t1 merges the local upstream (D1 / issues/480 HP-16), no longer
+    // failing with the local-upstream refusal.
+    let out = run_libra_command(&["pull"], p);
+    assert_cli_success(&out, "pull with local upstream");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_pull_repository_dot_merges() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let _guard = ChangeDirGuard::new(p);
+    let cur = run_libra_command(&["branch", "--show-current"], p);
+    assert_cli_success(&cur, "show current branch");
+    let cur = String::from_utf8_lossy(&cur.stdout).trim().to_string();
+
+    // `pull . <branch>` merges the current repository's branch (anonymous d).
+    let out = run_libra_command(&["pull", ".", cur.as_str()], p);
+    assert_cli_success(&out, "pull . <branch>");
+}
+
+/// B3-12: rewrite a local Git repo's config to advertise `objectformat`.
+fn force_git_source_objectformat(repo: &Path, value: &str) {
+    let git_config = repo.join(".git").join("config");
+    let mut text = fs::read_to_string(&git_config).expect("read git config");
+    if text.contains("repositoryformatversion = 0") {
+        text = text.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    } else if !text.contains("repositoryformatversion = 1") {
+        text.push_str("\n[core]\n\trepositoryformatversion = 1\n");
+    }
+    text.push_str(&format!("\n[extensions]\n\tobjectformat = {value}\n"));
+    fs::write(&git_config, text).expect("write git config");
+}
+
+#[test]
+#[serial(cwd)]
+fn pull_rejects_sha256_git_source() {
+    use super::{create_committed_repo_via_cli, create_linear_git_repo, parse_cli_error_stderr};
+
+    let (git_src, _) = create_linear_git_repo(1);
+    force_git_source_objectformat(git_src.path(), "sha256");
+
+    let repo = create_committed_repo_via_cli();
+    configure_pull_tracking(repo.path(), git_src.path(), "main");
+
+    let head_before = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_cli_success(&head_before, "rev-parse before pull");
+    let head_oid = String::from_utf8_lossy(&head_before.stdout)
+        .trim()
+        .to_string();
+
+    let out = run_libra_command(&["--json", "pull"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "{report:?}");
+    assert!(
+        report.hints.iter().any(|h| h.contains("fresh")
+            || h.contains("libra init --object-format")
+            || h.contains("SHA-256/BLAKE3")),
+        "hint must point at fresh init: {:?}",
+        report.hints
+    );
+
+    let head_after = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_cli_success(&head_after, "rev-parse after pull");
+    assert_eq!(
+        String::from_utf8_lossy(&head_after.stdout).trim(),
+        head_oid,
+        "pull reject must leave HEAD unchanged"
+    );
 }

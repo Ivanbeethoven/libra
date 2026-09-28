@@ -261,7 +261,7 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
         } => {
             write_frame(stdout, &IoEvent::Begin)?;
             maybe_test_slow_object_read(&oid);
-            apply_hash_kind(&hash_kind);
+            apply_hash_kind(&hash_kind)?;
             let outcome = match object_store_capability.as_ref() {
                 Some(capability) => read_object_blob_request(&oid, capability, byte_limit),
                 None => Err(ObjectBlobStatus::Unavailable),
@@ -473,7 +473,7 @@ fn hash_file_blob_beneath_with_session(
     hash_kind: &str,
     root_session: Option<u64>,
 ) -> io::Result<git_internal::hash::ObjectHash> {
-    apply_hash_kind(hash_kind);
+    apply_hash_kind(hash_kind)?;
     let stat = crate::utils::beneath::lstat_beneath(root, relative)?;
     if stat.is_symlink {
         let target = crate::utils::beneath::read_symlink_beneath(root, relative)?;
@@ -513,7 +513,8 @@ fn hash_regular_file_handle(
     mut file: std::fs::File,
     length: u64,
 ) -> io::Result<git_internal::hash::ObjectHash> {
-    let mut hasher = git_internal::utils::HashAlgorithm::new();
+    let mut hasher =
+        git_internal::utils::HashAlgorithm::new_for_kind(git_internal::hash::get_hash_kind());
     hasher.update(b"blob ");
     hasher.update(length.to_string().as_bytes());
     hasher.update(b"\0");
@@ -539,7 +540,11 @@ fn hash_regular_file_handle(
             "worktree file changed while it was being hashed",
         ));
     }
-    git_internal::hash::ObjectHash::from_bytes(&hasher.finalize()).map_err(io::Error::other)
+    git_internal::hash::ObjectHash::from_bytes_for_kind(
+        git_internal::hash::get_hash_kind(),
+        &hasher.finalize(),
+    )
+    .map_err(io::Error::other)
 }
 
 fn hash_lfs_file_handle(file: &std::fs::File, length: u64) -> io::Result<(String, u64)> {
@@ -562,11 +567,15 @@ fn hash_lfs_file_handle(file: &std::fs::File, length: u64) -> io::Result<(String
     Ok((hex::encode(hasher.finish().as_ref()), total))
 }
 
-fn apply_hash_kind(kind: &str) {
-    match kind {
-        "sha256" => git_internal::hash::set_hash_kind(git_internal::hash::HashKind::Sha256),
-        _ => git_internal::hash::set_hash_kind(git_internal::hash::HashKind::Sha1),
-    }
+fn apply_hash_kind(kind: &str) -> io::Result<()> {
+    let parsed = crate::internal::object_format::parse_config_value(kind).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported hash_kind '{kind}' (expected sha1|sha256|blake3)"),
+        )
+    })?;
+    git_internal::hash::set_hash_kind(parsed);
+    Ok(())
 }
 
 fn maybe_test_kill_after_checkpoint(seq: u64) {
@@ -618,7 +627,7 @@ pub(crate) fn read_object_blob_request(
 ) -> Result<Vec<u8>, ObjectBlobStatus> {
     use crate::utils::client_storage::{ClientStorage, ObjectReadFailure};
 
-    let Ok(hash) = oid.parse::<git_internal::hash::ObjectHash>() else {
+    let Ok(hash) = crate::internal::object_format::parse_repo_oid(oid) else {
         return Err(ObjectBlobStatus::Failed);
     };
     // Local-only + alternates, no directory creation / remote hydrate
@@ -704,4 +713,23 @@ pub(crate) fn write_object_blob_outcome(
 
 fn write_raw_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     crate::internal::worktree_io::protocol::write_raw_frame(writer, payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_hash_kind;
+
+    #[test]
+    fn worktree_io_unknown_format_errors() {
+        let err = apply_hash_kind("not-a-hash").expect_err("unknown must fail closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("unsupported hash_kind"),
+            "got: {err}"
+        );
+        // Valid tags still apply.
+        apply_hash_kind("blake3").expect("blake3 ok");
+        apply_hash_kind("sha256").expect("sha256 ok");
+        apply_hash_kind("sha1").expect("sha1 ok");
+    }
 }

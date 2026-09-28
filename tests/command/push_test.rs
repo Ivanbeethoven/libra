@@ -19,7 +19,9 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tokio::{process::Command as TokioCommand, time::timeout};
 
-use super::{create_committed_repo_via_cli, parse_cli_error_stderr, run_libra_command};
+use super::{
+    assert_cli_success, create_committed_repo_via_cli, parse_cli_error_stderr, run_libra_command,
+};
 
 fn libra_command(cwd: &std::path::Path) -> Command {
     let home = cwd.join(".libra-test-home");
@@ -32,6 +34,40 @@ fn libra_command(cwd: &std::path::Path) -> Command {
         .env("XDG_CONFIG_HOME", &config_home)
         .env("USERPROFILE", &home);
     cmd
+}
+
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_push_ssh_publickey_auth_diagnostic() {
+    use super::{
+        SSH_PUBLICKEY_AUTH_OUTPUT_MODES, assert_repo_refs_unchanged,
+        assert_ssh_publickey_auth_failure, create_ssh_publickey_auth_failure_script,
+        snapshot_repo_refs,
+    };
+
+    let repo = create_committed_repo_via_cli();
+    let ssh = create_ssh_publickey_auth_failure_script(repo.path());
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", "git@fixture.invalid:repo"],
+            repo.path(),
+        ),
+        "add SSH fixture remote",
+    );
+    let branch = run_libra_command(&["branch", "--show-current"], repo.path());
+    assert_cli_success(&branch, "show current branch");
+    let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+    let refs = snapshot_repo_refs(repo.path());
+    for mode in SSH_PUBLICKEY_AUTH_OUTPUT_MODES {
+        assert_ssh_publickey_auth_failure(
+            &["push", "origin", branch.as_str()],
+            repo.path(),
+            &ssh,
+            mode,
+        );
+        assert_repo_refs_unchanged(&refs, repo.path(), mode);
+    }
 }
 
 fn libra_tokio_command(cwd: &std::path::Path) -> TokioCommand {
@@ -303,9 +339,15 @@ async fn test_push_force_flag_parsing() {
 #[tokio::test]
 #[serial(cwd)]
 async fn test_push_file_remote_fails_without_reflog() {
-    // local file remotes are not supported; ensure we fail loudly and avoid reflog writes
+    // local file remotes are supported (HP-07): push to a local Libra target and
+    // assert the push succeeds and records the remote-tracking reflog.
     let remote_dir = tempfile::tempdir().unwrap();
     let remote_path = remote_dir.path();
+    let init_remote = libra_command(remote_path)
+        .args(["init", "--bare"])
+        .output()
+        .expect("init remote");
+    assert!(init_remote.status.success(), "init remote failed");
 
     // local repo
     let local_dir = tempfile::tempdir().unwrap();
@@ -371,25 +413,25 @@ async fn test_push_file_remote_fails_without_reflog() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // push should fail with clear fatal message
+    // push should succeed against the local Libra target
     let out = libra_command(local_path)
         .args(["push", "origin", "main"])
         .output()
         .expect("push");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("pushing to local file repositories is not supported"),
-        "stderr should mention unsupported file:// push, got: {stderr}"
+        out.status.success(),
+        "push to a local Libra target should succeed, got: {stderr}"
     );
 
-    // ensure no reflog entry is written
+    // the remote-tracking ref reflog is now written
     let db = get_db_conn_instance().await;
-    let entry = Reflog::find_one(&db, "refs/remotes/origin/master")
+    let entry = Reflog::find_one(&db, "refs/remotes/origin/main")
         .await
         .expect("query reflog");
     assert!(
-        entry.is_none(),
-        "reflog should not be created when push fails"
+        entry.is_some(),
+        "remote-tracking reflog should be recorded after a successful local push"
     );
 }
 
@@ -2736,5 +2778,222 @@ fn run_ok(dir: &Path, argv: &[&str]) {
         out.status.success(),
         "{argv:?}: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_libra_target_updates_ref() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // Create an empty local Libra target (bare, so no checked-out branch is
+    // protected against updates).
+    let target = tempfile::tempdir().unwrap();
+    let init = run_libra_command(&["init", "--bare"], target.path());
+    assert_cli_success(&init, "init bare target");
+
+    // Push the current branch directly to the local path (no configured remote).
+    let out = run_libra_command(
+        &["push", target.path().to_str().unwrap(), branch.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "push local libra target");
+
+    // The target now advertises the pushed branch.
+    let ls = run_libra_command(&["ls-remote", target.path().to_str().unwrap()], &repo_dir);
+    assert_cli_success(&ls, "ls-remote local target");
+    let stdout = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        stdout.contains(&format!("refs/heads/{branch}")),
+        "target should advertise the pushed branch, got: {stdout}"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_libra_nonbare_checked_out_branch_rejected() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // A non-bare target with the same branch checked out rejects the push (P7).
+    let target = tempfile::tempdir().unwrap();
+    libra::utils::test::setup_with_new_libra_in(target.path()).await;
+    let out = run_libra_command(
+        &["push", target.path().to_str().unwrap(), branch.as_str()],
+        &repo_dir,
+    );
+    assert!(
+        !out.status.success(),
+        "pushing to a non-bare target's checked-out branch must be rejected: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("checked-out"),
+        "rejection should mention the checked-out branch"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_git_target_updates_pack_and_ref() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // Create a bare Git target.
+    let target = tempfile::tempdir().unwrap();
+    let init = Command::new("git")
+        .args(["init", "--bare", target.path().to_str().unwrap()])
+        .status()
+        .expect("git init --bare");
+    assert!(init.success(), "git init --bare failed");
+
+    // Push the current branch directly to the bare Git target.
+    let out = run_libra_command(
+        &["push", target.path().to_str().unwrap(), branch.as_str()],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "push to bare Git target");
+
+    // The Git target accepts the pushed ref and its object store is clean.
+    let log = Command::new("git")
+        .args([
+            "-C",
+            target.path().to_str().unwrap(),
+            "log",
+            "--oneline",
+            branch.as_str(),
+        ])
+        .output()
+        .expect("git log on target");
+    assert!(log.status.success(), "target git log failed");
+    let fsck = Command::new("git")
+        .args(["-C", target.path().to_str().unwrap(), "fsck", "--full"])
+        .output()
+        .expect("git fsck on target");
+    assert!(fsck.status.success(), "target git fsck failed");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_local_tags_and_delete() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // Create a tag in the source repo.
+    assert_cli_success(
+        &run_libra_command(&["tag", "v1"], &repo_dir),
+        "create v1 tag",
+    );
+
+    // Bare Libra target.
+    let target = tempfile::tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare"], target.path()),
+        "init bare libra target",
+    );
+
+    // Push the branch and all tags.
+    let out = run_libra_command(
+        &[
+            "push",
+            "--tags",
+            target.path().to_str().unwrap(),
+            branch.as_str(),
+        ],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "push --tags to local Libra target");
+    let ls = run_libra_command(&["ls-remote", target.path().to_str().unwrap()], &repo_dir);
+    assert_cli_success(&ls, "ls-remote target");
+    let stdout = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        stdout.contains("refs/tags/v1"),
+        "target should advertise the pushed tag, got: {stdout}"
+    );
+
+    // Delete the tag on the local target (O5).
+    let del = run_libra_command(
+        &["push", target.path().to_str().unwrap(), ":refs/tags/v1"],
+        &repo_dir,
+    );
+    assert_cli_success(&del, "delete tag on local target");
+    let ls2 = run_libra_command(&["ls-remote", target.path().to_str().unwrap()], &repo_dir);
+    assert_cli_success(&ls2, "ls-remote after delete");
+    assert!(
+        !String::from_utf8_lossy(&ls2.stdout).contains("refs/tags/v1"),
+        "deleted tag should be gone from target"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn test_push_dot_updates_local_nondestructive_ref() {
+    let repo = create_committed_repo_via_cli();
+    let repo_dir = repo.path().to_path_buf();
+    let _guard = ChangeDirGuard::new(&repo_dir);
+
+    let current = run_libra_command(&["branch", "--show-current"], &repo_dir);
+    assert_cli_success(&current, "show current branch");
+    let branch = String::from_utf8_lossy(&current.stdout).trim().to_string();
+
+    // `push . <branch>:refs/heads/other` writes a non-checked-out local ref (D3).
+    let out = run_libra_command(
+        &["push", ".", &format!("{branch}:refs/heads/other")],
+        &repo_dir,
+    );
+    assert_cli_success(&out, "push . HEAD:refs/heads/other");
+    let ls = run_libra_command(&["ls-remote", "."], &repo_dir);
+    assert_cli_success(&ls, "ls-remote .");
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).contains("refs/heads/other"),
+        "D3: push . should create refs/heads/other, got: {}",
+        String::from_utf8_lossy(&ls.stdout)
+    );
+}
+
+#[test]
+#[serial(cwd)]
+fn blake3_push_round_trip() {
+    let remote_dir = tempfile::tempdir().expect("blake3 bare remote");
+    let remote_path = remote_dir.path();
+    let init_remote = run_libra_command(
+        &["init", "--bare", "--object-format", "blake3"],
+        remote_path,
+    );
+    assert_cli_success(&init_remote, "init blake3 bare remote");
+
+    let local = super::create_committed_repo_with_format("blake3");
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", remote_path.to_str().unwrap()],
+            local.path(),
+        ),
+        "add blake3 bare origin",
+    );
+    let out = run_libra_command(&["push", "origin", "main"], local.path());
+    assert_cli_success(&out, "blake3 push round-trip");
+    let ls = run_libra_command(&["ls-remote", remote_path.to_str().unwrap()], local.path());
+    assert_cli_success(&ls, "ls-remote after blake3 push");
+    assert!(
+        String::from_utf8_lossy(&ls.stdout).contains("refs/heads/main"),
+        "blake3 push must update remote main: {}",
+        String::from_utf8_lossy(&ls.stdout)
     );
 }

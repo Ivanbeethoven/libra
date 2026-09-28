@@ -24,11 +24,16 @@ libra bundle unbundle <file>
 - `verify` validates the v2 header, local prerequisites, pack version, and the
   complete pack checksum.
 - `list-heads` prints the advertised `<oid> <ref>` lines without importing.
-- `unbundle` validates prerequisites and checksum, builds the correct SHA-1 or
-  SHA-256 pack index, and installs the pack/index pair in the object store. It
-  prints the advertised heads but deliberately does **not** update refs, matching
+- `unbundle` validates prerequisites and checksum, builds the correct pack index
+  for the repository hash kind (SHA-1 → idx v1; SHA-256 and blake3 → idx v2), and
+  installs the pack/index pair in the object store. Cross-kind bundles fail closed
+  (checksum / OID width) with no residual pack or index writes. It prints the
+  advertised heads but deliberately does **not** update refs, matching
   `git bundle unbundle`. Repeated imports verify the installed pair before
   reporting success.
+- blake3 repositories are fully supported on this path: `create`/`verify`/
+  `list-heads`/`unbundle` use BLAKE3 pack trailers and idx v2. System Git cannot
+  consume blake3 bundles.
 
 Bundle input, collected raw object data, and final output are each capped at
 1 GiB. This also bounds memory before pack compression, so a highly compressible

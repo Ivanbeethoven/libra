@@ -6,9 +6,9 @@
 
 ## 对比 Git 与兼容性
 
-- 兼容级别：`partial`。`add`/`remove`/`rename`/`-v`/`show`/`get-url`/`set-url`/`prune` 加上 `set-branches [--add]`（重写 `remote.<name>.fetch`）、`set-head <branch>`/`-d`/`--delete`/`--auto`（写入/删除 `refs/remotes/<name>/HEAD`；`--auto` 向远端查询 HEAD）与详细 `remote show <name>` 已支持。`remote show <name>` 默认**在线**：通过 `fetch::discover_remote_with_name` 拉取远端 HEAD/ref，把分支分类为 `tracked`/`new`/`stale`，`queried = true`；`--no-query` 走离线缓存路径（状态 `cached`，`queried = false`）。`remote update [<group>|<remote>...]` 已支持：无参数时先读取 `remotes.default`，其中的 remote 或 `remotes.<group>` 均经统一 group resolver 展开；只有该键为空时才 fetch 所有配置远端。显式名称同样可命中 `remotes.<group>` 并展开为成员。`remote add -f`/`--fetch` 已支持；`remote update -p`/`--prune` 采用先 fetch 全部 resolved 远端、全部成功后再按有效 fetch destination 映射 prune 的两段式，因此失败不会遗留已删除 ref。`remote add` 的冷配置标志 `-t <branch>`（可重复，按 `+refs/heads/<branch>:refs/remotes/<name>/<branch>` 写入逐分支 fetch refspec）、`-m <branch>`（无条件写入 `refs/remotes/<name>/HEAD`）、`--tags`/`--no-tags`（互斥，写入 `remote.<name>.tagOpt`）与信息性 `add --mirror` 标记均已支持；镜像不写 `+refs/*:refs/*` refspec（fetch 尚不感知镜像）。
+- 兼容级别：`partial`。`add`/`remove`/`rename`/`-v`/`show`/`get-url`/`set-url`/`prune` 加上 `set-branches [--add]`（重写 `remote.<name>.fetch`）、`set-head <branch>`/`-d`/`--delete`/`--auto`（写入/删除 `refs/remotes/<name>/HEAD`；`--auto` 向远端查询 HEAD）与详细 `remote show <name>` 已支持。`remote show <name>` 默认**在线**：通过 `fetch::discover_remote_with_name` 拉取远端 HEAD/ref，把分支分类为 `tracked`/`new`/`stale`，`queried = true`；`--no-query` 走离线缓存路径（状态 `cached`，`queried = false`）。`remote update [<group>|<remote>...]` 已支持：无参数时先读取 `remotes.default`，其中的 remote 或 `remotes.<group>` 均经统一 group resolver 展开；只有该键为空时才 fetch 所有配置远端。显式名称同样可命中 `remotes.<group>` 并展开为成员。`remote add -f`/`--fetch` 已支持；`remote update -p`/`--prune` 采用先 fetch 全部 resolved 远端、全部成功后再按有效 fetch destination 映射 prune 的两段式，因此失败不会遗留已删除 ref。`remote add` 的冷配置标志 `-t <branch>`（可重复，按 `+refs/heads/<branch>:refs/remotes/<name>/<branch>` 写入逐分支 fetch refspec）、`-m <branch>`（无条件写入 `refs/remotes/<name>/HEAD`）、`--tags`/`--no-tags`（互斥，写入 `remote.<name>.tagOpt`）与信息性 `add --mirror[=fetch|push]`（裸 `--mirror`/`--mirror=fetch` 写 `+refs/*:refs/*` fetch refspec，`--mirror=push` 只写 `remote.<name>.mirror=true`；裸形式还写 `mirror=true` 并输出 Git 弃用警告，`-m` 与任何镜像、`-t` 与 push 镜像互斥（exit 128），未知模式为 129）均已支持；不带 `-t` 时 `remote add` 写默认 `+refs/heads/*:refs/remotes/<name>/*`（Git parity）。
 
-- P1-06 refspec 精确性：`set-branches` / `remote add -t` 写入的 `remote.<name>.fetch` 已由 `fetch` / `remote update` / `remote prune` 消费（prune 按映射后的 destination 判断存活）；`remote update` 无参数时先解析 `remotes.default`，未配置再枚举全部远程；`remote rename` 在单事务内迁移 config（含大小写不敏感的 fetch 变量目标）、branch upstream、SSH namespace、tracking refs、remote HEAD 与 tracking reflog，remote/SSH subsection 按完整远程名精确匹配，目标 namespace 冲突时完整回滚。
+- P1-06 refspec 精确性：`set-branches` / `remote add -t` 写入的 `remote.<name>.fetch` 已由 `fetch` / `remote update` / `remote prune` 消费（prune 按映射后的 destination 判断存活）；`remote update` 无参数时先解析 `remotes.default`，未配置再枚举全部远程；`remote rename` 在单事务内迁移 config（含大小写不敏感的 fetch 变量目标）、branch upstream（`*.remote` 与 `*.pushRemote`）、仓库级 `remote.pushDefault`、SSH namespace、tracking refs、remote HEAD 与 tracking reflog，remote/SSH subsection 按完整远程名精确匹配，目标 namespace 冲突时完整回滚；全局/系统级 `remote.pushDefault` 指向旧名时不变并输出 Git 同义警告。
 - 当前矩阵承诺常用 Git 行为已支持；新增语义必须同步矩阵、用户文档和测试。
 
 
@@ -51,8 +51,8 @@ flowchart TD
 - 用户文档：`docs/commands/remote.md`。
 - Synopsis：`libra remote <subcommand> [OPTIONS] [ARGS]`。
 - `remote update` 无参数时优先使用非空 `remotes.default`，否则更新全部配置远程；联网前先校验整批远程存在性与 `remote.<name>.fetch` 语法。
-- `remote rename` 把配置与 `refs/remotes/<old>/*`、remote HEAD、对应 reflog 一起事务迁移到新 namespace，不再只改配置名。
-- 公开参数/子命令包括：`add [-f/--fetch] [-t/--track <branch>]... [-m/--master <branch>] [--tags|--no-tags] [--mirror] <name> <url>`、`remove <name>`、`rename <old> <new>`、`-v`（verbose 列表）、`show [-n/--no-query] [-v/--verbose] [<name>]`、`get-url [--push] [--all] <name>`、`set-url [--add] [--delete] [--push] [--all] <name> <value>`、`prune [--dry-run] <name>`、`update [-p/--prune] [<group>|<remote>...]`、`set-branches [--add] <name> <branch>...`、`set-head [-a/--auto] [-d/--delete] <name> [<branch>]`。
+- `remote rename` 把配置（含 fetch refspec 目标、`branch.*.remote`/`branch.*.pushRemote`、仓库级 `remote.pushDefault`）与 `refs/remotes/<old>/*`、remote HEAD、对应 reflog 一起事务迁移到新 namespace；全局/系统级 `remote.pushDefault` 指向旧名时保持不变并输出警告（与 Git 一致）。
+- 公开参数/子命令包括：`add [-f/--fetch] [-t/--track <branch>]... [-m/--master <branch>] [--tags|--no-tags] [--mirror[=fetch|push]] <name> <url>`、`remove <name>`、`rename <old> <new>`、`-v`（verbose 列表）、`show [-n/--no-query] [-v/--verbose] [<name>]`、`get-url [--push] [--all] <name>`、`set-url [--add] [--delete] [--push] [--all] <name> <value>`、`prune [--dry-run] <name>`、`update [-p/--prune] [<group>|<remote>...]`、`set-branches [--add] <name> <branch>...`、`set-head [-a/--auto] [-d/--delete] <name> [<branch>]`。
 
 
 ## 还未实现的功能
@@ -61,10 +61,28 @@ flowchart TD
 |---|---|---|
 | ✅ 已实现 | `remote update [<group>\|<remote>...]`（批量 fetch） | `RemoteCmds::Update`/`RemoteOutput::Update` 已加；`resolve_update_remotes` 解析（无参=全部远端；命中 `remotes.<group>` 展开为组成员，否则按远端名），逐个调用 `fetch::fetch_repository_safe`。带集成测试（`remote_update_resolves_and_fetches_configured_remotes`）。 |
 | ✅ 已实现 | `remote update -p` / `--prune`（fetch 后顺带 prune 陈旧 tracking ref） | `RemoteCmds::Update` 加 `-p/--prune`；先 fetch 全部 resolved 远端、全部成功后再逐个复用 `run_prune_remote`，把 stale 分支汇总到 `RemoteOutput::Update.pruned`（`#[serde(default, skip_serializing_if = "Vec::is_empty")]`，保持无 `-p` 时 `{action, remotes}` JSON 形状不变）。fetch 全部成功后才进入 prune 阶段（两段式），避免某个远端 fetch 失败时把已删除的 ref 丢失在错误路径里。带集成测试：`remote_update_prune_flag_is_wired`（解析+无远端通知+不可达 fetch 失败）与 `remote_update_prune_removes_stale_tracking_branches`（真实本地远端端到端修剪 stale 跟踪 ref）。 |
-| ✅ 已实现 | `remote add` 冷配置标志 `-t/--track <branch>`（可重复）、`-m/--master <branch>`、`--tags`/`--no-tags` | `RemoteCmds::Add` 加四个字段，`run_add_remote` 收进 `AddRemoteArgs`：`-t` 每分支写一条 `+refs/heads/<branch>:refs/remotes/<name>/<branch>`（`ConfigKv::add`，与 `set-branches` 同格式，取代默认通配 refspec）；`--tags`/`--no-tags`（clap `conflicts_with`，互斥→129）写 `remote.<name>.tagOpt`；`-m` 在事务中 `Head::update_result_with_conn(Head::Branch, Some(name))` **无条件**写 `refs/remotes/<name>/HEAD` 的 `Head` 行（add 时跟踪 ref 尚不存在，与 Git `remote add -m` 一致；区别于 `set-head` 的存在性校验）。已与 git 差分验证 fetch refspec 与 tagOpt。带集成测试（`test_remote_add_cold_config_flags`，含 -t/--tags/-m 写入断言、--no-tags、--tags/--no-tags 冲突 129）。`add --mirror`（clap `conflicts_with = "track"`）写信息性 `remote.<name>.mirror=true` 标记、不写 `+refs/*:refs/*` refspec（与 `clone --mirror` 一致，fetch 尚不感知镜像），带集成测试 `test_remote_add_mirror_writes_marker_and_conflicts_with_track`。 |
+| ✅ 已实现 | `remote add` 冷配置标志 `-t/--track <branch>`（可重复）、`-m/--master <branch>`、`--tags`/`--no-tags`、`--mirror[=fetch|push]` 与默认 fetch refspec | `RemoteCmds::Add` 加对应字段，`run_add_remote` 收进 `AddRemoteArgs`：`-t` 每分支写一条 `+refs/heads/<branch>:refs/remotes/<name>/<branch>`（`ConfigKv::add`，与 `set-branches` 同格式，取代默认通配 refspec）；不带 `-t` 时写默认 `+refs/heads/*:refs/remotes/<name>/*`（Git parity）；`--tags`/`--no-tags`（clap `conflicts_with`，互斥→129）写 `remote.<name>.tagOpt`；`-m` 在事务中 `Head::update_result_with_conn(Head::Branch, Some(name))` **无条件**写 `refs/remotes/<name>/HEAD` 的 `Head` 行（add 时跟踪 ref 尚不存在，与 Git `remote add -m` 一致；区别于 `set-head` 的存在性校验）。`--mirror[=fetch|push]` 用 `Option<Option<RemoteMirrorMode>>` 表达裸/显式模式：裸与 fetch 写 `+refs/*:refs/*`，push 只写 `mirror=true`，裸形式额外写标志并 `emit_warning` 输出 Git 弃用警告，`-m` 与任意镜像、`-t` 与 push 镜像返回 128，未知模式为 clap 129。已与 git 2.55 差分验证 fetch refspec、镜像模式与组合错误退出码。带集成测试（`test_remote_add_default_refspec_and_mirror_matrix`、`test_remote_add_mirror_fetch_track_allowed`）。 |
+| ✅ 已实现 | `remote rename` 改写 `branch.*.pushRemote` 与仓库级 `remote.pushDefault`，并对全局级 `pushDefault` 告警 | `ConfigKv::rename_remote_with_conn` 在分支循环中同时改写 `branch.<b>.remote` 与 `branch.<b>.pushRemote`（大小写不敏感后缀匹配），并新增仓库级 `remote.pushDefault` 改写（仅当值等于旧名）；`run_rename_remote` 在事务前捕获本地 `pushDefault` 是否指向旧名，事务后若未被本地覆盖且全局/系统级 `pushDefault` 指向旧名，则 `emit_warning` 输出 Git 同义警告并保持全局值不变。`--mirror=fetch -t` 等组合限制、默认 refspec 与 `pushDefault`/`pushRemote` 改写均与 git 2.55 差分验证。带集成测试（`test_remote_rename_push_targets_matrix`、`test_remote_rename_global_push_default_warns_and_is_unchanged`）。 |
 
 ## 维护要求
 
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+## Issue #577 SSH 公钥拒绝诊断
+
+在线 `show`、`update`、`prune`、`set-head --auto` 与 `add -f` 保留 fetch discovery
+的带类型 SSH 公钥拒绝并映射 `LBR-AUTH-002`（exit 128）。分类要求首标头零字节
+EOF、直接退出码255、无 stdout 与完整方法列表中的精确 `publickey`；host-key
+优先，坏帧保留原代码。固定消息/hint 不输出原 stderr，并链接 SSH 设置指南。
+`add -f` 失败沿用既有状态转移，保留 fetch 前已登记的 remote。stderr 可被伪造，
+因此错误码不证明拒绝访问的具体原因。
+迁移窗口从 v0.24.1 发布起至少30天且至少跨过下一次 patch 发布（两者取较晚）；窗口内
+自动化应接受 `LBR-AUTH-002`，并兼容各入口的旧代码：在线 `show` 与
+`set-head --auto` 为 `LBR-NET-001`，`update`、`prune` 与 `add -f` 为 `LBR-NET-002`。
+
+
+## B3-07 capability-first wire kind
+
+See the user-facing command page for capability-first discovery, `object-format=blake3` negotiation, and mismatch stable codes. Named tests: `parse_discovery_does_not_infer_sha256_from_64_hex`, `blake3_*_round_trip`, `protocol_object_format_mismatch_error_contract`.

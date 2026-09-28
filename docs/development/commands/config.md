@@ -4,6 +4,11 @@
 
 `libra config` 的目标是读取和修改 Libra 配置，覆盖 local/global/system 作用域、多值项、section、类型化输出和机器可读格式。实现需要尊重 SQLite/Vault 存储边界，避免把配置安全性降级为可任意文本编辑，并把 Git 文本配置中的编辑、includeIf 等差异列为兼容缺口（`-z`/`--null` 输出已实现）。
 
+
+## `core.objectformat` 本地写禁门（B3-11）
+
+本地 scope 的 `config` 变更动词不得再改写 `core.objectformat`（ADR-B3-01）：`set`、裸 positional、`--add`、`--unset`、`--unset-all`、`--remove-section core`、涉及 `core` 的 `--rename-section`，以及导入内容含该键（变量名大小写不敏感）的 `import`，一律 `LBR-CLI-002` 拒绝；`import` 为原子拒绝。算法仅能在 `init`/`reinit` 时选定。global/system 上的同名键不被仓库命令消费，本门不改其行为。拦截层在 `src/command/config.rs`（`ScopedConfig` + section/import 路径），**不**在 `ConfigKv`（避免阻断 init）。
+
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。vault-backed local/global config 已支持；section 操作 `--remove-section <name>` / `--rename-section <old> <new>`（事务化，采用 Git 的 section/subsection 身份而非裸前缀——`--remove-section branch` 删除 `branch.<key>` 但不动 `branch.feature.*` 子节）已支持；`-z`/`--null` NUL 分隔输出（get/get-all 输出 `value\0`，`--get-regexp`/`--list` 输出 `key\nvalue\0`，`--name-only` 输出 `key\0`，`--show-origin` 前缀 `origin\0`）已支持；读取与设置时的类型规范化 `--type=<bool|int|path>` 及 `--bool`/`--int`/`--path` 快捷方式（bool 变体→true/false、int 的 k/m/g 1024 倍率、path 的 `~`/`~/` 展开；set 时在存储前校验+规范化，非法值报错不写入）已支持；`--system` 作用域（`/etc/libra/config.db`，可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖，级联优先级最低；vault 加密密钥与 `import` 在该作用域被拒绝）已支持；editor round-trip 和 includeIf 尚未完整支持。global 作用域路径为 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（各平台一致，含 macOS；本仓库 2026-09-19 GCX-01），legacy `<home>/.libra/config.db` 在被迁移前仍是活动回退（`migration_pending`），第一条真正读写 global 配置的命令会以「目录锁 + 只读 `VACUUM INTO` 快照 + `integrity_check`/receipt/行数校验 + 同目录 `rename`」把它一次性复制到新路径（GCX-02），legacy 文件原样保留为降级备份、失败时读回退并告警、写 fail-closed（`LBR-IO-002`）；`LIBRA_CONFIG_GLOBAL_DB` 仍是逐字覆写并禁用迁移；全域 vault unseal key 同域迁移到 `<config dir>/libra/vault-unseal-key`（0600/0700，复制不轮换，两份内容不同时 fail-closed），per-repo `~/.libra/vault-keys/<repo-id>` 与 `~/.libra/tmp` 位置不变（GCX-03）；`config path --json` / `doctor --global-schema` 的 `path_source` 取 `LIBRA_CONFIG_GLOBAL_DB`/`xdg`/`home`/`legacy`，并新增 `legacy_path`/`legacy_exists`/`migration_pending` 字段。

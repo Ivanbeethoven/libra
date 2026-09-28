@@ -811,7 +811,6 @@ pub async fn execute_safe(args: ArchiveArgs, _output: &OutputConfig) -> CliResul
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
 
     use git_internal::internal::object::tree::TreeItem;
     use serial_test::serial;
@@ -931,8 +930,10 @@ mod tests {
 
     #[test]
     fn collect_tree_entries_keeps_blob_metadata() {
-        let hash =
-            ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").expect("valid hash");
+        let hash = crate::internal::object_format::parse_repo_oid(
+            "8ab686eafeb1f44702738c8b0f24f2567c36da6d",
+        )
+        .expect("valid hash");
         let tree = Tree::from_tree_items(vec![
             TreeItem::new(TreeItemMode::Blob, hash, "README.md".to_string()),
             TreeItem::new(TreeItemMode::BlobExecutable, hash, "script.sh".to_string()),
@@ -955,8 +956,10 @@ mod tests {
 
     #[test]
     fn collect_tree_entries_skips_gitlinks() {
-        let hash =
-            ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").expect("valid hash");
+        let hash = crate::internal::object_format::parse_repo_oid(
+            "8ab686eafeb1f44702738c8b0f24f2567c36da6d",
+        )
+        .expect("valid hash");
         let tree = Tree::from_tree_items(vec![
             TreeItem::new(TreeItemMode::Commit, hash, "submodule".to_string()),
             TreeItem::new(TreeItemMode::Blob, hash, "README.md".to_string()),
@@ -979,8 +982,10 @@ mod tests {
             .block_on(setup_with_new_libra_in(repo.path()));
         let _cwd = ChangeDirGuard::new(repo.path());
 
-        let hash =
-            ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").expect("valid hash");
+        let hash = crate::internal::object_format::parse_repo_oid(
+            "8ab686eafeb1f44702738c8b0f24f2567c36da6d",
+        )
+        .expect("valid hash");
         let entries = vec![
             ArchiveEntry {
                 path: PathBuf::from("README.md"),
@@ -1017,8 +1022,10 @@ mod tests {
             .block_on(setup_with_new_libra_in(repo.path()));
         let _cwd = ChangeDirGuard::new(repo.path());
 
-        let hash =
-            ObjectHash::from_str("8ab686eafeb1f44702738c8b0f24f2567c36da6d").expect("valid hash");
+        let hash = crate::internal::object_format::parse_repo_oid(
+            "8ab686eafeb1f44702738c8b0f24f2567c36da6d",
+        )
+        .expect("valid hash");
         let entry = |path: &str| ArchiveEntry {
             path: PathBuf::from(path),
             source: ArchiveSource::Blob(hash),

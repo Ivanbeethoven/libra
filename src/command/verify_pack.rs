@@ -3,11 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use git_internal::hash::set_hash_kind;
+use git_internal::hash::{HashKind, get_hash_kind, set_hash_kind};
 
 use super::{
     verify_pack_decode::{decode_pack, validate_index_against_pack},
-    verify_pack_index::{infer_idx_v2_hash_kind, parse_index},
+    verify_pack_index::{idx_v2_matches_hash_kind, parse_index},
     verify_pack_render::{
         VerifyPackRenderMode, build_object_outputs, build_stats, render_verify_pack_batch_output,
         render_verify_pack_output,
@@ -20,6 +20,7 @@ use super::{
 use crate::utils::{
     error::{CliError, CliResult, StableErrorCode},
     output::OutputConfig,
+    util,
 };
 
 const VERIFY_PACK_EXAMPLES: &str = "\
@@ -29,6 +30,7 @@ EXAMPLES:
     libra verify-pack --pack pack.pack pack.idx                      Verify with an explicit pack path
     libra verify-pack -v pack-abc123.idx                             Print every indexed object hash and offset
     libra verify-pack -s pack-abc123.idx                             Print only pack statistics
+    libra verify-pack --hash-kind sha256 pack.idx                    Outside a repo, declare the index hash kind
     libra verify-pack pack-abc123.idx --json                         Structured JSON output for agents";
 
 #[derive(Parser, Debug)]
@@ -52,6 +54,12 @@ pub struct VerifyPackArgs {
     /// Show pack statistics only
     #[arg(short = 's', long = "stat-only", conflicts_with = "verbose")]
     pub stat_only: bool,
+
+    /// Object-format / hash kind used to parse the index (`sha1`, `sha256`, or
+    /// `blake3`). Required outside a repository; inside a repository the
+    /// stored `core.objectformat` is used and this flag must match when set.
+    #[arg(long = "hash-kind", value_name = "KIND")]
+    pub hash_kind: Option<String>,
 }
 
 pub async fn execute(args: VerifyPackArgs) -> Result<(), String> {
@@ -83,11 +91,14 @@ pub async fn execute_safe(args: VerifyPackArgs, output: &OutputConfig) -> CliRes
         );
     }
 
+    let hash_kind = resolve_verify_pack_hash_kind(args.hash_kind.as_deref())?;
+    set_hash_kind(hash_kind);
+
     let mode = render_mode(&args);
     let results = args
         .idx_files
         .iter()
-        .map(|idx_file| verify_pack(&args, idx_file))
+        .map(|idx_file| verify_pack(&args, idx_file, hash_kind))
         .collect::<CliResult<Vec<_>>>()?;
 
     if let [result] = results.as_slice() {
@@ -97,18 +108,58 @@ pub async fn execute_safe(args: VerifyPackArgs, output: &OutputConfig) -> CliRes
     }
 }
 
-fn verify_pack(args: &VerifyPackArgs, idx_file: &Path) -> CliResult<VerifyPackOutput> {
+fn resolve_verify_pack_hash_kind(explicit: Option<&str>) -> CliResult<HashKind> {
+    let in_repo = util::try_get_storage_path(None).is_ok();
+    let parsed_explicit = explicit
+        .map(|value| {
+            crate::internal::object_format::parse_config_value(value).map_err(|_| {
+                CliError::fatal(format!(
+                    "unsupported --hash-kind '{value}'; expected sha1, sha256, or blake3"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+            })
+        })
+        .transpose()?;
+
+    match (in_repo, parsed_explicit) {
+        (true, Some(kind)) => {
+            let repo_kind = get_hash_kind();
+            if kind != repo_kind {
+                return Err(CliError::fatal(format!(
+                    "--hash-kind {} does not match repository object format {}",
+                    kind.as_str(),
+                    repo_kind.as_str()
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+            Ok(repo_kind)
+        }
+        (true, None) => Ok(get_hash_kind()),
+        (false, Some(kind)) => Ok(kind),
+        (false, None) => Err(CliError::fatal(
+            "verify-pack outside a repository requires --hash-kind <sha1|sha256|blake3>; \
+             run inside a Libra repository to use core.objectformat"
+                .to_string(),
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments)),
+    }
+}
+
+fn verify_pack(
+    args: &VerifyPackArgs,
+    idx_file: &Path,
+    hash_kind: HashKind,
+) -> CliResult<VerifyPackOutput> {
     let pack_file = args
         .pack
         .clone()
         .unwrap_or_else(|| idx_file.with_extension("pack"));
 
     let idx_bytes = read_file(idx_file, "pack index")?;
-    if let Some(hash_kind) =
-        infer_idx_v2_hash_kind(&idx_bytes).map_err(|detail| invalid_index(idx_file, detail))?
-    {
-        set_hash_kind(hash_kind);
-    }
+    // Fail closed when a v2 index's tables/trailer do not match the resolved kind
+    // (sha256 vs blake3 share OID width, so guessing is forbidden).
+    idx_v2_matches_hash_kind(&idx_bytes, hash_kind)
+        .map_err(|detail| invalid_index(idx_file, detail))?;
     let parsed = parse_index(&idx_bytes).map_err(|detail| invalid_index(idx_file, detail))?;
     let decoded = decode_pack(&pack_file)?;
     validate_index_against_pack(&parsed, &decoded)

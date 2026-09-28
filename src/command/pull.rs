@@ -12,6 +12,7 @@ use crate::{
     internal::{
         config::{ConfigKv, LocalIdentityTarget, RemoteConfig, read_cascaded_config_value_strict},
         head::Head,
+        protocol::repository_arg,
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
@@ -93,6 +94,11 @@ pub struct PullArgs {
     /// Complete the merge by committing, overriding an earlier --no-commit (last one wins).
     #[clap(long, conflicts_with_all = ["rebase", "squash"], overrides_with = "no_commit")]
     commit: bool,
+
+    /// Allow merging histories that have no common ancestor, matching Git's
+    /// `pull --allow-unrelated-histories` (forwarded to the merge phase).
+    #[clap(long = "allow-unrelated-histories")]
+    allow_unrelated_histories: bool,
 
     /// Stash local (tracked) changes before integrating and re-apply them
     /// afterwards, so `pull` works on a dirty working tree.
@@ -207,6 +213,7 @@ pub(crate) enum PullError {
         "cannot pull: branch '{branch}' tracks a local upstream; \
          network commands do not operate on local upstreams (issues/480 HP-16)"
     )]
+    #[allow(dead_code)]
     LocalUpstream { branch: String },
 
     #[error("pull failed during fetch phase: {0}")]
@@ -337,6 +344,7 @@ impl PullArgs {
             autostash: false,
             no_progress: false,
             notes: false,
+            allow_unrelated_histories: false,
         }
     }
 }
@@ -411,7 +419,10 @@ pub(crate) async fn run_pull(
     let fetch_result = fetch::fetch_repository_with_result(
         target.remote_config.clone(),
         Some(target.remote_branch.clone()),
-        false,
+        // `pull` integrates exactly the requested branch; a single-branch fetch
+        // errors with git-parity `couldn't find remote ref` when it is absent
+        // instead of silently fetching all refs (issues/480 HP-11).
+        true,
         args.depth,
         false,
         // `git pull` auto-follows tags (and honours remote.<name>.tagOpt).
@@ -419,8 +430,14 @@ pub(crate) async fn run_pull(
         false,
         // `pull` does not prune; use `fetch --prune` or `remote prune`.
         false,
+        // `pull` does not prune tags either.
+        false,
         args.notes,
         &child_output,
+        false,
+        None,
+        &[],
+        false,
     )
     .await
     .map_err(PullError::Fetch)?;
@@ -502,12 +519,12 @@ pub(crate) async fn run_pull(
                 ff_only: effective.ff_only,
                 no_ff: effective.no_ff,
                 // `pull` does not expose merge strategies, strategy options,
-                // or unrelated-history override controls.
+                // or whitespace controls; unrelated-history override is exposed.
                 strategy: None,
                 favor: None,
                 whitespace: None,
                 renormalize: None,
-                allow_unrelated_histories: false,
+                allow_unrelated_histories: args.allow_unrelated_histories,
                 message: None,
                 into_name: None,
                 cleanup: None,
@@ -694,28 +711,25 @@ async fn resolve_pull_target(
     match (&args.repository, &args.refspec) {
         (Some(remote), Some(refspec)) => {
             let remote_branch = normalize_remote_branch_name(refspec);
-            let remote_config = ConfigKv::remote_config(remote)
-                .await
-                .ok()
-                .flatten()
-                .ok_or_else(|| PullError::RemoteNotFound(remote.clone()))?;
+            let (remote_config, _is_anonymous) = resolve_remote_config(remote).await?;
+            // Anonymous pulls still write a tracking ref under the sanitized
+            // single-component name; the plan's FETCH_HEAD semantic is equivalent
+            // to merging that ref (issues/480 HP-06).
+            let merge_target = format!("refs/remotes/{}/{remote_branch}", remote_config.name);
             Ok(ResolvedPullTarget {
                 branch,
                 upstream: format!("{remote}/{remote_branch}"),
-                merge_target: format!("refs/remotes/{remote}/{remote_branch}"),
+                merge_target,
                 remote_branch,
                 remote_config,
             })
         }
         (Some(remote), None) => {
-            let remote_config = ConfigKv::remote_config(remote)
-                .await
-                .ok()
-                .flatten()
-                .ok_or_else(|| PullError::RemoteNotFound(remote.clone()))?;
+            let (remote_config, _is_anonymous) = resolve_remote_config(remote).await?;
+            let merge_target = format!("refs/remotes/{}/{branch}", remote_config.name);
             Ok(ResolvedPullTarget {
                 upstream: format!("{remote}/{branch}"),
-                merge_target: format!("refs/remotes/{remote}/{branch}"),
+                merge_target,
                 remote_branch: branch.clone(),
                 branch,
                 remote_config,
@@ -726,8 +740,21 @@ async fn resolve_pull_target(
                 return Err(no_tracking_error(&branch, rebase).await);
             };
             if branch_config.remote == "." {
-                return Err(PullError::LocalUpstream {
-                    branch: branch.clone(),
+                // Local upstream (issues/480 HP-16): merge or rebase the local
+                // branch pointed to by `branch.<b>.merge` directly, without a
+                // network fetch.
+                let merge_short = branch_config
+                    .merge
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&branch_config.merge)
+                    .to_string();
+                let (remote_config, _) = resolve_remote_config(".").await?;
+                return Ok(ResolvedPullTarget {
+                    branch,
+                    upstream: format!("./{merge_short}"),
+                    merge_target: format!("refs/heads/{merge_short}"),
+                    remote_branch: merge_short.clone(),
+                    remote_config,
                 });
             }
             let remote_config = ConfigKv::remote_config(&branch_config.remote)
@@ -748,6 +775,27 @@ async fn resolve_pull_target(
         }
         (None, Some(_)) => unreachable!("clap requires repository when refspec is provided"),
     }
+}
+
+/// Resolve a pull repository argument to a remote config. A configured remote
+/// wins; otherwise an anonymous local-path / URL spec yields a synthetic
+/// `RemoteConfig` (with a refname-safe single-component name), which makes the
+/// pull merge `FETCH_HEAD` instead of a tracking ref (issues/480 HP-06).
+async fn resolve_remote_config(remote: &str) -> Result<(RemoteConfig, bool), PullError> {
+    if let Some(cfg) = ConfigKv::remote_config(remote).await.ok().flatten() {
+        return Ok((cfg, false));
+    }
+    if repository_arg::is_anonymous_repository_spec(remote) {
+        let name = repository_arg::anonymous_remote_name(remote);
+        return Ok((
+            RemoteConfig {
+                name,
+                url: remote.to_string(),
+            },
+            true,
+        ));
+    }
+    Err(PullError::RemoteNotFound(remote.to_string()))
 }
 
 async fn no_tracking_error(branch: &str, rebase: bool) -> PullError {
@@ -1011,8 +1059,17 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         fetch::FetchError::ConfigRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
-        fetch::FetchError::ObjectFormatMismatch { .. } => {
-            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
+        fetch::FetchError::ObjectFormatMismatch { remote, local } => {
+            let mut err = CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid);
+            if matches!(local, git_internal::hash::HashKind::Blake3)
+                || matches!(remote, git_internal::hash::HashKind::Blake3)
+            {
+                err = err.with_hint(
+                    "BLAKE3 object format is a Libra extension; standard Git does not support blake3",
+                );
+            }
+            err
         }
         fetch::FetchError::IncompletePack { .. } => CliError::fatal(error.to_string())
             .with_stable_code(StableErrorCode::NetworkProtocol)
@@ -1042,6 +1099,8 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         fetch::FetchError::LocalState { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
         }
+        fetch::FetchError::UnsupportedLocalGitSha256 => fetch::map_unsupported_local_git_sha256(),
+        fetch::FetchError::GitSourceConfig(error) => fetch::map_git_source_config_error(error),
     }
 }
 
@@ -1054,6 +1113,20 @@ fn map_fetch_discovery_error(message: String, source: &GitError) -> CliError {
             CliError::fatal(message)
                 .with_stable_code(StableErrorCode::NetworkProtocol)
                 .with_hint("check that the remote serves Git data and that a proxy has not altered the response")
+        }
+        GitError::IOError(error)
+            if crate::internal::protocol::ssh_client::is_ssh_public_key_authentication_failed(error) =>
+        {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::AuthPermissionDenied)
+                .with_hint(crate::internal::protocol::ssh_client::SSH_PUBLIC_KEY_AUTHENTICATION_HINT)
+        }
+        GitError::IOError(error)
+            if let Some(config_error) = error.get_ref().and_then(|inner| {
+                inner.downcast_ref::<crate::internal::protocol::local_client::GitSourceConfigError>()
+            }) =>
+        {
+            fetch::map_git_source_config_error(config_error)
         }
         GitError::IOError(error) if fetch::is_pkt_line_io_error(error) => {
             CliError::fatal(message)
@@ -1107,7 +1180,11 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoCorrupt)
         }
         merge::PullMergeError::UnrelatedHistories => {
-            CliError::failure(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
+            CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint(
+                    "pass --allow-unrelated-histories to pull if the histories should be joined",
+                )
         }
         merge::PullMergeError::VirtualAncestorTooDeep
         | merge::PullMergeError::VirtualAncestorTooWide { .. } => CliError::failure(error.to_string())

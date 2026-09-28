@@ -1,6 +1,6 @@
 //! HEAD management backed by the database, supporting local and remote heads, detached states, and transaction-safe query/update helpers.
 
-use std::{str::FromStr, time::Duration};
+use std::time::Duration;
 
 use git_internal::hash::{HashKind, ObjectHash};
 use sea_orm::{
@@ -68,21 +68,39 @@ fn parse_ref_commit_for_kind(
     what: &str,
     repo_kind: HashKind,
 ) -> Result<ObjectHash, BranchStoreError> {
-    let commit = ObjectHash::from_str(raw).map_err(|error| BranchStoreError::Corrupt {
-        name: ref_name.to_string(),
-        detail: format!("invalid {what}: {error}"),
-    })?;
-    if commit.kind() != repo_kind {
-        return Err(BranchStoreError::Corrupt {
-            name: ref_name.to_string(),
-            detail: format!(
-                "{what} is {:?} but this repository uses {:?}",
-                commit.kind(),
-                repo_kind
-            ),
-        });
+    // Parse under the repository's explicit kind. Wrong-length hex is then
+    // re-parsed under the legacy length→kind map (40→sha1, 64→sha256) solely
+    // so the diagnostic can say "is X but this repository uses Y" — matching
+    // the pre-B3-08 FromStr contract without calling the banned production
+    // FromStr path (blake3 is never inferred from length).
+    match crate::internal::object_format::parse_hex_for_kind(repo_kind, raw) {
+        Ok(commit) => Ok(commit),
+        Err(primary) => {
+            let inferred = match raw.len() {
+                40 => crate::internal::object_format::parse_hex_for_kind(HashKind::Sha1, raw).ok(),
+                64 => {
+                    crate::internal::object_format::parse_hex_for_kind(HashKind::Sha256, raw).ok()
+                }
+                _ => None,
+            };
+            if let Some(commit) = inferred
+                && commit.kind() != repo_kind
+            {
+                return Err(BranchStoreError::Corrupt {
+                    name: ref_name.to_string(),
+                    detail: format!(
+                        "{what} is {:?} but this repository uses {:?}",
+                        commit.kind(),
+                        repo_kind
+                    ),
+                });
+            }
+            Err(BranchStoreError::Corrupt {
+                name: ref_name.to_string(),
+                detail: format!("invalid {what}: {primary}"),
+            })
+        }
     }
-    Ok(commit)
 }
 
 fn decode_local_head(
@@ -116,21 +134,18 @@ async fn repository_hash_kind_with_conn<C: ConnectionTrait>(
                 "failed to read core.objectformat for HEAD: {error:#}"
             ))
         })?;
-    // Match CLI preflight exactly; HashKind::from_str also accepts noncanonical uppercase.
-    match entry
+    let value = entry
         .as_ref()
         .map(|entry| entry.value.as_str())
-        .unwrap_or("sha1")
-    {
-        "sha1" => Ok(HashKind::Sha1),
-        "sha256" => Ok(HashKind::Sha256),
-        value => Err(BranchStoreError::Corrupt {
+        .unwrap_or("sha1");
+    crate::internal::object_format::parse_config_value(value).map_err(|_| {
+        BranchStoreError::Corrupt {
             name: "core.objectformat".to_string(),
             detail: format!(
-                "unsupported repository object format '{value}'; expected 'sha1' or 'sha256'"
+                "unsupported repository object format '{value}'; expected 'sha1', 'sha256', or 'blake3'"
             ),
-        }),
-    }
+        }
+    })
 }
 
 impl Head {
@@ -347,8 +362,7 @@ impl Head {
                 detail: format!(
                     "HEAD reference is missing from storage for worktree '{}'; restore this worktree's HEAD reference before retrying",
                     scope.worktree_id().unwrap_or("main")
-                ),
-            })?;
+                )})?;
         let repo_kind = repository_hash_kind_with_conn(db).await?;
         decode_local_head(head, repo_kind)
     }
@@ -873,7 +887,7 @@ mod tests {
     /// Regression for v0.17.238: a remote HEAD row that is detached
     /// (`name = NULL`) but whose stored commit hash is unparseable must
     /// surface as `BranchStoreError::Corrupt`. Before v0.17.238 the lossy
-    /// `remote_current_with_conn` would panic via `ObjectHash::from_str(...).unwrap()`.
+    /// `remote_current_with_conn` would panic via `crate::internal::object_format::parse_repo_oid(...).unwrap()`.
     /// The error message names the canonical refspec
     /// (`refs/remotes/<remote>/HEAD`) so operators can locate the bad row.
     #[tokio::test]
@@ -1070,8 +1084,10 @@ mod tests {
         )
         .await
         .expect("target may retain its own branch");
-        let target_oid = ObjectHash::from_str(&"1".repeat(40)).expect("target oid");
-        let main_oid = ObjectHash::from_str(&"2".repeat(40)).expect("main oid");
+        let target_oid =
+            crate::internal::object_format::parse_repo_oid(&"1".repeat(40)).expect("target oid");
+        let main_oid =
+            crate::internal::object_format::parse_repo_oid(&"2".repeat(40)).expect("main oid");
         Head::update_for_scope_result_with_conn(&db, Head::Detached(target_oid), None, &target)
             .await
             .expect("update only target HEAD");
