@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.27.3] — 2026-09-28
+## [0.29.1] — 2026-09-28
 
 ### Local-path clone no longer hangs at "Fetching objects" (issue #496)
 
@@ -22,6 +22,33 @@
   `tests/command/clone_test.rs::test_clone_local_git_large_object_set_completes_in_budget`
   (2 500-blob local source clone under a 60 s budget).
 
+## [0.29.0] — 2026-09-28
+
+### AI repository commit refs with HashKind (B3-10)
+
+- Repository commit anchors use Libra tagged `repo-commit:<kind>:<kind-native hex>`
+  via `RepoCommitRef` / `RepoCommitRefStore` (`ai_index_task_run.base_commit_ref`
+  from B3-16). Agent bridge, traces, checkpoint, and projection resolvers accept
+  tagged or bare kind-native hex under the repository kind.
+- `IntegrityHash` remains SHA-256-only and never carries a repository OID; blake3
+  repo OIDs must not be passed as Run/PatchSet integrity digests.
+- Unborn-HEAD all-zero sentinels stay rejected as commit refs. The removed
+  `libra code` MCP `--stdio` surface is not restored — contract lives on agent
+  bridge / projection.
+
+## [0.28.0] — 2026-09-28
+
+### Cloud object-format metadata (REL-B3-02 / B3-17; B3-09 + B3-14)
+
+- D1 `repositories` / `object_index` carry nullable `object_format`; backup
+  writes the repository kind; restore refuses OID-width inference.
+- Ambiguous 64-hex cloud snapshots without metadata fail closed with
+  `LBR-REPO-002` (exit 128) and a re-backup hint. Legacy all-40-hex catalogs
+  without metadata remain sha1.
+- **Minimum compatible client:** a Libra binary that includes B3-14 cloud
+  metadata consumption (Libra ≥ 0.28.0). Older clients must not
+  restore new metadata-bearing snapshots via width guessing.
+
 ## [0.27.2] — 2026-09-28
 
 ### Commit the deletion of the last tracked file (issue #497)
@@ -41,17 +68,6 @@
   `commit -a` and via `add -A && commit`) and
   `tests/compat/commit_delete_last_tracked_file_test.rs` (Git upstream comparison
   plus clean-repo refusal).
-
-### Cloud object-format metadata (B3-09 / B3-14)
-
-- D1 `repositories` / `object_index` carry nullable `object_format`; backup
-  writes the repository kind; restore refuses OID-width inference.
-- Ambiguous 64-hex cloud snapshots without metadata fail closed with
-  `LBR-REPO-002` (exit 128) and a re-backup hint. Legacy all-40-hex catalogs
-  without metadata remain sha1.
-- **Minimum compatible client:** a Libra binary that includes B3-14 cloud
-  metadata consumption (this release, v0.27.2, and newer). Older clients must not
-  restore new metadata-bearing snapshots via width guessing.
 
 ## [0.27.1] — 2026-09-27
 

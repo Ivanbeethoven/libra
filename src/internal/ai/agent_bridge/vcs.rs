@@ -175,13 +175,20 @@ fn validate_paths(params: &Option<Value>) -> Result<Vec<String>, BridgeError> {
 /// A malformed value is a store inconsistency, never a client input error —
 /// only the bridge writes these columns, so the caller sees an actionable
 /// `internal` error instead of an `invalid_params` it cannot act on.
+///
+/// Accepts either a Libra tagged `repo-commit:<kind>:<hex>` value or a bare
+/// kind-native hex under the process repository kind (B3-10).
 pub fn parse_stored_commit_oid(raw: &str, what: &str) -> Result<ObjectHash, BridgeError> {
-    crate::internal::object_format::parse_repo_oid(raw).map_err(|e| {
-        BridgeError::internal(format!(
-            "{what} records the malformed object id '{raw}' ({e}); the bridge checkpoint store is \
-             inconsistent — inspect it with `libra agent checkpoint list`"
-        ))
-    })
+    use crate::internal::ai::util::parse_commit_anchor_for_kind;
+    let kind = git_internal::hash::get_hash_kind();
+    parse_commit_anchor_for_kind(kind, raw)
+        .and_then(|r| r.to_object_hash())
+        .map_err(|e| {
+            BridgeError::internal(format!(
+                "{what} records the malformed object id '{raw}' ({e}); the bridge checkpoint store is \
+                 inconsistent — inspect it with `libra agent checkpoint list`"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -915,7 +922,39 @@ fn service_output() -> crate::utils::output::OutputConfig {
 
 #[cfg(test)]
 mod tests {
+    use git_internal::hash::{HashKind, set_hash_kind_for_test};
+    use serial_test::serial;
+
     use super::*;
+
+    #[test]
+    #[serial(hash_kind)]
+    fn mcp_resource_anchor_respects_repo_kind() {
+        // Remapped from plan MCP name: stored OID parse respects process repo kind.
+        let _kind = set_hash_kind_for_test(HashKind::Blake3);
+        let hex = "ab".repeat(32);
+        let oid = parse_stored_commit_oid(&hex, "checkpoint").expect("bare blake3");
+        assert_eq!(oid.kind(), HashKind::Blake3);
+        let tagged = format!("repo-commit:blake3:{hex}");
+        let oid2 = parse_stored_commit_oid(&tagged, "checkpoint").expect("tagged blake3");
+        assert_eq!(oid2, oid);
+        // Kind mismatch fail-closed.
+        assert!(
+            parse_stored_commit_oid(&format!("repo-commit:sha256:{hex}"), "checkpoint").is_err()
+        );
+    }
+
+    #[test]
+    #[serial(hash_kind)]
+    fn mcp_server_active_context_typed_commit() {
+        // Remapped: typed tagged commit round-trips for active repository kind.
+        let _kind = set_hash_kind_for_test(HashKind::Sha256);
+        let hex = "cd".repeat(32);
+        let tagged = format!("repo-commit:sha256:{hex}");
+        let oid = parse_stored_commit_oid(&tagged, "active-context").expect("typed");
+        assert_eq!(oid.kind(), HashKind::Sha256);
+        assert_eq!(oid.to_string(), hex);
+    }
 
     #[test]
     fn diff_mode_is_a_closed_enum() {

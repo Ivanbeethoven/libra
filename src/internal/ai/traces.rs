@@ -756,21 +756,26 @@ fn validate_traces_inflight_marker(
         })?;
     }
     for oid in &marker.oids {
-        crate::internal::object_format::parse_repo_oid(oid).map_err(|error| {
+        crate::internal::ai::util::parse_repo_object_id(oid).map_err(|error| {
             anyhow!(
                 "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid object id '{oid}': {error}; inspect it with `libra agent doctor` before retrying"
             )
         })?;
     }
     for oid in &marker.created_oids {
-        crate::internal::object_format::parse_repo_oid(oid).map_err(|error| {
+        crate::internal::ai::util::parse_repo_object_id(oid).map_err(|error| {
             anyhow!(
                 "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid created object id '{oid}': {error}; inspect it with `libra agent doctor` before retrying"
             )
         })?;
     }
     if let Some(commit) = marker.commit.as_deref() {
-        crate::internal::object_format::parse_repo_oid(commit).map_err(|error| {
+        crate::internal::ai::util::parse_commit_anchor_for_kind(
+            git_internal::hash::get_hash_kind(),
+            commit,
+        )
+        .and_then(|r| r.to_object_hash())
+        .map_err(|error| {
             anyhow!(
                 "traces in-flight marker {expected_session_id}/{expected_attempt_id} contains invalid commit id '{commit}': {error}; inspect it with `libra agent doctor` before retrying"
             )
