@@ -128,12 +128,41 @@ pub fn validate_index_objects_with(
     missing_ok: bool,
 ) -> Result<(), TreePlumbingError> {
     let storage = util::objects_storage();
+    let entries = index.tracked_entries(0);
 
-    for entry in index.tracked_entries(0) {
+    // Fast path: one batched type probe resolves every entry that is present and
+    // correctly typed — in a healthy repository, the whole index. Local storage
+    // answers it from loose/pack headers, so no object body is read; the
+    // alternative is one full object read per entry, which dominates a commit on a
+    // large index. Anything the probe cannot answer (an absent object, or a backend
+    // that cannot probe cheaply) falls through to the per-object read below, so the
+    // error surface and the `missing_ok` valve are unchanged.
+    let probed = storage
+        .get_object_types_bounded_many(&entries.iter().map(|entry| entry.hash).collect::<Vec<_>>())
+        .ok();
+
+    for entry in entries.iter() {
         let mode = index_mode_to_tree_mode(entry.mode, &entry.name)?;
         let Some(expected) = expected_object_type(mode) else {
             continue;
         };
+        match probed.as_ref().and_then(|found| found.get(&entry.hash)) {
+            // Already answered with the expected type: nothing left to check.
+            Some(actual) if *actual == expected => continue,
+            // Answered with a different type: a real mismatch, reported exactly as
+            // the slow path below reports it.
+            Some(actual) => {
+                return Err(TreePlumbingError::WrongObjectType {
+                    path: entry.name.clone(),
+                    object: entry.hash,
+                    expected,
+                    actual: *actual,
+                });
+            }
+            // Not answered (absent, or the probe was unavailable): let the original
+            // read produce the exact error, including the `missing_ok` exemption.
+            None => {}
+        }
         let actual = match storage.get_object_type(&entry.hash) {
             Ok(actual) => actual,
             // PD-05: only "the object does not exist" is excusable, and only

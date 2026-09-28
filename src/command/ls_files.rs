@@ -147,7 +147,7 @@ pub async fn execute(args: LsFilesArgs) -> CliResult<()> {
     // worktree's view.
     let scope = crate::internal::worktree_scope::WorktreeScope::current();
     let view = crate::internal::sparse::SparseView::load(&scope).await;
-    let result = run_ls_files(&args, &view)?;
+    let result = run_ls_files(&args, &view, output.is_json())?;
     render_output(&result, &args, &output)?;
     Ok(())
 }
@@ -155,7 +155,7 @@ pub async fn execute(args: LsFilesArgs) -> CliResult<()> {
 pub async fn execute_safe(args: LsFilesArgs, output: &OutputConfig) -> CliResult<()> {
     let scope = crate::internal::worktree_scope::WorktreeScope::current();
     let view = crate::internal::sparse::SparseView::load(&scope).await;
-    let result = run_ls_files(&args, &view)?;
+    let result = run_ls_files(&args, &view, output.is_json())?;
     render_output(&result, &args, output)?;
     Ok(())
 }
@@ -163,6 +163,7 @@ pub async fn execute_safe(args: LsFilesArgs, output: &OutputConfig) -> CliResult
 fn run_ls_files(
     _args: &LsFilesArgs,
     view: &crate::internal::sparse::SparseView,
+    json: bool,
 ) -> CliResult<Vec<FileEntry>> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
     let workdir = util::working_dir();
@@ -244,6 +245,13 @@ fn run_ls_files(
         } else {
             &[0]
         };
+        // Worktree state is only needed to *filter* (`-d`/`-m`), to *label* (`-t`),
+        // or to fill the `status` field the JSON shape always carries. Plain
+        // `ls-files` is a pure index dump — Git never touches the worktree for it.
+        // Computing it unconditionally made every entry stat, and every file get
+        // read and hashed, which turns this command into minutes on a large or
+        // remotely-backed worktree.
+        let needs_worktree_state = _args.deleted || _args.modified || _args.tag || json;
         for stage in stages {
             for entry in index.tracked_entries(*stage) {
                 let worktree_path = workdir.join(&entry.name);
@@ -253,15 +261,19 @@ fn run_ls_files(
                 if _args.ignored && !is_excluded(&worktree_path) {
                     continue;
                 }
-                let exists = fs::symlink_metadata(&worktree_path).is_ok();
-                let is_deleted = !exists;
-                let is_modified = exists
-                    && entry_modified(
-                        &worktree_path,
-                        &entry.name,
-                        &entry.hash.to_string(),
-                        entry.mode,
-                    )?;
+                let (is_deleted, is_modified) = if needs_worktree_state {
+                    let exists = fs::symlink_metadata(&worktree_path).is_ok();
+                    let modified = exists
+                        && entry_modified(
+                            &worktree_path,
+                            &entry.name,
+                            &entry.hash.to_string(),
+                            entry.mode,
+                        )?;
+                    (!exists, modified)
+                } else {
+                    (false, false)
+                };
 
                 if _args.deleted && !is_deleted {
                     continue;
