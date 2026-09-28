@@ -25,12 +25,17 @@
 //!   artifact) when the remote cannot serve a standard fallback and no local
 //!   fallback object exists. Reassembly verifies the full `media_oid` BEFORE the
 //!   atomic publish.
+//! - **Paging is not identity (P-01):** the canonical manifest id hashes the
+//!   chunk sequence, not page boundaries. Local layouts store a bounded summary
+//!   plus immutable pages. The hash/offset index under `.libra/media/index` is
+//!   derived data and can be deleted and rebuilt; it is not repository config.
 
 pub mod capability;
 pub mod chunk_store;
 pub mod chunker;
 pub mod manifest;
 pub mod negotiate;
+pub mod page_cache;
 pub mod transfer;
 
 use ring::digest::{Context, SHA256};

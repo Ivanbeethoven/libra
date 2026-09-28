@@ -37,9 +37,16 @@ pub struct Chunk {
     pub chunk_hash: String,
 }
 
-/// Chunk a byte stream. Empty input yields no chunks; EOF always emits a
-/// trailing chunk covering remaining bytes (may be shorter than [`MIN_SIZE`]).
-pub fn chunk_reader<R: Read>(reader: R) -> io::Result<Vec<Chunk>> {
+/// Visit chunks one at a time. The callback borrows the raw chunk bytes for the
+/// duration of the call; callers that need the bytes later must copy them.
+/// Empty input yields no visits. EOF always emits a trailing chunk covering
+/// remaining bytes (may be shorter than [`MIN_SIZE`]).
+pub fn visit_chunks<R, E, F>(reader: R, mut visit: F) -> Result<(), E>
+where
+    R: Read,
+    E: From<io::Error>,
+    F: FnMut(&Chunk, &[u8]) -> Result<(), E>,
+{
     let chunker = StreamCDC::with_level_and_seed(
         reader,
         MIN_U32,
@@ -48,19 +55,30 @@ pub fn chunk_reader<R: Read>(reader: R) -> io::Result<Vec<Chunk>> {
         Normalization::Level1,
         SEED,
     );
-    let mut out = Vec::new();
     let mut offset: u64 = 0;
     for item in chunker {
-        let ChunkData { length, data, .. } = item.map_err(io::Error::other)?;
-        out.push(Chunk {
+        let ChunkData { length, data, .. } = item.map_err(|err| E::from(io::Error::other(err)))?;
+        let chunk = Chunk {
             offset,
             length: length as u64,
             chunk_hash: sha256_hex(&data),
-        });
+        };
+        visit(&chunk, &data)?;
         offset = offset
             .checked_add(length as u64)
-            .ok_or_else(|| io::Error::other("chunk offset overflow"))?;
+            .ok_or_else(|| E::from(io::Error::other("chunk offset overflow")))?;
     }
+    Ok(())
+}
+
+/// Chunk a byte stream into a `Vec`. Prefer [`visit_chunks`] on the production
+/// path so a large object is not retained as one vector.
+pub fn chunk_reader<R: Read>(reader: R) -> io::Result<Vec<Chunk>> {
+    let mut out = Vec::new();
+    visit_chunks(reader, |chunk, _data| -> io::Result<()> {
+        out.push(chunk.clone());
+        Ok(())
+    })?;
     Ok(out)
 }
 

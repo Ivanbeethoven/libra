@@ -149,15 +149,12 @@ impl MediaClient {
         if self.finalized_manifest(oid, size).await?.is_some() {
             return Ok(true);
         }
-        if size > (super::manifest::MAX_CHUNKS * chunker::MAX_SIZE) as u64 {
-            return Ok(false);
-        }
+        // No whole-file chunk-count cap (FL-07). This legacy client still posts
+        // one manifest body; paged upload replaces that in FL-02. Fall back
+        // only when that single body exceeds the negotiated envelope.
         let source = path.to_path_buf();
         let (mut manifest, _) =
             tokio::task::spawn_blocking(move || MediaManifest::build_from_file(source)).await??;
-        if manifest.chunks.len() > super::manifest::MAX_CHUNKS {
-            return Ok(false);
-        }
         manifest.validate()?;
         if manifest.media_oid != oid || manifest.media_size != size {
             bail!("local LFS object size or SHA-256 mismatch");

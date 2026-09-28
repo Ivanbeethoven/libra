@@ -15,13 +15,11 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         media::{
-            capability,
-            chunk_store::{self, MediaChunkStore},
-            manifest::MediaManifest,
+            capability, chunk_store,
+            manifest::{ManifestPage, ManifestSummary},
             negotiate::{self, ProbeOutcome, TransferDecision},
         },
         output::{OutputConfig, emit_json_data},
-        path,
     },
 };
 
@@ -29,7 +27,7 @@ pub const MEDIA_EXAMPLES: &str = "\
 EXAMPLES:
     libra media chunk big.psd                 FastCDC-chunk a file; print the manifest summary
     libra media chunk big.psd --store         Also persist chunks + manifest to the local media store
-    libra media inspect .libra/media/manifests/<oid>.json   Validate a manifest file
+    libra media inspect .libra/media/manifests/<oid>/summary.json   Validate a manifest summary
     libra media verify big.psd                Reassemble from the store and verify the media_oid
     libra media probe                         Probe the remote's chunked-LFS capability (falls back to standard LFS)
     libra --json media chunk big.psd          Structured JSON output for agents
@@ -94,67 +92,42 @@ pub async fn execute_safe(args: MediaArgs, output: &OutputConfig) -> CliResult<(
 struct ChunkSummary {
     media_oid: String,
     media_size: u64,
-    chunk_count: usize,
-    unique_chunks: usize,
+    chunk_count: u64,
+    page_count: u32,
+    unique_chunks: u64,
+    manifest_id: String,
     algorithm: String,
     stored: bool,
     manifest_path: Option<String>,
 }
 
 async fn chunk(path: &str, store: bool, output: &OutputConfig) -> CliResult<()> {
-    let (manifest, chunks) = MediaManifest::build_from_file(path).map_err(|e| {
-        CliError::fatal(format!("failed to chunk '{path}': {e}"))
-            .with_stable_code(StableErrorCode::IoReadFailed)
-    })?;
-
-    let mut unique = std::collections::HashSet::new();
-    for c in &manifest.chunks {
-        unique.insert(c.chunk_hash.clone());
-    }
-
-    let mut manifest_path = None;
-    if store {
-        let cs = MediaChunkStore::open();
-        let mut file = std::fs::File::open(path).map_err(|source| {
+    let stored_root;
+    let scratch;
+    let root = if store {
+        stored_root = chunk_store::repo_media_root()
+            .map_err(|err| media_store_err("open media store", err))?;
+        &stored_root
+    } else {
+        scratch = tempfile::tempdir().map_err(|source| {
             CliError::fatal(format!(
-                "failed to reopen '{path}' for storing chunks: {source}"
+                "failed to create a temporary media index: {source}"
             ))
-            .with_stable_code(StableErrorCode::IoReadFailed)
+            .with_stable_code(StableErrorCode::IoWriteFailed)
         })?;
-        for c in &chunks {
-            let bytes = chunk_store::read_span(&mut file, c.offset, c.length)
-                .map_err(|e| media_store_err("store chunk", e))?;
-            cs.put_chunk(&bytes)
-                .map_err(|e| media_store_err("store chunk", e))?;
-        }
-        // Persist the manifest as a content-addressed file.
-        let dir = path::media_manifests();
-        std::fs::create_dir_all(&dir).map_err(|source| {
-            CliError::fatal(format!("failed to create media manifest dir: {source}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
-        let mpath = dir.join(format!("{}.json", manifest.media_oid));
-        let json = manifest
-            .to_json()
-            .map_err(|e| CliError::fatal(format!("failed to serialize manifest: {e}")))?;
-        crate::utils::atomic_write::write_atomic(
-            &mpath,
-            json.as_bytes(),
-            crate::utils::atomic_write::sync_data_enabled(),
-        )
-        .map_err(|source| {
-            CliError::fatal(format!("failed to write manifest: {source}"))
-                .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
-        manifest_path = Some(mpath.display().to_string());
-    }
-
+        scratch.path()
+    };
+    let outcome = chunk_store::stream_media_file(std::path::Path::new(path), root, store)
+        .map_err(|err| media_store_err("chunk media file", err))?;
+    let manifest_path = store.then(|| outcome.manifest_path.display().to_string());
     let summary = ChunkSummary {
-        media_oid: manifest.media_oid.clone(),
-        media_size: manifest.media_size,
-        chunk_count: manifest.chunks.len(),
-        unique_chunks: unique.len(),
-        algorithm: manifest.algorithm.clone(),
+        media_oid: outcome.summary.oid,
+        media_size: outcome.summary.size,
+        chunk_count: outcome.summary.chunk_count,
+        page_count: outcome.summary.page_count,
+        unique_chunks: outcome.unique_chunks,
+        manifest_id: outcome.summary.manifest_id,
+        algorithm: outcome.summary.algorithm,
         stored: store,
         manifest_path: manifest_path.clone(),
     };
@@ -166,8 +139,8 @@ async fn chunk(path: &str, store: bool, output: &OutputConfig) -> CliResult<()> 
         println!("media_oid: {}", summary.media_oid);
         println!("size:      {} bytes", summary.media_size);
         println!(
-            "chunks:    {} ({} unique, algorithm {})",
-            summary.chunk_count, summary.unique_chunks, summary.algorithm
+            "chunks:    {} across {} pages ({} unique, algorithm {})",
+            summary.chunk_count, summary.page_count, summary.unique_chunks, summary.algorithm
         );
         if let Some(p) = &manifest_path {
             println!("stored:    chunks + manifest at {p}");
@@ -176,26 +149,63 @@ async fn chunk(path: &str, store: bool, output: &OutputConfig) -> CliResult<()> 
     Ok(())
 }
 
+#[derive(Serialize)]
+struct PageInspect {
+    page_no: u32,
+    entry_count: usize,
+}
+
 fn inspect(manifest_path: &str, output: &OutputConfig) -> CliResult<()> {
-    let text = std::fs::read_to_string(manifest_path).map_err(|source| {
+    let path = std::path::Path::new(manifest_path);
+    let target = if path.is_dir() {
+        path.join("summary.json")
+    } else {
+        path.to_path_buf()
+    };
+    let text = chunk_store::read_envelope_file(&target).map_err(|err| {
         CliError::fatal(format!(
-            "failed to read manifest '{manifest_path}': {source}"
+            "failed to read manifest '{}': {err}",
+            target.display()
         ))
         .with_stable_code(StableErrorCode::IoReadFailed)
     })?;
-    let manifest = MediaManifest::from_json(&text).map_err(|e| {
-        CliError::fatal(format!("invalid manifest '{manifest_path}': {e}"))
+    if let Ok(summary) = ManifestSummary::from_json(&text) {
+        return emit_summary(&summary, output);
+    }
+    let page = ManifestPage::from_json(&text).map_err(|err| {
+        CliError::fatal(format!("invalid manifest '{}': {err}", target.display()))
             .with_stable_code(StableErrorCode::CliInvalidArguments)
     })?;
+    let report = PageInspect {
+        page_no: page.page_no,
+        entry_count: page.entries.len(),
+    };
     if output.is_json() {
-        return emit_json_data("media.inspect", &manifest, output);
+        return emit_json_data("media.inspect", &report, output);
     }
     if !output.quiet {
-        println!("valid manifest (version {})", manifest.version);
-        println!("media_oid: {}", manifest.media_oid);
-        println!("size:      {} bytes", manifest.media_size);
-        println!("chunks:    {}", manifest.chunks.len());
-        println!("algorithm: {}", manifest.algorithm);
+        println!(
+            "valid manifest page {} ({} entries)",
+            report.page_no, report.entry_count
+        );
+    }
+    Ok(())
+}
+
+fn emit_summary(summary: &ManifestSummary, output: &OutputConfig) -> CliResult<()> {
+    if output.is_json() {
+        return emit_json_data("media.inspect", summary, output);
+    }
+    if !output.quiet {
+        println!("valid manifest summary (version {})", summary.version);
+        println!("media_oid:    {}", summary.oid);
+        println!("manifest_id:  {}", summary.manifest_id);
+        println!("size:         {} bytes", summary.size);
+        println!(
+            "chunks:       {} across {} pages",
+            summary.chunk_count, summary.page_count
+        );
+        println!("algorithm:    {}", summary.algorithm);
     }
     Ok(())
 }
@@ -223,22 +233,20 @@ async fn verify(
             ));
         }
     };
-    let mpath = path::media_manifests().join(format!("{oid}.json"));
-    let text = std::fs::read_to_string(&mpath).map_err(|_| {
+    let root =
+        chunk_store::repo_media_root().map_err(|err| media_store_err("open media store", err))?;
+    let summary = chunk_store::load_summary(&root, &oid).map_err(|_| {
         CliError::fatal(format!(
-            "no stored manifest for media_oid {oid} (expected {}); run 'libra media chunk --store' first",
-            mpath.display()
+            "no stored manifest summary for media_oid {oid} (expected {}); run 'libra media chunk --store' first",
+            chunk_store::summary_path(&root, &oid).display()
         ))
         .with_stable_code(StableErrorCode::CliInvalidTarget)
     })?;
-    let manifest = MediaManifest::from_json(&text)
-        .map_err(|e| CliError::fatal(format!("stored manifest for {oid} is invalid: {e}")))?;
 
-    // Reassemble to a temp path and verify the media_oid (verify-then-rename
-    // inside reassemble guarantees no partial/corrupt file survives a mismatch).
-    let store = MediaChunkStore::open();
+    // Reassemble one page at a time. verify-then-rename inside reassemble_paged
+    // guarantees no partial/corrupt file survives a mismatch.
     let tmp = std::env::temp_dir().join(format!("libra-media-verify-{oid}"));
-    let result = chunk_store::reassemble(&manifest, &store, &tmp);
+    let result = chunk_store::reassemble_paged(&root, &summary, &tmp);
     let _ = std::fs::remove_file(&tmp);
 
     let verified = result.is_ok();

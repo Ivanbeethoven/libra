@@ -19,7 +19,7 @@ OID.
 | Subcommand | Description | Example |
 |---|---|---|
 | `chunk <path> [--store]` | FastCDC-chunk a file and emit its manifest; `--store` persists chunks + manifest to `.libra/media`. | `libra media chunk big.psd --store` |
-| `inspect <manifest>` | Parse and validate a manifest JSON file. | `libra media inspect .libra/media/manifests/<oid>.json` |
+| `inspect <manifest>` | Validate a paged manifest summary (or one page envelope) and print the summary. Does not dump every chunk. | `libra media inspect .libra/media/manifests/<oid>/summary.json` |
 | `verify <path> \| --media-oid <oid>` | Reassemble from the local chunk store and verify the full `media_oid` (never publishes a corrupt file). | `libra media verify big.psd` |
 | `probe [--remote <name>]` | Probe the remote's media capability endpoint and report the transfer decision (chunked vs standard-LFS fallback). | `libra media probe --remote origin` |
 | `--json` | Structured JSON envelope on stdout (global flag). | `libra --json media chunk big.psd` |
@@ -85,16 +85,24 @@ object, then publishes the manifest. Repeating push resumes from missing chunks.
 Downloads use finalized manifests, reuse verified local chunks, and atomically
 publish only verified full content. Invalid manifests or corrupted remote chunks
 are errors and preserve the existing destination. No manifest, unsupported
-capabilities or disabled feature means standard full-object LFS. Objects exceeding
-the negotiated manifest/chunk count limits also use basic upload before any
-manifest is sent. Chunk-only uploads are not supported. Outside a Libra
+capabilities or disabled feature means standard full-object LFS.
+
+There is no whole-file chunk-count cap. `media chunk` pages the layout
+(at most 4096 entries per page, compact entries array at most 960 KiB, envelope at most 1 MiB) and
+prints a summary. Page boundaries are not part of the canonical manifest id.
+`--store` writes `.libra/media/manifests/<oid>/summary.json`, immutable
+`pages/<n>.json`, chunk bytes, and a derived hash/offset index under
+`.libra/media/index/local/<manifest_id>/`. That index can be deleted and is
+rebuilt on verify; it is not repository config. A legacy whole-manifest upload
+still falls back to basic LFS only when that single body exceeds the negotiated
+envelope. Chunk-only uploads are not supported. Outside a Libra
 repository, the public LFS download client uses basic LFS instead of creating a
 repository cache.
 
 The initial extension isolates chunks by authenticated user and repository;
 another user's data is fetched through the standard full-object fallback. It
 requires Bearer access tokens and does not introduce a public chunk-hash API.
-Manifests are limited to 10 MiB / 8192 chunks and chunks to 8 MiB. This is an
+Chunk payload is at most 256 KiB. This is an
 opt-in transport; deployments need explicit retention and quota planning.
 
 The ignored live test `monoengine_fastcdc_http_interop` is not Mega-only. Run it
@@ -131,7 +139,7 @@ current implementation does not claim completion of all Lore §6.5–6.8 guarant
 ```bash
 libra media chunk big.psd                 # chunk a file; print the manifest summary
 libra media chunk big.psd --store         # also persist chunks + manifest locally
-libra media inspect .libra/media/manifests/<oid>.json
+libra media inspect .libra/media/manifests/<oid>/summary.json
 libra media verify big.psd                # reassemble from the store and verify media_oid
 libra media probe --remote origin         # capability-probe; falls back to standard LFS
 libra --json media chunk big.psd          # structured JSON output for agents

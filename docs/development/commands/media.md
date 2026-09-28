@@ -15,10 +15,13 @@
 
 ## 设计方案
 
-- 算法保持冻结：in-tree gear hash + normalized chunking，MIN 512 KiB / AVG 2 MiB /
-  MAX 8 MiB，固定 SplitMix64 GEAR 表。它不是第三方 crate 的 v2020 算法。
-- `MediaManifest` 字段保持 v1；新增拒绝零长度、超大块、溢出、错误 fallback_oid、
-  不支持的 checksum 和超过 8192 块的清单。JSON 上限为 10 MiB。
+- 算法保持冻结：`fastcdc = "=3.2.1"`，v2020，Normalization::Level1，seed=0，
+  32768/65536/262144 bytes（`fastcdc-v2020-32k`）。
+- `MediaManifest` 字段保持 v1。没有全文件 `MAX_CHUNKS` 产品上限。本地布局是
+  有界 summary 加不可变页；P-01a 每页最多 4096 条且紧凑 entries 数组 ≤960 KiB。
+  页边界不参与 canonical id。派生 hash/offset 索引在
+  `.libra/media/index/<scope>/<manifest_id>/`，可删除后从页重建，不写全局配置库。
+  `media chunk` / `inspect` / `verify` 不构造全文件 chunk `Vec` 或整包 JSON。
 - `capability` 在仓库 LFS URL 后追加 `libra/media/v1/capabilities`，
   使用 host-scoped Bearer token、请求超时、有界响应和既有退避。
 - `transfer::MediaClient` 上传先准备 manifest/查询缺块，只上传缺失内容，再 finalize；

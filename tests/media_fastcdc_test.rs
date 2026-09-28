@@ -828,13 +828,30 @@ fn chunk_store_verify_roundtrip() {
     );
     assert_eq!(js["data"]["algorithm"].as_str(), Some("fastcdc-v2020-32k"));
 
-    // Manifest + chunk store landed under a private .libra/media sibling of objects/.
+    // Paged summary + chunk store landed under a private .libra/media sibling of objects/.
     let manifest = p
         .join(".libra")
         .join("media")
         .join("manifests")
-        .join(format!("{media_oid}.json"));
-    assert!(manifest.exists(), "manifest file persisted");
+        .join(&media_oid)
+        .join("summary.json");
+    assert!(manifest.exists(), "manifest summary persisted");
+    let summary_text = fs::read_to_string(&manifest).unwrap();
+    assert!(
+        !summary_text.contains("\"chunks\""),
+        "summary must not embed the chunk list"
+    );
+    assert!(
+        manifest
+            .parent()
+            .unwrap()
+            .join("pages")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some(),
+        "at least one manifest page persisted"
+    );
     assert!(
         p.join(".libra").join("media").join("chunks").exists(),
         "chunk store dir exists"
@@ -849,14 +866,23 @@ fn chunk_store_verify_roundtrip() {
     let vout = ok(&["--json", "media", "verify", &file], p);
     assert_eq!(json(&vout)["data"]["verified"].as_bool(), Some(true));
 
+    // The hash/offset index is derived. Deleting it must not change verify.
+    fs::remove_dir_all(p.join(".libra").join("media").join("index")).unwrap();
+    let vout = ok(&["--json", "media", "verify", &file], p);
+    assert_eq!(json(&vout)["data"]["verified"].as_bool(), Some(true));
+
     // Inspect the manifest.
     let iout = ok(
         &["--json", "media", "inspect", manifest.to_str().unwrap()],
         p,
     );
     assert_eq!(
-        json(&iout)["data"]["media_oid"].as_str(),
+        json(&iout)["data"]["oid"].as_str(),
         Some(media_oid.as_str())
+    );
+    assert!(
+        json(&iout)["data"].get("chunks").is_none(),
+        "inspect JSON is a summary, not the chunk list"
     );
     assert_eq!(
         json(&iout)["data"]["hash_algorithm"].as_str(),

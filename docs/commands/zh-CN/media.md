@@ -9,7 +9,7 @@ FastCDC LFS 媒体分块客户端（lore.md §6），是受 `fastcdc` 功能开�
 | 子命令 | 说明 | 示例 |
 |---|---|---|
 | `chunk <path> [--store]` | 对文件做 FastCDC 分块并输出 manifest；`--store` 会把 chunks + manifest 持久化到 `.libra/media`。 | `libra media chunk big.psd --store` |
-| `inspect <manifest>` | 解析并验证一个 manifest JSON 文件。 | `libra media inspect .libra/media/manifests/<oid>.json` |
+| `inspect <manifest>` | 校验分页 manifest 摘要（或单页信封）并打印摘要，不展开全部 chunk。 | `libra media inspect .libra/media/manifests/<oid>/summary.json` |
 | `verify <path> \| --media-oid <oid>` | 从本地 chunk store 重组并验证完整 `media_oid`（永不发布损坏文件）。 | `libra media verify big.psd` |
 | `probe [--remote <name>]` | 探测远端 media capability endpoint 并报告传输决策（chunked vs standard-LFS fallback）。 | `libra media probe --remote origin` |
 | `--json` | stdout 上的结构化 JSON 信封（全局标志）。 | `libra --json media chunk big.psd` |
@@ -43,7 +43,9 @@ libra media probe --remote origin
 
 正常 LFS push/upload 会准备 manifest、查询缺块、只上传缺失块，再请求 finalize。Mega 校验块的 SHA-256、完整文件 SHA-256 和冻结的 FastCDC 分块边界，保存标准 LFS 完整对象后才发布 manifest。重新 push 会再次查询缺块并续传。下载只使用已 finalize 的 manifest，复用校验通过的本地块，并在完整文件校验成功后原子替换目标。远端清单或块损坏会报错，保留已有目标文件；没有 manifest、能力不兼容或功能被禁用时使用标准完整对象 LFS。不支持仅保存块而丢弃完整对象的上传。
 
-Mega 当前按「认证用户＋仓库路径」隔离块和 manifest，其他用户通过既有标准 LFS 完整对象路径下载。这些端点要求 Bearer 访问令牌，不提供公开的裸 chunk-hash 查询或下载；这并不等于实现了完整仓库 ACL。manifest 上限为 10 MiB / 8192 块，单块上限为 8 MiB。
+本地分块没有全文件 chunk 条数上限。`media chunk` 按页产出布局（每页最多 4096 条，紧凑 entries 数组最多 960 KiB，信封最多 1 MiB）并只打印摘要。分页边界不参与 canonical manifest id。`--store` 写入 `.libra/media/manifests/<oid>/summary.json`、不可变 `pages/<n>.json`、chunk 字节，以及 `.libra/media/index/local/<manifest_id>/` 下的派生 hash/offset 索引。该索引可以删除，verify 时会从页重建，它不是仓库配置。旧的整包 manifest 上传仅在单个 body 超过协商信封时回退 basic LFS。
+
+Mega 当前按「认证用户＋仓库路径」隔离块和 manifest，其他用户通过既有标准 LFS 完整对象路径下载。这些端点要求 Bearer 访问令牌，不提供公开的裸 chunk-hash 查询或下载；这并不等于实现了完整仓库 ACL。chunk payload 上限为 256 KiB。
 
 Pending 描述符在 24 小时后过期，重新准备 manifest 可继续查询和上传缺块；过期数据不会自动回收。此扩展需要显式启用，部署前应规划保留策略与配额，不能对仍被已发布 manifest 引用的块直接设置生命周期删除。
 
@@ -56,7 +58,7 @@ Pending 描述符在 24 小时后过期，重新准备 manifest 可继续查询�
 ```bash
 libra media chunk big.psd                 # 对文件分块；打印 manifest 摘要
 libra media chunk big.psd --store         # 同时本地持久化 chunks + manifest
-libra media inspect .libra/media/manifests/<oid>.json
+libra media inspect .libra/media/manifests/<oid>/summary.json
 libra media verify big.psd                # 从 store 重组并验证 media_oid
 libra media probe --remote origin         # capability probe；回退到标准 LFS
 libra --json media chunk big.psd          # 给 agents 使用的结构化 JSON 输出

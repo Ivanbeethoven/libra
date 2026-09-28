@@ -11,12 +11,23 @@
 //! re-verifies the SHA-256 of raw bytes on read (never trusting on-disk data).
 
 use std::{
+    fs::File,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
-use super::{is_sha256_hex, manifest::MediaManifest, sha256_hex};
+use super::{
+    chunker, is_sha256_hex,
+    manifest::{
+        self, ChunkEntry, CreatedBy, ManifestPage, ManifestSummary, MediaManifest, PageBudget,
+    },
+    page_cache::{self, PageKey},
+    sha256_hex,
+};
 use crate::utils::atomic_write;
+
+/// Directory scope segment for the local derived index (`scope + manifest_id`).
+pub const LOCAL_INDEX_SCOPE: &str = "local";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MediaStoreError {
@@ -37,6 +48,19 @@ pub enum MediaStoreError {
         "reassembled content digest '{actual}' does not match the manifest media_oid '{expected}'"
     )]
     MediaOidMismatch { expected: String, actual: String },
+    #[error("{0}")]
+    Invalid(String),
+    #[error("chunk hash {hash} length conflict across pages: stored {stored}, new {new}")]
+    HashLengthConflict { hash: String, stored: u64, new: u64 },
+}
+
+impl From<std::io::Error> for MediaStoreError {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io {
+            path: "<media>".to_string(),
+            source,
+        }
+    }
 }
 
 /// A local media chunk store rooted at `.libra/media/chunks`.
@@ -262,4 +286,1177 @@ pub fn read_span(
             source,
         })?;
     Ok(buf)
+}
+
+const HASH_MAGIC: &[u8; 4] = b"LMH1";
+const OFFSET_MAGIC: &[u8; 4] = b"LMO1";
+const HASH_HEADER: u64 = 32;
+const HASH_SLOT: u64 = 64;
+const OFFSET_HEADER: u64 = 16;
+const OFFSET_SLOT: u64 = 64;
+const INITIAL_HASH_CAP: u64 = 1024;
+
+fn io_err(path: &Path, source: std::io::Error) -> MediaStoreError {
+    MediaStoreError::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+fn invalid(message: impl Into<String>) -> MediaStoreError {
+    MediaStoreError::Invalid(message.into())
+}
+
+fn map_manifest(err: manifest::ManifestError) -> MediaStoreError {
+    MediaStoreError::Invalid(err.to_string())
+}
+
+fn arr4(bytes: &[u8]) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    out.copy_from_slice(bytes);
+    out
+}
+
+fn arr8(bytes: &[u8]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out.copy_from_slice(bytes);
+    out
+}
+
+fn decode_hash(hash_hex: &str) -> Result<[u8; 32], MediaStoreError> {
+    if !is_sha256_hex(hash_hex) {
+        return Err(MediaStoreError::InvalidHash(hash_hex.to_string()));
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hash_hex, &mut out)
+        .map_err(|_| MediaStoreError::InvalidHash(hash_hex.to_string()))?;
+    Ok(out)
+}
+
+fn hash_len(capacity: u64) -> Result<usize, MediaStoreError> {
+    if !capacity.is_power_of_two() || capacity < 2 {
+        return Err(invalid("hash index capacity must be a power of two"));
+    }
+    let slots = capacity
+        .checked_mul(HASH_SLOT)
+        .ok_or_else(|| invalid("hash index size overflow"))?;
+    usize::try_from(HASH_HEADER + slots).map_err(|_| invalid("hash index size overflow"))
+}
+
+fn empty_hash_image(capacity: u64) -> Result<Vec<u8>, MediaStoreError> {
+    let mut bytes = vec![0u8; hash_len(capacity)?];
+    write_hash_header(&mut bytes, capacity, 0)?;
+    Ok(bytes)
+}
+
+fn empty_offset_image() -> Vec<u8> {
+    let mut bytes = vec![0u8; OFFSET_HEADER as usize];
+    bytes[..4].copy_from_slice(OFFSET_MAGIC);
+    bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+    bytes
+}
+
+pub(crate) struct HashSlot {
+    occupied: bool,
+    hash: [u8; 32],
+    length: u64,
+    offset: u64,
+    page_no: u32,
+}
+
+enum Place {
+    Inserted,
+    Duplicate,
+}
+
+fn hash_slot_range(index: u64) -> Result<std::ops::Range<usize>, MediaStoreError> {
+    let start = usize::try_from(HASH_HEADER + index * HASH_SLOT)
+        .map_err(|_| invalid("hash index offset overflow"))?;
+    Ok(start..start + HASH_SLOT as usize)
+}
+
+fn read_hash_slot(bytes: &[u8], index: u64) -> Result<HashSlot, MediaStoreError> {
+    let buf = bytes
+        .get(hash_slot_range(index)?)
+        .ok_or_else(|| invalid("hash index truncated"))?;
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&buf[1..33]);
+    Ok(HashSlot {
+        occupied: buf[0] == 1,
+        hash,
+        length: u64::from_le_bytes(arr8(&buf[33..41])),
+        offset: u64::from_le_bytes(arr8(&buf[41..49])),
+        page_no: u32::from_le_bytes(arr4(&buf[49..53])),
+    })
+}
+
+fn write_hash_slot(
+    bytes: &mut [u8],
+    index: u64,
+    hash: &[u8; 32],
+    length: u64,
+    offset: u64,
+    page_no: u32,
+) -> Result<(), MediaStoreError> {
+    let range = hash_slot_range(index)?;
+    let buf = bytes
+        .get_mut(range)
+        .ok_or_else(|| invalid("hash index truncated"))?;
+    buf[0] = 1;
+    buf[1..33].copy_from_slice(hash);
+    buf[33..41].copy_from_slice(&length.to_le_bytes());
+    buf[41..49].copy_from_slice(&offset.to_le_bytes());
+    buf[49..53].copy_from_slice(&page_no.to_le_bytes());
+    Ok(())
+}
+
+fn bucket(hash: &[u8; 32], capacity: u64) -> u64 {
+    // Fold every byte, then avalanche. A raw prefix (or a left-padded hex
+    // counter) must not collapse onto one slot.
+    let mut z = u64::from_le_bytes(arr8(&hash[0..8]))
+        ^ u64::from_le_bytes(arr8(&hash[8..16])).rotate_left(17)
+        ^ u64::from_le_bytes(arr8(&hash[16..24])).rotate_left(31)
+        ^ u64::from_le_bytes(arr8(&hash[24..32])).rotate_left(47);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    z & (capacity - 1)
+}
+
+fn place_hash(
+    bytes: &mut [u8],
+    capacity: u64,
+    hash: &[u8; 32],
+    length: u64,
+    offset: u64,
+    page_no: u32,
+) -> Result<Place, MediaStoreError> {
+    let start = bucket(hash, capacity);
+    for probe in 0..capacity {
+        let index = (start + probe) & (capacity - 1);
+        let slot = read_hash_slot(bytes, index)?;
+        if !slot.occupied {
+            write_hash_slot(bytes, index, hash, length, offset, page_no)?;
+            return Ok(Place::Inserted);
+        }
+        if slot.hash == *hash {
+            if slot.length != length {
+                return Err(MediaStoreError::HashLengthConflict {
+                    hash: hex::encode(hash),
+                    stored: slot.length,
+                    new: length,
+                });
+            }
+            return Ok(Place::Duplicate);
+        }
+    }
+    Err(invalid("hash index is full"))
+}
+
+fn lookup_hash_slot(
+    bytes: &[u8],
+    capacity: u64,
+    hash: &[u8; 32],
+) -> Result<Option<HashSlot>, MediaStoreError> {
+    let start = bucket(hash, capacity);
+    for probe in 0..capacity {
+        let index = (start + probe) & (capacity - 1);
+        let slot = read_hash_slot(bytes, index)?;
+        if !slot.occupied {
+            return Ok(None);
+        }
+        if slot.hash == *hash {
+            return Ok(Some(slot));
+        }
+    }
+    Ok(None)
+}
+
+fn write_hash_header(bytes: &mut [u8], capacity: u64, count: u64) -> Result<(), MediaStoreError> {
+    let buf = bytes
+        .get_mut(..HASH_HEADER as usize)
+        .ok_or_else(|| invalid("hash index truncated"))?;
+    buf[..4].copy_from_slice(HASH_MAGIC);
+    buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+    buf[8..16].copy_from_slice(&capacity.to_le_bytes());
+    buf[16..24].copy_from_slice(&count.to_le_bytes());
+    Ok(())
+}
+
+fn write_offset_header(bytes: &mut [u8], count: u64) -> Result<(), MediaStoreError> {
+    let buf = bytes
+        .get_mut(..OFFSET_HEADER as usize)
+        .ok_or_else(|| invalid("offset index truncated"))?;
+    buf[..4].copy_from_slice(OFFSET_MAGIC);
+    buf[4..8].copy_from_slice(&1u32.to_le_bytes());
+    buf[8..16].copy_from_slice(&count.to_le_bytes());
+    Ok(())
+}
+
+/// Derived hash → length and offset → chunk index. Keyed on disk by
+/// `scope/manifest_id` (the directory), not by repository config. Safe to delete;
+/// [`DiskMediaIndex::rebuild`] restores it from immutable pages.
+pub(crate) struct DiskMediaIndex {
+    dir: PathBuf,
+    hash_bytes: Vec<u8>,
+    offset_bytes: Vec<u8>,
+    capacity: u64,
+    hash_count: u64,
+    offset_count: u64,
+    expected_offset: u64,
+}
+
+impl DiskMediaIndex {
+    pub(crate) fn create(dir: &Path) -> Result<Self, MediaStoreError> {
+        Self::create_with_capacity(dir, INITIAL_HASH_CAP)
+    }
+
+    pub(crate) fn create_with_capacity(dir: &Path, capacity: u64) -> Result<Self, MediaStoreError> {
+        std::fs::create_dir_all(dir).map_err(|source| io_err(dir, source))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            hash_bytes: empty_hash_image(capacity)?,
+            offset_bytes: empty_offset_image(),
+            capacity,
+            hash_count: 0,
+            offset_count: 0,
+            expected_offset: 0,
+        })
+    }
+
+    pub(crate) fn open(dir: &Path) -> Result<Self, MediaStoreError> {
+        let hash_path = dir.join("hash.idx");
+        let offset_path = dir.join("offset.idx");
+        let hash_bytes = std::fs::read(&hash_path).map_err(|source| io_err(&hash_path, source))?;
+        let offset_bytes =
+            std::fs::read(&offset_path).map_err(|source| io_err(&offset_path, source))?;
+        let (capacity, hash_count) = read_hash_header(&hash_bytes)?;
+        let offset_count = read_offset_header(&offset_bytes)?;
+        if hash_bytes.len() != hash_len(capacity)? {
+            return Err(invalid("hash index length does not match its header"));
+        }
+        let expected_offset = if offset_count == 0 {
+            0
+        } else {
+            let last = read_offset_record(&offset_bytes, offset_count - 1)?;
+            last.offset
+                .checked_add(last.length)
+                .ok_or_else(|| invalid("chunk offset overflow"))?
+        };
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            hash_bytes,
+            offset_bytes,
+            capacity,
+            hash_count,
+            offset_count,
+            expected_offset,
+        })
+    }
+
+    #[cfg(test)]
+    #[cfg(test)]
+    pub(crate) fn unique_count(&self) -> u64 {
+        self.hash_count
+    }
+
+    /// `Ok(true)` when `hash_hex` was not yet present. Same hash with a different
+    /// length is a hard error, including across pages.
+    pub(crate) fn insert(
+        &mut self,
+        hash_hex: &str,
+        length: u64,
+        offset: u64,
+        page_no: u32,
+    ) -> Result<bool, MediaStoreError> {
+        if offset != self.expected_offset {
+            return Err(invalid(format!(
+                "chunk offset {offset} breaks contiguity (expected {})",
+                self.expected_offset
+            )));
+        }
+        let next = offset
+            .checked_add(length)
+            .ok_or_else(|| invalid("chunk offset overflow"))?;
+        let hash = decode_hash(hash_hex)?;
+        let fresh =
+            if let Some(existing) = lookup_hash_slot(&self.hash_bytes, self.capacity, &hash)? {
+                if existing.length != length {
+                    return Err(MediaStoreError::HashLengthConflict {
+                        hash: hash_hex.to_string(),
+                        stored: existing.length,
+                        new: length,
+                    });
+                }
+                false
+            } else {
+                if self
+                    .hash_count
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(2))
+                    .is_none_or(|loaded| loaded > self.capacity)
+                {
+                    self.grow_hash()?;
+                }
+                match place_hash(
+                    &mut self.hash_bytes,
+                    self.capacity,
+                    &hash,
+                    length,
+                    offset,
+                    page_no,
+                )? {
+                    Place::Inserted => self.hash_count += 1,
+                    Place::Duplicate => {
+                        return Err(invalid("hash index lost a lookup that reported a new hash"));
+                    }
+                }
+                true
+            };
+        self.append_offset(&hash, length, offset, page_no)?;
+        self.expected_offset = next;
+        Ok(fresh)
+    }
+
+    pub(crate) fn lookup_hash(
+        &mut self,
+        hash_hex: &str,
+    ) -> Result<Option<HashSlot>, MediaStoreError> {
+        let hash = decode_hash(hash_hex)?;
+        lookup_hash_slot(&self.hash_bytes, self.capacity, &hash)
+    }
+
+    pub(crate) fn lookup_offset(
+        &mut self,
+        target: u64,
+    ) -> Result<Option<OffsetRecord>, MediaStoreError> {
+        if self.offset_count == 0 {
+            return Ok(None);
+        }
+        let mut lo = 0u64;
+        let mut hi = self.offset_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let record = read_offset_record(&self.offset_bytes, mid)?;
+            if record.offset <= target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            return Ok(None);
+        }
+        let record = read_offset_record(&self.offset_bytes, lo - 1)?;
+        let end = record
+            .offset
+            .checked_add(record.length)
+            .ok_or_else(|| invalid("chunk offset overflow"))?;
+        if target < end {
+            Ok(Some(record))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<(), MediaStoreError> {
+        write_hash_header(&mut self.hash_bytes, self.capacity, self.hash_count)?;
+        write_offset_header(&mut self.offset_bytes, self.offset_count)?;
+        let hash_path = self.dir.join("hash.idx");
+        let offset_path = self.dir.join("offset.idx");
+        atomic_write::write_atomic(
+            &hash_path,
+            &self.hash_bytes,
+            atomic_write::sync_data_enabled(),
+        )
+        .map_err(|source| io_err(&hash_path, source))?;
+        atomic_write::write_atomic(
+            &offset_path,
+            &self.offset_bytes,
+            atomic_write::sync_data_enabled(),
+        )
+        .map_err(|source| io_err(&offset_path, source))?;
+        Ok(())
+    }
+
+    pub(crate) fn rebuild(
+        pages: &Path,
+        page_count: u32,
+        dir: &Path,
+    ) -> Result<Self, MediaStoreError> {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|source| io_err(dir, source))?;
+        }
+        let mut index = Self::create(dir)?;
+        let manifest_id = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        let mut expected = 0u64;
+        for page_no in 0..page_count {
+            let page = read_page_file(pages, LOCAL_INDEX_SCOPE, manifest_id, page_no)?;
+            for entry in page.entries {
+                if entry.offset != expected {
+                    return Err(invalid(format!(
+                        "chunk offset {} breaks contiguity (expected {expected})",
+                        entry.offset
+                    )));
+                }
+                index.insert(&entry.chunk_hash, entry.length, entry.offset, page_no)?;
+                expected = expected
+                    .checked_add(entry.length)
+                    .ok_or_else(|| invalid("chunk offset overflow"))?;
+            }
+        }
+        index.finish()?;
+        Ok(index)
+    }
+
+    fn append_offset(
+        &mut self,
+        hash: &[u8; 32],
+        length: u64,
+        offset: u64,
+        page_no: u32,
+    ) -> Result<(), MediaStoreError> {
+        let mut buf = [0u8; OFFSET_SLOT as usize];
+        buf[..8].copy_from_slice(&offset.to_le_bytes());
+        buf[8..16].copy_from_slice(&length.to_le_bytes());
+        buf[16..20].copy_from_slice(&page_no.to_le_bytes());
+        buf[24..56].copy_from_slice(hash);
+        let at = usize::try_from(OFFSET_HEADER + self.offset_count * OFFSET_SLOT)
+            .map_err(|_| invalid("offset index offset overflow"))?;
+        let end = at + OFFSET_SLOT as usize;
+        if self.offset_bytes.len() < end {
+            self.offset_bytes.resize(end, 0);
+        }
+        self.offset_bytes[at..end].copy_from_slice(&buf);
+        self.offset_count += 1;
+        Ok(())
+    }
+
+    fn grow_hash(&mut self) -> Result<(), MediaStoreError> {
+        let new_cap = self
+            .capacity
+            .checked_mul(2)
+            .ok_or_else(|| invalid("hash index capacity overflow"))?;
+        let mut new_bytes = empty_hash_image(new_cap)?;
+        for index in 0..self.capacity {
+            let slot = read_hash_slot(&self.hash_bytes, index)?;
+            if !slot.occupied {
+                continue;
+            }
+            match place_hash(
+                &mut new_bytes,
+                new_cap,
+                &slot.hash,
+                slot.length,
+                slot.offset,
+                slot.page_no,
+            )? {
+                Place::Inserted => {}
+                Place::Duplicate => {
+                    return Err(invalid("hash index corrupt during grow"));
+                }
+            }
+        }
+        write_hash_header(&mut new_bytes, new_cap, self.hash_count)?;
+        self.hash_bytes = new_bytes;
+        self.capacity = new_cap;
+        Ok(())
+    }
+}
+
+pub(crate) struct OffsetRecord {
+    pub offset: u64,
+    pub length: u64,
+    pub page_no: u32,
+    pub hash: [u8; 32],
+}
+
+fn read_hash_header(bytes: &[u8]) -> Result<(u64, u64), MediaStoreError> {
+    let buf = bytes
+        .get(..HASH_HEADER as usize)
+        .ok_or_else(|| invalid("hash index truncated"))?;
+    if &buf[..4] != HASH_MAGIC {
+        return Err(invalid("hash index magic mismatch"));
+    }
+    if u32::from_le_bytes(arr4(&buf[4..8])) != 1 {
+        return Err(invalid("hash index version mismatch"));
+    }
+    let capacity = u64::from_le_bytes(arr8(&buf[8..16]));
+    let count = u64::from_le_bytes(arr8(&buf[16..24]));
+    if capacity < 2 || !capacity.is_power_of_two() || count > capacity {
+        return Err(invalid("hash index header is corrupt"));
+    }
+    Ok((capacity, count))
+}
+
+fn read_offset_header(bytes: &[u8]) -> Result<u64, MediaStoreError> {
+    let buf = bytes
+        .get(..OFFSET_HEADER as usize)
+        .ok_or_else(|| invalid("offset index truncated"))?;
+    if &buf[..4] != OFFSET_MAGIC {
+        return Err(invalid("offset index magic mismatch"));
+    }
+    if u32::from_le_bytes(arr4(&buf[4..8])) != 1 {
+        return Err(invalid("offset index version mismatch"));
+    }
+    Ok(u64::from_le_bytes(arr8(&buf[8..16])))
+}
+
+fn read_offset_record(bytes: &[u8], index: u64) -> Result<OffsetRecord, MediaStoreError> {
+    let start = usize::try_from(OFFSET_HEADER + index * OFFSET_SLOT)
+        .map_err(|_| invalid("offset index offset overflow"))?;
+    let buf = bytes
+        .get(start..start + OFFSET_SLOT as usize)
+        .ok_or_else(|| invalid("offset index truncated"))?;
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&buf[24..56]);
+    Ok(OffsetRecord {
+        offset: u64::from_le_bytes(arr8(&buf[..8])),
+        length: u64::from_le_bytes(arr8(&buf[8..16])),
+        page_no: u32::from_le_bytes(arr4(&buf[16..20])),
+        hash,
+    })
+}
+
+pub fn read_envelope_file(path: &Path) -> Result<String, MediaStoreError> {
+    let file = File::open(path).map_err(|source| io_err(path, source))?;
+    let mut buf = Vec::new();
+    file.take((manifest::MAX_ENVELOPE_SIZE as u64) + 1)
+        .read_to_end(&mut buf)
+        .map_err(|source| io_err(path, source))?;
+    if buf.len() > manifest::MAX_ENVELOPE_SIZE {
+        return Err(invalid(format!(
+            "envelope '{}' exceeds {} bytes",
+            path.display(),
+            manifest::MAX_ENVELOPE_SIZE
+        )));
+    }
+    String::from_utf8(buf)
+        .map_err(|_| invalid(format!("envelope '{}' is not utf-8", path.display())))
+}
+
+pub fn repo_media_root() -> Result<PathBuf, MediaStoreError> {
+    crate::utils::path::media_chunks()
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| invalid("media chunks path has no parent"))
+}
+
+pub fn summary_path(media_root: &Path, oid: &str) -> PathBuf {
+    media_root.join("manifests").join(oid).join("summary.json")
+}
+
+fn pages_dir(media_root: &Path, oid: &str) -> PathBuf {
+    media_root.join("manifests").join(oid).join("pages")
+}
+
+fn index_dir_for(media_root: &Path, manifest_id: &str) -> PathBuf {
+    media_root
+        .join("index")
+        .join(LOCAL_INDEX_SCOPE)
+        .join(manifest_id)
+}
+
+pub fn load_summary(media_root: &Path, oid: &str) -> Result<ManifestSummary, MediaStoreError> {
+    if !is_sha256_hex(oid) {
+        return Err(MediaStoreError::InvalidHash(oid.to_string()));
+    }
+    let path = summary_path(media_root, oid);
+    let text = read_envelope_file(&path)?;
+    ManifestSummary::from_json(&text).map_err(map_manifest)
+}
+
+fn read_page_file(
+    pages: &Path,
+    scope: &str,
+    manifest_id: &str,
+    page_no: u32,
+) -> Result<ManifestPage, MediaStoreError> {
+    let cache = page_cache::PageCache::shared();
+    let key = PageKey {
+        scope: scope.to_string(),
+        manifest_id: manifest_id.to_string(),
+        page_no,
+    };
+    let text = if let Some(hit) = cache.get(&key) {
+        String::from_utf8(hit).map_err(|_| invalid("cached manifest page is not utf-8"))?
+    } else {
+        let path = pages.join(format!("{page_no:08}.json"));
+        let text = read_envelope_file(&path)?;
+        cache.insert(key, text.clone().into_bytes());
+        text
+    };
+    ManifestPage::from_json(&text).map_err(map_manifest)
+}
+
+pub struct StreamOutcome {
+    pub summary: ManifestSummary,
+    pub unique_chunks: u64,
+    pub max_buffered_entries: usize,
+    pub manifest_path: PathBuf,
+}
+
+struct PartialDirs {
+    paths: Vec<PathBuf>,
+    committed: bool,
+}
+
+impl Drop for PartialDirs {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for path in &self.paths {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn replace_dir(from: &Path, to: &Path) -> Result<(), MediaStoreError> {
+    if to.exists() {
+        std::fs::remove_dir_all(to).map_err(|source| io_err(to, source))?;
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+    }
+    std::fs::rename(from, to).map_err(|source| io_err(to, source))
+}
+
+/// Chunk `path` one page at a time into `media_root`. The canonical id is hashed
+/// as entries are flushed; page boundaries are not identity inputs. Chunk bytes
+/// are stored only when `store_chunks` is set.
+pub fn stream_media_file(
+    path: &Path,
+    media_root: &Path,
+    store_chunks: bool,
+) -> Result<StreamOutcome, MediaStoreError> {
+    let media_oid =
+        crate::utils::lfs::calc_lfs_file_hash(path).map_err(|source| io_err(path, source))?;
+    let media_size = std::fs::metadata(path)
+        .map_err(|source| io_err(path, source))?
+        .len();
+    let manifest_partial = media_root
+        .join("manifests")
+        .join(format!(".partial-{media_oid}"));
+    let index_partial = media_root
+        .join("index")
+        .join(LOCAL_INDEX_SCOPE)
+        .join(format!(".partial-{media_oid}"));
+    if manifest_partial.exists() {
+        std::fs::remove_dir_all(&manifest_partial)
+            .map_err(|source| io_err(&manifest_partial, source))?;
+    }
+    if index_partial.exists() {
+        std::fs::remove_dir_all(&index_partial).map_err(|source| io_err(&index_partial, source))?;
+    }
+    let mut partial = PartialDirs {
+        paths: vec![manifest_partial.clone(), index_partial.clone()],
+        committed: false,
+    };
+    std::fs::create_dir_all(manifest_partial.join("pages"))
+        .map_err(|source| io_err(&manifest_partial, source))?;
+    let mut writer = ManifestWriter::create(
+        &manifest_partial,
+        &index_partial,
+        &media_oid,
+        media_size,
+        manifest::local_created_by(),
+    )?;
+    let store = MediaChunkStore::at(media_root.join("chunks"));
+    let file = File::open(path).map_err(|source| io_err(path, source))?;
+    chunker::visit_chunks(
+        std::io::BufReader::new(file),
+        |chunk, data| -> Result<(), MediaStoreError> {
+            if store_chunks {
+                store.put_chunk(data)?;
+            }
+            writer.push(ChunkEntry {
+                offset: chunk.offset,
+                length: chunk.length,
+                chunk_hash: chunk.chunk_hash.clone(),
+                encoded_length: chunk.length,
+                compression: manifest::COMPRESSION_NONE.to_string(),
+                checksum: None,
+            })?;
+            Ok(())
+        },
+    )?;
+    let finished = writer.finish()?;
+    let index_final = index_dir_for(media_root, &finished.summary.manifest_id);
+    let manifest_final = media_root.join("manifests").join(&media_oid);
+    replace_dir(&index_partial, &index_final)?;
+    replace_dir(&manifest_partial, &manifest_final)?;
+    partial.committed = true;
+    Ok(StreamOutcome {
+        manifest_path: summary_path(media_root, &media_oid),
+        summary: finished.summary,
+        unique_chunks: finished.unique_chunks,
+        max_buffered_entries: finished.max_buffered_entries,
+    })
+}
+
+struct ManifestWriter {
+    manifest_dir: PathBuf,
+    pages_dir: PathBuf,
+    index: DiskMediaIndex,
+    hasher: manifest::CanonicalIdHasher,
+    page: Vec<ChunkEntry>,
+    budget: PageBudget,
+    page_no: u32,
+    chunk_count: u64,
+    covered: u64,
+    unique: u64,
+    max_buffered: usize,
+    media_oid: String,
+    media_size: u64,
+    created_by: CreatedBy,
+}
+
+struct FinishedManifest {
+    summary: ManifestSummary,
+    unique_chunks: u64,
+    max_buffered_entries: usize,
+}
+
+impl ManifestWriter {
+    fn create(
+        manifest_dir: &Path,
+        index_dir: &Path,
+        media_oid: &str,
+        media_size: u64,
+        created_by: CreatedBy,
+    ) -> Result<Self, MediaStoreError> {
+        let pages = manifest_dir.join("pages");
+        std::fs::create_dir_all(&pages).map_err(|source| io_err(&pages, source))?;
+        let hasher = manifest::CanonicalIdHasher::new(
+            manifest::MANIFEST_VERSION,
+            chunker::ALGORITHM,
+            manifest::HASH_ALGORITHM,
+            media_oid,
+            media_size,
+        )
+        .map_err(map_manifest)?;
+        Ok(Self {
+            manifest_dir: manifest_dir.to_path_buf(),
+            pages_dir: pages,
+            index: DiskMediaIndex::create(index_dir)?,
+            hasher,
+            page: Vec::new(),
+            budget: PageBudget::new(),
+            page_no: 0,
+            chunk_count: 0,
+            covered: 0,
+            unique: 0,
+            max_buffered: 0,
+            media_oid: media_oid.to_string(),
+            media_size,
+            created_by,
+        })
+    }
+
+    fn push(&mut self, entry: ChunkEntry) -> Result<(), MediaStoreError> {
+        if entry.offset != self.covered {
+            return Err(invalid(format!(
+                "chunk offset {} breaks contiguity (expected {})",
+                entry.offset, self.covered
+            )));
+        }
+        let next_covered = entry
+            .offset
+            .checked_add(entry.length)
+            .ok_or_else(|| invalid("chunk offset overflow"))?;
+        if !self.budget.try_push(&entry).map_err(map_manifest)? {
+            if self.page.is_empty() {
+                return Err(invalid(
+                    "single chunk entry exceeds page byte budget".to_string(),
+                ));
+            }
+            self.flush_page()?;
+            if !self.budget.try_push(&entry).map_err(map_manifest)? {
+                return Err(invalid(
+                    "single chunk entry exceeds page byte budget".to_string(),
+                ));
+            }
+        }
+        self.page.push(entry);
+        self.max_buffered = self.max_buffered.max(self.page.len());
+        self.covered = next_covered;
+        Ok(())
+    }
+
+    fn flush_page(&mut self) -> Result<(), MediaStoreError> {
+        if self.page.is_empty() {
+            return Ok(());
+        }
+        let page_no = self.page_no;
+        let page = ManifestPage {
+            page_no,
+            entries: std::mem::take(&mut self.page),
+        };
+        page.validate().map_err(map_manifest)?;
+        let bytes = serde_json::to_vec(&page).map_err(|err| invalid(err.to_string()))?;
+        if bytes.len() > manifest::MAX_ENVELOPE_SIZE {
+            return Err(invalid("page envelope exceeds size limit"));
+        }
+        let path = self.pages_dir.join(format!("{page_no:08}.json"));
+        atomic_write::write_atomic(&path, &bytes, atomic_write::sync_data_enabled())
+            .map_err(|source| io_err(&path, source))?;
+        for entry in &page.entries {
+            self.hasher.push(entry).map_err(map_manifest)?;
+            if self
+                .index
+                .insert(&entry.chunk_hash, entry.length, entry.offset, page_no)?
+            {
+                self.unique += 1;
+            }
+        }
+        self.chunk_count += page.entries.len() as u64;
+        self.budget = PageBudget::new();
+        self.page_no = self
+            .page_no
+            .checked_add(1)
+            .ok_or_else(|| invalid("page_no overflow"))?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<FinishedManifest, MediaStoreError> {
+        self.flush_page()?;
+        if self.covered != self.media_size {
+            return Err(invalid(format!(
+                "chunk lengths sum to {} but media_size is {}",
+                self.covered, self.media_size
+            )));
+        }
+        let manifest_id = self.hasher.finish();
+        let summary = ManifestSummary {
+            version: manifest::MANIFEST_VERSION,
+            algorithm: chunker::ALGORITHM.to_string(),
+            hash_algorithm: manifest::HASH_ALGORITHM.to_string(),
+            oid: self.media_oid,
+            size: self.media_size,
+            chunk_count: self.chunk_count,
+            page_count: self.page_no,
+            manifest_id,
+            created_by: Some(self.created_by),
+        };
+        summary.validate().map_err(map_manifest)?;
+        let bytes = serde_json::to_vec(&summary).map_err(|err| invalid(err.to_string()))?;
+        if bytes.len() > manifest::MAX_ENVELOPE_SIZE {
+            return Err(invalid("summary envelope exceeds size limit"));
+        }
+        let path = self.manifest_dir.join("summary.json");
+        atomic_write::write_atomic(&path, &bytes, atomic_write::sync_data_enabled())
+            .map_err(|source| io_err(&path, source))?;
+        self.index.finish()?;
+        Ok(FinishedManifest {
+            summary,
+            unique_chunks: self.unique,
+            max_buffered_entries: self.max_buffered,
+        })
+    }
+}
+
+fn open_or_rebuild(
+    media_root: &Path,
+    summary: &ManifestSummary,
+) -> Result<DiskMediaIndex, MediaStoreError> {
+    let dir = index_dir_for(media_root, &summary.manifest_id);
+    if let Ok(index) = DiskMediaIndex::open(&dir) {
+        return Ok(index);
+    }
+    DiskMediaIndex::rebuild(
+        &pages_dir(media_root, &summary.oid),
+        summary.page_count,
+        &dir,
+    )
+}
+
+/// Reassemble from immutable pages, one page at a time, checking the derived
+/// index for hash length and offset. A missing index is rebuilt from the pages.
+pub fn reassemble_paged(
+    media_root: &Path,
+    summary: &ManifestSummary,
+    dest: &Path,
+) -> Result<(), MediaStoreError> {
+    use ring::digest::{Context, SHA256};
+
+    summary.validate().map_err(map_manifest)?;
+    let mut index = open_or_rebuild(media_root, summary)?;
+    let store = MediaChunkStore::at(media_root.join("chunks"));
+    let io_error = |source| MediaStoreError::Io {
+        path: dest.display().to_string(),
+        source,
+    };
+    let target = std::path::absolute(dest).map_err(io_error)?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut writer = match std::fs::metadata(&target) {
+        Ok(metadata) => crate::utils::atomic_stream::StreamingAtomicFile::new_in_with_permissions(
+            parent,
+            atomic_write::sync_data_enabled(),
+            metadata.permissions(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::utils::atomic_stream::StreamingAtomicFile::new_in(
+                parent,
+                atomic_write::sync_data_enabled(),
+            )
+        }
+        Err(error) => return Err(io_error(error)),
+    }
+    .map_err(io_error)?;
+    let mut digest = Context::new(&SHA256);
+    let mut covered = 0u64;
+    let pages = pages_dir(media_root, &summary.oid);
+    for page_no in 0..summary.page_count {
+        let page = read_page_file(&pages, LOCAL_INDEX_SCOPE, &summary.manifest_id, page_no)?;
+        if page.page_no != page_no {
+            return Err(invalid(format!(
+                "stored page_no {} does not match {page_no}",
+                page.page_no
+            )));
+        }
+        for entry in &page.entries {
+            if entry.offset != covered {
+                return Err(invalid(format!(
+                    "chunk offset {} breaks contiguity (expected {covered})",
+                    entry.offset
+                )));
+            }
+            let hashed = index.lookup_hash(&entry.chunk_hash)?.ok_or_else(|| {
+                invalid(format!(
+                    "derived index has no entry for hash {}",
+                    entry.chunk_hash
+                ))
+            })?;
+            if hashed.length != entry.length {
+                return Err(MediaStoreError::HashLengthConflict {
+                    hash: entry.chunk_hash.clone(),
+                    stored: hashed.length,
+                    new: entry.length,
+                });
+            }
+            let located = index.lookup_offset(entry.offset)?.ok_or_else(|| {
+                invalid(format!(
+                    "derived index has no chunk covering offset {}",
+                    entry.offset
+                ))
+            })?;
+            if located.offset != entry.offset
+                || located.length != entry.length
+                || located.page_no != page_no
+                || located.hash.as_slice() != decode_hash(&entry.chunk_hash)?.as_slice()
+            {
+                return Err(invalid(format!(
+                    "derived index offset {} does not match page {page_no}",
+                    entry.offset
+                )));
+            }
+            let bytes = store.get_chunk(&entry.chunk_hash)?;
+            if bytes.len() as u64 != entry.length {
+                return Err(io_error(std::io::Error::other(
+                    "chunk length does not match manifest",
+                )));
+            }
+            digest.update(&bytes);
+            writer.write_all(&bytes).map_err(io_error)?;
+            covered = covered
+                .checked_add(entry.length)
+                .ok_or_else(|| invalid("chunk offset overflow"))?;
+        }
+    }
+    if covered != summary.size {
+        return Err(invalid(format!(
+            "chunk lengths sum to {covered} but media size is {}",
+            summary.size
+        )));
+    }
+    let actual = hex::encode(digest.finish().as_ref());
+    if actual != summary.oid {
+        return Err(MediaStoreError::MediaOidMismatch {
+            expected: summary.oid.clone(),
+            actual,
+        });
+    }
+    writer.persist(&target).map_err(io_error)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    fn entry(index: u64, length: u64) -> ChunkEntry {
+        ChunkEntry {
+            offset: index.saturating_mul(length),
+            length,
+            chunk_hash: format!("{index:064x}"),
+            encoded_length: length,
+            compression: manifest::COMPRESSION_NONE.to_string(),
+            checksum: None,
+        }
+    }
+
+    #[test]
+    fn hash_index_grows_and_finds_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = DiskMediaIndex::create_with_capacity(dir.path(), 16).unwrap();
+        for i in 0..40u64 {
+            assert!(index.insert(&format!("{i:064x}"), 10, i * 10, 0).unwrap());
+        }
+        index.finish().unwrap();
+        let mut opened = DiskMediaIndex::open(dir.path()).unwrap();
+        assert_eq!(opened.unique_count(), 40);
+        let at = opened.lookup_offset(25).unwrap().unwrap();
+        assert_eq!(at.offset, 20);
+        assert_eq!(at.length, 10);
+        let hashed = opened.lookup_hash(&format!("{:064x}", 3)).unwrap().unwrap();
+        assert_eq!(hashed.length, 10);
+        assert_eq!(hashed.offset, 30);
+    }
+
+    #[test]
+    fn cross_page_hash_length_conflict_is_rejected_and_same_length_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = ManifestWriter::create(
+            &dir.path().join("manifest"),
+            &dir.path().join("index"),
+            &"a".repeat(64),
+            4098,
+            manifest::local_created_by(),
+        )
+        .unwrap();
+        for i in 0..4096u64 {
+            writer.push(entry(i, 1)).unwrap();
+        }
+        let mut conflict = entry(0, 1);
+        conflict.offset = 4096;
+        conflict.length = 2;
+        conflict.encoded_length = 2;
+        writer.push(conflict).unwrap();
+        assert!(writer.finish().is_err());
+
+        let manifest_dir = dir.path().join("manifest-ok");
+        let index_dir = dir.path().join("index-ok");
+        let mut writer = ManifestWriter::create(
+            &manifest_dir,
+            &index_dir,
+            &"b".repeat(64),
+            4097,
+            manifest::local_created_by(),
+        )
+        .unwrap();
+        for i in 0..4096u64 {
+            writer.push(entry(i, 1)).unwrap();
+        }
+        let mut again = entry(0, 1);
+        again.offset = 4096;
+        writer.push(again).unwrap();
+        let finished = writer.finish().unwrap();
+        assert_eq!(finished.unique_chunks, 4096);
+        let mut index = DiskMediaIndex::open(&index_dir).unwrap();
+        let first = index.lookup_offset(0).unwrap().unwrap();
+        let second = index.lookup_offset(4096).unwrap().unwrap();
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(first.length, second.length);
+    }
+
+    #[test]
+    fn gap_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = ManifestWriter::create(
+            &dir.path().join("m"),
+            &dir.path().join("i"),
+            &"c".repeat(64),
+            3,
+            manifest::local_created_by(),
+        )
+        .unwrap();
+        writer.push(entry(0, 1)).unwrap();
+        let mut skipped = entry(2, 1);
+        skipped.offset = 5;
+        assert!(writer.push(skipped).is_err());
+    }
+
+    #[test]
+    fn logical_16gib_past_65536_chunks_stays_within_a_page_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let count = 65_537u64;
+        let length = chunker::MAX_SIZE as u64;
+        let size = count * length;
+        assert!(count > 65_536);
+        assert!(size > 16 * 1024 * 1024 * 1024);
+        let oid = "d".repeat(64);
+        let mut side = manifest::CanonicalIdHasher::new(
+            manifest::MANIFEST_VERSION,
+            chunker::ALGORITHM,
+            manifest::HASH_ALGORITHM,
+            &oid,
+            size,
+        )
+        .unwrap();
+        let mut writer = ManifestWriter::create(
+            &dir.path().join("manifest"),
+            &dir.path().join("index"),
+            &oid,
+            size,
+            manifest::local_created_by(),
+        )
+        .unwrap();
+        for i in 0..count {
+            let entry = entry(i, length);
+            side.push(&entry).unwrap();
+            writer.push(entry).unwrap();
+        }
+        let finished = writer.finish().unwrap();
+        assert_eq!(finished.summary.chunk_count, count);
+        assert_eq!(finished.summary.size, size);
+        assert_eq!(finished.summary.page_count, 17);
+        assert!(finished.max_buffered_entries <= manifest::MAX_PAGE_ENTRIES);
+        assert_eq!(finished.unique_chunks, count);
+        assert_eq!(finished.summary.manifest_id, side.finish());
+        let boundary = 4096 * length;
+        let mut index = DiskMediaIndex::open(&dir.path().join("index")).unwrap();
+        let at_boundary = index.lookup_offset(boundary).unwrap().unwrap();
+        assert_eq!(at_boundary.offset, boundary);
+        assert_eq!(at_boundary.page_no, 1);
+        let previous = index.lookup_offset(boundary - 1).unwrap().unwrap();
+        assert_eq!(previous.page_no, 0);
+        assert_eq!(previous.offset, boundary - length);
+        drop(index);
+        std::fs::remove_dir_all(dir.path().join("index")).unwrap();
+        let mut rebuilt = DiskMediaIndex::rebuild(
+            &dir.path().join("manifest").join("pages"),
+            finished.summary.page_count,
+            &dir.path().join("index"),
+        )
+        .unwrap();
+        let again = rebuilt.lookup_offset(boundary).unwrap().unwrap();
+        assert_eq!(again.offset, boundary);
+        assert_eq!(again.page_no, 1);
+    }
+
+    #[test]
+    fn stream_file_roundtrip_rebuilds_a_deleted_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("blob.bin");
+        std::fs::write(&source, b"libra-media-paging").unwrap();
+        let root = dir.path().join("media");
+        let outcome = stream_media_file(&source, &root, true).unwrap();
+        assert_eq!(outcome.summary.chunk_count, 1);
+        assert!(outcome.max_buffered_entries <= manifest::MAX_PAGE_ENTRIES);
+        let dest = dir.path().join("out.bin");
+        reassemble_paged(&root, &outcome.summary, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"libra-media-paging");
+        std::fs::remove_dir_all(root.join("index")).unwrap();
+        let dest2 = dir.path().join("out2.bin");
+        reassemble_paged(&root, &outcome.summary, &dest2).unwrap();
+        assert_eq!(std::fs::read(dest2).unwrap(), b"libra-media-paging");
+        assert!(root.join("index").join(LOCAL_INDEX_SCOPE).exists());
+    }
 }

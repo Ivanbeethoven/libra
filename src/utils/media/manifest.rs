@@ -1,6 +1,10 @@
 //! Media manifest model (lore.md §6.3) — the versioned description of a media
-//! object's FastCDC chunking. Serialized as a content-addressed JSON file under
-//! `.libra/media/manifests/<media_oid>.json` (no SQLite table, zero migration).
+//! object's FastCDC chunking.
+//!
+//! Local layouts are paged: `.libra/media/manifests/<media_oid>/summary.json`
+//! plus `pages/<page_no>.json`. Page boundaries are a transport/storage split
+//! and do not participate in the canonical id (P-01 / P-01a). There is no
+//! product-wide chunk-count cap.
 //!
 //! FROZEN schema (§6.1): field names and semantics are fixed for cross-client
 //! byte-identical determinism. The optional strong per-chunk `checksum` field
@@ -12,6 +16,7 @@
 
 use std::path::Path;
 
+use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -21,8 +26,19 @@ use super::{
 
 /// Manifest schema version (bumped on an incompatible on-disk change).
 pub const MANIFEST_VERSION: u32 = 1;
+/// Media metadata envelope: one page, summary, or status body (C-02).
+pub const MAX_ENVELOPE_SIZE: usize = 1_048_576;
+/// Legacy whole-manifest JSON cap still used by the pre-paging transfer client.
 pub const MAX_MANIFEST_SIZE: usize = 10 * 1024 * 1024;
-pub const MAX_CHUNKS: usize = 8192;
+/// Longest chunk list in one page (P-01a).
+pub const MAX_PAGE_ENTRIES: usize = 4096;
+/// Compact canonical entries-array budget. The remaining 64 KiB of the 1 MiB
+/// envelope is reserved for fixed page wrap fields (P-01a).
+pub const MAX_PAGE_ENTRIES_BYTES: usize = 960 * 1024;
+pub const MAX_CREATED_BY_BYTES: usize = 4096;
+pub const HASH_ALGORITHM: &str = "sha256";
+pub const COMPRESSION_NONE: &str = "none";
+pub const MANIFEST_PAGING: &str = "v1";
 
 /// One chunk entry in the manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +81,36 @@ pub struct MediaManifest {
     /// Optional pointer to a complete standard LFS media object for fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_oid: Option<String>,
+}
+
+/// Paging summary (P-01 / P-02). Not a full layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestSummary {
+    pub version: u32,
+    pub algorithm: String,
+    pub hash_algorithm: String,
+    pub oid: String,
+    pub size: u64,
+    pub chunk_count: u64,
+    pub page_count: u32,
+    pub manifest_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<CreatedBy>,
+}
+
+/// One immutable page of chunk entries (P-01a / P-02).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestPage {
+    pub page_no: u32,
+    pub entries: Vec<ChunkEntry>,
+}
+
+/// Running P-01a budget for one page. Byte length matches
+/// [`canonical_entries_bytes`] and only grows as entries are appended.
+#[derive(Debug, Clone, Copy)]
+pub struct PageBudget {
+    pub entries: usize,
+    pub bytes: usize,
 }
 
 /// Errors from manifest construction/validation.
@@ -158,31 +204,29 @@ impl MediaManifest {
     /// do not change the identity of the frozen content-defined chunk layout.
     pub fn id(&self) -> Result<String, ManifestError> {
         self.validate()?;
-        let bytes = serde_json::to_vec(&(
+        let mut hasher = CanonicalIdHasher::new(
             self.version,
             &self.algorithm,
             &self.hash_algorithm,
             &self.media_oid,
             self.media_size,
-            &self.chunks,
-        ))
-        .map_err(|error| ManifestError::Serde(error.to_string()))?;
-        Ok(super::sha256_hex(&bytes))
+        )?;
+        for entry in &self.chunks {
+            hasher.push(entry)?;
+        }
+        Ok(hasher.finish())
     }
 
     /// Validate the frozen invariants: version/algorithm/hash, a 64-hex
     /// `media_oid`, first-chunk-offset-0, contiguity, and that the chunk lengths
     /// sum to `media_size`. Returns an actionable error on any violation.
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.chunks.len() > MAX_CHUNKS
-            || self
-                .fallback_oid
-                .as_ref()
-                .is_some_and(|oid| oid != &self.media_oid)
+        if self
+            .fallback_oid
+            .as_ref()
+            .is_some_and(|oid| oid != &self.media_oid)
         {
-            return Err(ManifestError::Invalid(
-                "too many chunks or mismatched fallback_oid".into(),
-            ));
+            return Err(ManifestError::Invalid("mismatched fallback_oid".into()));
         }
         if self.version != MANIFEST_VERSION {
             return Err(ManifestError::Invalid(format!(
@@ -251,6 +295,295 @@ impl MediaManifest {
             )));
         }
         Ok(())
+    }
+}
+
+impl PageBudget {
+    pub fn new() -> Self {
+        Self {
+            entries: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Append `entry` when it still fits. `Ok(false)` means the page must be
+    /// flushed first; the budget is unchanged in that case.
+    pub fn try_push(&mut self, entry: &ChunkEntry) -> Result<bool, ManifestError> {
+        let entry_len = serde_json::to_vec(entry)
+            .map_err(|error| ManifestError::Serde(error.to_string()))?
+            .len();
+        let next = if self.entries == 0 {
+            entry_len.checked_add(2)
+        } else {
+            self.bytes
+                .checked_add(entry_len)
+                .and_then(|sum| sum.checked_add(1))
+        }
+        .ok_or_else(|| ManifestError::Invalid("page size overflow".into()))?;
+        if self.entries + 1 > MAX_PAGE_ENTRIES || next > MAX_PAGE_ENTRIES_BYTES {
+            return Ok(false);
+        }
+        self.entries += 1;
+        self.bytes = next;
+        Ok(true)
+    }
+}
+
+impl Default for PageBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Compact canonical encoding of a chunk-entry slice (identity / P-01a).
+pub fn canonical_entries_bytes(entries: &[ChunkEntry]) -> Result<Vec<u8>, ManifestError> {
+    serde_json::to_vec(entries).map_err(|error| ManifestError::Serde(error.to_string()))
+}
+
+/// Longest prefix length under the P-01a entry-count and byte budgets.
+pub fn longest_page_prefix(chunks: &[ChunkEntry]) -> Result<usize, ManifestError> {
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    let max = chunks.len().min(MAX_PAGE_ENTRIES);
+    let mut lo = 1usize;
+    let mut hi = max;
+    let mut best = 0usize;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let bytes = canonical_entries_bytes(&chunks[..mid])?;
+        if bytes.len() <= MAX_PAGE_ENTRIES_BYTES {
+            best = mid;
+            lo = mid + 1;
+        } else if mid == 1 {
+            return Err(ManifestError::Invalid(
+                "single chunk entry exceeds page byte budget".into(),
+            ));
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if best == 0 {
+        return Err(ManifestError::Invalid(
+            "unable to form a non-empty page under P-01a budgets".into(),
+        ));
+    }
+    Ok(best)
+}
+
+/// Deterministic P-01a page split. Empty input yields zero pages. Every
+/// non-final page is the longest legal prefix of the remainder; the final
+/// page is non-empty.
+pub fn split_pages(chunks: &[ChunkEntry]) -> Result<Vec<Vec<ChunkEntry>>, ManifestError> {
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pages = Vec::new();
+    let mut rest = chunks;
+    while !rest.is_empty() {
+        let n = longest_page_prefix(rest)?;
+        pages.push(rest[..n].to_vec());
+        rest = &rest[n..];
+    }
+    Ok(pages)
+}
+
+/// Streaming SHA-256 of the canonical identity tuple. Page boundaries are not
+/// inputs. The digest matches `serde_json` of
+/// `(version, algorithm, hash_algorithm, media_oid, media_size, chunks)`.
+pub struct CanonicalIdHasher {
+    ctx: Context,
+    any: bool,
+}
+
+impl CanonicalIdHasher {
+    pub fn new(
+        version: u32,
+        algorithm: &str,
+        hash_algorithm: &str,
+        media_oid: &str,
+        media_size: u64,
+    ) -> Result<Self, ManifestError> {
+        let prefix =
+            serde_json::to_vec(&(version, algorithm, hash_algorithm, media_oid, media_size))
+                .map_err(|error| ManifestError::Serde(error.to_string()))?;
+        if prefix.last() != Some(&b']') {
+            return Err(ManifestError::Invalid(
+                "canonical identity prefix is not a JSON array".into(),
+            ));
+        }
+        let mut ctx = Context::new(&SHA256);
+        ctx.update(&prefix[..prefix.len() - 1]);
+        ctx.update(b",");
+        ctx.update(b"[");
+        Ok(Self { ctx, any: false })
+    }
+
+    pub fn push(&mut self, entry: &ChunkEntry) -> Result<(), ManifestError> {
+        if self.any {
+            self.ctx.update(b",");
+        }
+        self.any = true;
+        let bytes =
+            serde_json::to_vec(entry).map_err(|error| ManifestError::Serde(error.to_string()))?;
+        self.ctx.update(&bytes);
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> String {
+        self.ctx.update(b"]");
+        self.ctx.update(b"]");
+        hex::encode(self.ctx.finish().as_ref())
+    }
+}
+
+pub fn local_created_by() -> CreatedBy {
+    CreatedBy {
+        client: "libra".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities: vec![chunker::ALGORITHM.to_string(), HASH_ALGORITHM.to_string()],
+    }
+}
+
+impl ManifestPage {
+    pub fn from_json(text: &str) -> Result<Self, ManifestError> {
+        if text.len() > MAX_ENVELOPE_SIZE {
+            return Err(ManifestError::Invalid(
+                "page envelope exceeds size limit".into(),
+            ));
+        }
+        let page: ManifestPage =
+            serde_json::from_str(text).map_err(|error| ManifestError::Serde(error.to_string()))?;
+        page.validate()?;
+        Ok(page)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.entries.is_empty() {
+            return Err(ManifestError::Invalid(
+                "page entries must be non-empty".into(),
+            ));
+        }
+        if self.entries.len() > MAX_PAGE_ENTRIES {
+            return Err(ManifestError::Invalid(
+                "page exceeds max_page_entries".into(),
+            ));
+        }
+        let bytes = canonical_entries_bytes(&self.entries)?;
+        if bytes.len() > MAX_PAGE_ENTRIES_BYTES {
+            return Err(ManifestError::Invalid(
+                "page entries exceed compact byte budget".into(),
+            ));
+        }
+        for (i, entry) in self.entries.iter().enumerate() {
+            validate_page_entry(i, entry)?;
+        }
+        Ok(())
+    }
+}
+
+impl ManifestSummary {
+    pub fn from_json(text: &str) -> Result<Self, ManifestError> {
+        if text.len() > MAX_ENVELOPE_SIZE {
+            return Err(ManifestError::Invalid(
+                "summary envelope exceeds size limit".into(),
+            ));
+        }
+        let summary: ManifestSummary =
+            serde_json::from_str(text).map_err(|error| ManifestError::Serde(error.to_string()))?;
+        summary.validate()?;
+        Ok(summary)
+    }
+
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.version != MANIFEST_VERSION {
+            return Err(ManifestError::Invalid(format!(
+                "unsupported manifest version {} (this binary supports {MANIFEST_VERSION})",
+                self.version
+            )));
+        }
+        if self.algorithm != chunker::ALGORITHM {
+            return Err(ManifestError::Invalid(format!(
+                "unsupported chunk algorithm '{}' (expected '{}')",
+                self.algorithm,
+                chunker::ALGORITHM
+            )));
+        }
+        if self.hash_algorithm != HASH_ALGORITHM {
+            return Err(ManifestError::Invalid(format!(
+                "unsupported hash algorithm '{}' (oid must be sha256)",
+                self.hash_algorithm
+            )));
+        }
+        if !is_sha256_hex(&self.oid) || !is_sha256_hex(&self.manifest_id) {
+            return Err(ManifestError::Invalid(
+                "oid and manifest_id must be 64 lowercase-hex characters".into(),
+            ));
+        }
+        if let Some(created_by) = &self.created_by {
+            let bytes = serde_json::to_vec(created_by)
+                .map_err(|error| ManifestError::Serde(error.to_string()))?;
+            if bytes.len() > MAX_CREATED_BY_BYTES {
+                return Err(ManifestError::Invalid(
+                    "created_by exceeds 4096 bytes".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_page_entry(i: usize, entry: &ChunkEntry) -> Result<(), ManifestError> {
+    if entry.checksum.is_some() {
+        return Err(ManifestError::Invalid(format!(
+            "chunk {i} has unsupported checksum"
+        )));
+    }
+    let max = chunker::MAX_SIZE as u64;
+    if entry.length == 0 || entry.length > max {
+        return Err(ManifestError::Invalid(format!(
+            "chunk {i} has invalid length"
+        )));
+    }
+    if !is_sha256_hex(&entry.chunk_hash) {
+        return Err(ManifestError::Invalid(format!(
+            "chunk {i} chunk_hash must be 64 lowercase-hex characters"
+        )));
+    }
+    if entry.compression != COMPRESSION_NONE {
+        return Err(ManifestError::Invalid(format!(
+            "chunk {i} has unsupported compression '{}' (supports only 'none')",
+            entry.compression
+        )));
+    }
+    if entry.encoded_length != entry.length {
+        return Err(ManifestError::Invalid(format!(
+            "chunk {i} encoded_length {} must equal length {}",
+            entry.encoded_length, entry.length
+        )));
+    }
+    Ok(())
+}
+
+impl MediaManifest {
+    /// Bounded summary of an in-memory manifest. Paging does not change [`Self::id`].
+    pub fn summary(&self) -> Result<ManifestSummary, ManifestError> {
+        let pages = split_pages(&self.chunks)?;
+        let page_count = u32::try_from(pages.len())
+            .map_err(|_| ManifestError::Invalid("page_count exceeds u32".into()))?;
+        let chunk_count = u64::try_from(self.chunks.len())
+            .map_err(|_| ManifestError::Invalid("chunk_count exceeds u64".into()))?;
+        Ok(ManifestSummary {
+            version: self.version,
+            algorithm: self.algorithm.clone(),
+            hash_algorithm: self.hash_algorithm.clone(),
+            oid: self.media_oid.clone(),
+            size: self.media_size,
+            chunk_count,
+            page_count,
+            manifest_id: self.id()?,
+            created_by: Some(self.created_by.clone()),
+        })
     }
 }
 
@@ -337,5 +670,141 @@ mod tests {
         let mut m = sample();
         m.media_size = 999; // sum mismatch
         assert!(m.validate().is_err());
+    }
+
+    fn tuple_id(manifest: &MediaManifest) -> String {
+        let bytes = serde_json::to_vec(&(
+            manifest.version,
+            &manifest.algorithm,
+            &manifest.hash_algorithm,
+            &manifest.media_oid,
+            manifest.media_size,
+            &manifest.chunks,
+        ))
+        .unwrap();
+        super::super::sha256_hex(&bytes)
+    }
+
+    fn synthetic_entry(index: u64, length: u64) -> ChunkEntry {
+        ChunkEntry {
+            offset: index.checked_mul(length).unwrap(),
+            length,
+            chunk_hash: format!("{index:064x}"),
+            encoded_length: length,
+            compression: COMPRESSION_NONE.to_string(),
+            checksum: None,
+        }
+    }
+
+    fn manifest_from(chunks: Vec<ChunkEntry>) -> MediaManifest {
+        let media_size = chunks.iter().map(|chunk| chunk.length).sum();
+        MediaManifest {
+            version: MANIFEST_VERSION,
+            algorithm: chunker::ALGORITHM.to_string(),
+            hash_algorithm: HASH_ALGORITHM.to_string(),
+            media_oid: "a".repeat(64),
+            media_size,
+            chunks,
+            created_by: local_created_by(),
+            fallback_oid: None,
+        }
+    }
+
+    #[test]
+    fn canonical_id_matches_tuple_encoding_and_ignores_pages() {
+        let chunks: Vec<_> = (0..4097).map(|i| synthetic_entry(i, 32 * 1024)).collect();
+        let manifest = manifest_from(chunks);
+        let id = manifest.id().unwrap();
+        assert_eq!(id, tuple_id(&manifest));
+        assert_eq!(id.len(), 64);
+
+        let pages = split_pages(&manifest.chunks).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].len(), MAX_PAGE_ENTRIES);
+        assert_eq!(pages[1].len(), 1);
+        let mut hasher = CanonicalIdHasher::new(
+            manifest.version,
+            &manifest.algorithm,
+            &manifest.hash_algorithm,
+            &manifest.media_oid,
+            manifest.media_size,
+        )
+        .unwrap();
+        for page in &pages {
+            for entry in page {
+                hasher.push(entry).unwrap();
+            }
+        }
+        assert_eq!(hasher.finish(), id);
+
+        let mut changed = manifest.clone();
+        changed.created_by.client = "other".to_string();
+        changed.fallback_oid = Some(changed.media_oid.clone());
+        assert_eq!(changed.id().unwrap(), id);
+    }
+
+    #[test]
+    fn empty_manifest_has_zero_pages_and_stable_id() {
+        let manifest = manifest_from(Vec::new());
+        assert!(split_pages(&manifest.chunks).unwrap().is_empty());
+        assert_eq!(manifest.id().unwrap(), tuple_id(&manifest));
+    }
+
+    #[test]
+    fn page_budget_matches_canonical_bytes_and_byte_split() {
+        let mut budget = PageBudget::new();
+        let mut kept = Vec::new();
+        for i in 0..8u64 {
+            let entry = synthetic_entry(i, 1024);
+            assert!(budget.try_push(&entry).unwrap());
+            kept.push(entry);
+        }
+        assert_eq!(budget.bytes, canonical_entries_bytes(&kept).unwrap().len());
+
+        let fat: Vec<_> = (0..200)
+            .map(|i| ChunkEntry {
+                offset: i,
+                length: 1,
+                chunk_hash: "ab".repeat(4000),
+                encoded_length: 1,
+                compression: COMPRESSION_NONE.to_string(),
+                checksum: None,
+            })
+            .collect();
+        let pages = split_pages(&fat).unwrap();
+        assert!(pages.len() >= 2);
+        assert!(pages[0].len() < MAX_PAGE_ENTRIES);
+        assert!(canonical_entries_bytes(&pages[0]).unwrap().len() <= MAX_PAGE_ENTRIES_BYTES);
+        let mut too_far = pages[0].clone();
+        too_far.push(pages[1][0].clone());
+        assert!(canonical_entries_bytes(&too_far).unwrap().len() > MAX_PAGE_ENTRIES_BYTES);
+
+        let mut greedy = PageBudget::new();
+        let mut greedy_len = 0usize;
+        for entry in &fat {
+            if !greedy.try_push(entry).unwrap() {
+                break;
+            }
+            greedy_len += 1;
+        }
+        assert_eq!(greedy_len, pages[0].len());
+
+        let huge = vec![ChunkEntry {
+            offset: 0,
+            length: 1,
+            chunk_hash: "a".repeat(MAX_PAGE_ENTRIES_BYTES),
+            encoded_length: 1,
+            compression: COMPRESSION_NONE.to_string(),
+            checksum: None,
+        }];
+        assert!(split_pages(&huge).is_err());
+    }
+
+    #[test]
+    fn product_chunk_cap_is_gone() {
+        let chunks: Vec<_> = (0..8193).map(|i| synthetic_entry(i, 1)).collect();
+        let manifest = manifest_from(chunks);
+        manifest.validate().unwrap();
+        assert_eq!(manifest.id().unwrap(), tuple_id(&manifest));
     }
 }
