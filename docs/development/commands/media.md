@@ -116,3 +116,11 @@ Media 拒绝读取后独立目标文件须保持原内容，随后标准 LFS 下
 chunk-only 策略、透明字节范围水合（FUSE）、跨租户 dedup 均未开放；显式 `media fetch` 片段导出已交付。
 Pending 描述符 24 小时到期，过期数据不会自动回收；部署方需明确保留策略，
 不得对仍被 Finalized manifest 共享的块设置无条件生命周期删除。
+
+## Effect evidence (FL-05)
+
+Local C-06 budgets for a fixed-seed 256 MiB fixture (duplicate dirty payload,
+1% same-length replace ≤ 5%, length-changing edits reported as cold-cut) live
+in `tests/fixtures/fastcdc/effect-budgets.json`. Real >2 GiB chunk/range bound
+is the ignored `p05_real_2gib_local_chunk_and_range_bound` gate.
+

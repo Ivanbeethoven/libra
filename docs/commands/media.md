@@ -188,3 +188,11 @@ libra media verify big.psd                # reassemble from the store and verify
 libra media probe --remote origin         # capability-probe; falls back to standard LFS
 libra --json media chunk big.psd          # structured JSON output for agents
 ```
+
+## Effect evidence (FL-05)
+
+Local C-06 budgets for a fixed-seed 256 MiB fixture (duplicate dirty payload,
+1% same-length replace ≤ 5%, length-changing edits reported as cold-cut) live
+in `tests/fixtures/fastcdc/effect-budgets.json`. Real >2 GiB chunk/range bound
+is the ignored `p05_real_2gib_local_chunk_and_range_bound` gate.
+

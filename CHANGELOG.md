@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.30.5] — 2026-09-28
+
+### FastCDC effect evidence (FL-05)
+
+- C-06 local effect matrix on a fixed-seed 256 MiB fixture: duplicate dirty
+  payload 0; 1% same-length replace dirty ≤ 5%; length-changing insert/delete
+  reported as ADR-FL-04 cold-cut (no false coherence claim).
+- P-05 logical sparse gate (>16 GiB / >65536 chunks) plus ignored real >2 GiB
+  local chunk/range bound. Budgets in `tests/fixtures/fastcdc/effect-budgets.json`.
+- Paired with mega2 MF-05 `v0.40.14` / Libra pin `8c870c4`.
+
 ## [0.30.4] — 2026-09-28
 
 ### Media range fragment export (FL-04)

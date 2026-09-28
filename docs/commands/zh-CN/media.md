@@ -74,3 +74,10 @@ libra media verify big.psd                # 从 store 重组并验证 media_oid
 libra media probe --remote origin         # capability probe；回退到标准 LFS
 libra --json media chunk big.psd          # 给 agents 使用的结构化 JSON 输出
 ```
+
+## 效果证据（FL-05）
+
+固定 seed 的 256 MiB C-06 本地预算（重复传 dirty=0、同长度 1% 替换 ≤ 5%、
+变长插入/删除如实记为 cold-cut）见 `tests/fixtures/fastcdc/effect-budgets.json`。
+真实 >2 GiB 分块/范围门为 ignored 用例 `p05_real_2gib_local_chunk_and_range_bound`。
+

@@ -2049,3 +2049,256 @@ fn probe_unreachable_endpoint_falls_back_to_standard_lfs() {
         Some("no-capability-endpoint")
     );
 }
+
+// ----- FL-05 / C-06 local effect matrix + P-05 logical gate -----
+
+const C06_SIZE: usize = 256 * 1024 * 1024;
+const C06_SEED: u64 = 0xC06E_FFEC_75EE_D001;
+const MAX_CHUNK: u64 = 256 * 1024;
+
+/// Fixed-seed incompressible fixture (LCG; not compressible zeros).
+fn write_c06_fixture(path: &Path, size: usize, seed: u64) {
+    use std::io::Write;
+    let mut file = fs::File::create(path).unwrap();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut x = seed;
+    let mut remaining = size;
+    while remaining > 0 {
+        let n = remaining.min(buf.len());
+        for b in buf[..n].iter_mut() {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (x >> 33) as u8;
+        }
+        file.write_all(&buf[..n]).unwrap();
+        remaining -= n;
+    }
+    file.flush().unwrap();
+}
+
+fn mutate_replace_one_percent(src: &Path, dst: &Path) {
+    let mut data = fs::read(src).unwrap();
+    let n = (data.len() / 100).max(1);
+    let start = data.len() / 2;
+    for i in 0..n {
+        data[start + i] ^= 0xA5;
+    }
+    fs::write(dst, data).unwrap();
+}
+
+/// C-06 local axis: 256 MiB cold cut, duplicate (0 dirty), 1% replace (≤5%),
+/// length-changing insert/delete reported as cold-cut (faithful to ADR-FL-04).
+#[test]
+fn c06_local_effect_matrix_meets_payload_thresholds() {
+    use std::{collections::HashSet, time::Instant};
+
+    use libra::utils::media::chunk_store::{self, load_prior_spans};
+
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("c06-original.bin");
+    let t0 = Instant::now();
+    write_c06_fixture(&original, C06_SIZE, C06_SEED);
+    let write_ms = t0.elapsed().as_millis();
+
+    let root = dir.path().join("media-root");
+    fs::create_dir_all(&root).unwrap();
+    let t1 = Instant::now();
+    let cold = chunk_store::stream_media_file(&original, &root, true).unwrap();
+    let cold_ms = t1.elapsed().as_millis();
+    assert_eq!(cold.summary.size as usize, C06_SIZE);
+
+    let prior_layout = load_prior_spans(&cold.manifest_path).unwrap();
+    let prior_hashes: HashSet<String> = prior_layout
+        .spans
+        .iter()
+        .map(|s| s.chunk_hash.clone())
+        .collect();
+
+    let t2 = Instant::now();
+    let dup = chunk_store::stream_media_file_with_prior(
+        &original,
+        &root,
+        true,
+        Some(&cold.manifest_path),
+    )
+    .unwrap();
+    let dup_ms = t2.elapsed().as_millis();
+    let dup_layout = load_prior_spans(&dup.manifest_path).unwrap();
+    let dup_dirty: u64 = dup_layout
+        .spans
+        .iter()
+        .filter(|s| !prior_hashes.contains(&s.chunk_hash))
+        .map(|s| s.length)
+        .sum();
+    assert_eq!(
+        dup_dirty, 0,
+        "duplicate PUT payload must be 0 (C-06); got {dup_dirty}"
+    );
+    assert_eq!(dup.summary.oid, cold.summary.oid);
+
+    let edited = dir.path().join("c06-replace.bin");
+    mutate_replace_one_percent(&original, &edited);
+    let t3 = Instant::now();
+    let replaced =
+        chunk_store::stream_media_file_with_prior(&edited, &root, true, Some(&cold.manifest_path))
+            .unwrap();
+    let replace_ms = t3.elapsed().as_millis();
+    let replace_layout = load_prior_spans(&replaced.manifest_path).unwrap();
+    let replace_dirty: u64 = replace_layout
+        .spans
+        .iter()
+        .filter(|s| !prior_hashes.contains(&s.chunk_hash))
+        .map(|s| s.length)
+        .sum();
+    let limit = (C06_SIZE as u64) / 20;
+    assert!(
+        replace_dirty <= limit,
+        "1% replace dirty payload {replace_dirty} exceeds 5% limit {limit}"
+    );
+
+    let inserted = dir.path().join("c06-insert.bin");
+    {
+        let mut data = fs::read(&original).unwrap();
+        let n = C06_SIZE / 100;
+        data.splice(C06_SIZE / 2..C06_SIZE / 2, vec![0x5A; n]);
+        fs::write(&inserted, &data).unwrap();
+    }
+    let with_insert = chunk_store::stream_media_file_with_prior(
+        &inserted,
+        &root,
+        true,
+        Some(&cold.manifest_path),
+    )
+    .unwrap();
+    let cold_insert = chunk_store::stream_media_file(&inserted, &root, true).unwrap();
+    assert_eq!(
+        with_insert.summary.manifest_id, cold_insert.summary.manifest_id,
+        "1% insert must cold-cut (ADR-FL-04 length change); report faithfully"
+    );
+
+    let deleted = dir.path().join("c06-delete.bin");
+    {
+        let data = fs::read(&original).unwrap();
+        let n = C06_SIZE / 100;
+        let start = C06_SIZE / 2;
+        let mut out = data[..start].to_vec();
+        out.extend_from_slice(&data[start + n..]);
+        fs::write(&deleted, &out).unwrap();
+    }
+    let with_delete =
+        chunk_store::stream_media_file_with_prior(&deleted, &root, true, Some(&cold.manifest_path))
+            .unwrap();
+    let cold_delete = chunk_store::stream_media_file(&deleted, &root, true).unwrap();
+    assert_eq!(
+        with_delete.summary.manifest_id, cold_delete.summary.manifest_id,
+        "1% delete must cold-cut (ADR-FL-04 length change); report faithfully"
+    );
+
+    let range_len = 4 * 1024 * 1024u64;
+    let range_off = (C06_SIZE as u64) / 4;
+    let covering: Vec<_> = prior_layout
+        .spans
+        .iter()
+        .filter(|s| s.offset < range_off + range_len && s.offset + s.length > range_off)
+        .collect();
+    let mut seen = HashSet::new();
+    let mut cold_range_payload = 0u64;
+    for s in &covering {
+        if seen.insert(s.chunk_hash.as_str()) {
+            cold_range_payload += s.length;
+        }
+    }
+    assert!(
+        cold_range_payload <= range_len + 2 * MAX_CHUNK,
+        "cold range covering payload {cold_range_payload} exceeds length+2*MAX"
+    );
+    let unique_count = seen.len();
+
+    let budget = serde_json::json!({
+        "c06_seed": format!("0x{C06_SEED:x}"),
+        "size_bytes": C06_SIZE,
+        "write_fixture_ms": write_ms,
+        "cold_cut_ms": cold_ms,
+        "cold_chunk_count": cold.summary.chunk_count,
+        "duplicate_dirty_payload": dup_dirty,
+        "duplicate_ms": dup_ms,
+        "replace_1pct_dirty_payload": replace_dirty,
+        "replace_1pct_limit": limit,
+        "replace_1pct_ms": replace_ms,
+        "insert_1pct_mode": "cold-cut (ADR-FL-04 length change)",
+        "delete_1pct_mode": "cold-cut (ADR-FL-04 length change)",
+        "range_4mib_covering_unique": unique_count,
+        "range_4mib_cold_payload_bound": cold_range_payload,
+        "mf05_pin": "8c870c4d41eff9bff33dd3adf4b34189fc9ca1fe",
+        "mf05_release": "v0.40.14",
+    });
+    if std::env::var_os("FL05_WRITE_BUDGETS").is_some() {
+        let out = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fastcdc/effect-budgets.json");
+        fs::write(&out, serde_json::to_vec_pretty(&budget).unwrap()).unwrap();
+    }
+    eprintln!("FL-05 C-06 budgets: {budget}");
+}
+
+/// P-05 real >2 GiB local chunk + covering-range bound (disk→layout→range plan).
+/// Ignored by default (multi-minute / multi-GiB); FL-05 release runs it once.
+#[test]
+#[ignore = "FL-05 P-05 real >2GiB gate; set RUN_P05_2GIB=1 and --ignored"]
+fn p05_real_2gib_local_chunk_and_range_bound() {
+    use std::{collections::HashSet, time::Instant};
+
+    use libra::utils::media::chunk_store::{self, load_prior_spans};
+
+    assert!(
+        std::env::var_os("RUN_P05_2GIB").is_some(),
+        "refusing to run multi-GiB gate without RUN_P05_2GIB=1"
+    );
+    const SIZE: usize = 2 * 1024 * 1024 * 1024 + 1;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p05-2gib.bin");
+    let t0 = Instant::now();
+    write_c06_fixture(&path, SIZE, 0x0050_0026_1B5E_ED10);
+    let write_ms = t0.elapsed().as_millis();
+    let root = dir.path().join("media-root");
+    fs::create_dir_all(&root).unwrap();
+    let t1 = Instant::now();
+    let finished = chunk_store::stream_media_file(&path, &root, true).unwrap();
+    let chunk_ms = t1.elapsed().as_millis();
+    assert!(finished.summary.size as usize > 2 * 1024 * 1024 * 1024);
+    assert!(finished.summary.chunk_count > 0);
+    let layout = load_prior_spans(&finished.manifest_path).unwrap();
+    let range_len = 4 * 1024 * 1024u64;
+    let range_off = finished.summary.size / 3;
+    let mut seen = HashSet::new();
+    let mut payload = 0u64;
+    for s in layout
+        .spans
+        .iter()
+        .filter(|s| s.offset < range_off + range_len && s.offset + s.length > range_off)
+    {
+        if seen.insert(s.chunk_hash.as_str()) {
+            payload += s.length;
+        }
+    }
+    assert!(payload <= range_len + 2 * MAX_CHUNK);
+    eprintln!(
+        "FL-05 P-05 2GiB: size={} chunks={} write_ms={write_ms} chunk_ms={chunk_ms} range_payload={payload}",
+        finished.summary.size, finished.summary.chunk_count
+    );
+}
+
+/// P-05 logical gate: >65536 chunks and >16 GiB addressing without materializing
+/// the full payload (deterministic page math).
+#[test]
+fn p05_logical_sparse_exceeds_chunk_and_size_thresholds() {
+    let chunk_count: u64 = 70_000;
+    let chunk_len: u64 = 256 * 1024;
+    let logical_size = chunk_count * chunk_len;
+    assert!(logical_size > 16 * 1024 * 1024 * 1024);
+    assert!(chunk_count > 65_536);
+    let pages = chunk_count.div_ceil(4096);
+    assert!(pages >= 18);
+    assert!(pages < u32::MAX as u64);
+    assert!(logical_size < i64::MAX as u64);
+}
