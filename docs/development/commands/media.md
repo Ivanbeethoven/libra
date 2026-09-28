@@ -17,20 +17,30 @@
 
 - 算法保持冻结：`fastcdc = "=3.2.1"`，v2020，Normalization::Level1，seed=0，
   32768/65536/262144 bytes（`fastcdc-v2020-32k`）。
-- `MediaManifest` 字段保持 v1。没有全文件 `MAX_CHUNKS` 产品上限。本地布局是
-  有界 summary 加不可变页；P-01a 每页最多 4096 条且紧凑 entries 数组 ≤960 KiB。
-  页边界不参与 canonical id。派生 hash/offset 索引在
-  `.libra/media/index/<scope>/<manifest_id>/`，可删除后从页重建，不写全局配置库。
+- `MediaManifest` 字段保持 v1。没有全文件字节数、chunk 条数或 manifest 大小的产品上限。
+  本地布局是有界 summary 加不可变页；P-01a 每页最多 4096 条且紧凑 entries 数组 ≤960 KiB，
+  单页/摘要/状态信封 ≤1 MiB。页边界不参与 canonical id。缓存命名空间是
+  `.libra/media/fastcdc-v2020-32k/{chunks,manifests,index}`。派生 hash/offset 索引在
+  `index/local/<manifest_id>/`，可删除后从页重建，不写全局配置库。
+  旧 `.libra/media/{chunks,manifests}`（`fastcdc-v1`）不读取、不写入、不删除。
   `media chunk` / `inspect` / `verify` 不构造全文件 chunk `Vec` 或整包 JSON。
-- `capability` 在仓库 LFS URL 后追加 `libra/media/v1/capabilities`，
-  使用 host-scoped Bearer token、请求超时、有界响应和既有退避。
-- `transfer::MediaClient` 上传先准备 manifest/查询缺块，只上传缺失内容，再 finalize；
-  服务端逐块校验、完整 SHA-256 校验和 FastCDC 边界校验后保存完整 LFS fallback，
-  最后发布可下载 manifest。失败重试重新查询缺块即可。
-- 下载只使用 Finalized manifest；按实际 offset/length 对应的内容块缓存恢复，不使用
-  旧等长分块的除法推算。缓存块读取时重算 SHA-256；远端坏块或坏清单拒绝发布。
-- `chunk_store::reassemble` 使用既有 `StreamingAtomicFile`，独占临时文件、
-  错误时自动清理、完整校验后原子覆盖目标。缓存仍在私有 `.libra/media` 中。
+- `capability` 在仓库 LFS URL 后追加 `libra/media/v1/capabilities`。
+  协商要求 `manifest_paging=v1`、`supports_manifest_id_read`、`batch_exists`、
+  标准 LFS fallback，以及页/信封/块限额。`range_read=false` 不阻止完整分块传输。
+  传输开始前能力不足回退标准 LFS；开始后认证、哈希、协议失败直接报错。
+  使用 host-scoped Bearer token、单次请求 120 秒超时、有界响应。
+- `transfer::MediaClient` 上传提交 summary，按页 PUT，seal 后用磁盘索引只上传
+  missing 游标点名的 hash（重复 hash 一次，未知 hash 报错），再轮询持久 finalize 任务。
+  `complete` 必须匹配 `manifest_id`/`oid`/`size`。可重试失败用同一 `task_id` 重新排队；
+  429 遵守 `Retry-After`（1–30 秒）。无进展 10 分钟失败，持续进展没有固定总时限。
+  已发布的 MF-06 `POST manifests` 仍解析完整 `MediaManifest`。客户端先提交 summary；
+  收到 HTTP 400 且紧凑整包能放进 1 MiB 时重试一次。超过信封的布局失败关闭，
+  不退回 basic LFS。
+- 下载固定 `manifest_id`：`by-media` 与 `finalized/{id}` 的 id/oid/size 必须一致，
+  页与块都走 `finalized/{id}/...`。按 offset/length 取块，不使用等长除法。
+  缓存块读取时重算 SHA-256；远端坏块或坏清单拒绝发布。
+- `chunk_store::reassemble_paged` 使用既有 `StreamingAtomicFile`，独占临时文件、
+  错误时自动清理、完整校验后原子覆盖目标。
 - `LFSClient::upload_object/download_object` 的新调用严格在 feature gate 内。
   标准 LFS batch 保持 basic，不向普通服务端发送扩展上传请求。
 
@@ -42,12 +52,23 @@
 |---|---|
 | GET | /capabilities |
 | POST | /manifests |
+| PUT | /manifests/{id}/pages/{page_no} |
+| POST | /manifests/{id}/seal |
+| GET | /manifests/{id}/missing |
 | PUT | /manifests/{id}/chunks/{hash} |
 | POST | /manifests/{id}/finalize |
+| GET | /tasks/{task_id} |
 | GET | /manifests/by-media/{oid} |
-| GET | /manifests/by-media/{oid}/chunks/{hash} |
+| GET | /finalized/{id} |
+| GET | /finalized/{id}/pages |
+| GET | /finalized/{id}/chunks/{hash} |
 
-prepare 返回 manifest_id 和 missing_chunks。manifest_id 是紧凑 JSON 数组
+`POST manifests` 的规范请求体是 summary（version、algorithm、hash_algorithm、oid、size、
+chunk_count、page_count、manifest_id、有界 created_by），返回 `manifest_id`。
+页 PUT 提交 `ManifestPage`。seal 后 missing 按 cursor 分页，每页最多 4096 个 hash。
+finalize 返回 202 `{task_id,manifest_id,state,status_url}`；`status_url` 必须是同源
+`tasks/{task_id}` 或 `libra/media/v1/tasks/{task_id}`，客户端不跟随跨源地址。
+manifest_id 是紧凑 JSON 数组
 `[version,algorithm,hash_algorithm,media_oid,media_size,chunks]` 的 SHA-256，
 不包含客户端 provenance。冻结边界保证同一内容的合法 manifest ID 一致。
 

@@ -27,8 +27,14 @@
 //!   atomic publish.
 //! - **Paging is not identity (P-01):** the canonical manifest id hashes the
 //!   chunk sequence, not page boundaries. Local layouts store a bounded summary
-//!   plus immutable pages. The hash/offset index under `.libra/media/index` is
-//!   derived data and can be deleted and rebuilt; it is not repository config.
+//!   plus immutable pages under `.libra/media/fastcdc-v2020-32k/`. The hash/offset
+//!   index there is derived data and can be deleted and rebuilt; it is not
+//!   repository config. The legacy `.libra/media/{chunks,manifests}` cache is
+//!   left in place and is not read, written, or deleted.
+//! - **Paged transfer (P-02/P-04):** upload prepares a summary, puts canonical
+//!   pages, seals, PUTs only hashes named by the paged missing cursor, and polls
+//!   a durable finalize task. Download pins `manifest_id` and checks id, oid,
+//!   and size before replacing the destination.
 
 pub mod capability;
 pub mod chunk_store;

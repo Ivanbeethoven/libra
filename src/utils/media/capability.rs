@@ -12,7 +12,8 @@ use serde::Deserialize;
 use super::negotiate::ProbeOutcome;
 use crate::utils::backoff::{RetryOutcome, RetryPolicy, retry_idempotent};
 
-/// The remote media capability document (§6.4). All fields are read defensively.
+/// The remote media capability document (shared table / MF-02). Missing fields
+/// stay at the safe default: no paging, no manifest-id read, zero page budget.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Capabilities {
     #[serde(default)]
@@ -25,6 +26,7 @@ pub struct Capabilities {
     pub hash_algorithms: Vec<String>,
     #[serde(default)]
     pub max_chunk_size: u64,
+    /// Envelope limit (1 MiB). Older documents used this as a whole-manifest cap.
     #[serde(default)]
     pub max_manifest_size: u64,
     #[serde(default)]
@@ -33,6 +35,30 @@ pub struct Capabilities {
     pub supports_range_read: bool,
     #[serde(default)]
     pub supports_standard_lfs_fallback: bool,
+    #[serde(default)]
+    pub batch_exists: bool,
+    #[serde(default)]
+    pub range_read: bool,
+    #[serde(default)]
+    pub standard_lfs_fallback: bool,
+    #[serde(default)]
+    pub supports_manifest_id_read: bool,
+    #[serde(default)]
+    pub manifest_paging: String,
+    #[serde(default)]
+    pub max_page_entries: u64,
+    #[serde(default)]
+    pub max_page_bytes: u64,
+}
+
+impl Capabilities {
+    pub(crate) fn batch_exists_enabled(&self) -> bool {
+        self.batch_exists || self.supports_batch_exists
+    }
+
+    pub(crate) fn keeps_standard_fallback(&self) -> bool {
+        self.standard_lfs_fallback || self.supports_standard_lfs_fallback
+    }
 }
 
 /// How a single HTTP status maps to a probe step. Pure + unit-testable; the
@@ -197,5 +223,39 @@ mod tests {
             "https://host.example:8443/repo.git/info/lfs/libra/media/v1/capabilities?tenant=one"
         );
         assert!(join_capabilities_url("not a url").is_none());
+    }
+
+    #[test]
+    fn decodes_mega2_v1_capability_document() {
+        let raw = r#"{
+            "version":"1","chunked_lfs":true,
+            "chunk_algorithms":["fastcdc-v2020-32k"],"hash_algorithms":["sha256"],
+            "max_chunk_size":262144,"max_manifest_size":1048576,
+            "supports_batch_exists":true,"supports_range_read":false,
+            "supports_standard_lfs_fallback":true,
+            "batch_exists":true,"range_read":false,"standard_lfs_fallback":true,
+            "supports_manifest_id_read":true,"manifest_paging":"v1",
+            "max_page_entries":4096,"max_page_bytes":1048576
+        }"#;
+        let caps: Capabilities = serde_json::from_str(raw).unwrap();
+        assert_eq!(caps.manifest_paging, "v1");
+        assert!(caps.supports_manifest_id_read);
+        assert!(caps.batch_exists_enabled());
+        assert!(caps.keeps_standard_fallback());
+        assert!(!caps.range_read);
+        assert!(!caps.supports_range_read);
+        assert_eq!(caps.max_page_entries, 4096);
+        assert_eq!(caps.max_page_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn omitted_paging_fields_stay_closed() {
+        let raw = r#"{"version":"1","chunked_lfs":true,"chunk_algorithms":["fastcdc-v2020-32k"],"hash_algorithms":["sha256"],"max_chunk_size":262144,"max_manifest_size":1048576,"supports_batch_exists":true,"supports_range_read":false,"supports_standard_lfs_fallback":true}"#;
+        let caps: Capabilities = serde_json::from_str(raw).unwrap();
+        assert!(!caps.supports_manifest_id_read);
+        assert!(caps.manifest_paging.is_empty());
+        assert_eq!(caps.max_page_entries, 0);
+        assert_eq!(caps.max_page_bytes, 0);
+        assert!(caps.batch_exists_enabled());
     }
 }

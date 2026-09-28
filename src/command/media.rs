@@ -27,7 +27,7 @@ pub const MEDIA_EXAMPLES: &str = "\
 EXAMPLES:
     libra media chunk big.psd                 FastCDC-chunk a file; print the manifest summary
     libra media chunk big.psd --store         Also persist chunks + manifest to the local media store
-    libra media inspect .libra/media/manifests/<oid>/summary.json   Validate a manifest summary
+    libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json   Validate a manifest summary
     libra media verify big.psd                Reassemble from the store and verify the media_oid
     libra media probe                         Probe the remote's chunked-LFS capability (falls back to standard LFS)
     libra --json media chunk big.psd          Structured JSON output for agents
@@ -35,7 +35,7 @@ EXAMPLES:
 NOTES:
     FastCDC media chunking is a feature-gated Libra extension (lore.md §6). The
     media_oid is always SHA-256 of the full file (standard-LFS-compatible), and
-    chunks live in a private .libra/media store outside the Git object graph.
+    chunks live in a private .libra/media/fastcdc-v2020-32k store outside the Git object graph.
     Cross-machine chunked transfer requires Mega built with --features fastcdc
     and a stored access token. Other remotes fall back to standard Git LFS.";
 

@@ -8,7 +8,7 @@
 //! (§6.4:438, "never half-write"). The default for a fully-compatible remote is
 //! Chunked; every doubt degrades to standard LFS.
 
-use super::{capability::Capabilities, chunker};
+use super::{capability::Capabilities, chunker, manifest};
 
 /// Outcome of probing the remote's media-capability endpoint. Distinguishes a
 /// missing endpoint (404 / connection refused) from a server error that
@@ -58,6 +58,8 @@ pub enum BlockReason {
     /// has no local complete fallback object — a chunk-only upload would leave
     /// no interoperable object, so the operation is refused.
     NoFallbackAndServerRefuses,
+    /// Explicit range export must not fall back to a whole-object transfer.
+    RangeExportRefused,
 }
 
 impl FallbackReason {
@@ -78,6 +80,7 @@ impl BlockReason {
     pub fn as_str(self) -> &'static str {
         match self {
             BlockReason::NoFallbackAndServerRefuses => "no-fallback-and-server-refuses",
+            BlockReason::RangeExportRefused => "range-export-refused",
         }
     }
 }
@@ -132,11 +135,16 @@ pub fn negotiate(
             reason: FallbackReason::IncompatibleAlgorithm,
         };
     }
-    // The server must accept our frozen maximum chunk size and expose the batch
-    // existence API that chunk dedup depends on; otherwise chunked transfer would
-    // fail mid-stream. (Range read is only for deferred range-hydration, so it is
-    // NOT required for the basic chunked upload/download decision.)
-    if caps.max_chunk_size < chunker::MAX_SIZE as u64 || !caps.supports_batch_exists {
+    // The server must accept our frozen maximum chunk size, the batch-exists
+    // diff, and the v1 paging envelope. `range_read=false` does not block
+    // ordinary chunked transfer or a later covering-chunk export.
+    let paging_ok = caps.manifest_paging == manifest::MANIFEST_PAGING
+        && caps.supports_manifest_id_read
+        && caps.max_page_entries >= manifest::MAX_PAGE_ENTRIES as u64
+        && caps.max_page_bytes >= manifest::MAX_ENVELOPE_SIZE as u64
+        && caps.max_manifest_size >= manifest::MAX_ENVELOPE_SIZE as u64;
+    if caps.max_chunk_size < chunker::MAX_SIZE as u64 || !caps.batch_exists_enabled() || !paging_ok
+    {
         return TransferDecision::StandardLfs {
             reason: FallbackReason::InsufficientServerCapability,
         };
@@ -149,13 +157,51 @@ pub fn negotiate(
     // Chunked is viable. NEVER half-write: if the server keeps no standard
     // fallback object AND we have no local complete object, refuse rather than
     // create a chunk-only artifact nothing else can read.
-    if !caps.supports_standard_lfs_fallback && !local_fallback_present {
+    if !caps.keeps_standard_fallback() && !local_fallback_present {
         return TransferDecision::Block {
             reason: BlockReason::NoFallbackAndServerRefuses,
         };
     }
     TransferDecision::Chunked {
         algorithm: chunker::ALGORITHM.to_string(),
+    }
+}
+
+/// Explicit range export. Any condition that would use whole-object LFS for an
+/// ordinary transfer is a hard refusal here (C-03). `range_read=false` still
+/// allows a covering-chunk export when the rest of the paging contract holds.
+pub fn negotiate_range_export(
+    probe: &ProbeOutcome,
+    repo_policy_chunked_enabled: bool,
+) -> TransferDecision {
+    match negotiate(probe, repo_policy_chunked_enabled, true) {
+        TransferDecision::Chunked { algorithm } => TransferDecision::Chunked { algorithm },
+        TransferDecision::StandardLfs { .. } | TransferDecision::Block { .. } => {
+            TransferDecision::Block {
+                reason: BlockReason::RangeExportRefused,
+            }
+        }
+    }
+}
+
+/// Ordinary LFS may fall back only before a media transfer starts. After
+/// prepare, authentication, hash, and protocol failures stay fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolPhase {
+    BeforeMedia,
+    InMedia,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    StandardLfsFallback,
+    FailClosed,
+}
+
+pub fn failure_disposition(phase: ProtocolPhase) -> FailureDisposition {
+    match phase {
+        ProtocolPhase::BeforeMedia => FailureDisposition::StandardLfsFallback,
+        ProtocolPhase::InMedia => FailureDisposition::FailClosed,
     }
 }
 
@@ -167,6 +213,7 @@ fn parse_major(version: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::media::{chunker, manifest};
 
     fn good_caps() -> Capabilities {
         Capabilities {
@@ -174,11 +221,18 @@ mod tests {
             chunked_lfs: true,
             chunk_algorithms: vec!["fastcdc-v2020-32k".to_string()],
             hash_algorithms: vec!["sha256".to_string()],
-            max_chunk_size: 8 * 1024 * 1024,
-            max_manifest_size: 10 * 1024 * 1024,
+            max_chunk_size: chunker::MAX_SIZE as u64,
+            max_manifest_size: manifest::MAX_ENVELOPE_SIZE as u64,
             supports_batch_exists: true,
-            supports_range_read: true,
+            supports_range_read: false,
             supports_standard_lfs_fallback: true,
+            batch_exists: true,
+            range_read: false,
+            standard_lfs_fallback: true,
+            supports_manifest_id_read: true,
+            manifest_paging: manifest::MANIFEST_PAGING.to_string(),
+            max_page_entries: manifest::MAX_PAGE_ENTRIES as u64,
+            max_page_bytes: manifest::MAX_ENVELOPE_SIZE as u64,
         }
     }
 
@@ -242,7 +296,27 @@ mod tests {
         sl(c, InsufficientServerCapability);
         let mut c = good_caps();
         c.supports_batch_exists = false;
+        c.batch_exists = false;
         sl(c, InsufficientServerCapability);
+        let mut c = good_caps();
+        c.chunk_algorithms = vec!["fastcdc-v1".to_string()];
+        sl(c, IncompatibleAlgorithm);
+        let mut c = good_caps();
+        c.manifest_paging.clear();
+        sl(c, InsufficientServerCapability);
+        let mut c = good_caps();
+        c.supports_manifest_id_read = false;
+        sl(c, InsufficientServerCapability);
+        let mut c = good_caps();
+        c.max_page_entries = 4095;
+        sl(c, InsufficientServerCapability);
+        let mut c = good_caps();
+        c.max_page_bytes = manifest::MAX_ENVELOPE_SIZE as u64 - 1;
+        sl(c, InsufficientServerCapability);
+        let mut c = good_caps();
+        c.max_manifest_size = 32;
+        sl(c, InsufficientServerCapability);
+        // range_read=false is already the green fixture and still selects Chunked.
         // repo policy disabled → fallback (checked with an otherwise-green caps)
         assert_eq!(
             negotiate(&ProbeOutcome::Ok(good_caps()), false, true),
@@ -256,6 +330,7 @@ mod tests {
     fn block_when_no_fallback_and_server_refuses() {
         let mut c = good_caps();
         c.supports_standard_lfs_fallback = false;
+        c.standard_lfs_fallback = false;
         assert_eq!(
             negotiate(&ProbeOutcome::Ok(c.clone()), true, false),
             TransferDecision::Block {
@@ -267,5 +342,35 @@ mod tests {
             negotiate(&ProbeOutcome::Ok(c), true, true),
             TransferDecision::Chunked { .. }
         ));
+    }
+
+    #[test]
+    fn range_export_never_falls_back_to_a_whole_object() {
+        assert_eq!(
+            negotiate_range_export(&ProbeOutcome::NoEndpoint, true),
+            TransferDecision::Block {
+                reason: BlockReason::RangeExportRefused
+            }
+        );
+        let mut missing_id = good_caps();
+        missing_id.supports_manifest_id_read = false;
+        assert_eq!(
+            negotiate_range_export(&ProbeOutcome::Ok(missing_id), true),
+            TransferDecision::Block {
+                reason: BlockReason::RangeExportRefused
+            }
+        );
+        assert!(matches!(
+            negotiate_range_export(&ProbeOutcome::Ok(good_caps()), true),
+            TransferDecision::Chunked { .. }
+        ));
+        assert_eq!(
+            failure_disposition(ProtocolPhase::BeforeMedia),
+            FailureDisposition::StandardLfsFallback
+        );
+        assert_eq!(
+            failure_disposition(ProtocolPhase::InMedia),
+            FailureDisposition::FailClosed
+        );
     }
 }

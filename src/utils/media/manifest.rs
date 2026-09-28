@@ -14,7 +14,7 @@
 //! authoritative per-chunk integrity in v1 is `chunk_hash` (SHA-256 of the raw
 //! chunk); a true CRC-32C is a forward-compatible future addition.
 
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use ring::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
@@ -28,8 +28,8 @@ use super::{
 pub const MANIFEST_VERSION: u32 = 1;
 /// Media metadata envelope: one page, summary, or status body (C-02).
 pub const MAX_ENVELOPE_SIZE: usize = 1_048_576;
-/// Legacy whole-manifest JSON cap still used by the pre-paging transfer client.
-pub const MAX_MANIFEST_SIZE: usize = 10 * 1024 * 1024;
+/// Wire alias of [`MAX_ENVELOPE_SIZE`]. A full manifest is not one request body.
+pub const MAX_MANIFEST_SIZE: usize = MAX_ENVELOPE_SIZE;
 /// Longest chunk list in one page (P-01a).
 pub const MAX_PAGE_ENTRIES: usize = 4096;
 /// Compact canonical entries-array budget. The remaining 64 KiB of the 1 MiB
@@ -565,6 +565,86 @@ pub(crate) fn validate_page_entry(i: usize, entry: &ChunkEntry) -> Result<(), Ma
     Ok(())
 }
 
+/// Next covered offset, or an error for overlap, a gap, or `u64` overflow.
+pub fn advance_coverage(expected: u64, entry: &ChunkEntry) -> Result<u64, ManifestError> {
+    if entry.offset < expected {
+        return Err(ManifestError::Invalid(format!(
+            "chunk offset {} overlaps (expected {expected})",
+            entry.offset
+        )));
+    }
+    if entry.offset > expected {
+        return Err(ManifestError::Invalid(format!(
+            "chunk offset {} breaks contiguity (expected {expected})",
+            entry.offset
+        )));
+    }
+    expected
+        .checked_add(entry.length)
+        .ok_or_else(|| ManifestError::Invalid("chunk offset overflow".into()))
+}
+
+/// A non-final page must be the longest P-01a prefix of itself plus the next entry.
+pub fn non_final_page_is_longest(
+    page: &[ChunkEntry],
+    next: &ChunkEntry,
+) -> Result<(), ManifestError> {
+    if page.is_empty() {
+        return Err(ManifestError::Invalid(
+            "non-final page must be non-empty".into(),
+        ));
+    }
+    let mut extended = Vec::with_capacity(page.len() + 1);
+    extended.extend_from_slice(page);
+    extended.push(next.clone());
+    let legal = longest_page_prefix(&extended)?;
+    if legal != page.len() {
+        return Err(ManifestError::Invalid(
+            "non-final page is not the longest P-01a prefix".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse one page JSON envelope (≤1 MiB) and validate P-01a entry budgets.
+pub fn parse_page_envelope(bytes: &[u8]) -> Result<ManifestPage, ManifestError> {
+    if bytes.len() > MAX_ENVELOPE_SIZE {
+        return Err(ManifestError::Invalid(
+            "page envelope exceeds size limit".into(),
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| ManifestError::Invalid("page envelope is not utf-8".into()))?;
+    ManifestPage::from_json(text)
+}
+
+/// Rejects an empty cursor and any cursor already observed on this stream.
+#[derive(Debug, Default)]
+pub struct CursorGuard {
+    seen: HashSet<String>,
+}
+
+impl CursorGuard {
+    pub fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+        }
+    }
+
+    pub fn observe(&mut self, next: Option<&str>) -> Result<(), ManifestError> {
+        let Some(cursor) = next else {
+            return Ok(());
+        };
+        if cursor.is_empty() {
+            return Err(ManifestError::Invalid("empty paging cursor".into()));
+        }
+        if !self.seen.insert(cursor.to_owned()) {
+            return Err(ManifestError::Invalid("paging cursor cycled".into()));
+        }
+        Ok(())
+    }
+}
+
 impl MediaManifest {
     /// Bounded summary of an in-memory manifest. Paging does not change [`Self::id`].
     pub fn summary(&self) -> Result<ManifestSummary, ManifestError> {
@@ -806,5 +886,69 @@ mod tests {
         let manifest = manifest_from(chunks);
         manifest.validate().unwrap();
         assert_eq!(manifest.id().unwrap(), tuple_id(&manifest));
+    }
+
+    #[test]
+    fn page_envelope_and_coverage_matrix() {
+        let one = ManifestPage {
+            page_no: 0,
+            entries: vec![synthetic_entry(0, 32)],
+        };
+        let bytes = serde_json::to_vec(&one).unwrap();
+        assert!(bytes.len() <= MAX_ENVELOPE_SIZE);
+        assert_eq!(parse_page_envelope(&bytes).unwrap(), one);
+        assert!(parse_page_envelope(&vec![b'x'; MAX_ENVELOPE_SIZE + 1]).is_err());
+
+        let mut over = one.clone();
+        over.entries = (0..=MAX_PAGE_ENTRIES as u64)
+            .map(|i| synthetic_entry(i, 1))
+            .collect();
+        assert!(over.validate().is_err());
+
+        let mut covered = 0u64;
+        for entry in &one.entries {
+            covered = advance_coverage(covered, entry).unwrap();
+        }
+        assert_eq!(covered, 32);
+        assert!(advance_coverage(10, &synthetic_entry(0, 1)).is_err());
+        let mut gap = synthetic_entry(0, 1);
+        gap.offset = 12;
+        assert!(advance_coverage(10, &gap).is_err());
+        let mut overflow = synthetic_entry(0, 2);
+        overflow.offset = u64::MAX - 1;
+        assert!(advance_coverage(u64::MAX - 1, &overflow).is_err());
+
+        let mut guard = CursorGuard::new();
+        guard.observe(Some("a")).unwrap();
+        guard.observe(None).unwrap();
+        assert!(guard.observe(Some("")).is_err());
+        assert!(guard.observe(Some("a")).is_err());
+    }
+
+    #[test]
+    fn deterministic_page_counts_and_non_final_prefix() {
+        for (count, pages) in [(4096usize, 1usize), (4097, 2), (65536, 16), (65537, 17)] {
+            let chunks: Vec<_> = (0..count as u64).map(|i| synthetic_entry(i, 32)).collect();
+            let split = split_pages(&chunks).unwrap();
+            assert_eq!(split.len(), pages, "{count} entries");
+            assert!(
+                split
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .all(|page| page.len() == MAX_PAGE_ENTRIES)
+            );
+            assert!(!split.last().unwrap().is_empty());
+            let logical = (count as u64).checked_mul(256 * 1024).unwrap();
+            assert!(logical > 2 * 1024 * 1024 * 1024 || count < 8192);
+        }
+
+        let page: Vec<_> = (0..MAX_PAGE_ENTRIES as u64)
+            .map(|i| synthetic_entry(i, 32))
+            .collect();
+        let next = synthetic_entry(MAX_PAGE_ENTRIES as u64, 32);
+        non_final_page_is_longest(&page, &next).unwrap();
+        let short = &page[..page.len() - 1];
+        assert!(non_final_page_is_longest(short, &page[page.len() - 1]).is_err());
     }
 }

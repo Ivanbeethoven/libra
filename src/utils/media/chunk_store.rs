@@ -3,8 +3,8 @@
 //! Deliberately NOT a Git [`crate::utils::storage::Storage`] backend: chunks are
 //! RAW bytes keyed by their SHA-256, with no Git `<type> <len>\0` framing and no
 //! zlib — so a chunk can never be mistaken for (or become) a Git object. It
-//! lives at `.libra/media/chunks/<ab>/<chunk_hash>`, a physical sibling of
-//! `objects/` (see [`crate::utils::path::media_chunks`]) that is never walked as
+//! lives at `.libra/media/fastcdc-v2020-32k/chunks/<ab>/<chunk_hash>`, a physical
+//! sibling of `objects/` (see [`crate::utils::path::media_chunks`]) that is never walked as
 //! a loose-object store, and it bypasses [`crate::utils::client_storage`]
 //! entirely so no `object_index`/cloud-backup rows are enqueued for non-Git
 //! content. It reuses the crash-safe `write_atomic` temp+rename discipline and
@@ -63,7 +63,7 @@ impl From<std::io::Error> for MediaStoreError {
     }
 }
 
-/// A local media chunk store rooted at `.libra/media/chunks`.
+/// A local media chunk store rooted at `.libra/media/<namespace>/chunks`.
 pub struct MediaChunkStore {
     root: PathBuf,
 }
@@ -192,6 +192,40 @@ impl MediaChunkStore {
     /// Whether a chunk is present locally (does not re-verify — cheap existence).
     pub fn has_chunk(&self, chunk_hash: &str) -> bool {
         is_sha256_hex(chunk_hash) && self.chunk_path(chunk_hash).exists()
+    }
+
+    /// Page/index directory plus the chunk directory to write.
+    ///
+    /// `.libra/media/chunks` (legacy v1) is redirected to
+    /// `.libra/media/fastcdc-v2020-32k` and is not read or deleted. A store
+    /// already rooted at `…/chunks` keeps that directory.
+    pub fn resolved_cache(&self) -> (PathBuf, Self) {
+        let chunks = &self.root;
+        let Some(parent) = chunks.parent() else {
+            return (
+                chunks.clone(),
+                Self {
+                    root: chunks.clone(),
+                },
+            );
+        };
+        if chunks.file_name() == Some(std::ffi::OsStr::new("chunks"))
+            && parent.file_name() == Some(std::ffi::OsStr::new("media"))
+        {
+            let layout = parent.join(crate::utils::path::MEDIA_CACHE_NAMESPACE);
+            return (
+                layout.clone(),
+                Self {
+                    root: layout.join("chunks"),
+                },
+            );
+        }
+        (
+            parent.to_path_buf(),
+            Self {
+                root: chunks.clone(),
+            },
+        )
     }
 }
 
@@ -626,6 +660,16 @@ impl DiskMediaIndex {
         lookup_hash_slot(&self.hash_bytes, self.capacity, &hash)
     }
 
+    /// `(offset, length)` for a content hash, if the derived index contains it.
+    pub(crate) fn lookup_span(
+        &mut self,
+        hash_hex: &str,
+    ) -> Result<Option<(u64, u64)>, MediaStoreError> {
+        Ok(self
+            .lookup_hash(hash_hex)?
+            .map(|slot| (slot.offset, slot.length)))
+    }
+
     pub(crate) fn lookup_offset(
         &mut self,
         target: u64,
@@ -858,6 +902,72 @@ fn index_dir_for(media_root: &Path, manifest_id: &str) -> PathBuf {
         .join("index")
         .join(LOCAL_INDEX_SCOPE)
         .join(manifest_id)
+}
+
+pub(crate) fn open_index(
+    media_root: &Path,
+    manifest_id: &str,
+) -> Result<DiskMediaIndex, MediaStoreError> {
+    DiskMediaIndex::open(&index_dir_for(media_root, manifest_id))
+}
+
+pub(crate) fn prepare_index(
+    media_root: &Path,
+    manifest_id: &str,
+) -> Result<DiskMediaIndex, MediaStoreError> {
+    let dir = index_dir_for(media_root, manifest_id);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|source| io_err(&dir, source))?;
+    }
+    DiskMediaIndex::create(&dir)
+}
+
+pub(crate) fn load_local_page(
+    media_root: &Path,
+    oid: &str,
+    manifest_id: &str,
+    page_no: u32,
+) -> Result<ManifestPage, MediaStoreError> {
+    read_page_file(
+        &pages_dir(media_root, oid),
+        LOCAL_INDEX_SCOPE,
+        manifest_id,
+        page_no,
+    )
+}
+
+pub(crate) fn write_page(
+    media_root: &Path,
+    oid: &str,
+    page: &ManifestPage,
+) -> Result<(), MediaStoreError> {
+    page.validate().map_err(map_manifest)?;
+    let bytes = serde_json::to_vec(page).map_err(|err| invalid(err.to_string()))?;
+    if bytes.len() > manifest::MAX_ENVELOPE_SIZE {
+        return Err(invalid("page envelope exceeds size limit"));
+    }
+    let dir = pages_dir(media_root, oid);
+    std::fs::create_dir_all(&dir).map_err(|source| io_err(&dir, source))?;
+    let path = dir.join(format!("{:08}.json", page.page_no));
+    atomic_write::write_atomic(&path, &bytes, atomic_write::sync_data_enabled())
+        .map_err(|source| io_err(&path, source))
+}
+
+pub(crate) fn write_summary(
+    media_root: &Path,
+    summary: &ManifestSummary,
+) -> Result<(), MediaStoreError> {
+    summary.validate().map_err(map_manifest)?;
+    let bytes = serde_json::to_vec(summary).map_err(|err| invalid(err.to_string()))?;
+    if bytes.len() > manifest::MAX_ENVELOPE_SIZE {
+        return Err(invalid("summary envelope exceeds size limit"));
+    }
+    let path = summary_path(media_root, &summary.oid);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| io_err(parent, source))?;
+    }
+    atomic_write::write_atomic(&path, &bytes, atomic_write::sync_data_enabled())
+        .map_err(|source| io_err(&path, source))
 }
 
 pub fn load_summary(media_root: &Path, oid: &str) -> Result<ManifestSummary, MediaStoreError> {
@@ -1290,6 +1400,26 @@ pub fn reassemble_paged(
 #[cfg(test)]
 mod paging_tests {
     use super::*;
+
+    #[test]
+    fn legacy_v1_cache_root_is_not_the_namespace() {
+        assert_eq!(
+            crate::utils::path::MEDIA_CACHE_NAMESPACE,
+            crate::utils::media::chunker::ALGORITHM
+        );
+        let legacy = Path::new("/repo/.libra/media/chunks");
+        let store = MediaChunkStore::at(legacy.to_path_buf());
+        let (layout, chunks) = store.resolved_cache();
+        assert_eq!(layout, Path::new("/repo/.libra/media/fastcdc-v2020-32k"));
+        assert_eq!(
+            chunks.root,
+            Path::new("/repo/.libra/media/fastcdc-v2020-32k/chunks")
+        );
+        let current = MediaChunkStore::at(chunks.root.clone());
+        let (again, same) = current.resolved_cache();
+        assert_eq!(again, layout);
+        assert_eq!(same.root, chunks.root);
+    }
 
     fn entry(index: u64, length: u64) -> ChunkEntry {
         ChunkEntry {
