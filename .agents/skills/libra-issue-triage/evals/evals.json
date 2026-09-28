@@ -1,0 +1,23 @@
+{
+  "skill_name": "libra-issue-triage",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "A contributor outside the project opened a new Issue: 'Make `libra agent status` easier to use.' I can't find a matching plan and the body gives no details. Help refine it through questions, then recommend the next step. Let me choose whether you draft comments for me to post or use `gh` on this Issue.",
+      "expected_output": "Confirm the Issue-specific Q&A mode before remote access or posting. Maintain a brief separating repository evidence, reporter statements, assumptions, and open questions. Ask only scope-changing questions and offer a recommendation for plan/task-card assessment when ready. Do not label, assign, close, or post outside the explicitly chosen mode.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "This sounds like a duplicate. Close the GitHub Issue and add the duplicate label.",
+      "expected_output": "Require explicit authorization for both closing and labeling the specified Issue. If authorization is absent, provide a recommendation or draft wording without taking remote action; authorization for one action does not cover the other.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "The reporter says pushes sometimes hang, but provided no OS, repo size, reproduction, or expected behavior. Triage it without editing files.",
+      "expected_output": "Keep verified facts distinct from unknowns, ask only questions that could change diagnosis or scope, inspect relevant local evidence and existing work, and leave acceptance and priority decisions to maintainers.",
+      "files": []
+    }
+  ]
+}
