@@ -103,6 +103,7 @@ monoengine_fastcdc_http_interop	lane:cwd	changes the process working directory (
 paged_upload_finalize_and_download_round_trip	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 porcelain_v2_unmerged_row_from_subdirectory_keeps_real_worktree_mode	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 porcelain_v2_unmerged_u_line	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+prior_chunk_cli_upload_consumes_cached_layout_and_rejects_source_change	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 r2_connection_basic	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 racily_clean_entry_is_content_compared_not_trusted	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 remote_update_prune_removes_stale_tracking_branches	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)

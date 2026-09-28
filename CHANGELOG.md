@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.30.2] — 2026-09-28
+
+### Prior re-chunk for FastCDC media (FL-03)
+
+- `libra media chunk --prior-manifest <file> --store` reuses same-offset
+  matching chunks from a valid prior layout; dirty regions are re-chunked
+  (ADR-FL-04). Length changes and missing prior stay cold-cut.
+- Upload prefers the cached new-oid layout and re-verifies size/oid/chunk
+  hashes before prepare; a source change fails closed without remote submit.
+- Illegal prior manifests fail without publishing a new cache entry.
+
 ## [0.30.1] — 2026-09-28
 
 ### Local-path clone no longer hangs at "Fetching objects" (issue #496)

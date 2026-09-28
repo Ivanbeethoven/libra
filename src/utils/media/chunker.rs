@@ -462,13 +462,12 @@ mod tests {
             if let Some(old) = prior
                 .iter()
                 .find(|p| p.offset == chunk.offset && p.length == chunk.length)
+                && old.chunk_hash == chunk.chunk_hash
             {
-                if old.chunk_hash == chunk.chunk_hash {
-                    reused += 1;
-                    let start = chunk.offset as usize;
-                    let end = start + chunk.length as usize;
-                    assert_eq!(chunk.chunk_hash, sha256_hex(&data[start..end]));
-                }
+                reused += 1;
+                let start = chunk.offset as usize;
+                let end = start + chunk.length as usize;
+                assert_eq!(chunk.chunk_hash, sha256_hex(&data[start..end]));
             }
         }
         assert!(reused >= 1, "at least one unchanged prior chunk is reused");
