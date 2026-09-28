@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.27.3] — 2026-09-28
+
+### Local-path clone no longer hangs at "Fetching objects" (issue #496)
+
+- `libra clone <local-path>` of a large repository (thousands of commits / tens
+  of thousands of reachable objects) no longer deadlocks at the "Fetching
+  objects" phase with 0% CPU. The local-path fetch path now encodes the pack
+  through the single shared `pack_writer::encode_pack_bytes` encoder (the same
+  one `repack`/`pack-objects`/`maintenance` use) instead of a second in-house
+  copy in `src/internal/protocol/local_client.rs`.
+- Root cause (ADR-CLH-01 / issues/496): the pre-fix in-house `encode_pack_bytes`
+  fed every entry into a bounded input channel (capacity 1 000) in the same task
+  before draining the bounded output channel (capacity 1 000). Once the
+  reachable object set exceeded the channel capacity, the encoder blocked
+  writing to the full output channel while the feeder blocked sending into the
+  full input channel — a circular wait. `pack_writer` already feeds entries from
+  a dedicated task so the output channel is drained concurrently.
+- Regression guards: `pack_writer::tests::encode_pack_bytes_does_not_deadlock_above_channel_capacity`
+  (2 500 entries, wrapped in `tokio::time::timeout`) and
+  `tests/command/clone_test.rs::test_clone_local_git_large_object_set_completes_in_budget`
+  (2 500-blob local source clone under a 60 s budget).
+
 ## [0.27.2] — 2026-09-28
 
 ### Commit the deletion of the last tracked file (issue #497)

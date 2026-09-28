@@ -7,12 +7,12 @@
 //! hidden `pack-objects` command — goes through here so there is exactly one
 //! pack encoder rather than several hand-rolled ones.
 //!
-//! This deliberately mirrors the wire encoder in
-//! [`crate::internal::protocol::local_client`]: both drive the same
-//! `PackEncoder`, but that one frames the pack bytes into a sideband fetch
-//! response while this one writes a file and generates the index. Keeping the
-//! two separate is intentional — they have different output sinks — but neither
-//! re-implements the pack format itself.
+//! The byte-level encoder here is also the single source of truth for the
+//! local-path fetch path: [`crate::internal::protocol::local_client`] frames
+//! these same bytes into a sideband fetch response (ADR-CLH-01 / issues/496),
+//! so there is exactly one `PackEncoder` path and no hand-rolled body that can
+//! drift or deadlock. The caller's sink differs (write a file + index vs frame
+//! into a sideband stream), but no caller re-implements the pack format.
 //!
 //! # Correctness notes
 //!
@@ -658,5 +658,47 @@ mod tests {
         assert!(publish_pack_bytes(&bytes, dir.path(), HashKind::Sha1).is_err());
         assert!(!dir.path().join(format!("pack-{checksum}.pack")).exists());
         assert!(!dir.path().join(format!("pack-{checksum}.idx")).exists());
+    }
+
+    /// Regression guard for ADR-CLH-01 / ADR-IG-01: encoding more entries than
+    /// the sum of the two bounded channel capacities (1_000 + 1_000 = 2_000)
+    /// must NOT deadlock. The pre-fix in-house copy fed every entry into the
+    /// bounded input channel before draining the bounded output channel; past
+    /// ~2 000 objects the encoder blocked writing to the full output channel
+    /// while the feeder blocked sending into the full input channel — a circular
+    /// wait that hung the local-path clone at "Fetching objects" (0% CPU).
+    /// Wrap the encode in `tokio::time::timeout` so this test itself fails
+    /// rather than hanging if the deadlock regresses.
+    #[test]
+    fn encode_pack_bytes_does_not_deadlock_above_channel_capacity() {
+        use tokio::time::{Duration, timeout};
+
+        set_hash_kind(HashKind::Sha1);
+        // Distinct contents so the encoder sees unique objects (no spurious
+        // dedup masking the channel behaviour).
+        let entries: Vec<Entry> = (0..2_500)
+            .map(|i| {
+                let content = format!("blob-content-{i}");
+                Entry::from(Blob::from_content(&content))
+            })
+            .collect();
+        assert!(entries.len() > 2_000, "test must exceed channel capacities");
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let pack = timeout(
+                Duration::from_secs(30),
+                encode_pack_bytes(entries, HashKind::Sha1),
+            )
+            .await
+            .expect("encode_pack_bytes must not deadlock")
+            .expect("encode large pack set");
+            // A real v2 pack starts with the PACK signature.
+            assert!(pack.len() >= 12, "pack has signature + header");
+            assert_eq!(&pack[..4], b"PACK", "pack signature");
+        });
     }
 }

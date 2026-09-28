@@ -286,6 +286,18 @@ plan-20260714 PD-06 / register D20): local-Libra shallow negotiation stays
 **declined** — fail-closed is the accepted end state, not a pending gap; see the
 development compatibility register D20 for rationale and restart conditions.
 
+### Local-path clone object encoding (CLH-01)
+
+A `libra clone <local-path>` of a large repository (thousands of commits / tens
+of thousands of reachable objects) encodes the pack through the shared
+`pack_writer::encode_pack_bytes` encoder that `repack`/`pack-objects`/
+`maintenance` already use. This eliminates the deterministic deadlock where the
+local-path fetch hung at “Fetching objects” (0% CPU) once the reachable object
+set exceeded the bounded encoder channels. No command option, output field or
+error code changed; the fix only routes local-path fetching through the single,
+correctly-bounded encoder (ADR-CLH-01 / issues/496; supersedes issues/487
+ADR-IG-01's adjacent-scope fix).
+
 Diff prefix configuration is part of the `diff` compatibility surface:
 `diff.noPrefix`, `diff.mnemonicPrefix`, `diff.srcPrefix`, and `diff.dstPrefix`
 honor the strict local → global → system cascade and Git precedence. Mnemonic

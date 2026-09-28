@@ -17,6 +17,7 @@
 - 源码分层：主要实现文件为 `src/command/clone.rs`。参数/子命令类型包括：`CloneArgs`；输出、错误或状态类型包括：`CloneOutput`、`CloudCloneSiteOutput`、`CloneError`；主要执行函数包括：`execute`、`execute_safe`。
 - 源码意图：源码模块注释说明该命令会解析 URL、通过协议客户端获取对象、检出工作树，并写入初始 refs/config；执行层生成 `CloneOutput`，渲染层按 `OutputConfig` 输出。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；对象路径会解析 revision 并读写 blob/tree/commit/tag 等对象；引用路径会读取或更新 SQLite refs、HEAD 与 reflog；网络路径会解析 remote 配置、协商协议并处理 pack/idx 数据；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据。
+- 本地路径（`/path` 或 `file://`，包括本地 Git 与本地 Libra 源）的 pack 编码复用 `crate::internal::pack_writer::encode_pack_bytes`（ADR-CLH-01，issues/496）：本地传输与 `repack`/`pack-objects`/`maintenance` 共用同一编码器，避免修复前 `local_client.rs` 内嵌副本在对象数超过有界通道容量时于 “Fetching objects” 死锁（0% CPU）。
 
 - 流程图：以下流程图按当前源码分层展示主路径和底层对象边界，便于维护者把代码入口、执行函数和副作用范围对应起来。
 
