@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.30.2] — 2026-09-28
+## [0.30.3] — 2026-09-28
 
 ### Prior re-chunk for FastCDC media (FL-03)
 
