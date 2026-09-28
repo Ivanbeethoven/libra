@@ -184,7 +184,7 @@ structured report is always present.
 | Stable code | Meaning |
 | --- | --- |
 | `LBR-REPO-001` | Not inside a Libra repository |
-| `LBR-REPO-002` | Repository metadata is corrupt or incompatible. Includes opening a repository whose `schema_versions` tip is newer than this binary (`UnsupportedFuture` — refuse before SeaORM SELECT). **Minimum client for `ai_index_task_run.base_commit_ref` (B3-16):** Libra ≥ 0.27.1. |
+| `LBR-REPO-002` | Repository metadata is corrupt or incompatible. Includes opening a repository whose `schema_versions` tip is newer than this binary (`UnsupportedFuture` — refuse before SeaORM SELECT). **Minimum client for `ai_index_task_run.base_commit_ref` (B3-16):** Libra ≥ 0.27.1. **Minimum client for cloud `object_format` metadata restore (REL-B3-02 / B3-14):** Libra ≥ 0.28.0. |
 | `LBR-REPO-003` | Repository state blocks the operation |
 | `LBR-WORKTREE-001` | The pagination cursor is malformed or expired; drop it and re-read the first page |
 | `LBR-WORKTREE-002` | A worktree/workspace scope is corrupt or unreadable; repair it before trusting any diagnostic report |
