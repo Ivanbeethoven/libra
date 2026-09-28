@@ -2,9 +2,14 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
-use libra::utils::pager::LIBRA_TEST_ENV;
+use libra::utils::{pager::LIBRA_TEST_ENV, test::ConfigDbFixture};
+use serial_test::serial;
 use tempfile::tempdir;
 
 use super::parse_cli_error_stderr;
@@ -47,6 +52,345 @@ fn run_libra_with_home(args: &[&str], cwd: &Path, home: &Path) -> std::process::
         .env(LIBRA_TEST_ENV, "1")
         .output()
         .unwrap()
+}
+
+/// Build a clone command whose global/system config DBs are pinned to the
+/// isolated `ConfigDbFixture` paths, so a clone outside any repository can
+/// read a seeded global policy (HKT-01).
+fn clone_command(cwd: &Path, config: &ConfigDbFixture) -> Command {
+    let home = cwd.join(".home");
+    let config_home = home.join(".config");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
+    cmd.current_dir(cwd)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("LIBRA_CONFIG_GLOBAL_DB", config.global_db())
+        .env("LIBRA_CONFIG_SYSTEM_DB", config.system_db())
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env(LIBRA_TEST_ENV, "1");
+    cmd
+}
+
+#[cfg(unix)]
+fn create_clone_fake_ssh_script(root: &Path, log: &Path) -> PathBuf {
+    let script_path = root.join("fake_ssh.sh");
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" >> {log}
+printf -- '---\n' >> {log}
+remote_cmd=""
+for arg in "$@"; do remote_cmd="$arg"; done
+if [ -z "$remote_cmd" ]; then
+  echo "missing remote command" >&2
+  exit 2
+fi
+exec sh -c "$remote_cmd"
+"#,
+        log = log.to_string_lossy()
+    );
+    fs::write(&script_path, script).expect("write fake ssh");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(&script_path)
+        .expect("stat fake ssh")
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script_path, perms).expect("chmod fake ssh");
+    script_path
+}
+
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_clone_ssh_uses_global_host_key_policy() {
+    let root = tempdir().expect("clone fixture root");
+    let remote_dir = root.path().join("remote.git");
+    let work_dir = root.path().join("git_work");
+    let log_path = root.path().join("fake_ssh.log");
+    let dest = root.path().join("clone-out");
+    let config = ConfigDbFixture::new().expect("isolate configuration paths");
+
+    // Build a committed bare git remote over which clone will run.
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("init bare remote")
+            .success()
+    );
+    fs::create_dir_all(&work_dir).expect("create work dir");
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["init"])
+            .status()
+            .expect("init work")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["config", "user.name", "Clone Test User"])
+            .status()
+            .expect("git user.name")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["config", "user.email", "clone-test@example.com"])
+            .status()
+            .expect("git user.email")
+            .success()
+    );
+    fs::write(work_dir.join("README.md"), "ssh global policy clone").expect("write README");
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["add", "README.md"])
+            .status()
+            .expect("git add")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["commit", "-m", "initial"])
+            .status()
+            .expect("git commit")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["remote", "add", "origin", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("git remote add")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["push", "origin", "HEAD:refs/heads/main"])
+            .status()
+            .expect("git push")
+            .success()
+    );
+
+    let ssh = create_clone_fake_ssh_script(root.path(), &log_path);
+
+    // Seed a global policy through the real CLI, then clone from a cwd that is
+    // NOT a repository so only the global scope can supply the policy.
+    let seed = clone_command(root.path(), &config)
+        .args([
+            "config",
+            "set",
+            "--global",
+            "ssh.strictHostKeyChecking",
+            "accept-new",
+        ])
+        .output()
+        .expect("seed global policy");
+    assert!(
+        seed.status.success(),
+        "seed global policy failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let clone = clone_command(root.path(), &config)
+        .env("LIBRA_SSH_COMMAND", &ssh)
+        .env("LIBRA_TEST_SSH_LOG", &log_path)
+        .args([
+            "clone",
+            &format!("git@fakehost:{}", remote_dir.to_string_lossy()),
+            dest.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run clone over fake ssh");
+    assert!(
+        clone.status.success(),
+        "clone should succeed, stderr: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert!(dest.exists(), "clone must create the destination directory");
+    let log = fs::read_to_string(&log_path).expect("read fake ssh log");
+    assert!(
+        log.contains("StrictHostKeyChecking=accept-new"),
+        "clone outside a repo must adopt the seeded global policy, log: {log}"
+    );
+}
+
+/// A fake `ssh` that reports a host-key verification failure on its first
+/// invocation, then executes the remote command. The counter file drives the
+/// state so a retry transport can succeed after an interactive accept.
+#[cfg(unix)]
+fn create_stateful_hostkey_ssh_script(root: &Path, counter: &Path, log: &Path) -> PathBuf {
+    let script_path = root.join("hostkey_ssh.sh");
+    use std::os::unix::fs::PermissionsExt;
+    let text = format!(
+        r#"#!/bin/sh
+set -eu
+count=0
+[ -f {counter} ] && count=$(cat {counter})
+printf '%s\n' "$@" >> {log}
+if [ "$count" -lt 1 ]; then
+  echo "Host key verification failed." >&2
+  printf '%s' "$((count+1))" > {counter}
+  exit 255
+fi
+remote_cmd=""
+for arg in "$@"; do remote_cmd="$arg"; done
+exec sh -c "$remote_cmd"
+"#,
+        counter = counter.to_string_lossy(),
+        log = log.to_string_lossy(),
+    );
+    fs::write(&script_path, text).expect("write stateful ssh");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))
+        .expect("chmod stateful ssh");
+    script_path
+}
+
+#[cfg(unix)]
+fn create_keyscan_script(root: &Path, line: &str) -> PathBuf {
+    let script_path = root.join("keyscan.sh");
+    use std::os::unix::fs::PermissionsExt;
+    let text = format!("#!/bin/sh\necho '{line}'\n");
+    fs::write(&script_path, text).expect("write keyscan");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod keyscan");
+    script_path
+}
+
+#[cfg(unix)]
+#[test]
+#[serial(cwd, env)]
+fn test_clone_ssh_host_key_interactive_accepts_and_writes_trust() {
+    use std::{io::Write, process::Stdio};
+
+    let root = tempdir().expect("clone interactive fixture root");
+    let remote_dir = root.path().join("remote.git");
+    let work_dir = root.path().join("git_work");
+    let dest = root.path().join("clone-out");
+    let counter = root.path().join("count");
+    let log = root.path().join("ssh.log");
+    let config = ConfigDbFixture::new().expect("isolate configuration paths");
+
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("init bare remote")
+            .success()
+    );
+    fs::create_dir_all(&work_dir).expect("create work dir");
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["init"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["config", "user.name", "Clone Test"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["config", "user.email", "c@example.com"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(work_dir.join("README.md"), "interactive clone").expect("write README");
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["commit", "-m", "init"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["remote", "add", "origin", remote_dir.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["push", "origin", "HEAD:refs/heads/main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let ssh = create_stateful_hostkey_ssh_script(root.path(), &counter, &log);
+    let keyscan = create_keyscan_script(
+        root.path(),
+        "fakehost ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8pcsF4tFk4q1mQtC0Zz0Yv",
+    );
+    let known_hosts = root.path().join(".home").join(".ssh").join("known_hosts");
+
+    let mut child = clone_command(root.path(), &config)
+        .env("LIBRA_SSH_HOST_KEY_CONFIRM", "1")
+        .env("LIBRA_SSH_COMMAND", &ssh)
+        .env("LIBRA_SSH_KEYSCAN_COMMAND", &keyscan)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args([
+            "clone",
+            &format!("git@fakehost:{}", remote_dir.to_string_lossy()),
+            dest.to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("spawn clone");
+    child
+        .stdin
+        .take()
+        .expect("clone stdin")
+        .write_all(b"yes\n")
+        .expect("feed yes");
+    let output = child.wait_with_output().expect("wait for clone");
+
+    assert!(
+        output.status.success(),
+        "interactive clone must succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dest.exists(), "clone must create the destination");
+    assert!(
+        known_hosts.exists(),
+        "an accepted host key must write the known-hosts destination"
+    );
+    let content = fs::read_to_string(&known_hosts).expect("read known_hosts");
+    assert!(
+        content.contains("fakehost ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8pcsF4tFk4q1mQtC0Zz0Yv"),
+        "known_hosts must contain the accepted host key, got: {content}"
+    );
 }
 
 fn assert_retired_publish_restore_source(output: &std::process::Output, dest: &Path) {

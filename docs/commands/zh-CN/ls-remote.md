@@ -145,12 +145,15 @@ Clone 将主机核验指引放在结构化 hints 中；其它命令边界在 mes
 
 ## SSH 认证与捕获诊断
 
-无论是否由终端调用，Libra 都以 `BatchMode=yes` 启动 SSH，不在 Libra 命令中
-询问私钥口令或进行交互式主机信任决定。重试前请先在 `ssh-agent` 中加载或解锁
-加密私钥。主机信任应先通过可信服务商控制台或其它可信渠道核对指纹，再手动
-更新 `~/.ssh/known_hosts`；也可以单独建立交互 SSH 连接，核对显示的指纹后才
-接受。`ssh -T git@github.com` 是 GitHub 示例，请使用实际仓库 SSH 用户、主机
-和端口，不要接受未经核验的指纹。
+Libra 以 `BatchMode=yes` 启动 SSH（用于非交互、非 TTY、JSON 与 machine 调用方）。
+在人类终端且有效政策为 `ask`（`ssh.strictHostKeyChecking` 未设或为 `ask`）时，
+首次连接未知 SSH 主机会显示与 Git 相容的指纹确认提示；接受后把主机密钥写入你
+OpenSSH 配置的目的 known-hosts，并继续原命令；拒绝、EOF 或主机密钥变更则失败
+关闭。Libra 不询问私钥口令——重试前请先在 `ssh-agent` 中加载或解锁加密私钥。
+主机信任应先通过可信服务商控制台或其它可信渠道核对指纹，再手动更新
+`~/.ssh/known_hosts`；也可以单独建立交互 SSH 连接，核对显示的指纹后才接受。
+`ssh -T git@github.com` 是 GitHub 示例，请使用实际仓库 SSH 用户、主机和端口，
+不要接受未经核验的指纹。
 
 上述严格的 discovery 公钥拒绝使用固定 hint：检查
 `libra config list --ssh-keys`、SSH agent 与仓库权限，并链接

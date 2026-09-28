@@ -23,7 +23,7 @@ use libra::{
     },
     utils::{
         output::OutputConfig,
-        test::{ChangeDirGuard, setup_with_new_libra_in},
+        test::{ChangeDirGuard, ConfigDbFixture, setup_with_new_libra_in},
     },
 };
 use serial_test::serial;
@@ -243,6 +243,23 @@ fn test_fetch_cli_without_remote_is_noop_like_git() {
 }
 
 #[cfg(unix)]
+/// A fake `ssh-keyscan` that records an invocation by touching a marker file.
+fn create_keyscan_marker_script(root: &Path, marker: &Path) -> PathBuf {
+    let script_path = root.join("fake_keyscan.sh");
+    let text = format!("#!/bin/sh\ntouch {}\n\n", marker.to_string_lossy());
+    fs::write(&script_path, text).expect("write keyscan marker script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script_path)
+            .expect("stat keyscan")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod keyscan");
+    }
+    script_path
+}
+
 fn create_fake_ssh_script(root: &Path) -> PathBuf {
     let script_path = root.join("fake_ssh.sh");
     let script = r#"#!/bin/sh
@@ -255,6 +272,11 @@ fi
 
 if [ "${LIBRA_TEST_SSH_FAIL:-}" = "hostkey" ]; then
   echo "Host key verification failed." >&2
+  exit 255
+fi
+
+if [ "${LIBRA_TEST_SSH_FAIL:-}" = "changed" ]; then
+  echo "REMOTE HOST IDENTIFICATION HAS CHANGED; Host key verification failed." >&2
   exit 255
 fi
 
@@ -941,6 +963,120 @@ async fn test_fetch_ssh_host_key_failure_is_reported() {
     }
 }
 
+/// Non-interactive SSH host-key failure must never prompt, never write
+/// known-hosts, and never invoke `ssh-keyscan` (HKT-02 GC-HKT-01).
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd, env)]
+async fn test_fetch_ssh_host_key_noninteractive_writes_no_trust() {
+    let temp_root = tempdir().expect("failed to create temp root");
+    let remote_dir = temp_root.path().join("remote.git");
+    let repo_dir = temp_root.path().join("libra_repo");
+    let key_marker = temp_root.path().join("keyscan_ran");
+    let known_hosts = temp_root.path().join("known_hosts");
+    let ssh_script = create_fake_ssh_script(temp_root.path());
+    let keyscan_script = create_keyscan_marker_script(temp_root.path(), &key_marker);
+
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("init bare remote")
+            .success()
+    );
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let ssh_remote = format!("git@fakehost:{}", remote_dir.to_string_lossy());
+    ConfigKv::set("remote.origin.url", &ssh_remote, false)
+        .await
+        .unwrap();
+
+    for extra in [Vec::<&str>::new(), vec!["--json"], vec!["--machine"]] {
+        let key_marker_removed = std::fs::remove_file(&key_marker).is_ok();
+        assert!(
+            key_marker_removed || !key_marker.exists(),
+            "pre-clear marker"
+        );
+        let mut command = libra_command(&repo_dir);
+        command
+            .env("LIBRA_SSH_COMMAND", &ssh_script)
+            .env("LIBRA_TEST_SSH_FAIL", "hostkey")
+            .env("LIBRA_SSH_KEYSCAN_COMMAND", &keyscan_script);
+        for arg in &extra {
+            command.arg(arg);
+        }
+        let output = command
+            .args(["fetch", "origin"])
+            .output()
+            .expect("run non-interactive fetch");
+        assert_eq!(output.status.code(), Some(128), "{extra:?}: {output:?}");
+        let (_, report) = parse_cli_error_stderr(&output.stderr);
+        assert_eq!(report.error_code, "LBR-NET-001", "{extra:?}: {report:?}");
+        assert!(
+            !key_marker.exists(),
+            "non-interactive {extra:?} must not invoke ssh-keyscan"
+        );
+        assert!(
+            !known_hosts.exists(),
+            "non-interactive {extra:?} must not write known_hosts"
+        );
+    }
+}
+
+/// A changed host key must never enter the interactive confirmation path
+/// (ADR-HKT-03): no prompt, no known-hosts write, no keyscan.
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd, env)]
+async fn test_ssh_changed_host_key_never_prompts() {
+    let temp_root = tempdir().expect("failed to create temp root");
+    let remote_dir = temp_root.path().join("remote.git");
+    let repo_dir = temp_root.path().join("libra_repo");
+    let key_marker = temp_root.path().join("keyscan_ran");
+    let known_hosts = temp_root.path().join("known_hosts");
+    let ssh_script = create_fake_ssh_script(temp_root.path());
+    let keyscan_script = create_keyscan_marker_script(temp_root.path(), &key_marker);
+
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("init bare remote")
+            .success()
+    );
+    fs::create_dir_all(&repo_dir).expect("create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let ssh_remote = format!("git@fakehost:{}", remote_dir.to_string_lossy());
+    ConfigKv::set("remote.origin.url", &ssh_remote, false)
+        .await
+        .unwrap();
+
+    let output = libra_command(&repo_dir)
+        .env("LIBRA_SSH_COMMAND", &ssh_script)
+        .env("LIBRA_TEST_SSH_FAIL", "changed")
+        .env("LIBRA_SSH_KEYSCAN_COMMAND", &keyscan_script)
+        .env("LIBRA_SSH_HOST_KEY_CONFIRM", "1")
+        .args(["fetch", "origin"])
+        .output()
+        .expect("run changed-key fetch");
+    assert_eq!(output.status.code(), Some(128), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SSH host identity has changed") || stderr.contains("changed"),
+        "changed error must surface, stderr: {stderr}"
+    );
+    assert!(
+        !key_marker.exists(),
+        "changed key must not invoke ssh-keyscan"
+    );
+    assert!(
+        !known_hosts.exists(),
+        "changed key must not write known_hosts"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial(cwd)]
@@ -1000,6 +1136,219 @@ async fn test_fetch_ssh_invalid_vault_key_fails_without_fallback() {
     assert!(
         !log_path.exists(),
         "fetch should fail before invoking SSH when vault key is invalid"
+    );
+}
+
+/// Seed `ssh.strictHostKeyChecking` into a global/system config database through
+/// the real CLI, so the local -> global -> system cascade is exercised
+/// end-to-end (HKT-01). `scope_flag` is `--global` or `--system`.
+fn seed_ssh_policy_config(cwd: &Path, scope_flag: &str, value: &str) {
+    let out = libra_command(cwd)
+        .args([
+            "config",
+            "set",
+            scope_flag,
+            "ssh.strictHostKeyChecking",
+            value,
+        ])
+        .output()
+        .expect("failed to seed ssh.strictHostKeyChecking");
+    assert!(
+        out.status.success(),
+        "seed ssh.strictHostKeyChecking={value} ({scope_flag}) failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Remove `ssh.strictHostKeyChecking` from the global config database.
+fn unset_global_ssh_policy(cwd: &Path) {
+    let out = libra_command(cwd)
+        .args(["config", "unset", "--global", "ssh.strictHostKeyChecking"])
+        .output()
+        .expect("failed to unset global ssh.strictHostKeyChecking");
+    assert!(
+        out.status.success(),
+        "unset global ssh.strictHostKeyChecking failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// Register the fixture so the cascade test can run fetch repeatedly over the same remote.
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd, env)]
+async fn test_fetch_ssh_resolves_host_key_policy_cascade() {
+    let temp_root = tempdir().expect("failed to create temp root");
+    let remote_dir = temp_root.path().join("remote.git");
+    let repo_dir = temp_root.path().join("libra_repo");
+    let work_dir = temp_root.path().join("git_work");
+    let log_path = temp_root.path().join("fake_ssh.log");
+    let ssh_script = create_fake_ssh_script(temp_root.path());
+    // Isolate global/system config DBs and HOME/XDG from the real user.
+    let _config = ConfigDbFixture::new().expect("isolate configuration paths");
+
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("failed to init bare remote")
+            .success()
+    );
+    fs::create_dir_all(&work_dir).expect("failed to create work dir");
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["init"])
+            .status()
+            .expect("failed to init git workdir")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["config", "user.name", "Fetch Test User"])
+            .status()
+            .expect("git user.name")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["config", "user.email", "fetch-test@example.com"])
+            .status()
+            .expect("git user.email")
+            .success()
+    );
+    fs::write(work_dir.join("README.md"), "hello ssh cascade").expect("write README");
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["add", "README.md"])
+            .status()
+            .expect("git add")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["commit", "-m", "initial commit"])
+            .status()
+            .expect("git commit")
+            .success()
+    );
+    let current_branch = String::from_utf8(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("read branch")
+            .stdout,
+    )
+    .expect("branch not utf8")
+    .trim()
+    .to_string();
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["remote", "add", "origin", remote_dir.to_str().unwrap()])
+            .status()
+            .expect("git remote add")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args([
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{current_branch}"),
+            ])
+            .status()
+            .expect("git push")
+            .success()
+    );
+
+    fs::create_dir_all(&repo_dir).expect("failed to create repo dir");
+    setup_with_new_libra_in(&repo_dir).await;
+    let _guard = ChangeDirGuard::new(&repo_dir);
+    let ssh_remote = format!("git@fakehost:{}", remote_dir.to_string_lossy());
+    ConfigKv::set("remote.origin.url", &ssh_remote, false)
+        .await
+        .unwrap();
+
+    // Assert a single fetch invocation against an expected option in the ssh log.
+    let run_fetch = |env_mode: Option<&str>| {
+        let mut command = libra_command(&repo_dir);
+        command
+            .env("LIBRA_SSH_COMMAND", &ssh_script)
+            .env("LIBRA_TEST_SSH_LOG", &log_path);
+        match env_mode {
+            Some(mode) => {
+                command.env("LIBRA_SSH_STRICT_HOST_KEY_CHECKING", mode);
+            }
+            None => {
+                command.env_remove("LIBRA_SSH_STRICT_HOST_KEY_CHECKING");
+            }
+        }
+        let output = command
+            .args(["fetch", "origin"])
+            .output()
+            .expect("failed to run fetch over fake ssh");
+        assert!(
+            output.status.success(),
+            "fetch should succeed, stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ssh_log = fs::read_to_string(&log_path).expect("read fake ssh log");
+        std::fs::remove_file(&log_path).expect("clear ssh log");
+        ssh_log
+    };
+
+    // 1. Non-empty env var must override global.
+    seed_ssh_policy_config(&repo_dir, "--global", "accept-new");
+    let log = run_fetch(Some("yes"));
+    assert!(
+        log.contains("StrictHostKeyChecking=yes")
+            && !log.contains("StrictHostKeyChecking=accept-new"),
+        "env must override global, log: {log}"
+    );
+
+    // 2. Local config must override global.
+    seed_ssh_policy_config(&repo_dir, "--global", "accept-new");
+    ConfigKv::set("ssh.strictHostKeyChecking", "no", false)
+        .await
+        .unwrap();
+    let log = run_fetch(None);
+    assert!(
+        log.contains("StrictHostKeyChecking=no")
+            && !log.contains("StrictHostKeyChecking=accept-new"),
+        "local must override global, log: {log}"
+    );
+    ConfigKv::unset("ssh.strictHostKeyChecking").await.unwrap();
+
+    // 3. Global is read when no local and no env.
+    seed_ssh_policy_config(&repo_dir, "--global", "yes");
+    let log = run_fetch(None);
+    assert!(
+        log.contains("StrictHostKeyChecking=yes"),
+        "global policy must be honored when local/env absent, log: {log}"
+    );
+    unset_global_ssh_policy(&repo_dir);
+
+    // 4. System is the fallback when global is absent.
+    seed_ssh_policy_config(&repo_dir, "--system", "no");
+    let log = run_fetch(None);
+    assert!(
+        log.contains("StrictHostKeyChecking=no"),
+        "system policy must be the fallback when global absent, log: {log}"
+    );
+
+    // 5. `ask` defers to ssh_config: no StrictHostKeyChecking option is passed.
+    seed_ssh_policy_config(&repo_dir, "--global", "ask");
+    let log = run_fetch(None);
+    assert!(
+        !log.contains("StrictHostKeyChecking="),
+        "ask must not pass StrictHostKeyChecking, log: {log}"
     );
 }
 

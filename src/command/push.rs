@@ -977,12 +977,18 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     // Local file path remotes are not supported for push
     validate_local_refspecs(&args, &current_branch).await?;
 
-    let remote_client = RemoteClient::from_spec_with_remote(&repo_url, Some(&repository))
-        .await
-        .map_err(|e| PushError::InvalidRemoteUrl {
-            url: repo_url.clone(),
-            detail: e.to_string(),
-        })?;
+    let host_key_confirmation =
+        crate::internal::protocol::ssh_client::host_key_confirmation_for_output(output);
+    let remote_client = RemoteClient::from_spec_with_remote_and_confirmation(
+        &repo_url,
+        Some(&repository),
+        host_key_confirmation,
+    )
+    .await
+    .map_err(|e| PushError::InvalidRemoteUrl {
+        url: repo_url.clone(),
+        detail: e.to_string(),
+    })?;
     let remote_client = remote_client
         .with_network_timeouts(PUSH_CONNECT_TIMEOUT, PUSH_IDLE_TIMEOUT)
         .map_err(|e| PushError::Network(format!("failed to configure remote transport: {e}")))?;

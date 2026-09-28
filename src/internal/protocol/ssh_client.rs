@@ -4,7 +4,7 @@
 //! Uses the vault-generated SSH private key for authentication when available.
 
 use std::{
-    io::{Error as IoError, ErrorKind},
+    io::{self, BufRead, Error as IoError, ErrorKind},
     time::Duration,
 };
 
@@ -396,6 +396,272 @@ fn default_ssh_idle_timeout() -> Duration {
     DEFAULT_SSH_IDLE_TIMEOUT
 }
 
+/// Decision returned by an interactive host-key confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostKeyDecision {
+    /// The user explicitly accepted; trust was written and the transport may be retried.
+    Accepted,
+    /// The user rejected, EOF/empty answer, or a non-fatal confirmation failure.
+    Rejected,
+    /// `ssh-keyscan` produced no host key; proceed without writing trust.
+    NoHostKeys,
+}
+
+/// Interactive host-key confirmation policy (ADR-HKT-01, HKT-02).
+///
+/// Only constructed when the caller has already determined that interactive
+/// confirmation is eligible (human output, TTY, effective `ask` policy). The
+/// prompt is built locally from verified host-key metadata; no remote stderr,
+/// banner, ANSI sequence or protocol byte is replayed. On an explicit
+/// accept, the host-key entries are written to `known_hosts_path` and the
+/// original batch transport is retried once.
+/// Read one answer line from the interactive prompt.
+type HostKeyAnswerReader = Box<dyn Fn() -> io::Result<String> + Send + Sync>;
+/// Write one prompt line to the interactive output.
+type HostKeyPromptWriter = Box<dyn Fn(&str) -> io::Result<()> + Send + Sync>;
+
+pub(crate) struct HostKeyConfirmation {
+    /// Destination for the accepted trust entries (resolved from the user's
+    /// ssh_config `UserKnownHostsFile`, defaulting to `~/.ssh/known_hosts`).
+    pub(crate) known_hosts_path: std::path::PathBuf,
+    /// Override the `ssh-keyscan` binary; `None` uses `LIBRA_SSH_KEYSCAN_COMMAND`
+    /// or `ssh-keyscan`.
+    pub(crate) keyscan_command: Option<std::path::PathBuf>,
+    /// Read one answer line; default reads from stdin.
+    pub(crate) read_answer: HostKeyAnswerReader,
+    /// Write one prompt line; default writes to stderr.
+    pub(crate) write_prompt: HostKeyPromptWriter,
+}
+
+impl HostKeyConfirmation {
+    /// A confirmation with default stdin/stdout I/O and a host-resolved
+    /// known-hosts destination.
+    pub(crate) fn with_path(known_hosts_path: std::path::PathBuf) -> Self {
+        Self {
+            known_hosts_path,
+            keyscan_command: None,
+            read_answer: Box::new(default_read_answer),
+            write_prompt: Box::new(default_write_prompt),
+        }
+    }
+}
+
+impl Default for HostKeyConfirmation {
+    fn default() -> Self {
+        Self::with_path(default_known_hosts_path())
+    }
+}
+
+fn default_read_answer() -> io::Result<String> {
+    let mut line = String::new();
+    let n = std::io::stdin().lock().read_line(&mut line)?;
+    if n == 0 {
+        // EOF (e.g. closed stdin) is treated as reject.
+        return Ok(String::new());
+    }
+    Ok(line)
+}
+
+fn default_write_prompt(text: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(text.as_bytes())?;
+    stderr.flush()
+}
+
+/// Best-effort resolution of the known-hosts destination for a host.
+///
+/// Honors the first `UserKnownHostsFile` in the matching `Host` block of the
+/// user's `~/.ssh/config`; otherwise falls back to `~/.ssh/known_hosts`.
+/// `HostKeyAlias` is a known limitation (documented in
+/// `docs/development/internal/ssh-host-key-interaction.md`).
+pub(crate) fn default_known_hosts_path() -> std::path::PathBuf {
+    if let Some(path) = user_known_hosts_file_from_ssh_config() {
+        return path;
+    }
+    home_ssh_known_hosts()
+}
+
+fn home_ssh_known_hosts() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    home.join(".ssh").join("known_hosts")
+}
+
+/// Scan `~/.ssh/config` for the first `UserKnownHostsFile` option, relative
+/// paths expanded against `~/.ssh`. Returns `None` when absent or unreadable.
+fn user_known_hosts_file_from_ssh_config() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let config = home.join(".ssh").join("config");
+    let text = std::fs::read_to_string(&config).ok()?;
+    let mut in_matching_host = true;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = line
+            .strip_prefix("Host")
+            .or_else(|| line.strip_prefix("host"))
+        {
+            let patterns = value.trim();
+            in_matching_host = !patterns.is_empty();
+        } else if in_matching_host && line.to_ascii_lowercase().starts_with("userknownhostsfile") {
+            let value = line
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            if !value.is_empty() {
+                return Some(expand_tilde(value, &home));
+            }
+        }
+    }
+    None
+}
+
+fn expand_tilde(value: &str, home: &std::path::Path) -> std::path::PathBuf {
+    if value == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    std::path::PathBuf::from(value)
+}
+
+/// Resolve whether interactive host-key confirmation is eligible for a command.
+///
+/// Returns `Some(confirmation)` only when the command is not JSON/machine
+/// output and (stdin, stdout, stderr) are all terminals. `LIBRA_SSH_HOST_KEY_CONFIRM`
+/// (any non-empty value) forces interaction for automation/test harnesses that
+/// feed the answer on stdin without being attached to a terminal. The `ask`
+/// policy requirement is enforced separately inside [`SshClient`], which also
+/// refuses to prompt for changed keys (ADR-HKT-03).
+pub(crate) fn host_key_confirmation_for_output(
+    output: &crate::utils::output::OutputConfig,
+) -> Option<HostKeyConfirmation> {
+    use std::io::IsTerminal;
+    if output.is_json() {
+        return None;
+    }
+    if let Ok(raw) = std::env::var("LIBRA_SSH_HOST_KEY_CONFIRM")
+        && !raw.trim().is_empty()
+    {
+        return Some(HostKeyConfirmation::default());
+    }
+    if std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+    {
+        Some(HostKeyConfirmation::default())
+    } else {
+        None
+    }
+}
+
+/// The `ssh-keyscan` binary, honoring `LIBRA_SSH_KEYSCAN_COMMAND`.
+fn ssh_keyscan_command(override_path: Option<&std::path::Path>) -> String {
+    if let Some(path) = override_path {
+        return path.to_string_lossy().to_string();
+    }
+    std::env::var("LIBRA_SSH_KEYSCAN_COMMAND").unwrap_or_else(|_| "ssh-keyscan".to_string())
+}
+
+/// One parsed `ssh-keyscan` line: `<hosttoken> <keytype> <base64-blob>`.
+#[derive(Debug, Clone)]
+struct ParsedKeyscanHostKey {
+    host_token: String,
+    key_type: String,
+    blob: String,
+}
+
+/// Parse a `ssh-keyscan` output line, returning the parsed entry or `None` for
+/// malformed lines (blank lines, banners, comments).
+fn parse_keyscan_line(line: &str) -> Option<ParsedKeyscanHostKey> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let host_token = parts.next()?.to_string();
+    let key_type = parts.next()?.to_string();
+    let blob = parts.next()?.to_string();
+    if blob.is_empty() {
+        return None;
+    }
+    Some(ParsedKeyscanHostKey {
+        host_token,
+        key_type,
+        blob,
+    })
+}
+
+/// Compute the OpenSSH `SHA256:<base64>` fingerprint of a base64-encoded key
+/// blob. Matches `ssh-keygen -E sha256 -lf` output.
+fn ssh_fingerprint(blob_b64: &str) -> Option<String> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let blob = STANDARD.decode(blob_b64).ok()?;
+    let digest = sha2::Sha256::digest(&blob);
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    Some(format!("SHA256:{}", STANDARD_NO_PAD.encode(digest)))
+}
+
+/// Resolve an answer against the displayed fingerprints.
+///
+/// Returns `Some(true)` for an explicit accept (`yes` or the full fingerprint),
+/// `Some(false)` for a reject (`no` or empty/EOF), and `None` for an
+/// unrecognized input that should re-prompt. Fingerprints are compared
+/// case-insensitively and with or without the `SHA256:` prefix.
+fn resolve_host_key_answer(answer: &str, fingerprints: &[String]) -> Option<bool> {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
+        return Some(false);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "yes" {
+        return Some(true);
+    }
+    if lower == "no" {
+        return Some(false);
+    }
+    let normalized = lower.strip_prefix("sha256:").unwrap_or(lower.as_str());
+    for fingerprint in fingerprints {
+        let fp_lower = fingerprint.to_ascii_lowercase();
+        let fp_normalized = fp_lower
+            .strip_prefix("sha256:")
+            .unwrap_or(fp_lower.as_str());
+        if normalized == fp_normalized {
+            return Some(true);
+        }
+    }
+    None
+}
+
+/// Append accepted host-key entries (in `known_hosts` line format) to the
+/// destination, creating parent directories as needed.
+fn append_known_hosts_entries(path: &std::path::Path, entries: &[String]) -> io::Result<()> {
+    use std::io::Write;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for entry in entries {
+        writeln!(file, "{entry}")?;
+    }
+    Ok(())
+}
+
 pub struct SshClient {
     user: String,
     host: String,
@@ -405,6 +671,7 @@ pub struct SshClient {
     temp_key_file: Option<NamedTempFile>,
     strict_host_key_checking: String,
     idle_timeout: Duration,
+    host_key_confirmation: Option<HostKeyConfirmation>,
 }
 
 impl SshClient {
@@ -454,6 +721,22 @@ impl SshClient {
         Ok(self)
     }
 
+    /// Enable interactive host-key confirmation (HKT-02).
+    ///
+    /// Only effective when the effective policy is `ask` and the transport
+    /// reports a typed `Untrusted` host key. The confirmation is built locally
+    /// from `ssh-keyscan` metadata and writes trust on explicit accept.
+    pub(crate) fn with_host_key_confirmation(mut self, confirmation: HostKeyConfirmation) -> Self {
+        self.host_key_confirmation = Some(confirmation);
+        self
+    }
+
+    /// Whether the interactive host-key path may run. Confirmation requires an
+    /// `ask` policy and an explicitly enabled confirmation.
+    fn host_key_confirmation_enabled(&self) -> bool {
+        self.strict_host_key_checking == "ask" && self.host_key_confirmation.is_some()
+    }
+
     fn from_ssh_url(spec: &str) -> Result<Self, String> {
         let url = url::Url::parse(spec).map_err(|e| format!("invalid SSH URL: {e}"))?;
         let user = if url.username().is_empty() {
@@ -479,6 +762,7 @@ impl SshClient {
             temp_key_file: None,
             strict_host_key_checking: "ask".to_string(),
             idle_timeout: default_ssh_idle_timeout(),
+            host_key_confirmation: None,
         })
     }
 
@@ -502,6 +786,7 @@ impl SshClient {
             temp_key_file: None,
             strict_host_key_checking: "ask".to_string(),
             idle_timeout: default_ssh_idle_timeout(),
+            host_key_confirmation: None,
         })
     }
 
@@ -629,6 +914,24 @@ impl SshClient {
         &self,
         service: ServiceType,
     ) -> Result<DiscoveryResult, GitError> {
+        match self.discovery_reference_inner(service).await {
+            Err(error)
+                if self.host_key_confirmation_enabled()
+                    && git_error_is_host_key_untrusted(&error) =>
+            {
+                match self.confirm_host_key().await {
+                    HostKeyDecision::Accepted => self.discovery_reference_inner(service).await,
+                    _ => Err(error),
+                }
+            }
+            other => other,
+        }
+    }
+
+    async fn discovery_reference_inner(
+        &self,
+        service: ServiceType,
+    ) -> Result<DiscoveryResult, GitError> {
         let mut child = self
             .spawn_service(service)
             .await
@@ -699,6 +1002,46 @@ impl SshClient {
     }
 
     pub(crate) async fn fetch_objects_with_expected_shallow_boundaries(
+        &self,
+        have: &[String],
+        want: &[String],
+        shallow: &[String],
+        depth: Option<usize>,
+        expected_boundaries: Option<&[String]>,
+    ) -> Result<FetchStream, IoError> {
+        match self
+            .fetch_objects_with_expected_shallow_boundaries_inner(
+                have,
+                want,
+                shallow,
+                depth,
+                expected_boundaries,
+            )
+            .await
+        {
+            Err(error)
+                if self.host_key_confirmation_enabled()
+                    && io_error_is_host_key_untrusted(&error) =>
+            {
+                match self.confirm_host_key().await {
+                    HostKeyDecision::Accepted => {
+                        self.fetch_objects_with_expected_shallow_boundaries_inner(
+                            have,
+                            want,
+                            shallow,
+                            depth,
+                            expected_boundaries,
+                        )
+                        .await
+                    }
+                    _ => Err(error),
+                }
+            }
+            other => other,
+        }
+    }
+
+    async fn fetch_objects_with_expected_shallow_boundaries_inner(
         &self,
         have: &[String],
         want: &[String],
@@ -876,6 +1219,21 @@ impl SshClient {
     }
 
     pub async fn send_pack(&self, data: Bytes) -> Result<Bytes, IoError> {
+        match self.send_pack_inner(data.clone()).await {
+            Err(error)
+                if self.host_key_confirmation_enabled()
+                    && io_error_is_host_key_untrusted(&error) =>
+            {
+                match self.confirm_host_key().await {
+                    HostKeyDecision::Accepted => self.send_pack_inner(data).await,
+                    _ => Err(error),
+                }
+            }
+            other => other,
+        }
+    }
+
+    async fn send_pack_inner(&self, data: Bytes) -> Result<Bytes, IoError> {
         let mut child = self.spawn_service(ServiceType::ReceivePack).await?;
         let advertisement = {
             let stdout = child
@@ -975,6 +1333,134 @@ impl SshClient {
         }
         Ok(())
     }
+
+    /// Fetch the host keys via `ssh-keyscan`, returning parsed entries or
+    /// `None` when keyscan fails or yields nothing (fail without writing trust).
+    async fn run_ssh_keyscan(
+        &self,
+        confirmation: &HostKeyConfirmation,
+    ) -> Option<Vec<ParsedKeyscanHostKey>> {
+        let cmd_str = ssh_keyscan_command(confirmation.keyscan_command.as_deref());
+        let mut cmd = tokio::process::Command::new(cmd_str);
+        cmd.arg("-t").arg("ed25519,ecdsa,rsa");
+        if self.port != DEFAULT_SSH_PORT {
+            cmd.arg("-p").arg(self.port.to_string());
+        }
+        cmd.arg(&self.host);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(self.idle_timeout, cmd.output())
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let entries: Vec<ParsedKeyscanHostKey> =
+            text.lines().filter_map(parse_keyscan_line).collect();
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        }
+    }
+
+    /// Run the interactive host-key confirmation (ADR-HKT-01). Only called
+    /// when the effective policy is `ask` and the transport reported a typed
+    /// `Untrusted` host key. Never replays remote output; every prompt byte is
+    /// built locally from verified keyscan metadata.
+    async fn confirm_host_key(&self) -> HostKeyDecision {
+        let confirmation = match &self.host_key_confirmation {
+            Some(confirmation) => confirmation,
+            None => return HostKeyDecision::Rejected,
+        };
+        let entries = match self.run_ssh_keyscan(confirmation).await {
+            Some(entries) => entries,
+            None => return HostKeyDecision::NoHostKeys,
+        };
+        let mut fingerprints = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            if let Some(fingerprint) = ssh_fingerprint(&entry.blob) {
+                fingerprints.push(fingerprint);
+            }
+        }
+        if fingerprints.is_empty() {
+            return HostKeyDecision::NoHostKeys;
+        }
+
+        let host_label = if self.port == DEFAULT_SSH_PORT {
+            self.host.clone()
+        } else {
+            format!("[{}]:{}", self.host, self.port)
+        };
+        let known_hosts_lines: Vec<String> = entries
+            .iter()
+            .map(|entry| format!("{} {} {}", entry.host_token, entry.key_type, entry.blob))
+            .collect();
+
+        // Bounded re-prompt loop: an unrecognized answer re-prompts a small
+        // number of times, then fails closed (Rejected) rather than hanging.
+        let mut attempts = 0u32;
+        loop {
+            let mut prompt =
+                format!("The authenticity of host '{host_label}' can't be established.\n");
+            for (entry, fingerprint) in entries.iter().zip(fingerprints.iter()) {
+                prompt.push_str(&format!(
+                    "{} key fingerprint is {}.\n",
+                    entry.key_type, fingerprint
+                ));
+            }
+            prompt
+                .push_str("Are you sure you want to continue connecting (yes/no/[fingerprint])? ");
+            if (confirmation.write_prompt)(&prompt).is_err() {
+                return HostKeyDecision::Rejected;
+            }
+            let answer = match (confirmation.read_answer)() {
+                Ok(answer) => answer,
+                Err(_) => return HostKeyDecision::Rejected,
+            };
+            match resolve_host_key_answer(&answer, &fingerprints) {
+                Some(true) => {
+                    if append_known_hosts_entries(
+                        &confirmation.known_hosts_path,
+                        &known_hosts_lines,
+                    )
+                    .is_err()
+                    {
+                        // A failed trust write must not loop; let the original
+                        // error surface so the user can fix the destination.
+                        return HostKeyDecision::Rejected;
+                    }
+                    return HostKeyDecision::Accepted;
+                }
+                Some(false) => return HostKeyDecision::Rejected,
+                None => {
+                    attempts += 1;
+                    if attempts >= 10 {
+                        return HostKeyDecision::Rejected;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn git_error_is_host_key_untrusted(error: &GitError) -> bool {
+    matches!(
+        error,
+        GitError::NetworkError(detail) if detail.starts_with(SSH_HOST_KEY_UNCONFIRMED_SIGNAL)
+    )
+}
+
+fn io_error_is_host_key_untrusted(error: &IoError) -> bool {
+    error.get_ref().is_some_and(|inner| {
+        matches!(
+            inner.downcast_ref::<SshHostKeyUnconfirmed>(),
+            Some(SshHostKeyUnconfirmed::Untrusted)
+        )
+    })
 }
 
 #[derive(Debug)]
@@ -1311,6 +1797,8 @@ pub(crate) mod tests {
             assert_typed_frame_error(read_frame_fixture(wire).await.unwrap_err(), expected);
         }
     }
+
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -1828,9 +2316,10 @@ pub(crate) mod tests {
             tokio::time::timeout(Duration::from_secs(5), async {
                 let key = "vault.ssh.pkt11-vault.privkey";
                 ConfigKv::set(key, "not-hex", false).await.unwrap();
-                let error = RemoteClient::from_spec_with_remote(
+                let error = RemoteClient::from_spec_with_remote_and_confirmation(
                     "git@fixture.invalid:repo",
                     Some("pkt11-vault"),
+                    None,
                 )
                 .await
                 .err()
@@ -1843,9 +2332,10 @@ pub(crate) mod tests {
                     .await
                     .unwrap();
                 ConfigKv::set(key, "not-hex", true).await.unwrap();
-                let error = RemoteClient::from_spec_with_remote(
+                let error = RemoteClient::from_spec_with_remote_and_confirmation(
                     "git@fixture.invalid:repo",
                     Some("pkt11-vault"),
+                    None,
                 )
                 .await
                 .err()
@@ -3285,5 +3775,344 @@ pub(crate) mod tests {
             reader_task.await.expect("reader task should finish"),
             expected_len
         );
+    }
+
+    #[cfg(unix)]
+    fn write_interactive_ssh_script(
+        root: &std::path::Path,
+        ad: &std::path::Path,
+        counter: &std::path::Path,
+        fail_stderr: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = root.join("interactive_ssh.sh");
+        let text = format!(
+            "#!/bin/sh\nset -eu\ncount=0\n[ -f {c} ] && count=$(cat {c})\nif [ \"$count\" -lt 1 ]; then\n  printf '%s\\n' {stderr} >&2\n  printf '%s' \"$((count+1))\" > {c}\n  exit 255\nfi\ncat {ad}\nexit 0\n",
+            c = shell_single_quote(counter.to_str().unwrap()),
+            stderr = shell_single_quote(fail_stderr),
+            ad = shell_single_quote(ad.to_str().unwrap()),
+        );
+        std::fs::write(&script, text).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn write_keyscan_script(root: &std::path::Path, line: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = root.join("keyscan.sh");
+        let text = format!("#!/bin/sh\necho {line}\n", line = shell_single_quote(line));
+        std::fs::write(&script, text).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// Build an `SshClient` wired to fake ssh/keyscan plus an injectable prompt
+    /// answer, returning the client and the env guards that must outlive the
+    /// transport run (`LIBRA_SSH_COMMAND` / `LIBRA_SSH_KEYSCAN_COMMAND`).
+    #[cfg(unix)]
+    fn interactive_client(
+        ssh_script: &std::path::Path,
+        keyscan_script: &std::path::Path,
+        known_hosts: &std::path::Path,
+        answer: &'static str,
+        prompt: Arc<Mutex<Vec<String>>>,
+    ) -> (
+        SshClient,
+        crate::utils::test::ScopedEnvVar,
+        crate::utils::test::ScopedEnvVar,
+    ) {
+        use crate::utils::test::ScopedEnvVar;
+        let ssh_guard = ScopedEnvVar::set("LIBRA_SSH_COMMAND", ssh_script);
+        let keyscan_guard = ScopedEnvVar::set("LIBRA_SSH_KEYSCAN_COMMAND", keyscan_script);
+        let prompt_read = prompt.clone();
+        let confirmation = HostKeyConfirmation {
+            known_hosts_path: known_hosts.to_path_buf(),
+            keyscan_command: None,
+            read_answer: Box::new(move || Ok(answer.to_string())),
+            write_prompt: Box::new(move |text| {
+                prompt_read.lock().unwrap().push(text.to_string());
+                Ok(())
+            }),
+        };
+        let client = SshClient::from_ssh_spec("git@fakehost:repo")
+            .unwrap()
+            .with_strict_host_key_checking("ask".to_string())
+            .unwrap()
+            .with_host_key_confirmation(confirmation)
+            .with_idle_timeout(Duration::from_secs(2));
+        (client, ssh_guard, keyscan_guard)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn pkt_line_client_interactive_host_key_accepts_writes_trust_and_retries() {
+        use std::sync::{Arc, Mutex};
+
+        let root = tempfile::tempdir().unwrap();
+        let ad = root.path().join("ad");
+        let counter = root.path().join("count");
+        let known_hosts = root.path().join("known_hosts");
+        let key_base = root.path().join("id");
+        let pubfile = root.path().join("id.pub");
+        let ssh_script = write_interactive_ssh_script(
+            root.path(),
+            &ad,
+            &counter,
+            "Host key verification failed.",
+        );
+        std::fs::write(&ad, b"0000").unwrap();
+
+        assert!(
+            std::process::Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-f", key_base.to_str().unwrap(), "-N", ""])
+                .status()
+                .unwrap()
+                .success(),
+            "ssh-keygen must generate a fixture key"
+        );
+        let pubtext = std::fs::read_to_string(&pubfile).unwrap();
+        let mut parts = pubtext.split_whitespace();
+        let key_type = parts.next().unwrap().to_string();
+        let blob = parts.next().unwrap().to_string();
+        let fp_output = std::process::Command::new("ssh-keygen")
+            .args(["-E", "sha256", "-lf", pubfile.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let expected_fp = String::from_utf8(fp_output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let keyscan_line = format!("fakehost {key_type} {blob}");
+        let keyscan_script = write_keyscan_script(root.path(), &keyscan_line);
+
+        let prompt = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client, _ssh, _keyscan) = interactive_client(
+            &ssh_script,
+            &keyscan_script,
+            &known_hosts,
+            "yes\n",
+            prompt.clone(),
+        );
+        let result = client.discovery_reference(ServiceType::UploadPack).await;
+        assert!(
+            result.is_ok(),
+            "accept must retry and succeed, got: {:?}",
+            result.err()
+        );
+        let content = std::fs::read_to_string(&known_hosts).expect("known_hosts written");
+        assert!(
+            content.contains(&keyscan_line),
+            "known_hosts must contain the accepted key line, got: {content}"
+        );
+        let joined = prompt.lock().unwrap().join("");
+        assert!(
+            joined.contains(&expected_fp),
+            "prompt must show fingerprint: {joined}"
+        );
+        assert!(
+            joined.contains("key fingerprint is"),
+            "prompt must label fingerprint"
+        );
+        assert!(
+            joined.contains("continue connecting"),
+            "prompt must ask for confirmation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn pkt_line_client_interactive_host_key_reject_writes_no_trust() {
+        use std::sync::{Arc, Mutex};
+
+        let root = tempfile::tempdir().unwrap();
+        let ad = root.path().join("ad");
+        let counter = root.path().join("count");
+        let known_hosts = root.path().join("known_hosts");
+        let ssh_script = write_interactive_ssh_script(
+            root.path(),
+            &ad,
+            &counter,
+            "Host key verification failed.",
+        );
+        std::fs::write(&ad, b"0000").unwrap();
+        let keyscan_line = "fakehost ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8pcsF4tFk4q1mQtC0Zz0Yv";
+        let keyscan_script = write_keyscan_script(root.path(), keyscan_line);
+
+        let prompt = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client, _ssh, _keyscan) = interactive_client(
+            &ssh_script,
+            &keyscan_script,
+            &known_hosts,
+            "no\n",
+            prompt.clone(),
+        );
+        let error = client
+            .discovery_reference(ServiceType::UploadPack)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            git_error_is_host_key_untrusted(&error),
+            "reject must surface the untrusted error: {error:?}"
+        );
+        assert!(!known_hosts.exists(), "reject must not write known_hosts");
+        assert!(
+            !prompt.lock().unwrap().is_empty(),
+            "reject must still show the prompt before reading the answer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn pkt_line_client_interactive_host_key_eof_rejects_without_trust() {
+        use std::sync::{Arc, Mutex};
+
+        let root = tempfile::tempdir().unwrap();
+        let ad = root.path().join("ad");
+        let counter = root.path().join("count");
+        let known_hosts = root.path().join("known_hosts");
+        let ssh_script = write_interactive_ssh_script(
+            root.path(),
+            &ad,
+            &counter,
+            "Host key verification failed.",
+        );
+        std::fs::write(&ad, b"0000").unwrap();
+        let keyscan_script = write_keyscan_script(
+            root.path(),
+            "fakehost ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8pcsF4tFk4q1mQtC0Zz0Yv",
+        );
+
+        let prompt = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (client, _ssh, _keyscan) = interactive_client(
+            &ssh_script,
+            &keyscan_script,
+            &known_hosts,
+            "",
+            prompt.clone(),
+        );
+        let error = client
+            .discovery_reference(ServiceType::UploadPack)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            git_error_is_host_key_untrusted(&error),
+            "EOF must reject and surface untrusted: {error:?}"
+        );
+        assert!(!known_hosts.exists(), "EOF must not write known_hosts");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn pkt_line_client_interactive_host_key_changed_key_never_prompts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let ad = root.path().join("ad");
+        let counter = root.path().join("count");
+        let known_hosts = root.path().join("known_hosts");
+        let ssh_script = write_interactive_ssh_script(
+            root.path(),
+            &ad,
+            &counter,
+            "REMOTE HOST IDENTIFICATION HAS CHANGED; Host key verification failed.",
+        );
+        std::fs::write(&ad, b"0000").unwrap();
+        let keyscan_script = write_keyscan_script(
+            root.path(),
+            "fakehost ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG8pcsF4tFk4q1mQtC0Zz0Yv",
+        );
+
+        use crate::utils::test::ScopedEnvVar;
+        let _ssh = ScopedEnvVar::set("LIBRA_SSH_COMMAND", &ssh_script);
+        let _keyscan = ScopedEnvVar::set("LIBRA_SSH_KEYSCAN_COMMAND", &keyscan_script);
+        let answers = Arc::new(AtomicUsize::new(0));
+        let answers_read = answers.clone();
+        let confirmation = HostKeyConfirmation {
+            known_hosts_path: known_hosts.clone(),
+            keyscan_command: None,
+            read_answer: Box::new(move || {
+                answers_read.fetch_add(1, Ordering::SeqCst);
+                Ok("yes\n".to_string())
+            }),
+            write_prompt: Box::new(|_| Ok(())),
+        };
+        let client = SshClient::from_ssh_spec("git@fakehost:repo")
+            .unwrap()
+            .with_strict_host_key_checking("ask".to_string())
+            .unwrap()
+            .with_host_key_confirmation(confirmation)
+            .with_idle_timeout(Duration::from_secs(2));
+        let error = client
+            .discovery_reference(ServiceType::UploadPack)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&error, GitError::NetworkError(detail) if detail.starts_with(super::SSH_HOST_KEY_CHANGED_SIGNAL)),
+            "changed key must surface the changed error: {error:?}"
+        );
+        assert_eq!(
+            answers.load(Ordering::SeqCst),
+            0,
+            "changed key must never prompt"
+        );
+        assert!(
+            !known_hosts.exists(),
+            "changed key must not write known_hosts"
+        );
+    }
+
+    #[test]
+    fn host_key_fingerprint_matches_ssh_keygen() {
+        // The fingerprint format must match `ssh-keygen -E sha256 -lf` so a user
+        // can compare it against a trusted channel (GC-HKT-02).
+        let root = tempfile::tempdir().unwrap();
+        let key_base = root.path().join("id");
+        let pubfile = root.path().join("id.pub");
+        assert!(
+            std::process::Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-f", key_base.to_str().unwrap(), "-N", ""])
+                .status()
+                .unwrap()
+                .success(),
+            "ssh-keygen must generate a fixture key"
+        );
+        let pubtext = std::fs::read_to_string(&pubfile).unwrap();
+        let blob = pubtext.split_whitespace().nth(1).unwrap().to_string();
+        let fp_output = std::process::Command::new("ssh-keygen")
+            .args(["-E", "sha256", "-lf", pubfile.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let expected_fp = String::from_utf8(fp_output.stdout)
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let computed = ssh_fingerprint(&blob).expect("fingerprint must compute");
+        assert_eq!(computed, expected_fp, "fingerprint must match ssh-keygen");
+    }
+
+    #[test]
+    fn resolve_host_key_answer_matrix() {
+        let fps = vec!["SHA256:AbCdEf".to_string()];
+        assert_eq!(resolve_host_key_answer("yes\n", &fps), Some(true));
+        assert_eq!(resolve_host_key_answer("YES", &fps), Some(true));
+        assert_eq!(resolve_host_key_answer("no\n", &fps), Some(false));
+        assert_eq!(resolve_host_key_answer("", &fps), Some(false));
+        assert_eq!(resolve_host_key_answer("   \n", &fps), Some(false));
+        assert_eq!(resolve_host_key_answer("SHA256:abcdef", &fps), Some(true));
+        assert_eq!(resolve_host_key_answer("sha256:abcdef", &fps), Some(true));
+        assert_eq!(resolve_host_key_answer("abcdef", &fps), Some(true));
+        assert_eq!(resolve_host_key_answer("gibberish", &fps), None);
     }
 }

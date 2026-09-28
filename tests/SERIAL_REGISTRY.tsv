@@ -887,3 +887,8 @@ clone_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 clone reject; se
 clone_rejects_unknown_git_source_format	lane:cwd	B3-12 local Git unknown/unreadable objectformat reject; serial(cwd) while spawning CLI subprocesses
 fetch_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 fetch reject; serial(cwd) while spawning CLI subprocesses
 pull_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 pull reject; serial(cwd) while spawning CLI subprocesses
+test_clone_ssh_host_key_interactive_accepts_and_writes_trust	lane:cwd+env	uses an isolated repository and fake SSH/keyscan environment while exercising interactive host-key confirmation
+test_clone_ssh_uses_global_host_key_policy	lane:cwd+env	uses an isolated HOME/config-db fixture while cloning an SSH remote outside any repository
+test_fetch_ssh_host_key_noninteractive_writes_no_trust	lane:cwd+env	uses an isolated repository and fake SSH/keyscan environment while exercising fail-closed non-interactive host-key behavior
+test_fetch_ssh_resolves_host_key_policy_cascade	lane:cwd+env	uses an isolated HOME/config-db fixture and fake SSH while exercising the host-key policy cascade
+test_ssh_changed_host_key_never_prompts	lane:cwd+env	uses an isolated repository and fake SSH/keyscan environment while proving changed keys never prompt

@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-28（本次完成 plan-20260925 Session Capture 收口复核及最终全量验证；并收口 issues/497 至 v0.27.2；其余行沿用原 2026-09-27 快照，未逐项复核）。
+> **当前快照：** 2026-09-28（本次收口 issues/582 至 v0.29.1：HKT-00/01/02 全部 `done/complete`；并完成 plan-20260925 Session Capture 收口复核及最终全量验证；并收口 issues/497 至 v0.27.2；其余行沿用原 2026-09-27 快照，未逐项复核）。
 
 ---
 
@@ -85,7 +85,7 @@
 | [`issues/468.md`](issues/468.md) | Data collection and refinement | 未启动 | DC-01..DC-04（4 卡） |
 | [`issues/500.md`](issues/500.md) | Feature：Centralized Storage for Libra Statistics Data | 未启动 | CS-01..CS-04（4 卡） |
 | [`issues/577.md`](issues/577.md) | SSH 公钥认证失败误报 pkt-line 协议错误与配置文档 | **已收口** | 2026-09-27：SA-02/SA-01 均为 `done` / `complete`；PR #578 合并为 `5eb833f9`，v0.24.1 发布与 8/8 release jobs 全绿；网站 `cf@667d7da8`、Worker `c7011920` 和七个生产页验证完成；Issue #577 CLOSED |
-| [`issues/582.md`](issues/582.md) | Git 相容的互動式 SSH 主機金鑰確認 | 已排期 | HKT-00..HKT-02 全部 `pending`；HKT-00 先移交 issues/480 HP-17 與 plan-20260901 DEFER-07，再依序交付 cascade 與受限 TTY confirmation |
+| [`issues/582.md`](issues/582.md) | Git 相容的互動式 SSH 主機金鑰確認 | **已收口** | HKT-00 `done/complete`（no-release 設計與 HP-17／DEFER-07 移交）；HKT-01 `done/complete`（首次 clone 的 host-key policy cascade）；HKT-02 `done/complete`（受限 human-terminal unknown-host confirmation）；聚合发布 `v0.29.1`；全量 nextest 8271/8271 绿
 
 ---
 
@@ -336,7 +336,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`issues/487`](issues/487.md) | IG-01 | 本地传输复用已修复的 pack 编码器 | 无（必最先完成） | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/488`](issues/488.md) | GR-01 | `grep --exclude-standard` / `--no-exclude-standard` | 无 | 尚未 Codex review | 无 | ❌ 禁止开工 |
 | [`issues/490`](issues/490.md) | SW-01 | 采用支持 index v3 扩展标志的 `git-internal` | 无 | 尚未 Codex review | DEP-AD-07：与 plan-20260918 串行 | ❌ 禁止开工 |
-| [`issues/582`](issues/582.md) | HKT-00 | 固定安全 host-key interaction 設計，並移交 HP-17／DEFER-07 | 无 | R1 `PASS`（計劃自審） | DEP-HKT-01/02/03：開工時須刷新既有計劃與固定 Git/OpenSSH 參照 | ⚠️ 設計卡可重核後啟動；HKT-01／02 必須依序等待前卡 `done/complete` |
+| [`issues/582`](issues/582.md) | HKT-00 | 固定安全 host-key interaction 設計，並移交 HP-17／DEFER-07 | 无 | R1 `PASS`（計劃自審） | DEP-HKT-01/02/03 已滿足：HKT-00 固定 Git/OpenSSH 參照並完成移交，HKT-01/02 已实现 | ✅ HKT-00/01/02 全部 `done/complete`（v0.29.1） |
 
 > 说明：✅ = 无任何门控，可立即开工；⚠️ = 内部无前置但仍有外部/跨计划 `DEP-*` 或发布队列约束；❌ = 计划级 review 门未过（多数 issue 计划尚未 Codex review），按模板 ER-05 / GC-01 **禁止**标 `in-progress`。
 >

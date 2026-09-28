@@ -536,6 +536,16 @@ through a trusted channel before replacing an existing known_hosts entry; do not
 bypass host-key checking. Unknown and changed host keys both use LBR-NET-001,
 but their fixed messages and guidance differ.
 
+In an interactive human terminal with an effective `ask` policy
+(`ssh.strictHostKeyChecking` unset or `ask`), an unknown host key enters a
+Git-compatible fingerprint confirmation before the batch transport: accepting it
+writes the host key to the user's OpenSSH known-hosts destination and retries,
+while rejecting, EOF or a changed key fails closed at `LBR-NET-001`. JSON,
+machine and non-TTY callers never prompt and never invoke `ssh-keyscan`; they
+keep the existing fixed unknown-key error. Prompt bytes are built locally from
+verified host-key metadata; no raw remote stderr, banner or control sequence is
+rendered.
+
 A stderr collection timeout does not by itself discard complete protocol output
 and an observed local exit status. Non-zero exit status and primary read errors
 still fail the operation. Unavailable diagnostics produce only a fixed debug

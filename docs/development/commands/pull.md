@@ -176,15 +176,19 @@ with fixed protocol reasons. HTTP(S) discovery/advertisement framing is unchange
 
 ## SSH authentication and captured diagnostics
 
-Libra invokes SSH with `BatchMode=yes` for both terminal and non-terminal callers.
-It does not prompt for a private-key passphrase or an interactive host-key
-decision during a Libra command. Load or unlock an encrypted key in `ssh-agent`
-before retrying. For host trust, verify the fingerprint through a trusted
-provider console or another trusted channel before manually updating
-`~/.ssh/known_hosts`. Alternatively, make a separate interactive SSH connection
-and compare the displayed fingerprint before accepting it. For example,
-`ssh -T git@github.com` uses GitHub; use the actual repository SSH user, host and
-port. Do not accept a fingerprint that has not been verified.
+Libra invokes SSH with `BatchMode=yes` for non-interactive, non-TTY, JSON and
+machine callers. In a human terminal with an effective `ask` policy
+(`ssh.strictHostKeyChecking` unset or `ask`), a first connection to an unknown
+SSH host shows a Git-compatible fingerprint confirmation prompt; accepting it
+writes the host key to your OpenSSH known-hosts destination and the original
+command continues, while rejecting, EOF or a changed host key fails closed.
+Libra never prompts for a private-key passphrase - load or unlock an encrypted
+key in `ssh-agent` before retrying. For host trust, verify the fingerprint
+through a trusted provider console or another trusted channel before manually
+updating `~/.ssh/known_hosts`, or make a separate interactive SSH connection and
+compare the displayed fingerprint. For example, `ssh -T git@github.com` uses
+GitHub; use the actual repository SSH user, host and port. Do not accept a
+fingerprint that has not been verified.
 
 `ssh.strictHostKeyChecking` retains its existing `ask`, `yes`, `accept-new` and
 `no` values. `ask` leaves that SSH option to the user's SSH configuration;

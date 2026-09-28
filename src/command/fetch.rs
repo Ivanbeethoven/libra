@@ -54,7 +54,7 @@ use crate::{
             is_missing_shallow_capability, is_shallow_advertisement_changed,
             local_client::{GitSourceConfigError, LocalClient, git_repo_hash_kind},
             repository_arg, set_wire_hash_kind,
-            ssh_client::{SshClient, is_ssh_spec},
+            ssh_client::{HostKeyConfirmation, SshClient, is_ssh_spec},
         },
         reflog::{HEAD, Reflog, ReflogAction, ReflogContext},
         tag::{self, TagObject},
@@ -97,13 +97,24 @@ impl RemoteClient {
     /// Create a `RemoteClient` from a URL spec, optionally providing the
     /// logical remote name so that vault-backed SSH keys can be resolved
     /// via `vault.ssh.<remote>.privkey`.
-    pub(crate) async fn from_spec_with_remote(
+    /// Create a `RemoteClient` from a URL spec, optionally attaching an
+    /// interactive host-key confirmation to the SSH transport (HKT-02).
+    ///
+    /// The logical remote name is used to resolve vault-backed SSH keys
+    /// (`vault.ssh.<remote>.privkey`).
+    pub(crate) async fn from_spec_with_remote_and_confirmation(
         spec: &str,
         remote: Option<&str>,
+        host_key_confirmation: Option<HostKeyConfirmation>,
     ) -> Result<Self, String> {
         // Check for SSH-style URLs first (before Url::parse which doesn't handle SCP-style)
         if is_ssh_spec(spec) {
-            let client = configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote).await?;
+            let client = configure_ssh_client(
+                SshClient::from_ssh_spec(spec)?,
+                remote,
+                host_key_confirmation,
+            )
+            .await?;
             return Ok(Self::Ssh(client));
         }
 
@@ -128,8 +139,12 @@ impl RemoteClient {
                     Ok(Self::Git(GitClient::from_url(&url)))
                 }
                 "ssh" => {
-                    let client =
-                        configure_ssh_client(SshClient::from_ssh_spec(spec)?, remote).await?;
+                    let client = configure_ssh_client(
+                        SshClient::from_ssh_spec(spec)?,
+                        remote,
+                        host_key_confirmation,
+                    )
+                    .await?;
                     Ok(Self::Ssh(client))
                 }
                 other => Err(format!("unsupported remote scheme '{other}'")),
@@ -292,12 +307,16 @@ const SSH_KEY_TEMP_FILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 async fn configure_ssh_client(
     mut client: SshClient,
     remote: Option<&str>,
+    host_key_confirmation: Option<HostKeyConfirmation>,
 ) -> Result<SshClient, String> {
     if let Err(error) = cleanup_expired_vault_ssh_temp_files() {
         tracing::warn!("failed to clean up expired SSH key temp files: {error}");
     }
     if let Some(mode) = load_ssh_host_key_checking_mode().await {
         client = client.with_strict_host_key_checking(mode)?;
+    }
+    if let Some(confirmation) = host_key_confirmation {
+        client = client.with_host_key_confirmation(confirmation);
     }
     // Try to load vault SSH key for authentication.
     // Priority:
@@ -531,15 +550,21 @@ async fn try_load_legacy_ssh_key_path() -> Option<String> {
 
 /// Load host key checking mode from env/config for SSH transport.
 ///
-/// Precedence:
-/// 1) `LIBRA_SSH_STRICT_HOST_KEY_CHECKING`
-/// 2) repo config `ssh.strictHostKeyChecking`
+/// Precedence (ADR-HKT-02), highest first:
 ///
-/// When unset, the `SshClient` default (`ask`) applies: no
-/// `StrictHostKeyChecking` option is passed to `ssh`, so the user's
-/// `~/.ssh/config` governs the host-key policy. BatchMode is always enabled,
-/// so interactive trust and passphrase prompts run separately. Supported
-/// values: `ask`, `yes`, `accept-new`, `no`.
+/// 1. non-empty `LIBRA_SSH_STRICT_HOST_KEY_CHECKING`
+/// 2. local (if a current repository exists) `ssh.strictHostKeyChecking`
+/// 3. global
+/// 4. system
+///
+/// Unset -> `SshClient` default (`ask`).
+///
+/// The strict local -> global -> system cascade lets a first `clone` outside
+/// any repository read an explicit global/system policy (HKT-01). When unset
+/// or empty, the `SshClient` default (`ask`) applies: no `StrictHostKeyChecking`
+/// option is passed to `ssh`, so the user's `~/.ssh/config` governs the policy.
+/// BatchMode is always enabled, so interactive trust and passphrase prompts run
+/// separately. Supported values: `ask`, `yes`, `accept-new`, `no`.
 async fn load_ssh_host_key_checking_mode() -> Option<String> {
     if let Ok(raw) = std::env::var("LIBRA_SSH_STRICT_HOST_KEY_CHECKING") {
         let mode = raw.trim();
@@ -548,11 +573,20 @@ async fn load_ssh_host_key_checking_mode() -> Option<String> {
         }
     }
 
-    use crate::utils::util;
-    if util::try_get_storage_path(None).is_err() {
-        return None;
+    use crate::internal::config::{LocalIdentityTarget, read_cascaded_config_value_strict};
+    match read_cascaded_config_value_strict(
+        LocalIdentityTarget::CurrentRepo,
+        "ssh.strictHostKeyChecking",
+    )
+    .await
+    {
+        Ok(Some(value)) if !value.trim().is_empty() => Some(value),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::debug!("skipping ssh.strictHostKeyChecking resolution: {error}");
+            None
+        }
     }
-    load_config("ssh", None, "strictHostKeyChecking").await
 }
 
 /// Default connect timeout for a network fetch (seconds).
@@ -1670,24 +1704,31 @@ fn render_fetch_output(result: &FetchOutput, output: &OutputConfig) -> CliResult
     Ok(())
 }
 
-pub(crate) async fn discover_remote(
-    remote_spec: &str,
-) -> Result<(RemoteClient, DiscoveryResult), FetchError> {
-    discover_remote_with_name(remote_spec, None).await
-}
-
-/// Like [`discover_remote`] but accepts an optional logical remote name
-/// so that vault-backed SSH keys (`vault.ssh.<remote>.privkey`) can be
-/// resolved during transport setup.
+/// Accepts an optional logical remote name so that vault-backed SSH keys
+/// (`vault.ssh.<remote>.privkey`) can be resolved during transport setup.
 pub(crate) async fn discover_remote_with_name(
     remote_spec: &str,
     remote_name: Option<&str>,
 ) -> Result<(RemoteClient, DiscoveryResult), FetchError> {
+    discover_remote_with_name_and_confirmation(remote_spec, remote_name, None).await
+}
+
+/// Like [`discover_remote_with_name`] but attaches an optional interactive
+/// host-key confirmation to the SSH transport (HKT-02).
+pub(crate) async fn discover_remote_with_name_and_confirmation(
+    remote_spec: &str,
+    remote_name: Option<&str>,
+    host_key_confirmation: Option<HostKeyConfirmation>,
+) -> Result<(RemoteClient, DiscoveryResult), FetchError> {
     let remote_client = async {
-        RemoteClient::from_spec_with_remote(remote_spec, remote_name)
-            .await?
-            .with_resolved_fetch_timeouts(remote_name)
-            .await
+        RemoteClient::from_spec_with_remote_and_confirmation(
+            remote_spec,
+            remote_name,
+            host_key_confirmation,
+        )
+        .await?
+        .with_resolved_fetch_timeouts(remote_name)
+        .await
     }
     .await
     .map_err(|message| {
@@ -2307,8 +2348,14 @@ async fn fetch_repository_with_result_reusing(
     } else if branch.is_none() {
         validate_configured_fetch_refspecs(&remote_config.name).await?;
     }
-    let (remote_client, discovery) =
-        discover_remote_with_name(&remote_config.url, Some(&remote_config.name)).await?;
+    let host_key_confirmation =
+        crate::internal::protocol::ssh_client::host_key_confirmation_for_output(output);
+    let (remote_client, discovery) = discover_remote_with_name_and_confirmation(
+        &remote_config.url,
+        Some(&remote_config.name),
+        host_key_confirmation,
+    )
+    .await?;
     // Redact credentials from the URL before storing it in the result to
     // prevent secret leakage in both human and JSON output.
     let normalized_url =

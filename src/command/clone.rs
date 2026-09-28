@@ -1278,9 +1278,15 @@ async fn execute_clone_inner(
         eprintln!("Connecting to {} ...", args.remote_repo);
     }
 
-    let (remote_client, discovery) = fetch::discover_remote(&remote_repo)
-        .await
-        .map_err(|source| (CloneError::DiscoverRemote { source }, None))?;
+    let host_key_confirmation =
+        crate::internal::protocol::ssh_client::host_key_confirmation_for_output(output);
+    let (remote_client, discovery) = fetch::discover_remote_with_name_and_confirmation(
+        &remote_repo,
+        None,
+        host_key_confirmation,
+    )
+    .await
+    .map_err(|source| (CloneError::DiscoverRemote { source }, None))?;
 
     // Inspect a local Git source's `.git/shallow` before creating the dest so
     // `--reject-shallow` and corrupt metadata leave no partial clone behind.

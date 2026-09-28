@@ -241,7 +241,7 @@ impl From<LsRemoteError> for CliError {
 }
 
 pub async fn execute_safe(args: LsRemoteArgs, output: &OutputConfig) -> CliResult<()> {
-    let data = run_ls_remote(args).await.map_err(CliError::from)?;
+    let data = run_ls_remote(args, output).await.map_err(CliError::from)?;
     render_ls_remote_output(&data, output)?;
     if data.exit_code && !data.get_url && data.entries.is_empty() {
         return Err(CliError::silent_exit(2));
@@ -249,7 +249,10 @@ pub async fn execute_safe(args: LsRemoteArgs, output: &OutputConfig) -> CliResul
     Ok(())
 }
 
-async fn run_ls_remote(args: LsRemoteArgs) -> Result<LsRemoteOutput, LsRemoteError> {
+async fn run_ls_remote(
+    args: LsRemoteArgs,
+    output: &OutputConfig,
+) -> Result<LsRemoteOutput, LsRemoteError> {
     let (remote_display, remote_url, remote_name) = resolve_remote(&args.repository).await?;
     let visible_remote = visible_remote_display(&remote_display, remote_name.as_deref());
     if args.get_url {
@@ -268,12 +271,18 @@ async fn run_ls_remote(args: LsRemoteArgs) -> Result<LsRemoteOutput, LsRemoteErr
         });
     }
 
-    let client = RemoteClient::from_spec_with_remote(&remote_url, remote_name.as_deref())
-        .await
-        .map_err(|reason| LsRemoteError::InvalidRemote {
-            spec: visible_remote.clone(),
-            reason: sanitize_remote_error_reason(&reason, &remote_url),
-        })?;
+    let host_key_confirmation =
+        crate::internal::protocol::ssh_client::host_key_confirmation_for_output(output);
+    let client = RemoteClient::from_spec_with_remote_and_confirmation(
+        &remote_url,
+        remote_name.as_deref(),
+        host_key_confirmation,
+    )
+    .await
+    .map_err(|reason| LsRemoteError::InvalidRemote {
+        spec: visible_remote.clone(),
+        reason: sanitize_remote_error_reason(&reason, &remote_url),
+    })?;
     let discovery = client
         .discovery_reference(UploadPack)
         .await
@@ -1250,6 +1259,7 @@ mod pkt_line_boundary_tests {
                     Duration::from_secs(45),
                     super::run_ls_remote(
                         LsRemoteArgs::try_parse_from(["ls-remote", server.url.as_str()]).unwrap(),
+                        &OutputConfig::default(),
                     ),
                 )
                 .await
