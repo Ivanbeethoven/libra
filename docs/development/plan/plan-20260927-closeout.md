@@ -31,12 +31,20 @@
 **具体动作（按序）：**
 - [x] **复现与取证**：诊断 live run 捕获 `unrecoverable: 539399e63d9f31286e022b931cc2ab29f8107cdb`（blob "durable heal\n"）；测试未先 `cloud sync`，blob 未进 R2。
 - [ ] **对照存储**：对同 repo 列举 R2 前缀下 key；查本地 `object_index` 行，确认该 OID 是否有行、`is_synced` 值。
-- [ ] **定位漏点**：
+- [x] **定位漏点**：
   - 若 `object_index` 无该行 → 修写入路径（`client_storage.rs` 写对象后确保入对象索引；`db.rs:1200/1261` 的登记点）。
   - 若有行但 `is_synced=1` 却不在 R2 → 修 sync 的 `exist_batch`/上传时序（`sync.rs:157` 起批量上传），保证「标已同步」仅在确实上传成功后发生。
   - 若 fsck 发现对象不被 sync 覆盖 → 让 sync 也上传 reflog/`extra_roots` 可达对象，或调整 fsck 候选集。
 - [ ] **加回归**：新增一个测试，构造「离库对象在 R2 存在」场景，断言 `--heal` 后 `unrecoverable==0` 且全部愈合；若本地可跑则并入 `cloud_storage_backup_test`，否则只在 live 门（`cloud_live_no_skip.sh`）下运行。
 - [x] **验证**：dispatch `main`（含 `cloud sync` 修复）live runs，`compat-live-cloud` **21/21** 绿（`fsck_heal`、`cloud_sync_name_conflict` 均 ok）。
+
+**G-1 收尾判定（2026-09-29 逐项复核，未执行者不勾）：**
+
+- **定位漏点 → 已勾选。** 根因不是产品侧漏写/漏传，而是**测试操作次序**：`fsck_heal_restores_object_from_durable_tier` 在该 run 里从未先 `cloud sync`，blob `539399e63d9f31286e022b931cc2ab29f8107cdb`（"durable heal\n"）从未进入 R2，而测试已在删除本地对象后断言 durable tier。上面列出的三种代码假设（`object_index` 漏登记 / `is_synced` 早标 / fsck 候选集超出 sync 上传范围）均**未被证据支持**，无需按分支修写入路径或上传时序。修复见 `5296b9f`（删除本地对象前先 `cloud sync`）。证据：live run `36602151296` 日志 `test result: ok. 21 passed; 0 failed; … finished in 539.84s`，对比其后之前的连续 4 个 failure run。
+- **对照存储 → 保持未勾，且判定为已失效。** 该项要求对该 repo 列举 R2 前缀 key 并核对本地 `object_index` 行的 `is_synced` 值，是**真 R2 操作**，本地不可执行；且当根因定为测试次序后，该取证对结论不再是必要条件。此为文档化豁免，不得当成产品缺口。
+- **加回归 → 保持未勾。** `5296b9f` 只是给**既有** live 用例补了 1 行 `cloud sync`（`tests/cloud_storage_backup_test.rs:1755` 附近），**未新增**计划所要求的「离库对象在 R2 存在」独立回归；当前覆盖来自该既有 live 门。留给 Cloud FIX 卡。
+
+因此 G-1 不再是产品/行为缺口，但**仍未全部勾选**，不构成可宣称整计划 complete 的依据。
 
 **关键文件：** `src/utils/client_storage.rs`、`src/internal/db.rs`、`src/command/cloud/sync.rs`、`src/command/fsck.rs`、`tests/cloud_storage_backup_test.rs`、`.github/workflows/live-compat.yml`。
 
