@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-28（本次收口 issues/582 至 v0.30.2：HKT-00/01/02 全部 `done/complete`；并完成 plan-20260925 Session Capture 收口复核及最终全量验证；并收口 issues/497 至 v0.27.2；issues/496 CLH-01..04 落地并发布 v0.30.1；其余行沿用原 2026-09-27 快照，未逐项复核）。
+> **当前快照：** 2026-09-29（Issue #574 维护者评论已确认 Operation Log v2 契约、五个命令族查询/变更范围及 debug 性能门；QP-00/QP-01 均 `pending`，计划评审未通过前不得开工；其余状态沿用 2026-09-28 快照，未逐项复核）。
 
 ---
 
@@ -84,6 +84,7 @@
 | [`issues/451.md`](issues/451.md) | RFC：version-aware M2 Episode memory | 未启动 | RFC-01..RFC-04（4 卡） |
 | [`issues/468.md`](issues/468.md) | Data collection and refinement | 未启动 | DC-01..DC-04（4 卡） |
 | [`issues/500.md`](issues/500.md) | Feature：Centralized Storage for Libra Statistics Data | 未启动 | CS-01..CS-04（4 卡） |
+| [`issues/574.md`](issues/574.md) | 大型仓库只读查询触发持久操作快照 | 未启动（草案待评审；Issue maintainer 于 2026-09-29 确认契约、五个命令族范围及 debug 性能门） | QP-00/QP-01 均 `pending`；QP-01 受 `DEP-QP-01` 的 `src/cli.rs` 跨计划串行门控；log 性能交由 #478 评估；锁清理仍属 #469 `DEFER-01` |
 | [`issues/577.md`](issues/577.md) | SSH 公钥认证失败误报 pkt-line 协议错误与配置文档 | **已收口** | 2026-09-27：SA-02/SA-01 均为 `done` / `complete`；PR #578 合并为 `5eb833f9`，v0.24.1 发布与 8/8 release jobs 全绿；网站 `cf@667d7da8`、Worker `c7011920` 和七个生产页验证完成；Issue #577 CLOSED |
 | [`issues/582.md`](issues/582.md) | Git 相容的互動式 SSH 主機金鑰確認 | **已收口** | HKT-00 `done/complete`（no-release 設計與 HP-17／DEFER-07 移交）；HKT-01 `done/complete`（首次 clone 的 host-key policy cascade）；HKT-02 `done/complete`（受限 human-terminal unknown-host confirmation）；聚合发布 `v0.29.1`；全量 nextest 8271/8271 绿
 
@@ -402,7 +403,8 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 | DEP-CP-04 | Release/window exclusion | Respect plan-20260921 REL-VG-01 file reservation | Verify before intersecting edits, not only before version bump |
 | DEP-CP-05 | Contract/file exclusion | issues/476/478/480 command evolution and overlapping files | Refresh actual parameters and reserve conflicting files |
 | DEP-CP-06 | Agent read contract | plan-20260819 models and identity-scoped readers | Verify before CP-13..15; does not block static stage |
-| DEP-AD-12 / DEP-CLI-mirror | 跨计划写集互斥 | `src/cli.rs` 三态串行：plan-20260918 OI-05、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、issues/483 CO-03/04 | 生效；OI-05 开工前必须核对 |
+| DEP-AD-12 / DEP-CLI-mirror | 跨计划写集互斥 | `src/cli.rs` 三态串行：plan-20260918 OI-05、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、issues/483 CO-03/04、issues/574 QP-01 | 生效；各卡开工前须核对 |
+| DEP-QP-01 | 跨计划写集互斥 | issues/574 QP-01 与 issues/483 CO-03/04、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、plan-20260918 OI-05 共用 `src/cli.rs` 中央 census，镜像 `DEP-AD-12 / DEP-CLI-mirror` | 生效；QP-01 计划评审 PASS 后仍须开工前核实三态窗口 |
 | DEP-GCX-02 | 跨计划写集互斥 | plan-20260919 与 plan-20260918 的 `COMPATIBILITY.md`/docs/网站页串行 | 生效 |
 | DEP-FL-04 | 跨计划前置 | plan-20260913 依赖 plan-20260907 完整收口 | plan-20260907 未启动 |
 | DEP-CC-05 | 跨计划前置 | plan-20260905 CC-02..06 依赖 plan-20260904 全部非延后卡完成 | plan-20260904 未启动 |
