@@ -4,13 +4,13 @@
 >
 > **维护规则（强制）**
 >
-> 1. 每张卡的状态推进（`pending` → `in-progress` → `blocked` → `done`，`Acceptance` 随 ER-04 转移）都在「计划一览」的对应行更新，并附发布版本 / commit / 日期。
+> 1. 每张卡的状态推进（`pending` → `in-progress` → `blocked` → `done`，`Acceptance` 随 ER-04 转移）都在「计划一览」的对应行更新，并附发布版本 / commit / 时间（`YYYY-MM-DD HH:MM:SS UTC`）。
 > 2. 计划收口、拆卡、合并发布、新增 `DEFER-*`、`DEP-*` 状态变化，同步更新「延后与未决策项」与「跨计划依赖」两节。
 > 3. 新建计划：在「计划一览」加一行（类别、状态、一句话进度），并在「未启动计划」或「实施中计划」小节落位。
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
-> 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
+> 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-09-29（plan-20260927：核心结构拆分已实现+验证；全量 nextest 8274/8274 绿；发布 `v0.30.8` 全平台成功（Linux amd64/arm64、macOS、Windows build+upload+homebrew+install-scripts+stable-manifest 8/8 job 绿）；Windows 跨编译修复；Cloudflare D1 错误消息上浮修复；live-compat 真实 D1/R2 20/21（`cloud_sync_name_conflict` 已修，`fsck_heal` 待查）。仍待：Cloud FIX 卡受保护环境协议、FIX-CM-WT-MOVE 的 DEP-CM-WT-COMPAT、22 项 EX 批准与计划级 Claude `VERDICT: PASS`。同日更新 plan-20260926 的评审门（R11 字面 `VERDICT: PASS`））。其余行沿用原快照，未逐项复核）。
+> **当前快照：** 2026-09-29 15:37:02 UTC（本时刻起，模板 `v2.12`：验收证据写入计划文件，不新建证据文件或文件夹。此前于 2026-09-29 15:32:56 UTC 起，状态推进与快照改为 `YYYY-MM-DD HH:MM:SS UTC`；模板 `v2.11` 允许日期计划与 Issue 计划在标识后附加不超过 5 个小写英语单词。此前快照事实仍为：plan-20260927：核心结构拆分已实现+验证；全量 nextest 8274/8274 绿；发布 `v0.30.8` 全平台成功（Linux amd64/arm64、macOS、Windows build+upload+homebrew+install-scripts+stable-manifest 8/8 job 绿）；Windows 跨编译修复；Cloudflare D1 错误消息上浮修复；live-compat 真实 D1/R2 20/21（`cloud_sync_name_conflict` 已修，`fsck_heal` 待查）。仍待：Cloud FIX 卡受保护环境协议、FIX-CM-WT-MOVE 的 DEP-CM-WT-COMPAT、22 项 EX 批准与计划级 Claude `VERDICT: PASS`。plan-20260926 评审门为 R11 字面 `VERDICT: PASS`。其余行沿用原快照，未逐项复核）。
 
 ---
 
