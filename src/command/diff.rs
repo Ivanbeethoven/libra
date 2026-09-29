@@ -4,14 +4,10 @@ pub(crate) mod compare;
 pub(crate) mod options;
 mod render;
 
-pub(crate) use compare::*;
-use self::render::*;
-
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(test)]
 use std::sync::Arc;
-
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -24,16 +20,12 @@ use std::{
 };
 
 use clap::Parser;
+pub(crate) use compare::*;
 use git_internal::{
     hash::{HashKind, ObjectHash, set_hash_kind},
     internal::{
         index::{Index, IndexEntry, Time},
-        object::{
-            ObjectTrait,
-            blob::Blob,
-            tree::TreeItemMode,
-            types::ObjectType,
-        },
+        object::{ObjectTrait, blob::Blob, tree::TreeItemMode, types::ObjectType},
         pack::utils::calculate_object_hash,
     },
 };
@@ -43,7 +35,10 @@ use tempfile::NamedTempFile;
 
 #[cfg(test)]
 use self::options::parse_rename_score;
-use self::options::{DiffPrefixes, resolve_diff_config};
+use self::{
+    options::{DiffPrefixes, resolve_diff_config},
+    render::*,
+};
 use crate::{
     command::{
         load_object, read_worktree_blob_bytes,

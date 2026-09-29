@@ -1,8 +1,6 @@
 //! Worktree doctor/repair: confirmations, layout preview, scope diagnostics, legacy
 //! capture-scope adoption, migration recovery, and the repair driver.
 #![allow(unused_imports)]
-use super::*;
-
 use std::{
     collections::HashSet,
     env, fs, io,
@@ -13,6 +11,7 @@ use clap::{Parser, Subcommand};
 use sea_orm::{ConnectionTrait, Statement};
 use serde::Serialize;
 
+use super::*;
 #[cfg(unix)]
 use crate::utils::fuse as fuse_utils;
 use crate::{
@@ -1073,7 +1072,9 @@ pub(crate) async fn adopt_legacy_capture_scope(
     Ok(())
 }
 
-pub(crate) async fn legacy_capture_scope_exists(conn: &sea_orm::DatabaseConnection) -> CliResult<bool> {
+pub(crate) async fn legacy_capture_scope_exists(
+    conn: &sea_orm::DatabaseConnection,
+) -> CliResult<bool> {
     let result = conn
         .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
@@ -1307,7 +1308,10 @@ pub(crate) async fn doctor_repo_identity(conn: &sea_orm::DatabaseConnection) -> 
         })
 }
 
-pub(crate) fn render_doctor_single(diagnostic: WorkspaceDiagnostic, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_doctor_single(
+    diagnostic: WorkspaceDiagnostic,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         let payload = WorktreeDoctorSingle {
             schema_version: DOCTOR_SCHEMA_VERSION,
@@ -1817,7 +1821,10 @@ pub(crate) async fn verify_migrated_worktree(
     Ok(())
 }
 
-pub(crate) fn render_migrate_layout(result: &MigrateLayoutOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_migrate_layout(
+    result: &MigrateLayoutOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.repair", result, output);
     }
@@ -2039,7 +2046,9 @@ pub(crate) struct WorktreeRepairIdentityOutput {
     commondir_restored: bool,
 }
 
-pub(crate) async fn repair_worktree_identity(path: String) -> WorktreeResult<WorktreeRepairIdentityOutput> {
+pub(crate) async fn repair_worktree_identity(
+    path: String,
+) -> WorktreeResult<WorktreeRepairIdentityOutput> {
     let _registry_lock = acquire_registry_lock_async().await?;
     // A legacy v1 registry carries NO persisted identities — refuse before
     // the locked loader would durably upgrade it (backfilling ids from the

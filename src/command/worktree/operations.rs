@@ -1,36 +1,12 @@
 //! Worktree normal operations: add/reattach/list/lock/unlock/move/prune/remove/umount
 //! plus the lifecycle/journal persistence helpers they share.
 #![allow(unused_imports)]
-use super::*;
-
 use std::{
     env, fs, io,
     path::{Path, PathBuf},
 };
 
 use clap::{Parser, Subcommand};
-use serde::Serialize;
-
-#[cfg(unix)]
-use crate::utils::fuse as fuse_utils;
-use crate::{
-    command::restore::{self, RestoreArgs},
-    internal::{
-        branch::Branch,
-        head::Head,
-        sequencer::WorktreeControl,
-        workspace::RepoIdentity,
-    },
-    utils::{
-        error::{CliError, CliResult, StableErrorCode},
-        output::{OutputConfig, emit_json_data},
-        util,
-    },
-};
-
-
-use self::doctor::*;
-
 pub(crate) use lock::acquire_registry_lock_async;
 pub(crate) use registry::{
     DETACHED_MARKER, LinkedHistory, WorktreeEntry, WorktreeEntryState, WorktreeState,
@@ -40,11 +16,25 @@ pub(crate) use registry::{
 #[cfg(test)]
 use registry::{REGISTRY_SCHEMA_VERSION, WorktreeStateV1};
 use registry::{
-    RegistryShape, canonicalize, ensure_main_entry, find_entry, find_entry_mut,
-    load_state, load_state_for_repair, load_state_readonly, load_state_readonly_at,
-    normalize_v2_ids, resolve_worktree_id, save_state, state_path, write_state,
+    RegistryShape, canonicalize, ensure_main_entry, find_entry, find_entry_mut, load_state,
+    load_state_for_repair, load_state_readonly, load_state_readonly_at, normalize_v2_ids,
+    resolve_worktree_id, save_state, state_path, write_state,
 };
+use serde::Serialize;
 
+use self::doctor::*;
+use super::*;
+#[cfg(unix)]
+use crate::utils::fuse as fuse_utils;
+use crate::{
+    command::restore::{self, RestoreArgs},
+    internal::{branch::Branch, head::Head, sequencer::WorktreeControl, workspace::RepoIdentity},
+    utils::{
+        error::{CliError, CliResult, StableErrorCode},
+        output::{OutputConfig, emit_json_data},
+        util,
+    },
+};
 
 /// Manage multiple working trees attached to this repository.
 //
@@ -776,7 +766,10 @@ pub(crate) async fn reattach_worktree(
     })
 }
 
-pub(crate) fn render_add_worktree(result: &WorktreeAddOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_add_worktree(
+    result: &WorktreeAddOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.add", result, output);
     }
@@ -835,7 +828,9 @@ pub(crate) async fn lifecycle_delete(
     Ok(())
 }
 
-pub(crate) async fn lifecycle_rows(db: &sea_orm::DatabaseConnection) -> Result<Vec<(String, String)>, String> {
+pub(crate) async fn lifecycle_rows(
+    db: &sea_orm::DatabaseConnection,
+) -> Result<Vec<(String, String)>, String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let rows = db
         .query_all_raw(Statement::from_string(
@@ -906,7 +901,10 @@ pub(crate) async fn journal_set_stage(
     Ok(())
 }
 
-pub(crate) async fn journal_resolve(db: &sea_orm::DatabaseConnection, id: i64) -> Result<(), String> {
+pub(crate) async fn journal_resolve(
+    db: &sea_orm::DatabaseConnection,
+    id: i64,
+) -> Result<(), String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
@@ -918,7 +916,9 @@ pub(crate) async fn journal_resolve(db: &sea_orm::DatabaseConnection, id: i64) -
     Ok(())
 }
 
-pub(crate) async fn journal_pending(db: &sea_orm::DatabaseConnection) -> Result<Vec<PendingIntent>, String> {
+pub(crate) async fn journal_pending(
+    db: &sea_orm::DatabaseConnection,
+) -> Result<Vec<PendingIntent>, String> {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     let rows = db
         .query_all_raw(Statement::from_string(
@@ -954,7 +954,10 @@ pub(crate) async fn journal_pending(db: &sea_orm::DatabaseConnection) -> Result<
     Ok(pending)
 }
 
-pub(crate) async fn scoped_state_active(db: &sea_orm::DatabaseConnection, worktree_id: &str) -> bool {
+pub(crate) async fn scoped_state_active(
+    db: &sea_orm::DatabaseConnection,
+    worktree_id: &str,
+) -> bool {
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     for table in ["sequence_state", "rebase_state", "bisect_state"] {
         let query = format!("SELECT COUNT(*) FROM {table} WHERE worktree_id = ?");
@@ -1205,7 +1208,11 @@ pub(crate) async fn format_worktree_porcelain(
     Ok(out)
 }
 
-pub(crate) fn info_file_has_effective_content(path: &std::path::Path, name: &str, base: &Path) -> bool {
+pub(crate) fn info_file_has_effective_content(
+    path: &std::path::Path,
+    name: &str,
+    base: &Path,
+) -> bool {
     match name {
         "exclude" => crate::utils::util::ignore_file_defines_any_pattern(path, base),
         "attributes" => crate::utils::attributes::file_defines_any_rule(path, base),
@@ -1358,7 +1365,10 @@ pub(crate) fn clear_common_info_files() -> CliResult<String> {
     }
 }
 
-pub(crate) async fn lock_worktree(path: String, reason: Option<String>) -> WorktreeResult<WorktreeLockOutput> {
+pub(crate) async fn lock_worktree(
+    path: String,
+    reason: Option<String>,
+) -> WorktreeResult<WorktreeLockOutput> {
     let _registry_lock = acquire_registry_lock_async().await?;
     let mut state = load_state()?;
     let target = resolve_path(&path, "worktree path")?;
@@ -1386,7 +1396,10 @@ pub(crate) async fn lock_worktree(path: String, reason: Option<String>) -> Workt
     })
 }
 
-pub(crate) fn render_lock_worktree(result: &WorktreeLockOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_lock_worktree(
+    result: &WorktreeLockOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.lock", result, output);
     }
@@ -1418,7 +1431,10 @@ pub(crate) async fn unlock_worktree(path: String) -> WorktreeResult<WorktreeUnlo
     })
 }
 
-pub(crate) fn render_unlock_worktree(result: &WorktreeUnlockOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_unlock_worktree(
+    result: &WorktreeUnlockOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.unlock", result, output);
     }
@@ -1575,7 +1591,10 @@ pub(crate) async fn move_worktree(src: String, dest: String) -> WorktreeResult<W
     })
 }
 
-pub(crate) fn render_move_worktree(result: &WorktreeMoveOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_move_worktree(
+    result: &WorktreeMoveOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.move", result, output);
     }
@@ -1742,7 +1761,10 @@ pub(crate) async fn prune_worktrees() -> WorktreeResult<WorktreePruneOutput> {
     })
 }
 
-pub(crate) fn render_prune_worktrees(result: &WorktreePruneOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_prune_worktrees(
+    result: &WorktreePruneOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.prune", result, output);
     }
@@ -1761,7 +1783,10 @@ pub(crate) fn render_prune_worktrees(result: &WorktreePruneOutput, output: &Outp
     Ok(())
 }
 
-pub(crate) async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<WorktreeRemoveOutput> {
+pub(crate) async fn remove_worktree(
+    path: String,
+    delete_dir: bool,
+) -> WorktreeResult<WorktreeRemoveOutput> {
     let _registry_lock = acquire_registry_lock_async().await?;
     let _repository_ref_lease = acquire_worktree_ref_lease().await?;
     let mut state = load_state()?;
@@ -2132,7 +2157,10 @@ pub(crate) async fn remove_worktree_delete_dir(
     })
 }
 
-pub(crate) fn render_remove_worktree(result: &WorktreeRemoveOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_remove_worktree(
+    result: &WorktreeRemoveOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.remove", result, output);
     }
@@ -2162,7 +2190,10 @@ pub(crate) fn render_remove_worktree(result: &WorktreeRemoveOutput, output: &Out
 }
 
 #[cfg(unix)]
-pub(crate) fn umount_fuse_path(path: String, cleanup: bool) -> WorktreeResult<WorktreeUmountOutput> {
+pub(crate) fn umount_fuse_path(
+    path: String,
+    cleanup: bool,
+) -> WorktreeResult<WorktreeUmountOutput> {
     let target = resolve_path(&path, "FUSE worktree path")?;
     let mountpoint = fuse_utils::resolve_task_worktree_mountpoint_arg(&target);
     fuse_utils::force_unmount_path(&mountpoint).map_err(|source| {
@@ -2203,7 +2234,10 @@ pub(crate) fn umount_fuse_path(path: String, cleanup: bool) -> WorktreeResult<Wo
 }
 
 #[cfg(unix)]
-pub(crate) fn render_umount_fuse_path(result: &WorktreeUmountOutput, output: &OutputConfig) -> CliResult<()> {
+pub(crate) fn render_umount_fuse_path(
+    result: &WorktreeUmountOutput,
+    output: &OutputConfig,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.umount", result, output);
     }

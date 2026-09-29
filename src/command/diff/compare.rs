@@ -1,8 +1,6 @@
 //! Diff comparison/selection: revision/scan/algorithm resolution, side
 //! hydration, pathspec filtering and rename detection.
 #![allow(unused_imports)]
-use super::*;
-
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::{
@@ -40,6 +38,7 @@ use tempfile::NamedTempFile;
 #[cfg(test)]
 use self::options::parse_rename_score;
 use self::options::{DiffPrefixes, ResolvedDiffConfig, resolve_diff_config};
+use super::*;
 use crate::{
     command::{
         load_object, read_worktree_blob_bytes,
@@ -57,8 +56,6 @@ use crate::{
         preview_object, util,
     },
 };
-
-
 
 pub(crate) async fn run_diff(
     args: &DiffArgs,
@@ -718,7 +715,10 @@ pub(crate) async fn run_diff(
     })
 }
 
-pub(crate) fn filter_diff_files_by_pathspec(files: &mut Vec<DiffFileStat>, pathspecs: &PathspecSet) {
+pub(crate) fn filter_diff_files_by_pathspec(
+    files: &mut Vec<DiffFileStat>,
+    pathspecs: &PathspecSet,
+) {
     if pathspecs.is_empty() {
         return;
     }
@@ -970,7 +970,9 @@ pub(crate) async fn get_commit_blobs(
         .map(|(blobs, _)| blobs)
 }
 
-pub(crate) async fn get_commit_entries(commit_hash: &ObjectHash) -> Result<DiffTreeEntries, DiffError> {
+pub(crate) async fn get_commit_entries(
+    commit_hash: &ObjectHash,
+) -> Result<DiffTreeEntries, DiffError> {
     let commit = load_object::<Commit>(commit_hash).map_err(|e| DiffError::ObjectLoad {
         kind: "commit",
         object_id: commit_hash.to_string(),

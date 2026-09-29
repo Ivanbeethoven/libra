@@ -22,8 +22,6 @@ use git_internal::{
         },
     },
 };
-
-
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -63,23 +61,12 @@ mod autostash;
 mod conflict;
 mod content;
 mod output;
-mod tree_merge;
-mod signing;
 mod rename_merge;
+mod signing;
 mod state;
+mod tree_merge;
 mod virtual_base;
 mod workdir;
-
-pub(crate) use conflict::*;
-pub(crate) use tree_merge::*;
-use output::*;
-pub(crate) use output::{
-    clear_squash_message, load_squash_message, merge_commit_message, merge_commit_parents,
-};
-pub(crate) use rename_merge::*;
-pub(crate) use virtual_base::*;
-pub(crate) use content::*;
-pub(crate) use workdir::*;
 
 // Preserve the existing command::merge type path for downstream callers.
 #[allow(unused_imports)]
@@ -91,9 +78,19 @@ use autostash::{
     preflight_held_autostash, prepare_merge_autostash, resolve_pending_autostash,
     resolve_pending_autostash_with, store_pending_autostash, verify_autostash_ownership,
 };
+pub(crate) use conflict::*;
+pub(crate) use content::*;
+use output::*;
+pub(crate) use output::{
+    clear_squash_message, load_squash_message, merge_commit_message, merge_commit_parents,
+};
+pub(crate) use rename_merge::*;
 pub(crate) use state::{
     MergeState, merge_in_progress, merge_state_for_pseudo_refs, merge_state_gc_oids,
 };
+pub(crate) use tree_merge::*;
+pub(crate) use virtual_base::*;
+pub(crate) use workdir::*;
 
 /// `--help` examples shown in `libra merge --help` output.
 ///
@@ -480,39 +477,40 @@ pub(crate) struct PullMergeSummary {
     /// Concrete backend selected for a public `libra merge`. This is additive:
     /// `strategy` retains its established outcome-category values for existing
     /// JSON consumers. Internal pull integrations leave it absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_strategy: Option<String>,
     /// The previous HEAD commit before merge (None for root commits).
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub old_commit: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
     pub files_changed: usize,
     pub up_to_date: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicted_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub aborted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     pub continued: bool,
     /// `--dry-run`: this summary is a preview; nothing was written. Absent from
     /// JSON for every real merge (schema-frozen additive field).
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub dry_run: bool,
     /// `--dry-run` only: the merge would stop on conflicts (in
     /// `conflicted_paths`). Absent from JSON for every real merge.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub would_conflict: bool,
     /// `--dry-run` only: the category of every would-be conflict (MG-04), so a
     /// caller can tell a `file-directory` collision — with the path the file
     /// would be moved to — from a `content` or `modify-delete` conflict. Absent
     /// whenever empty (schema-additive; every real merge omits it).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflict_kinds: Vec<ConflictReport>,
     /// Autostash outcome (lore.md §1.8): `applied` (re-applied cleanly),
     /// `stashed` (re-apply conflicted; entry promoted to the stash list), or
     /// `kept` (held while merge state persists, e.g. `--no-commit`). Absent
     /// whenever autostash was off or the tree was clean (schema-additive).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostash: Option<String>,
 }
 
@@ -525,7 +523,7 @@ pub(crate) struct ConflictReport {
     /// `content` | `modify-delete` | `file-directory`.
     pub kind: String,
     /// D/F only: the colliding path the directory keeps.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_path: Option<String>,
 }
 
@@ -535,6 +533,91 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[cfg(test)]
+mod summary_serde_tests {
+    use super::{ConflictReport, PullMergeSummary};
+
+    fn idle_summary() -> PullMergeSummary {
+        PullMergeSummary {
+            strategy: "already-up-to-date".to_string(),
+            selected_strategy: None,
+            old_commit: Some("abc".to_string()),
+            commit: None,
+            files_changed: 0,
+            up_to_date: true,
+            parents: Vec::new(),
+            conflicted_paths: Vec::new(),
+            aborted: false,
+            continued: false,
+            dry_run: false,
+            would_conflict: false,
+            conflict_kinds: Vec::new(),
+            autostash: None,
+        }
+    }
+
+    #[test]
+    fn up_to_date_summary_keeps_null_commit_and_omits_idle_fields() {
+        let value = serde_json::to_value(idle_summary()).expect("summary serializes");
+        let object = value.as_object().expect("object");
+        assert!(object.get("commit").is_some_and(serde_json::Value::is_null));
+        assert_eq!(
+            object.get("old_commit").and_then(|v| v.as_str()),
+            Some("abc")
+        );
+        for absent in [
+            "parents",
+            "aborted",
+            "continued",
+            "selected_strategy",
+            "conflicted_paths",
+            "dry_run",
+            "would_conflict",
+            "conflict_kinds",
+            "autostash",
+        ] {
+            assert!(object.get(absent).is_none(), "{absent} must be omitted");
+        }
+    }
+
+    #[test]
+    fn root_fast_forward_emits_null_old_commit() {
+        let mut summary = idle_summary();
+        summary.strategy = "fast-forward".to_string();
+        summary.old_commit = None;
+        summary.commit = Some("def".to_string());
+        summary.up_to_date = false;
+        let value = serde_json::to_value(summary).expect("summary serializes");
+        let object = value.as_object().expect("object");
+        assert!(
+            object
+                .get("old_commit")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        assert_eq!(object.get("commit").and_then(|v| v.as_str()), Some("def"));
+    }
+
+    #[test]
+    fn abort_emits_aborted_and_keeps_null_commit() {
+        let mut summary = idle_summary();
+        summary.strategy = "abort".to_string();
+        summary.aborted = true;
+        summary.up_to_date = false;
+        let value = serde_json::to_value(summary).expect("summary serializes");
+        let object = value.as_object().expect("object");
+        assert_eq!(object.get("aborted").and_then(|v| v.as_bool()), Some(true));
+        assert!(object.get("continued").is_none());
+        assert!(object.get("parents").is_none());
+        assert!(object.get("commit").is_some_and(serde_json::Value::is_null));
+    }
+
+    #[test]
+    fn conflict_report_omitted_original_path_defaults_to_none() {
+        let report: ConflictReport =
+            serde_json::from_str(r#"{"path":"a","kind":"content"}"#).expect("report deserializes");
+        assert!(report.original_path.is_none());
+    }
+}
 
 /// Git's `evaluate_result()` score: worktree/index differences plus unmerged
 /// index entries. Lower is better; a later strategy wins a tie, matching
@@ -10996,19 +11079,18 @@ mod recursive {
         internal::object::{
             blob::Blob,
             commit::Commit,
+            signature::{Signature, SignatureType},
             tree::TreeItemMode,
         },
     };
 
-    use git_internal::internal::object::signature::{Signature, SignatureType};
-
     use super::{
         ConflictStyle, GitlinkEntries, MAX_VIRTUAL_ANCESTOR_BASES, MAX_VIRTUAL_ANCESTOR_DEPTH,
-        MAX_XDIFF_SIZE, MergeTreeEntry, PullMergeError,
-        VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL, VirtualBlobs, conflict_marker_length_at_depth,
-        ensure_virtual_ancestor_depth, fold_merge_bases, merge_bases_of_folded,
-        merge_bases_of_folded_with, merge_input_exceeds_xdiff_size, merge_input_is_binary,
-        merge_virtual_items, recorded_merge_base, virtual_base_fold_order, virtual_merged_mode,
+        MAX_XDIFF_SIZE, MergeTreeEntry, PullMergeError, VIRTUAL_OURS_LABEL, VIRTUAL_THEIRS_LABEL,
+        VirtualBlobs, conflict_marker_length_at_depth, ensure_virtual_ancestor_depth,
+        fold_merge_bases, merge_bases_of_folded, merge_bases_of_folded_with,
+        merge_input_exceeds_xdiff_size, merge_input_is_binary, merge_virtual_items,
+        recorded_merge_base, virtual_base_fold_order, virtual_merged_mode,
     };
 
     fn oid(byte: u8) -> ObjectHash {

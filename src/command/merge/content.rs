@@ -1,8 +1,6 @@
 //! Merge content: blob bytes -> conflict-marker rendering, diff3/zdiff3/refined
 //! text merge and the shared blob-loading/renormalization helpers.
 #![allow(unused_imports)]
-use super::*;
-
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -14,6 +12,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// Preserve the existing command::merge type path for downstream callers.
+#[allow(unused_imports)]
+pub(crate) use autostash::StoppedMerge;
+pub(crate) use autostash::{
+    MergeAutostash, conclude_merge_after_commit, conclude_stopped_merge, snapshot_stopped_merge,
+};
+use autostash::{
+    preflight_held_autostash, prepare_merge_autostash, resolve_pending_autostash,
+    resolve_pending_autostash_with, store_pending_autostash, verify_autostash_ownership,
+};
 use clap::{Parser, ValueEnum};
 use git_internal::{
     hash::ObjectHash,
@@ -28,11 +36,15 @@ use git_internal::{
     },
 };
 use serde::{Deserialize, Serialize};
+pub(crate) use state::{
+    MergeState, merge_in_progress, merge_state_for_pseudo_refs, merge_state_gc_oids,
+};
 
+use self::workdir::*;
 use super::{
     get_target_commit, load_object, load_object_raw, rename_detect, reset,
     restore::{self, RestoreArgs},
-    save_object, status, switch,
+    save_object, status, switch, *,
 };
 use crate::{
     command::{
@@ -60,23 +72,6 @@ use crate::{
         output::{OutputConfig, emit_json_data},
         path, util, worktree,
     },
-};
-
-
-use self::workdir::*;
-
-// Preserve the existing command::merge type path for downstream callers.
-#[allow(unused_imports)]
-pub(crate) use autostash::StoppedMerge;
-pub(crate) use autostash::{
-    MergeAutostash, conclude_merge_after_commit, conclude_stopped_merge, snapshot_stopped_merge,
-};
-use autostash::{
-    preflight_held_autostash, prepare_merge_autostash, resolve_pending_autostash,
-    resolve_pending_autostash_with, store_pending_autostash, verify_autostash_ownership,
-};
-pub(crate) use state::{
-    MergeState, merge_in_progress, merge_state_for_pseudo_refs, merge_state_gc_oids,
 };
 
 pub(crate) fn text_renormalization_for_path(path: &Path) -> TextRenormalization {
@@ -194,7 +189,12 @@ pub(crate) fn normalize_merge_input(
     NormalizedMergeInput { canonical, lines }
 }
 
-pub(crate) fn normalized_marker(body: &[u8], marker: u8, marker_len: usize, label: Option<&[u8]>) -> bool {
+pub(crate) fn normalized_marker(
+    body: &[u8],
+    marker: u8,
+    marker_len: usize,
+    label: Option<&[u8]>,
+) -> bool {
     if body.len() < marker_len || body[..marker_len].iter().any(|byte| *byte != marker) {
         return false;
     }
@@ -208,7 +208,11 @@ pub(crate) fn normalized_marker(body: &[u8], marker: u8, marker_len: usize, labe
     }
 }
 
-pub(crate) fn find_normalized_line(input: &NormalizedMergeInput, cursor: usize, key: &[u8]) -> Option<usize> {
+pub(crate) fn find_normalized_line(
+    input: &NormalizedMergeInput,
+    cursor: usize,
+    key: &[u8],
+) -> Option<usize> {
     input.lines[cursor..]
         .iter()
         .position(|line| line.key == key)
@@ -554,7 +558,12 @@ pub(crate) struct ConflictMarkerLabels<'a> {
     pub theirs: &'a str,
 }
 
-pub(crate) fn marker_bytes(byte: u8, marker_len: usize, label: Option<&str>, eol: &[u8]) -> Vec<u8> {
+pub(crate) fn marker_bytes(
+    byte: u8,
+    marker_len: usize,
+    label: Option<&str>,
+    eol: &[u8],
+) -> Vec<u8> {
     let mut marker = vec![byte; marker_len];
     if let Some(label) = label {
         marker.push(b' ');
@@ -960,7 +969,10 @@ pub(crate) fn unambiguous_conflict_marker_length(sides: &[&[u8]]) -> usize {
     DEFAULT_MARKER_LENGTH.max(longest.saturating_add(1))
 }
 
-pub(crate) fn load_merge_blob(hash: ObjectHash, virtual_blobs: &VirtualBlobs) -> Result<Blob, PullMergeError> {
+pub(crate) fn load_merge_blob(
+    hash: ObjectHash,
+    virtual_blobs: &VirtualBlobs,
+) -> Result<Blob, PullMergeError> {
     if let Some(data) = virtual_blobs.get(&hash) {
         return Ok(Blob::from_content_bytes(data.clone()));
     }

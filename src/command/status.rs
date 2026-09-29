@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
-    io::{Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -60,26 +60,25 @@ pub(crate) use input::{
     resolve_status_threshold,
 };
 use input::{StatusConfigExtras, apply_status_config_defaults};
-#[allow(unused_imports)]
-pub(crate) use scan::head_object_unreadable;
-use scan::*;
-pub(crate) use scan::{load_head_commit_tree, load_status_index};
-
+pub(crate) use output::io_blocked_reason_and_code;
+use output::render_status_to_writer;
 // Output renderers moved to `output`; keep the crate-visible `status::` paths
 // for existing callers, sibling modules that glob-import `super::*`, and tests.
 pub use output::{
     PorcelainV2Data, ShortStatusEntry, StatusOutcome, build_porcelain_v2_data, build_status_json,
     cache_warning, current_to_workdir, deliver_warnings_stderr, generate_short_format_status,
-    generate_short_status_entries, index_mode_to_tree_item_mode,
-    is_gitlink_index_entry, output_porcelain, output_short_format, quote_pathname,
-    quote_pathname_bytes, raw_path_base64, raw_path_sort_key,
+    generate_short_status_entries, index_mode_to_tree_item_mode, is_gitlink_index_entry,
+    output_porcelain, output_short_format, quote_pathname, quote_pathname_bytes, raw_path_base64,
+    raw_path_sort_key,
 };
 #[allow(unused_imports)]
 pub(crate) use output::{
     generate_short_format_status_with_unmerged, generate_short_status_entries_with_unmerged,
 };
-pub(crate) use output::io_blocked_reason_and_code;
-use output::render_status_to_writer;
+#[allow(unused_imports)]
+pub(crate) use scan::head_object_unreadable;
+use scan::*;
+pub(crate) use scan::{load_head_commit_tree, load_status_index};
 
 // ---------------------------------------------------------------------------
 // Shared warnings and result data
