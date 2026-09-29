@@ -44,7 +44,7 @@
 
 ## G-2：FIX-CM-WT-MOVE（EXDEV 跨设备 move）
 
-**现状：** `src/command/worktree/operations.rs::move_worktree` 已有 `fs::rename` + `or_else` 复制回退，及 `journal_*` 持久 intent。**实现基本在**，卡点是补丁兼容性证明。
+**现状：** `src/command/worktree/operations.rs::move_worktree` 已有 `fs::rename` + `or_else` 复制回退，及 `journal_*` 持久 intent。**实现仅部分在**：EXDEV 回退仍是 `fs_extra::dir::copy` → `fs::rename` → `fs::remove_dir_all(src)`，失败时回滚 `fs::remove_dir_all(dest)`；计划要求的完整树复核、三态路径探测、原子 no-replace 发布、owned 隔离与故障注入均未实现。**卡点因此包含实现缺口与补丁兼容性决策两层，不只是「补证」。**
 
 **具体动作：**
 - [ ] **补丁兼容源证**（在脚本/测试内可执行的证明）：
@@ -54,6 +54,27 @@
   - [ ] 用旧二进制与 `worktree prune --dry-run`/`repair` 各做一次跨编译回归（不 bump，只用当前树生成的东西验证语义）。
 - [ ] **若任一证不了**：记录 **breaking/minor 方案**（含独立兼容窗口与 ER-08 版本约束），呈给用户/维护者取决定；**不预设 minor 已授权**。
 - [ ] 状态更新：`DEP-CM-WT-COMPAT` 由 `blocked` → `passed`（具名 owner 确认）后，FIX-CM-WT-MOVE、CM-05、CM-13 才正式验收。
+
+### G-2 源证判定结论（2026-09-29 源码复核 @ `bdb7727`，呈请用户/维护者决定）
+
+**结论：4 项补丁兼容源证在当前源码上均不成立，进入 G-2 自身的 breaking/minor fallback；未预设 minor 已授权，`DEP-CM-WT-COMPAT` 维持 `blocked`。上面的勾选项按本结论保持未勾。**
+
+| 源证项 | 判定 | 证据锚点 |
+|---|---|---|
+| 旧 `prune`/`remove` 不能无视 pending move fence | ❌ 不成立 | `journal_pending` 调用点仅 `doctor.rs:1573,2313,3348` 与 `operations.rs:1504`（move 自身的迁移守卫）；`prune_worktrees`（`operations.rs:1604`）与 `remove_worktree`（`operations.rs:1786`）只读 registry，不查 pending intent |
+| 旧 `repair` 不能改坏 v2 状态（NUL 哨兵/保留字段） | ❌ 未实现 | `registry.rs:126` `REGISTRY_SCHEMA_VERSION = 3`；`parse_document` 仅对未知 `schema_version` fail-closed，源码无 NUL 哨兵/保留字段方案 |
+| `down` 与 `v1→v2` 转换同事务串行、旧进程已退出 | ❌ 未实现 | `move_worktree` 无 down/转换串行门；`src/internal/db.rs:744` 的 `migration::run_builtin_migrations` 在普通连接上自动应用全部注册 migration（模块文档 `db.rs:12`），`db.rs:117` 明示不可 down |
+| 旧二进制 × `prune --dry-run`/`repair` 跨编译回归 | ❌ 不存在 | `tests/command/worktree_test.rs` 仅 `test_worktree_move_cross_device_error_is_portable`（`:65`）与 `test_worktree_move_across_filesystems_rolls_back_when_supported`（`:1312`） |
+
+**实现缺口（超出「补证」范围）：** `operations.rs:1541-1568` 的 EXDEV 回退无内容复核；`copied_path != dest_path` 时用普通 `fs::rename` 发布（非原子 no-replace）；`remove_dir_all(src)` 失败即删除 `dest` —— 正是 `plan-20260927.md` 风险登记表标记的 P1「删除唯一完整副本」。仓库内唯一的 no-replace 原子发布点在 `doctor.rs:1649`（repair 备份），与 move 无关。
+
+**ER-08 判定：** patch 交付要求「源码 + 旧二进制实证」双证（`plan-20260927.md:185,975`），当前**不满足**；minor 须用户重新定范围（`plan-20260927.md:986`：本卡无 minor 授权）。
+
+**待用户/维护者决定（二选一）：**
+- **方案 A（patch）**：先按 `plan-20260927.md:850` 候选设计实现 `move_exdev` + 临时 future-schema capability receipt（新连接与预打开旧 mutator/repair 均被 fence、up/down 与 `v1→v2` 原子排竞、SIGKILL 窗口不泄漏旧 writer、收敛后 down 不被自动 up 重施），再按 `plan-20260927.md:975` 的完成定义取证。
+- **方案 B（breaking/minor）**：记录独立兼容窗口与 ER-08 版本约束，由用户另行授权版本范围并修订计划。
+
+决定前，FIX-CM-WT-MOVE 与 CM-05/CM-13 保持 `blocked`，其它无写集冲突卡继续。
 
 **关键文件：** `src/command/worktree/operations.rs`（move_worktree/journal_*）、`src/command/worktree/registry.rs`（版本面）、`docs/development/plan/plan-status.md`。
 
