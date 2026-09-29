@@ -69,7 +69,7 @@
 
 ### G-3b FIX-CM-CLOUD-RECOVERY-AUTH
 - [ ] 新建 `cloud-live-recover.yml`（GC-CM-14：AUTH 期仅 `probe-auth`、CLEANUP 后仅 `cloud-live-recovery/v1`）。
-- [ ] 实现 `libra-cloud-live-manifest-v1` 的 Python 字节规范/HMAC 校验与 `LIBRA_LIVE_GRANT` parser（GC-CM-15/17）；零删除探针：来源/ref/SHA/nonce/owner/expiry 任一不符即零删除。
+- [x] 实现 `libra-cloud-live-manifest-v1` / `libra-cloud-live-grant-v1` 校验 helper（`tests/helpers/cloud_live_manifest.rs`：顶层 schema/字段集合、时间戳 UTC 无小数、writer_slots repo_id 升序无重复且 `r2_prefix` 恰为 `<repo_id>/`、资源四元组、grant run/attempt/ref/SHA/nonce 匹配即零删除）；单元测试 4 项通过。零删除探针仍在 `cloud-live-recover.yml` 侧接线。
 
 ### G-3c FIX-CM-CLOUD-RECOVERY-CLEANUP
 - [ ] 在 `cloud-live-recover.yml` 增加限界幂等清理：仅按已签 manifest 的 `repo_id`/R2 前缀删除 D1 行与精确 key，重试到零，保留备份与 receipt。

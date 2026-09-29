@@ -11,3 +11,5 @@ pub mod mock_completion_model;
 pub mod mock_provider_server;
 
 pub mod cloud_live_resources;
+
+pub mod cloud_live_manifest;
