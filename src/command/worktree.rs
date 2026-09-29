@@ -745,6 +745,7 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
                 .map_err(WorktreeError::into_cli_error)?;
             render_remove_worktree(&result, output)
         }
+        #[cfg(unix)]
         WorktreeSubcommand::Umount { path, cleanup } => {
             let result = umount_fuse_path(path, cleanup).map_err(WorktreeError::into_cli_error)?;
             render_umount_fuse_path(&result, output)
