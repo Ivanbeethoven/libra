@@ -37,7 +37,7 @@
 
 - 日期计划命名为 `plan-YYYYMMDD.md`，用于可执行的实现、迁移、发布或文档收敛任务。
 - **计划执行状况单一视图（强制）：** 仓库根的计划目录下存在 [`plan-status.md`](plan-status.md)，是全仓计划的单一执行状况视图，按任务卡粒度汇总每份计划的状态，并登记计划内延后决策/实施项（`DEFER-*`）与跨计划依赖。**任何执行计划的 Agent 在完成或推进一张任务卡时，必须在同一变更中同步更新 `plan-status.md`**（状态、发布版本/commit、日期）；新建计划时必须在 `plan-status.md`「计划一览」登记一行，并把本文件更新义务写入新计划的「使用规则」或修订历史。`plan-status.md` 的「计划一览」表是跨计划状态的权威视图，冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 日期索引交叉核对。
-- **计划目录只放计划与协调文件（强制，v2.10）：** `docs/development/plan/` 目录本身及其 `issues/` 子目录只承载计划正文、`plan-status.md` 与 `plan-template.md`。**不得**在计划目录下另外构建 `evidence/`、`baseline/`、`scratch/`、`umask-diagnosis/` 等验收/证据/快照目录；所有这类内容——测试运行摘要与计数、SHA-256 与 run ID、C/D 组门结果、浏览器/网站部署证据、基线/快照——都必须写入**对应计划文件**内的专门小节（例如「实施证据汇总」或某卡卡的 `Current evidence`/`Verification` 记录），并在该计划的修订历史登记。若验收需要保留 durable 的 JUnit XML、逐文件 hash、截图等大体积原始产出，可压缩为计划文件内的表格/摘要或代码块引用，但不得作为独立文件存留在计划目录；确有必要保留外部原始产物时，以计划文件内的链接指向仓库外的永久对象（如 release asset、CI artifact URL 或站点 URL），同样不计入计划目录写集。
+- **计划目录只放计划与协调文件（强制，v2.10）：** `docs/development/plan/` 目录本身及其 `issues/` 子目录只承载计划正文、`plan-status.md` 与 `plan-template.md`。**不得**在计划目录下另外构建 `evidence/`、`baseline/`、`scratch/`、`umask-diagnosis/` 等验收/证据/快照目录；所有这类内容——测试运行摘要与计数、SHA-256 与 run ID、C/D 组门结果、浏览器/网站部署证据、基线/快照——都必须写入**对应计划文件**内的专门小节（例如「实施证据汇总」或某卡的 `Current evidence`/`Verification` 记录），并在该计划的修订历史登记。若验收需要保留 durable 的 JUnit XML、逐文件 hash、截图等大体积原始产出，可压缩为计划文件内的表格/摘要或代码块引用，但不得作为独立文件存留在计划目录；确有必要保留外部原始产物时，以计划文件内的链接指向仓库外的永久对象（如 release asset、CI artifact URL 或站点 URL），同样不计入计划目录写集。
 - 长期能力只进入 `plan-long.md`。日期计划可以链接长期能力编号，但不得把长期路线图复制成重复任务表。
 - 每个计划必须以当前 checkout 的源码、测试、用户文档和兼容矩阵为事实基线。历史计划、截图、会议记录或竞品描述只能作为线索，不能作为已实现证据。
 - 每个任务卡必须能交给 Agent 独立执行：范围明确、依赖明确、文件落点明确、验收标准明确、验证命令明确。
