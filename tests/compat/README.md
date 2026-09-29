@@ -43,6 +43,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `client_storage_production_unwrap_guard.rs` | unwrap audit (v0.17.264) | `src/utils/client_storage.rs` must not regress on bare `.unwrap()` |
 | `extra_production_unwrap_guard.rs` | unwrap audit (v0.17.266) | extra audited files (`lfs.rs`, `object.rs`, `storage/local.rs`, `storage/tiered.rs`, `path_ext.rs`, `git_protocol.rs`, `lfs_structs.rs`, `command/reflog.rs`) must not regress |
 | `all_production_unwrap_guard.rs` | unwrap audit (v0.17.268) | catch-all guard walking the entire `src/` tree; new modules are automatically in scope |
+| `diff_production_expect_guard.rs` | FIX-CM-08 (plan-20260927) | `src/command/diff.rs` + `diff/*.rs` must not regress: no bare `.unwrap()`, and every production `.expect(...)` must carry an `// INVARIANT:` justification |
 | `agent_run_non_exhaustive_guard.rs` | agent_run | every `pub enum` exposed under `src/internal/ai/agent_run/` must carry `#[non_exhaustive]` so additive evolution is non-breaking |
 | `agent_docs_contract.rs` | agent plan docs | `docs/development/tracing/agent.md` must not claim removed provider surfaces still exist, drop public schema/retention/raw-export constraints, or link stale internal-plan files |
 | `agent_capability_matrix_pin.rs` | AG-16 capability contract | E1 `DeclaredAgentCaps` serializes exactly 8 snake_case keys; first-batch roster frozen to `claude-code`/`codex`/`opencode`; unsupported/unknown agents never installable or launchable |

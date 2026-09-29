@@ -13,7 +13,12 @@
 
 use std::{fs, path::PathBuf};
 
-const TARGET_FILES: &[&str] = &["src/command/diff.rs", "src/utils/blob_similarity.rs"];
+const TARGET_FILES: &[&str] = &[
+    "src/command/diff.rs",
+    "src/command/diff/compare.rs",
+    "src/command/diff/render.rs",
+    "src/command/diff/options.rs",
+];
 
 #[test]
 fn diff_production_code_has_no_unjustified_panics() {

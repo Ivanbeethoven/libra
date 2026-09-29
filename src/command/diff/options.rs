@@ -4,7 +4,7 @@ const DEFAULT_CONTEXT: usize = 3;
 const DEFAULT_RENAME_SCORE: u32 = 30000;
 
 #[derive(Clone)]
-pub(super) struct ResolvedDiffConfig {
+pub(crate) struct ResolvedDiffConfig {
     pub(super) context: usize,
     pub(super) rename_threshold: Option<u32>,
     /// `diff.renameLimit`: per-side inexact candidate cap; `0` disables the

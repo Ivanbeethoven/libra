@@ -145,7 +145,6 @@ fn try_cwd_lock() -> Option<CwdLockGuard> {
         .try_acquire()
 }
 
-#[cfg(test)]
 pub(crate) fn cwd_lock_guard() -> CwdLockGuard {
     cwd_lock()
 }
