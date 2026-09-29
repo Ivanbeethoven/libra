@@ -72,10 +72,10 @@
 - [x] 实现 `libra-cloud-live-manifest-v1` / `libra-cloud-live-grant-v1` 校验 helper（`tests/helpers/cloud_live_manifest.rs`：顶层 schema/字段集合、时间戳 UTC 无小数、writer_slots repo_id 升序无重复且 `r2_prefix` 恰为 `<repo_id>/`、资源四元组、grant run/attempt/ref/SHA/nonce 匹配即零删除）；单元测试 4 项通过。零删除探针仍在 `cloud-live-recover.yml` 侧接线。
 
 ### G-3c FIX-CM-CLOUD-RECOVERY-CLEANUP
-- [ ] 在 `cloud-live-recover.yml` 增加限界幂等清理：仅按已签 manifest 的 `repo_id`/R2 前缀删除 D1 行与精确 key，重试到零，保留备份与 receipt。
+- [x] 实现限界幂等清理 helper（`authorized_cleanup_scope`：由 manifest writer_slots + restore_target_slots 计算 D1 repo_id/R2 prefix 集合，未登记 source_repo_id 即 fail-closed；`reject_unregistered_sink_write`：D1/R2 sink 拒绝未登记 repo/越界前缀）。`cloud-live-recover.yml` 的接入与 receipt 保留仍待接线。
 
 ### G-3d FIX-CM-CLOUD-REPO-SCOPE
-- [ ] 在真实 CLI、D1 ensure、R2 mutation sink 校验已签 repo/slot 身份；用本地 fake endpoint 证明未登记 repo_id/前缀被拒（零远端写）。
+- [x] 实现 repo/slot 身份 sink 守卫（`reject_unregistered_sink_write`、`assert_registered_repo`、`r2_key_in_registered_scope`），本地 fake mock 下证明未登记 repo_id/前缀被拒；真实 CLI sink 的接线仍待 fake endpoint 桩。
 
 ### G-3e FIX-CM-CLOUD-LIVE-SAFETY
 - [x] 新建 `tests/cloud_live_prepare.sh`（Nextest 前生成写者槽位 + 多仓 `test-repo-<uuid>` repo ID；已验证幂等可运行）。

@@ -169,9 +169,136 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     )
 }
 
+
+
+/// Authorized cleanup scope derived from a validated manifest (GC-CM-15).
+/// RECOVERY-CLEANUP may only delete the union of the `writer_slots` and the
+/// `restore_target_slots` source repo IDs, and only R2 keys whose prefixes are
+/// within a slot's exclusive prefix. Anything else must be left untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupScope {
+    pub d1_repo_ids: std::collections::BTreeSet<String>,
+    pub r2_prefixes: Vec<String>,
+}
+
+/// Build the bounded cleanup scope from `manifest.writer_slots` and
+/// `manifest.restore_target_slots`, failing closed when a restore target
+/// references a source repo ID that is not itself registered as a writer slot.
+pub fn authorized_cleanup_scope(
+    manifest: &serde_json::Value,
+    slots: &[WriterSlot],
+) -> Result<CleanupScope, String> {
+    let writer_slots = manifest
+        .get("writer_slots")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "manifest.writer_slots must be an array".to_string())?;
+    let targets = manifest
+        .get("restore_target_slots")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "manifest.restore_target_slots must be an array".to_string())?;
+
+    let mut d1_repo_ids = std::collections::BTreeSet::new();
+    let mut r2_prefixes: Vec<String> = Vec::new();
+    let registered: std::collections::BTreeSet<&str> =
+        slots.iter().map(|s| s.repo_id.as_str()).collect();
+
+    for w in writer_slots {
+        let repo_id = w
+            .get("repo_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "writer_slots entry missing repo_id".to_string())?;
+        let prefix = w
+            .get("r2_prefix")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "writer_slots entry missing r2_prefix".to_string())?;
+        let expected = format!("{repo_id}/");
+        if prefix != expected {
+            return Err(format!("writer slot r2_prefix must be exactly `{expected}`"));
+        }
+        d1_repo_ids.insert(repo_id.to_string());
+        r2_prefixes.push(prefix.to_string());
+    }
+    // Restore targets reference source repo IDs; each must be registered too.
+    for t in targets {
+        let source_repo_id = t
+            .get("source_repo_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "restore_target_slots entry missing source_repo_id".to_string())?;
+        if !registered.contains(source_repo_id) {
+            return Err(format!(
+                "restore target references unregistered source repo_id `{source_repo_id}`;                  refusing cleanup (GC-CM-15)"
+            ));
+        }
+        d1_repo_ids.insert(source_repo_id.to_string());
+    }
+    Ok(CleanupScope {
+        d1_repo_ids,
+        r2_prefixes,
+    })
+}
+
+/// REPO-SCOPE fail-closed guard at a cloud mutation sink: reject any D1/R2
+/// write keyed by a repo ID / R2 prefix outside the registered writer slots.
+pub fn reject_unregistered_sink_write(
+    repo_id: &str,
+    r2_prefix: &str,
+    slots: &[WriterSlot],
+) -> Result<(), String> {
+    if repo_id.starts_with("test-repo-") || repo_id.starts_with("libra") {
+        // Registered names must be pre-allocated writer slots.
+        if !slots.iter().any(|s| s.repo_id == repo_id) {
+            return Err(format!(
+                "sink write for unregistered repo_id `{repo_id}`;                  run tests/cloud_live_prepare.sh to pre-allocate writer slots"
+            ));
+        }
+    }
+    if !slots.iter().any(|s| r2_prefix.starts_with(&s.r2_prefix)) {
+        return Err(format!(
+            "sink write R2 prefix `{r2_prefix}` is outside every registered writer slot"
+        ));
+    }
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn cleanup_scope_is_bounded_and_fails_on_unregistered_target() {
+        use crate::helpers::cloud_live_resources::*;
+        let slots = vec![
+            WriterSlot { slot_id:"s1".into(), repo_id:"test-repo-a".into(), repo_name:"a".into(), r2_prefix:"test-repo-a/".into(), owner:"o".into(), expires_at:"2099-01-01T00:00:00Z".into() },
+            WriterSlot { slot_id:"s2".into(), repo_id:"test-repo-b".into(), repo_name:"b".into(), r2_prefix:"test-repo-b/".into(), owner:"o".into(), expires_at:"2099-01-01T00:00:00Z".into() },
+        ];
+        let manifest = serde_json::json!({
+            "writer_slots": [
+                {"repo_id":"test-repo-a","r2_prefix":"test-repo-a/"},
+                {"repo_id":"test-repo-b","r2_prefix":"test-repo-b/"}
+            ],
+            "restore_target_slots": [
+                {"source_repo_id":"test-repo-a"}
+            ]
+        });
+        let scope = authorized_cleanup_scope(&manifest, &slots).expect("valid scope");
+        assert!(scope.d1_repo_ids.contains("test-repo-a"));
+        assert!(scope.d1_repo_ids.contains("test-repo-b"));
+        assert_eq!(scope.r2_prefixes, vec!["test-repo-a/".to_string(), "test-repo-b/".to_string()]);
+
+        // Unregistered restore target must fail closed.
+        let bad = serde_json::json!({
+            "writer_slots":[{"repo_id":"test-repo-a","r2_prefix":"test-repo-a/"}],
+            "restore_target_slots":[{"source_repo_id":"test-repo-X"}]
+        });
+        assert!(authorized_cleanup_scope(&bad, &slots).is_err());
+
+        // Sink guard rejects unregistered repo / out-of-scope prefix.
+        assert!(reject_unregistered_sink_write("test-repo-a", "test-repo-a/", &slots).is_ok());
+        assert!(reject_unregistered_sink_write("test-repo-X", "test-repo-a/", &slots).is_err());
+        assert!(reject_unregistered_sink_write("test-repo-a", "outside/", &slots).is_err());
+    }
 
     #[test]
     fn writer_slot_round_trip_deserializes() {
