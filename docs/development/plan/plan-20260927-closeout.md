@@ -114,6 +114,15 @@
 
 **关键文件：** `tests/cloud_live_no_skip.sh`、`tests/cloud_live_prepare.sh`、`tests/helpers/cloud_live_resources.rs`、`.github/workflows/live-compat.yml`、`.github/workflows/cloud-live-recover.yml`（新增）。
 
+**G-3e 缺陷修正（2026-09-29 复核 @ `e9c46b1`）：**
+
+- **现象：** `cloud_live_resources_test` 在 `Cargo.toml:254` 注册时**没有 `required-features`**，因此属于默认 L1 套件；但它里面的 `tests::cloud_live_resources_helper_compiles` 直接调用 `resource_identity_probe`，而该函数在身份缺失时 `assert!` 硬 panic（`tests/helpers/cloud_live_resources.rs:86`）。在**未导出** `LIBRA_D1_ACCOUNT_ID` 的 shell 里实测 `7 passed; 1 failed`。已排除仓库级注入：`.cargo/config.toml` 的 `[env]` 只设 `RUST_MIN_STACK`。
+- **影响：** `AGENTS.md:99`（「`cargo test --all` runs the default L1 suite (the acceptance gate)」）与 `AGENTS.md:129`（PR 自检清单）都把 `cargo test --all` 当验收门，且 AGENTS.md 全文**不含** `.env.test` 字样；因此干净 checkout 上按文档跑验收门会直接失败。CI 因 `compat-offline-core` 注入 L2/L3 secrets 才不复现，属于「本地不可复现的假绿」风险。
+- **附带的空断言：** 原测试体是 `assert!(!x.is_empty() || x.is_empty())`（恒真），不验证任何东西，与同文件头「runs its unit tests in the default L1 suite (no real D1/R2 needed)」的声明自相矛盾。
+- **修正：** 改为按 `LIBRA_D1_ACCOUNT_ID` 是否配置分别断言两支——已配置则要求探针解析出非空身份；未配置则用 `catch_unwind` 要求探针 fail-closed。实测**无 env** 与 **`source .env.test`** 两种环境均为 `8 passed; 0 failed`，使文件头与 `tests/INDEX.md:225` 的「default L1 suite (no real D1/R2)」陈述重新成立。
+- **附注：** 上面第 2 条里的「`cloud_live_resources_test` 3/3 绿」是当时的数字；该 target 现含 **8** 个测试，引用时应以现有计数为准。
+- **同批第二处门禁破损（格式）：** `cargo +nightly fmt --all --check` 在 `e9c46b1` 上**退出 1**，违规点全在本计划 Cloud 卡新增的两个 helper：`tests/helpers/cloud_live_manifest.rs`（10 处）与 `tests/helpers/cloud_live_resources.rs`（7 处）——即 `208fc99`/`338dd95` 提交时没有跑过 nightly fmt。CI 的 `compat-rustfmt` 作业（`.github/workflows/base.yml:12`，`run: cargo +nightly fmt --all --check`）因此在下一次 PR 上必然红；而 `base.yml` 的 `on:` 只有 `pull_request`，所以直推 `main` 不会触发，属于**潜伏的红**（`main` 自身处于违约状态却看不到）。已执行 `cargo +nightly fmt --all` 修复；改动经 AST 等价核验——去空白再去尾随逗号后逐字符相同，唯一结构差异是 `unwrap_or_else` 里的 `panic!(...)` 被包成块表达式，语义不变；修好后 `fmt --all --check` 退出 0，`cloud_live_resources_test` 仍 8/8 绿。
+
 ---
 
 ## G-4：22 项 EX + 计划级 `VERDICT: PASS`

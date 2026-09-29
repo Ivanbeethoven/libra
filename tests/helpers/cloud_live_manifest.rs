@@ -97,8 +97,17 @@ pub fn validate_manifest_schema(payload: &serde_json::Value) -> Result<(), Strin
         return Err(format!("manifest schema must be `{MANIFEST_SCHEMA}`"));
     }
     let expected: std::collections::BTreeSet<&str> = [
-        "schema", "source", "recovery", "run", "resources", "global_preimage",
-        "backup", "local_restore", "writer_slots", "restore_target_slots", "mac_key_id",
+        "schema",
+        "source",
+        "recovery",
+        "run",
+        "resources",
+        "global_preimage",
+        "backup",
+        "local_restore",
+        "writer_slots",
+        "restore_target_slots",
+        "mac_key_id",
     ]
     .into_iter()
     .collect();
@@ -140,7 +149,10 @@ pub fn validate_manifest_schema(payload: &serde_json::Value) -> Result<(), Strin
 
     // writer/restore slot entries must be objects.
     for key in ["writer_slots", "restore_target_slots"] {
-        let arr = obj.get(key).and_then(serde_json::Value::as_array).ok_or_else(|| format!("manifest.{key} must be an array"))?;
+        let arr = obj
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("manifest.{key} must be an array"))?;
         for slot in arr {
             if !slot.is_object() {
                 return Err(format!("manifest.{key} entries must be objects"));
@@ -153,7 +165,12 @@ pub fn validate_manifest_schema(payload: &serde_json::Value) -> Result<(), Strin
         .get("resources")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "manifest.resources must be an object".to_string())?;
-    for k in ["d1_account_id", "d1_database_id", "r2_account_id", "r2_bucket"] {
+    for k in [
+        "d1_account_id",
+        "d1_database_id",
+        "r2_account_id",
+        "r2_bucket",
+    ] {
         if resources
             .get(k)
             .and_then(serde_json::Value::as_str)
@@ -174,7 +191,9 @@ pub fn validate_manifest_schema(payload: &serde_json::Value) -> Result<(), Strin
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "manifest.run.expires_at must be a string".to_string())?;
     if !is_rfc3339_utc(run_expires) {
-        return Err(format!("manifest.run.expires_at must be UTC no-fractional: {run_expires}"));
+        return Err(format!(
+            "manifest.run.expires_at must be UTC no-fractional: {run_expires}"
+        ));
     }
     Ok(())
 }
@@ -203,7 +222,9 @@ pub fn validate_grant(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "grant.mode missing".to_string())?;
     if !matches!(mode, "write" | "probe" | "recovery") {
-        return Err(format!("grant.mode must be write|probe|recovery, got `{mode}`"));
+        return Err(format!(
+            "grant.mode must be write|probe|recovery, got `{mode}`"
+        ));
     }
     let run_id = obj
         .get("run_id")
@@ -238,13 +259,17 @@ pub fn validate_grant(
         return Err(format!("grant.run_id {run_id} != expected {expect_run_id}"));
     }
     if attempt != expect_attempt {
-        return Err(format!("grant.attempt {attempt} != expected {expect_attempt}"));
+        return Err(format!(
+            "grant.attempt {attempt} != expected {expect_attempt}"
+        ));
     }
     if r#ref != expect_ref {
         return Err(format!("grant.ref `{ref}` != expected `{expect_ref}`"));
     }
     if head_sha != expect_head_sha {
-        return Err(format!("grant.head_sha `{head_sha}` != expected `{expect_head_sha}`"));
+        return Err(format!(
+            "grant.head_sha `{head_sha}` != expected `{expect_head_sha}`"
+        ));
     }
     let _ = nonce;
     Ok(())
@@ -272,10 +297,14 @@ pub fn validate_writer_slots(payload: &serde_json::Value) -> Result<(), String> 
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| "writer slot missing r2_prefix".to_string())?;
         if prefix != format!("{repo_id}/") {
-            return Err(format!("writer slot r2_prefix must be exactly `{repo_id}/`"));
+            return Err(format!(
+                "writer slot r2_prefix must be exactly `{repo_id}/`"
+            ));
         }
         if !repo_id.starts_with("test-repo-") {
-            return Err(format!("writer slot repo_id must be `test-repo-<uuid>`, got `{repo_id}`"));
+            return Err(format!(
+                "writer slot repo_id must be `test-repo-<uuid>`, got `{repo_id}`"
+            ));
         }
         if seen.insert(repo_id, ()).is_some() {
             return Err(format!("duplicate writer slot repo_id `{repo_id}`"));
@@ -317,7 +346,10 @@ mod tests {
         let mut m = manifest();
         validate_manifest_schema(&m).expect("valid manifest");
         // writer_slots here are unsorted (b then a) -> should fail ascending.
-        assert!(validate_writer_slots(&m).is_err(), "unsorted writer_slots must fail");
+        assert!(
+            validate_writer_slots(&m).is_err(),
+            "unsorted writer_slots must fail"
+        );
         // Now provide sorted.
         m["writer_slots"] = serde_json::json!([
             {"slot_id":"s1","repo_id":"test-repo-a","repo_name":"a","r2_prefix":"test-repo-a/","owner":"o","expires_at":"2099-01-01T00:00:00Z"},
@@ -348,8 +380,14 @@ mod tests {
             "nonce":"ab".repeat(32), "owner":"genedna","expires_at":"2099-01-01T00:00:00Z"
         });
         assert!(validate_grant(&g, 42, 1, "refs/tags/v0.30.8", &"a".repeat(40)).is_ok());
-        assert!(validate_grant(&g, 43, 1, "refs/tags/v0.30.8", &"a".repeat(40)).is_err(), "run mismatch must fail");
-        assert!(validate_grant(&g, 42, 1, "refs/heads/main", &"a".repeat(40)).is_err(), "ref mismatch must fail");
+        assert!(
+            validate_grant(&g, 43, 1, "refs/tags/v0.30.8", &"a".repeat(40)).is_err(),
+            "run mismatch must fail"
+        );
+        assert!(
+            validate_grant(&g, 42, 1, "refs/heads/main", &"a".repeat(40)).is_err(),
+            "ref mismatch must fail"
+        );
     }
 
     #[test]

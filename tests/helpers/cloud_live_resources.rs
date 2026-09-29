@@ -73,8 +73,9 @@ pub fn slots_dir() -> PathBuf {
 /// Load the pre-allocated writer slots, or fail closed if absent.
 pub fn load_writer_slots() -> Vec<WriterSlot> {
     let path = slots_dir().join("slots.json");
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("failed to read {path:?}: {err}; run tests/cloud_live_prepare.sh first"));
+    let data = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!("failed to read {path:?}: {err}; run tests/cloud_live_prepare.sh first")
+    });
     serde_json::from_str(&data)
         .unwrap_or_else(|err| panic!("invalid slots.json at {path:?}: {err}"))
 }
@@ -163,13 +164,8 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     // YYYY-MM-DDTHH:MM:SSZ (GC-CM-15: UTC, no fractional seconds).
     let s = s.strip_suffix('Z')?;
     let dt = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok()?;
-    Some(
-        SystemTime::UNIX_EPOCH
-            + Duration::from_secs(dt.and_utc().timestamp().max(0) as u64),
-    )
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(dt.and_utc().timestamp().max(0) as u64))
 }
-
-
 
 /// Authorized cleanup scope derived from a validated manifest (GC-CM-15).
 /// RECOVERY-CLEANUP may only delete the union of the `writer_slots` and the
@@ -213,7 +209,9 @@ pub fn authorized_cleanup_scope(
             .ok_or_else(|| "writer_slots entry missing r2_prefix".to_string())?;
         let expected = format!("{repo_id}/");
         if prefix != expected {
-            return Err(format!("writer slot r2_prefix must be exactly `{expected}`"));
+            return Err(format!(
+                "writer slot r2_prefix must be exactly `{expected}`"
+            ));
         }
         d1_repo_ids.insert(repo_id.to_string());
         r2_prefixes.push(prefix.to_string());
@@ -260,18 +258,30 @@ pub fn reject_unregistered_sink_write(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn cleanup_scope_is_bounded_and_fails_on_unregistered_target() {
         use crate::helpers::cloud_live_resources::*;
         let slots = vec![
-            WriterSlot { slot_id:"s1".into(), repo_id:"test-repo-a".into(), repo_name:"a".into(), r2_prefix:"test-repo-a/".into(), owner:"o".into(), expires_at:"2099-01-01T00:00:00Z".into() },
-            WriterSlot { slot_id:"s2".into(), repo_id:"test-repo-b".into(), repo_name:"b".into(), r2_prefix:"test-repo-b/".into(), owner:"o".into(), expires_at:"2099-01-01T00:00:00Z".into() },
+            WriterSlot {
+                slot_id: "s1".into(),
+                repo_id: "test-repo-a".into(),
+                repo_name: "a".into(),
+                r2_prefix: "test-repo-a/".into(),
+                owner: "o".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            },
+            WriterSlot {
+                slot_id: "s2".into(),
+                repo_id: "test-repo-b".into(),
+                repo_name: "b".into(),
+                r2_prefix: "test-repo-b/".into(),
+                owner: "o".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            },
         ];
         let manifest = serde_json::json!({
             "writer_slots": [
@@ -285,7 +295,10 @@ mod tests {
         let scope = authorized_cleanup_scope(&manifest, &slots).expect("valid scope");
         assert!(scope.d1_repo_ids.contains("test-repo-a"));
         assert!(scope.d1_repo_ids.contains("test-repo-b"));
-        assert_eq!(scope.r2_prefixes, vec!["test-repo-a/".to_string(), "test-repo-b/".to_string()]);
+        assert_eq!(
+            scope.r2_prefixes,
+            vec!["test-repo-a/".to_string(), "test-repo-b/".to_string()]
+        );
 
         // Unregistered restore target must fail closed.
         let bad = serde_json::json!({
