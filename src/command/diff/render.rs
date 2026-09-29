@@ -4,6 +4,7 @@
 #![allow(unused_imports)]
 use super::*;
 use crate::utils::{output::emit_json_data, pager::Pager};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::{
     cell::RefCell,

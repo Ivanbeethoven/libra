@@ -2161,6 +2161,7 @@ pub(crate) fn render_remove_worktree(result: &WorktreeRemoveOutput, output: &Out
     Ok(())
 }
 
+#[cfg(unix)]
 pub(crate) fn umount_fuse_path(path: String, cleanup: bool) -> WorktreeResult<WorktreeUmountOutput> {
     let target = resolve_path(&path, "FUSE worktree path")?;
     let mountpoint = fuse_utils::resolve_task_worktree_mountpoint_arg(&target);
@@ -2201,6 +2202,7 @@ pub(crate) fn umount_fuse_path(path: String, cleanup: bool) -> WorktreeResult<Wo
     })
 }
 
+#[cfg(unix)]
 pub(crate) fn render_umount_fuse_path(result: &WorktreeUmountOutput, output: &OutputConfig) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("worktree.umount", result, output);

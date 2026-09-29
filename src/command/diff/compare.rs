@@ -3,6 +3,7 @@
 #![allow(unused_imports)]
 use super::*;
 
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::{
     cell::RefCell,

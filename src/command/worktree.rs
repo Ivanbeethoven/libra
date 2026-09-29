@@ -749,6 +749,8 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             let result = umount_fuse_path(path, cleanup).map_err(WorktreeError::into_cli_error)?;
             render_umount_fuse_path(&result, output)
         }
+        #[cfg(not(unix))]
+        WorktreeSubcommand::Umount { .. } => Ok(()),
         WorktreeSubcommand::Doctor {
             workspace_id,
             limit,
