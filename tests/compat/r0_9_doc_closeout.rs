@@ -131,12 +131,12 @@ fn status_docs_carry_the_warning_code_and_source_table() {
 /// without a matching doc update. Reads the `io_blocked_reason_and_code`
 /// match arms rather than a hand-copied list.
 fn implemented_io_blocked_reasons() -> Vec<String> {
-    let source = read("src/command/status.rs");
+    let source = read("src/command/status/output.rs");
     let body = source
         .split_once("fn io_blocked_reason_and_code(")
         .and_then(|(_, rest)| rest.split_once("\n}\n"))
         .map(|(body, _)| body.to_string())
-        .expect("src/command/status.rs must define io_blocked_reason_and_code");
+        .expect("src/command/status/output.rs must define io_blocked_reason_and_code");
     let mut reasons = Vec::new();
     for arm in body.split("IoBlockedReason::").skip(1) {
         // The first string literal after the variant is the wire value.

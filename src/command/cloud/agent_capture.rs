@@ -174,7 +174,7 @@ fn validate_agent_capture_restore_row_budget(
     Ok(())
 }
 
-pub(super) struct AgentCaptureRestoreRows<'a> {
+pub(crate) struct AgentCaptureRestoreRows<'a> {
     pub(super) sessions: &'a [AgentSessionV2Row],
     pub(super) checkpoints: &'a [AgentCheckpointV2Row],
     pub(super) claims: &'a [AgentSubagentContentClaimRow],

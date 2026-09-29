@@ -463,7 +463,7 @@ async fn repair_audit_rows(repo: &Path) -> Vec<(String, String)> {
     let conn = Database::connect(opts).await.expect("open repo db");
     conn.query_all_raw(Statement::from_string(
         DatabaseBackend::Sqlite,
-        "SELECT command_name, status FROM operation WHERE command_name = 'worktree repair' \
+        "SELECT command_name, status FROM operation WHERE command_name = 'worktree' \
          ORDER BY op_id",
     ))
     .await
@@ -536,7 +536,7 @@ async fn fuse_repair_shares_one_audit_boundary_with_core_repair() {
         1,
         "exactly one audit row covers the combined repair: {rows:?}"
     );
-    assert_eq!(rows[0].1, "succeeded");
+    assert_eq!(rows[0].1, "success");
 }
 
 /// The same boundary, failing: a FUSE-state repair error must close the ONE
