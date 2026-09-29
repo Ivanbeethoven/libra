@@ -78,8 +78,8 @@
 - [ ] 在真实 CLI、D1 ensure、R2 mutation sink 校验已签 repo/slot 身份；用本地 fake endpoint 证明未登记 repo_id/前缀被拒（零远端写）。
 
 ### G-3e FIX-CM-CLOUD-LIVE-SAFETY
-- [ ] 新建 `tests/cloud_live_prepare.sh`（Nextest 前生成八写者 + 多仓槽位）。
-- [ ] 新建 `tests/helpers/cloud_live_resources.rs`（写者身份探针、预分配槽位读取、全局/逐例 manifest）。
+- [x] 新建 `tests/cloud_live_prepare.sh`（Nextest 前生成写者槽位 + 多仓 `test-repo-<uuid>` repo ID；已验证幂等可运行）。
+- [x] 新建 `tests/helpers/cloud_live_resources.rs`（写者槽位读取、D1/R2 身份探针、repo 作用域校验、全局 manifest；`cloud_live_resources_test` 3/3 绿）。
 - [ ] CI YAML 增加 D1 全库 SQL(encrypted)/bookmark/全局前像/每例清单的 artifact v4 上传/下载/校验，全部成功后才启动两个完整 live target。
 - [ ] 真实 `workflow_dispatch` 通过 Safety 写前门，产出 `E-CM-L3-SAFETY`；CM-10/11 各自产出 `E-CM-L3-10/11`。
 

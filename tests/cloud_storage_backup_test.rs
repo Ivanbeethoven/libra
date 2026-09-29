@@ -1869,7 +1869,9 @@ async fn fsck_heal_restores_object_from_durable_tier() {
             .as_u64()
             .expect("heal.unrecoverable"),
         0,
-        "every object is present in the durable tier, so nothing is unrecoverable"
+        "every object is present in the durable tier, so nothing is unrecoverable; \
+         heal messages: {:?}",
+        json["data"]["heal"]["messages"]
     );
     assert!(
         commit_obj_path.exists(),

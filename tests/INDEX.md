@@ -222,6 +222,7 @@ dedicated feature-on steps.
 |---|---|---|---|
 | `cloud_storage_backup_test` | 5 | D1/R2 backup + restore round-trip, no-skip live gate and local preflight | `src/command/cloud.rs`, `src/utils/d1_client.rs`, `src/utils/client_storage.rs` |
 | `agent_cloud_tombstone_test` | 5 | A0-10 deferral guard: a local agent-capture erase does not propagate a tombstone to the D1 mirror (skips without `test-live-cloud` + `LIBRA_D1_*`) | `src/utils/d1_client.rs`, `src/internal/ai/history.rs` |
+| `cloud_live_resources_test` | 5 | plan-20260927 GC-CM-12 writer-slot / identity / manifest helper; runs in the default L1 suite (no real D1/R2) | `tests/helpers/cloud_live_resources.rs`, `tests/cloud_live_prepare.sh` |
 | `storage_r2_test` | 5 | Object store R2 path | `src/utils/client_storage.rs` |
 
 ## Wave 6 — Performance smoke (LIBRA_RUN_PERF=1)

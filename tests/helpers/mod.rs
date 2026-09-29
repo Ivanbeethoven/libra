@@ -6,7 +6,8 @@
 #[allow(dead_code)]
 pub mod mock_codex;
 #[allow(dead_code)]
-#[allow(dead_code)]
 pub mod mock_completion_model;
 #[allow(dead_code)]
 pub mod mock_provider_server;
+
+pub mod cloud_live_resources;
