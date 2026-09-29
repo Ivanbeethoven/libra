@@ -251,6 +251,10 @@ name = "compat_diff_production_expect_guard"
 path = "tests/compat/diff_production_expect_guard.rs"
 
 [[test]]
+name = "cloud_live_resources_test"
+path = "tests/cloud_live_resources_test.rs"
+
+[[test]]
 name = "compat_object_hash_parsing_guard"
 path = "tests/compat/compat_object_hash_parsing_guard.rs"
 
