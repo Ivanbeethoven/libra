@@ -115,6 +115,25 @@
 - [ ] 由具名独立 reviewer 对 22 条 `EX-CM-*`（准确分子，如 CM-02 `AC=39/8`、CM-13 `AC=34/8`）逐一书面同意。
 - [ ] 全部通过后，在 `plan-status.md` 把对应卡 `Lifecycle/Acceptance` 由 `in-progress`/空 更新为 `done`/完整，并删除或关闭本临时计划。
 
+### G-4 计划级证据整理（2026-09-29 独立远端核实 @ `2c66f86`）
+
+**已核实（本轮以 `gh`/`libra` 直接读回，非转引 `plan-status.md`）：**
+
+| 证据 | 实测 | 核实来源 |
+|---|---|---|
+| `v0.30.8` 已发布 | annotated tag `v0.30.8`，tag 对象 `bd083fa9d9a05604ac0b9d5bc8a8b8df4d66ff53`，tagger `Eli Ma`，message `Release v0.30.8`，创建 `2026-09-29T14:28:09Z`，非 draft/prerelease | `gh release view v0.30.8`、`gh api repos/libra-tools/libra/git/tags/<oid>` |
+| `release.yml` 8/8 绿 | run `36582964833`：`build-and-upload`×4（`aarch64-unknown-linux-gnu`/`x86_64-pc-windows-msvc`/`aarch64-apple-darwin`/`x86_64-unknown-linux-gnu`）+ `update-homebrew-tap` + `request-stable-manifest` + `upload-install-scripts` + `verify-homebrew-formula` 全 `success` | `gh run view 36582964833 --json jobs` |
+| peeled commit | `0358668d220000e03704aef6c7206a45eae651ba`（"…; bump to v0.30.8"），且**是 `main` 的祖先** | `gh api` + `libra merge-base --is-ancestor` |
+| 版本面未被本计划触碰 | `main` 上 `Cargo.toml`/`install.sh`/`install.ps1` 各 1 处 `0.30.8`，与执行规则「不 bump」一致 | `grep -c` |
+| live-compat 真 D1/R2 21/21 | run `36602151296` job `compat-live-cloud` success；日志 `test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 539.84s`（另 1 处 `1 passed`） | `gh run view 36602151296 --log` |
+| 制品通道 | release 的 GitHub assets 为空是**预期**：`release.yml` 首行为 `Build and Release to R2`，产物经 R2/CDN 发布 | `.github/workflows/release.yml:1` |
+
+**未在本树独立复现：** 「nextest 8274/8274 绿」目前仅为 `plan-status.md` 的发布者 attest。复现需 `source .env.test && source .env.live-test`，而本计划 D-CM-STD（`plan-20260927.md:202`）明令：在写前门证明默认解析仍为 `local/tiered=false` 之前，不得带 live 凭据跑默认全量。故本轮**刻意不跑**，留待发布者在通过 D-CM-STD 预检的树上执行。
+
+**残留风险（建议纳入评审口径）：** `gh api … .verification.verified=false`，`reason=unknown_key` —— GitHub 侧无法验证 `v0.30.8` tag 签名（签名者公钥未注册到 GitHub 账号）。D-CM-STD 要求「独立读回远端 annotated tag 对象 OID、**签名验证**和 peeled commit SHA」，若此项须由第三方在 GitHub 界面完成，则当前**不满足**；若只要求本地 `libra tag -v`，请评审明确记录该口径。
+
+**阻断性发现：步骤 1 的前提不成立。** 步骤 1 要求整理「**实现已完成**」的证据，但 `plan-20260927.md` 的 22 张卡当前**无一张** `Lifecycle/Acceptance` 为 `done`/完整。故本轮只整理了「已发布 + 已绿」的部分并保持本项未勾选；「实现已完成」须待 22 卡按依赖序逐卡 `done` 后重述。
+
 **关键文件：** `docs/development/plan/plan-20260927.md`（评审记录/修订历史），`docs/development/plan/plan-status.md`。
 
 ---
