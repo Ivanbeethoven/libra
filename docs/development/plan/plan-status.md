@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照日期见本文件头；每次更新必须把日期改到当天。
 >
-> **当前快照：** 2026-09-29（推进 plan-20260927：FIX-CM-01/04/08、CM-02/03/05/07/08/09/11/12/13 本地实现+验证；全量 nextest 8273/8273 绿（bd4a8e357）；`worktree-fuse` feature 编译+`fuse_repair_*` 2/2 绿（FIX-CM-04 契约修正与 ADR-CM-01 `#[path]` 声明）。其余行沿用原 2026-09-28 快照，未逐项复核）。
+> **当前快照：** 2026-09-29（plan-20260927：核心结构拆分已实现+验证；全量 nextest 8274/8274 绿；发布 `v0.30.8` 全平台成功（Linux amd64/arm64、macOS、Windows build+upload+homebrew+install-scripts+stable-manifest 8/8 job 绿）；Windows 跨编译修复；Cloudflare D1 错误消息上浮修复；live-compat 真实 D1/R2 20/21（`cloud_sync_name_conflict` 已修，`fsck_heal` 待查）。仍待：Cloud FIX 卡受保护环境协议、FIX-CM-WT-MOVE 的 DEP-CM-WT-COMPAT、22 项 EX 批准与计划级 Claude `VERDICT: PASS`）。其余行沿用原快照，未逐项复核）。
 
 ---
 
