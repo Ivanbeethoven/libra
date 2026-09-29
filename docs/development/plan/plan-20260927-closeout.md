@@ -12,7 +12,7 @@
 
 | 剩余项 | 卡点本质 | 目标（checklist 验收） |
 |---|---|---|
-| G-1 `fsck_heal_restores_object_from_durable_tier` live 测试（20/21） | Cloud 备份补全性 bug（某可达对象未进 R2） | live `--features test-live-cloud` 下 21/21 |
+| G-1 `fsck_heal_restores_object_from_durable_tier` live 测试（已修，21/21） | 测试未先 `cloud sync`，blob 未进 R2 → 已修复 | live `--features test-live-cloud` 21/21 已确认 |
 | G-2 FIX-CM-WT-MOVE（EXDEV move） | 旧二进制 patch 兼容性**决策** | 给出补丁兼容源证 ≤ scope；否则呈 breaking/minor 方案 |
 | G-3 4 个 Cloud FIX 卡（LIVE-GATE 接线 + RECOVERY-AUTH/CLEANUP/REPO-SCOPE/LIVE-SAFETY） | CI/环境/受保护协议工程 | `cloud_live_prepare.sh`/`cloud_live_resources.rs` 等基建落地 + live 受保护 dispatch 通过 |
 | G-4 22 项 EX 批准 + 计划级 Claude `VERDICT: PASS` | **外部评审流程** | 字面 PASS + 具名 reviewer 逐条 EX 同意 |
@@ -29,14 +29,14 @@
 3. fsck 的 `collect_heal_candidates`（`fsck.rs:802` 起）通过 refs/reflogs/index 发现的对象超出 sync 上传范围（例如只被 `extra_roots` 或 reflog 引用、sync 未覆盖）。
 
 **具体动作（按序）：**
-- [ ] **复现与取证**：在 live workflow 的 `compat-live-cloud` job 中打印 `run_heal_pass` 的 `report.messages`（含 `unrecoverable: ‹hash›`），记录具体 OID 与 `o_type`（commit/tree/blob/agent_*）。
+- [x] **复现与取证**：诊断 live run 捕获 `unrecoverable: 539399e63d9f31286e022b931cc2ab29f8107cdb`（blob "durable heal\n"）；测试未先 `cloud sync`，blob 未进 R2。
 - [ ] **对照存储**：对同 repo 列举 R2 前缀下 key；查本地 `object_index` 行，确认该 OID 是否有行、`is_synced` 值。
 - [ ] **定位漏点**：
   - 若 `object_index` 无该行 → 修写入路径（`client_storage.rs` 写对象后确保入对象索引；`db.rs:1200/1261` 的登记点）。
   - 若有行但 `is_synced=1` 却不在 R2 → 修 sync 的 `exist_batch`/上传时序（`sync.rs:157` 起批量上传），保证「标已同步」仅在确实上传成功后发生。
   - 若 fsck 发现对象不被 sync 覆盖 → 让 sync 也上传 reflog/`extra_roots` 可达对象，或调整 fsck 候选集。
 - [ ] **加回归**：新增一个测试，构造「离库对象在 R2 存在」场景，断言 `--heal` 后 `unrecoverable==0` 且全部愈合；若本地可跑则并入 `cloud_storage_backup_test`，否则只在 live 门（`cloud_live_no_skip.sh`）下运行。
-- [ ] **验证**：重新 dispatch 受保护 `workflow_dispatch`（v0.30.8 或下一个 release SHA），观察 `compat-live-cloud` 21/21。
+- [x] **验证**：dispatch `main`（含 `cloud sync` 修复）live runs，`compat-live-cloud` **21/21** 绿（`fsck_heal`、`cloud_sync_name_conflict` 均 ok）。
 
 **关键文件：** `src/utils/client_storage.rs`、`src/internal/db.rs`、`src/command/cloud/sync.rs`、`src/command/fsck.rs`、`tests/cloud_storage_backup_test.rs`、`.github/workflows/live-compat.yml`。
 
