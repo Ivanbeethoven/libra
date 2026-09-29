@@ -696,6 +696,51 @@ fn restore_index_tracked(
     let mut file_paths = filter_paths(&index.tracked_files(), pathspecs);
     file_paths.extend(deleted_files_index);
 
+    // Batch-resolve the blob lengths needed to author NEW index entries.
+    //
+    // The helper below otherwise loads an entire blob just to read `data.len()`. On a
+    // fresh worktree every path is new, so that is one full object load (and decompress)
+    // per entry — the dominant cost of `restore --staged` on a large tree. Sizes are
+    // the decoded length, so they cannot come from an on-disk byte count; `object_sizes`
+    // answers them without materializing any payload, in one storage-runtime round trip.
+    // Unique hashes are deduplicated because one blob is commonly referenced by several
+    // paths.
+    let mut size_cache: Option<HashMap<ObjectHash, u32>> = None;
+    {
+        let mut needed: Vec<ObjectHash> = Vec::new();
+        let mut seen: HashSet<ObjectHash> = HashSet::new();
+        for path in &file_paths {
+            if index.tracked(path_to_utf8_typed(path)?, 0) {
+                continue;
+            }
+            if let Some(target) = target_map.get(path)
+                && !matches!(target.mode, Some(TreeItemMode::Commit))
+                && seen.insert(target.hash)
+            {
+                needed.push(target.hash);
+            }
+        }
+        if !needed.is_empty() {
+            match util::objects_storage().object_sizes(&needed) {
+                Ok(sizes) => {
+                    let mut cache: HashMap<ObjectHash, u32> = HashMap::with_capacity(needed.len());
+                    for (hash, size) in needed.into_iter().zip(sizes) {
+                        if let Some(size) = size.and_then(|s| u32::try_from(s).ok()) {
+                            cache.insert(hash, size);
+                        }
+                    }
+                    size_cache = Some(cache);
+                }
+                // Fall back to per-object loads; the error surface is unchanged.
+                Err(error) => tracing::warn!(
+                    count = needed.len(),
+                    %error,
+                    "batch object-size lookup failed; falling back to per-object loads"
+                ),
+            }
+        }
+    }
+
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
 
@@ -708,7 +753,7 @@ fn restore_index_tracked(
                     index_entry_from_target(
                         path_str.to_string(),
                         *target,
-                        restore_target_index_size(*target)?,
+                        restore_target_index_size(*target, size_cache.as_mut())?,
                     ),
                 );
                 restored.push(path.display().to_string());
@@ -726,7 +771,7 @@ fn restore_index_tracked(
                     index_entry_from_target(
                         path_str.to_string(),
                         *target,
-                        restore_target_index_size(*target)?,
+                        restore_target_index_size(*target, size_cache.as_mut())?,
                     ),
                 );
                 restored.push(path.display().to_string());
@@ -1643,12 +1688,34 @@ fn remove_worktree_path_for_restore(path: &Path) -> Result<(), RestoreError> {
     }
 }
 
-fn restore_target_index_size(target: RestoreTarget) -> Result<u32, RestoreError> {
+/// Resolve the index `size` for `target`, preferring `size_cache` over a full object
+/// load.
+///
+/// The naive form needs `blob.data.len()`. That is the DECODED length, so it cannot be
+/// obtained from an on-disk byte count without materializing the blob. Callers that
+/// author many entries at once (a fresh worktree makes every path new) prime a
+/// batch-resolved cache instead, because one full load per entry dominates
+/// `restore --staged` on a large tree. On a miss the length is obtained the original
+/// way and written back, so repeated references to one blob cost at most one load and
+/// the error surface is unchanged.
+fn restore_target_index_size(
+    target: RestoreTarget,
+    size_cache: Option<&mut HashMap<ObjectHash, u32>>,
+) -> Result<u32, RestoreError> {
     if matches!(target.mode, Some(TreeItemMode::Commit)) {
         return Ok(0);
     }
+    if let Some(cache) = size_cache.as_deref()
+        && let Some(size) = cache.get(&target.hash)
+    {
+        return Ok(*size);
+    }
     let blob = load_object::<Blob>(&target.hash).map_err(|_| RestoreError::ReadObject)?;
-    u32::try_from(blob.data.len()).map_err(|_| RestoreError::ReadObject)
+    let size = u32::try_from(blob.data.len()).map_err(|_| RestoreError::ReadObject)?;
+    if let Some(cache) = size_cache {
+        cache.insert(target.hash, size);
+    }
+    Ok(size)
 }
 
 fn conflict_payload_is_executable(index: &Index, path: &str) -> bool {
