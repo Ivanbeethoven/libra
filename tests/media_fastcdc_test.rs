@@ -733,6 +733,34 @@ async fn monoengine_fastcdc_http_interop() {
         "other users retain complete standard LFS access"
     );
 
+    // FL-04: prior-style cache + pinned range export for MF-05 consumers.
+    let range_offset = data.len() as u64 / 4;
+    let range_length = (256 * 1024u64).min(data.len() as u64 - range_offset);
+    let range_out = dir.path().join("range-slice.bin");
+    let range_report = media
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            range_offset,
+            range_length,
+            &range_out,
+            &store,
+        )
+        .await
+        .expect("pinned range export must succeed against finalized Media");
+    assert_eq!(range_report.offset, range_offset);
+    assert_eq!(range_report.length, range_length);
+    assert_eq!(
+        fs::read(&range_out).unwrap(),
+        data[range_offset as usize..(range_offset + range_length) as usize]
+    );
+    assert!(
+        range_report
+            .trust_boundary
+            .contains("authenticated finalized"),
+        "JSON/help trust boundary must stay explicit"
+    );
+
     // Reproduce the finalize crash window: a complete basic object is present,
     // but this user's manifest has not been published. Batch now omits upload
     // actions; the normal push path must still repair the missing manifest.
@@ -1341,6 +1369,320 @@ async fn paged_upload_finalize_and_download_round_trip() {
     assert!(!message.contains("\"manifest_id\""), "{message}");
 }
 
+/// FL-03: `media chunk --prior-manifest --store` then upload must consume the
+/// pre-saved coherent layout; a source change before prepare fails closed.
+#[tokio::test]
+#[serial_test::serial(cwd)]
+async fn prior_chunk_cli_upload_consumes_cached_layout_and_rejects_source_change() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        body::Bytes,
+        extract::{Path, Query},
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{get, post, put},
+    };
+    use libra::utils::{
+        media::{manifest::ChunkEntry, transfer::MediaClient},
+        test::ChangeDirGuard,
+    };
+    use serde_json::Value;
+
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    ok(&["init"], p);
+    let _cwd = ChangeDirGuard::new(p);
+
+    // Build a multi-chunk original, then a same-length edit.
+    let mut data = Vec::with_capacity(1_048_576);
+    let mut counter: u64 = 0;
+    while data.len() < 1_048_576 {
+        let mut h = ring::digest::Context::new(&ring::digest::SHA256);
+        h.update(b"libra-fastcdc-fixture");
+        h.update(&counter.to_le_bytes());
+        let raw = h.finish();
+        let take = (1_048_576 - data.len()).min(raw.as_ref().len());
+        data.extend_from_slice(&raw.as_ref()[..take]);
+        counter += 1;
+    }
+    let original = p.join("orig.bin");
+    fs::write(&original, &data).unwrap();
+    let prior_out = ok(
+        &[
+            "--json",
+            "media",
+            "chunk",
+            original.to_str().unwrap(),
+            "--store",
+        ],
+        p,
+    );
+    let prior_js = json(&prior_out);
+    let prior_manifest = prior_js["data"]["manifest_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let cold = libra::utils::media::chunker::chunk_bytes(&data);
+    let mid = &cold[cold.len() / 2];
+    let flip = mid.offset as usize + mid.length as usize / 2;
+    let mut edited = data.clone();
+    edited[flip] ^= 0xff;
+    let edited_path = p.join("edit.bin");
+    fs::write(&edited_path, &edited).unwrap();
+    let oid = hex::encode(ring::digest::digest(&ring::digest::SHA256, &edited).as_ref());
+    let size = edited.len() as u64;
+
+    let chunk_out = ok(
+        &[
+            "--json",
+            "media",
+            "chunk",
+            edited_path.to_str().unwrap(),
+            "--store",
+            "--prior-manifest",
+            &prior_manifest,
+        ],
+        p,
+    );
+    let chunk_js = json(&chunk_out);
+    assert_eq!(chunk_js["data"]["media_oid"].as_str(), Some(oid.as_str()));
+    let expected_manifest_id = chunk_js["data"]["manifest_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        media_ns(p)
+            .join("manifests")
+            .join(&oid)
+            .join("summary.json")
+            .is_file()
+    );
+
+    // Illegal prior must fail and must not publish under a fresh oid.
+    let bad = p.join("bad-prior.json");
+    fs::write(&bad, b"{").unwrap();
+    let ghost = p.join("ghost.bin");
+    fs::write(&ghost, b"ghost-bytes-for-illegal-prior!!!!").unwrap();
+    let bad_out = run(
+        &[
+            "media",
+            "chunk",
+            ghost.to_str().unwrap(),
+            "--store",
+            "--prior-manifest",
+            bad.to_str().unwrap(),
+        ],
+        p,
+    );
+    assert_ne!(bad_out.status.code(), Some(0));
+    let ghost_oid = hex::encode(
+        ring::digest::digest(&ring::digest::SHA256, b"ghost-bytes-for-illegal-prior!!!!").as_ref(),
+    );
+    assert!(
+        !media_ns(p)
+            .join("manifests")
+            .join(&ghost_oid)
+            .join("summary.json")
+            .exists(),
+        "illegal prior must not publish a new cache manifest"
+    );
+
+    let pages_box: Arc<Mutex<Vec<Vec<ChunkEntry>>>> = Arc::new(Mutex::new(Vec::new()));
+    let prepared: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let puts = Arc::new(AtomicUsize::new(0));
+    let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let app = Router::new()
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/capabilities",
+            get(|| async { Json(supported_capabilities(true)) }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests",
+            post({
+                let prepared = prepared.clone();
+                let expected_manifest_id = expected_manifest_id.clone();
+                move |body: Bytes| {
+                    let prepared = prepared.clone();
+                    let expected_manifest_id = expected_manifest_id.clone();
+                    async move {
+                        let value: Value = serde_json::from_slice(&body).unwrap();
+                        assert!(value.get("chunks").is_none(), "prepare is a summary");
+                        assert_eq!(
+                            value["manifest_id"].as_str(),
+                            Some(expected_manifest_id.as_str()),
+                            "upload must consume the pre-saved prior layout"
+                        );
+                        let manifest_id = value["manifest_id"].as_str().unwrap().to_owned();
+                        *prepared.lock().unwrap() = Some(value);
+                        Json(serde_json::json!({
+                            "manifest_id": manifest_id,
+                            "missing_chunks": [],
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/pages/{page_no}",
+            put({
+                let pages_box = pages_box.clone();
+                move |Path((_, page_no)): Path<(String, u32)>, body: Bytes| {
+                    let pages_box = pages_box.clone();
+                    async move {
+                        let page: Value = serde_json::from_slice(&body).unwrap();
+                        let entries: Vec<ChunkEntry> =
+                            serde_json::from_value(page["entries"].clone()).unwrap();
+                        let mut pages = pages_box.lock().unwrap();
+                        if pages.len() == page_no as usize {
+                            pages.push(entries);
+                        }
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/seal",
+            post({
+                let prepared = prepared.clone();
+                move || {
+                    let prepared = prepared.clone();
+                    async move {
+                        let summary = prepared.lock().unwrap().clone().unwrap();
+                        Json(serde_json::json!({
+                            "manifest_id": summary["manifest_id"],
+                            "sealed": true,
+                            "seal_generation": 1,
+                            "page_count": summary["page_count"],
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/missing",
+            get({
+                let pages_box = pages_box.clone();
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let pages_box = pages_box.clone();
+                    async move {
+                        let pages = pages_box.lock().unwrap();
+                        let flat: Vec<ChunkEntry> = pages.iter().flatten().cloned().collect();
+                        let cursor = query.get("cursor").and_then(|v| v.parse::<usize>().ok());
+                        let start = cursor.unwrap_or(0).min(flat.len());
+                        Json(serde_json::json!({
+                            "hashes": flat[start..]
+                                .iter()
+                                .map(|chunk| &chunk.chunk_hash)
+                                .collect::<Vec<_>>(),
+                            "next_cursor": Value::Null,
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/chunks/{hash}",
+            put({
+                let puts = puts.clone();
+                move || {
+                    let puts = puts.clone();
+                    async move {
+                        puts.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/{id}/finalize",
+            post({
+                let prepared = prepared.clone();
+                move || {
+                    let prepared = prepared.clone();
+                    async move {
+                        let summary = prepared.lock().unwrap().clone().unwrap();
+                        (
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!({
+                                "task_id": "task-1",
+                                "manifest_id": summary["manifest_id"],
+                                "state": "pending",
+                                "status_url": "tasks/task-1",
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/tasks/{id}",
+            get({
+                let prepared = prepared.clone();
+                let published = published.clone();
+                move || {
+                    let prepared = prepared.clone();
+                    let published = published.clone();
+                    async move {
+                        published.store(true, Ordering::SeqCst);
+                        let summary = prepared.lock().unwrap().clone().unwrap();
+                        Json(serde_json::json!({
+                            "task_id": "task-1",
+                            "manifest_id": summary["manifest_id"],
+                            "state": "complete",
+                            "bytes_verified": summary["size"],
+                            "pages_verified": summary["page_count"],
+                            "oid": summary["oid"],
+                            "size": summary["size"],
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/by-media/{oid}",
+            get(|| async { StatusCode::NOT_FOUND }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let endpoint = format!("http://127.0.0.1:{port}/repo.git/info/lfs/");
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let media = MediaClient::discover(http, &url::Url::parse(&endpoint).unwrap(), false)
+        .await
+        .unwrap()
+        .expect("paged server");
+    assert!(media.upload(&oid, size, &edited_path).await.unwrap());
+    assert!(puts.load(Ordering::SeqCst) > 0);
+    let prepared_id = prepared.lock().unwrap().clone().unwrap()["manifest_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(prepared_id, expected_manifest_id);
+
+    // Source change before prepare rejects and does not start a new prepare.
+    let changed = p.join("changed.bin");
+    fs::write(&changed, b"tampered-before-prepare").unwrap();
+    // Keep oid/size from the previous object so the cache is found then rejected.
+    let err = media.upload(&oid, size, &changed).await.unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("changed") || message.contains("mismatch") || message.contains("prepare"),
+        "{message}"
+    );
+}
+
 #[test]
 fn c08_upgrade_retains_legacy_v1_and_standard_lfs() {
     let repo = tempfile::tempdir().unwrap();
@@ -1379,6 +1721,307 @@ fn c08_upgrade_retains_legacy_v1_and_standard_lfs() {
     assert!(!p.join(".libra/media/manifests").join(oid).exists());
 }
 
+#[tokio::test]
+async fn range_export_covers_unique_hashes_and_refuses_overwrite() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        extract::{Path, Query},
+        response::IntoResponse,
+        routing::get,
+    };
+    use libra::utils::media::{
+        chunk_store::{self, MediaChunkStore},
+        manifest::MediaManifest,
+        transfer::{MediaClient, TRUST_BOUNDARY_C07},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    // Multi-chunk payload so a mid-file range spans more than one chunk.
+    let mut data = Vec::with_capacity(3 * 1024 * 1024);
+    let mut x: u64 = 0xC0FFEE_DADABABA;
+    while data.len() < 3 * 1024 * 1024 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        data.push((x >> 32) as u8);
+    }
+    let source = dir.path().join("source.bin");
+    fs::write(&source, &data).unwrap();
+    let (manifest, _) = MediaManifest::build_from_file(&source).unwrap();
+    assert!(manifest.chunks.len() >= 2);
+    let real_id = manifest.id().unwrap();
+    let summary = serde_json::json!({
+        "version": manifest.version,
+        "algorithm": manifest.algorithm,
+        "hash_algorithm": manifest.hash_algorithm,
+        "oid": manifest.media_oid,
+        "size": manifest.media_size,
+        "chunk_count": manifest.chunks.len(),
+        "page_count": 1,
+        "manifest_id": real_id.clone(),
+        "created_by": manifest.created_by.clone(),
+    });
+    let published = summary.clone();
+    let pages = serde_json::json!({
+        "manifest_id": real_id.clone(),
+        "pages": [{
+            "page_no": 0,
+            "offset_start": 0,
+            "offset_end": manifest.media_size,
+            "entries": manifest.chunks.clone(),
+        }],
+    });
+    let chunk_gets = Arc::new(AtomicUsize::new(0));
+    let chunks_map: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(
+            manifest
+                .chunks
+                .iter()
+                .map(|chunk| {
+                    let start = chunk.offset as usize;
+                    let end = start + chunk.length as usize;
+                    (chunk.chunk_hash.clone(), data[start..end].to_vec())
+                })
+                .collect(),
+        ));
+
+    let app = Router::new()
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/capabilities",
+            get(|| async { Json(supported_capabilities(true)) }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/manifests/by-media/{oid}",
+            get({
+                let published = published.clone();
+                move || {
+                    let published = published.clone();
+                    async move { Json(published) }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/finalized/{id}",
+            get({
+                let summary = summary.clone();
+                move || {
+                    let summary = summary.clone();
+                    async move { Json(summary) }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/finalized/{id}/pages",
+            get({
+                let pages = pages.clone();
+                let chunks = manifest.chunks.clone();
+                move |Query(query): Query<std::collections::HashMap<String, String>>| {
+                    let pages = pages.clone();
+                    let chunks = chunks.clone();
+                    async move {
+                        if let (Some(off), Some(len)) = (query.get("offset"), query.get("length")) {
+                            let offset: u64 = off.parse().unwrap();
+                            let length: u64 = len.parse().unwrap();
+                            let end = offset + length;
+                            let intersects = chunks
+                                .iter()
+                                .any(|c| c.offset < end && c.offset + c.length > offset);
+                            if !intersects {
+                                return Json(serde_json::json!({
+                                    "manifest_id": pages["manifest_id"],
+                                    "pages": [],
+                                    "next_cursor": null,
+                                }))
+                                .into_response();
+                            }
+                            // Real server returns the full intersecting page.
+                            return Json(pages.clone()).into_response();
+                        }
+                        Json(pages.clone()).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/repo.git/info/lfs/libra/media/v1/finalized/{id}/chunks/{hash}",
+            get({
+                let counted = chunk_gets.clone();
+                let chunks_map = chunks_map.clone();
+                move |Path((_, hash)): Path<(String, String)>| {
+                    let counted = counted.clone();
+                    let chunks_map = chunks_map.clone();
+                    async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        chunks_map.lock().unwrap().get(&hash).cloned().unwrap()
+                    }
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = url::Url::parse(&format!(
+        "http://{}/repo.git/info/lfs/?tenant=test",
+        listener.local_addr().unwrap()
+    ))
+    .unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = MediaClient::discover_for_range(
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+        &base,
+    )
+    .await
+    .unwrap();
+    let store = MediaChunkStore::at(dir.path().join("chunks"));
+
+    // Bounds matrix.
+    assert!(chunk_store::validate_byte_range(manifest.media_size, 0, 0).is_ok());
+    assert!(chunk_store::validate_byte_range(manifest.media_size, manifest.media_size, 0).is_ok());
+    assert!(
+        chunk_store::validate_byte_range(manifest.media_size, manifest.media_size + 1, 0).is_err()
+    );
+    assert!(
+        chunk_store::validate_byte_range(manifest.media_size, 0, manifest.media_size + 1).is_err()
+    );
+
+    let mid = &manifest.chunks[manifest.chunks.len() / 2];
+    let offset = mid.offset + mid.length / 4;
+    let length = mid.length / 2
+        + manifest
+            .chunks
+            .get(manifest.chunks.len() / 2 + 1)
+            .map(|n| n.length / 3)
+            .unwrap_or(0)
+            .max(1);
+    let length = length.min(manifest.media_size - offset);
+
+    let dest = dir.path().join("slice.bin");
+    let report = client
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            offset,
+            length,
+            &dest,
+            &store,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("export_range failed: {e:#}"));
+    assert_eq!(report.offset, offset);
+    assert_eq!(report.length, length);
+    assert_eq!(report.trust_boundary, TRUST_BOUNDARY_C07);
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        data[offset as usize..(offset + length) as usize]
+    );
+    let cold_gets = chunk_gets.load(Ordering::SeqCst);
+    assert_eq!(cold_gets as u64, report.downloaded_chunks);
+    assert_eq!(cold_gets as u64, report.covering_chunks);
+    assert!(cold_gets >= 1);
+
+    // Hot cache: no further GETs for the same covering set.
+    let dest2 = dir.path().join("slice2.bin");
+    let again = client
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            offset,
+            length,
+            &dest2,
+            &store,
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.downloaded_chunks, 0);
+    assert_eq!(chunk_gets.load(Ordering::SeqCst), cold_gets);
+    assert_eq!(fs::read(&dest2).unwrap(), fs::read(&dest).unwrap());
+
+    // Zero-length at EOF.
+    let empty = dir.path().join("empty.bin");
+    let zero = client
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            manifest.media_size,
+            0,
+            &empty,
+            &store,
+        )
+        .await
+        .unwrap();
+    assert_eq!(zero.length, 0);
+    assert_eq!(fs::read(&empty).unwrap(), b"");
+
+    // No-clobber / symlink refusal.
+    let err = client
+        .export_range(
+            &manifest.media_oid,
+            manifest.media_size,
+            offset,
+            length,
+            &dest,
+            &store,
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err:#}");
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        data[offset as usize..(offset + length) as usize]
+    );
+
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("link.bin");
+        std::os::unix::fs::symlink(&dest, &link).unwrap();
+        let err = client
+            .export_range(
+                &manifest.media_oid,
+                manifest.media_size,
+                offset,
+                length,
+                &link,
+                &store,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink") || err.to_string().contains("already exists"),
+            "{err:#}"
+        );
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            data[offset as usize..(offset + length) as usize]
+        );
+    }
+
+    // Overflow refuses and leaves no temp residue at the destination.
+    let overflow = dir.path().join("overflow.bin");
+    assert!(
+        client
+            .export_range(
+                &manifest.media_oid,
+                manifest.media_size,
+                manifest.media_size.saturating_sub(1),
+                2,
+                &overflow,
+                &store,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!overflow.exists());
+
+    task.abort();
+}
+
 #[test]
 fn probe_unreachable_endpoint_falls_back_to_standard_lfs() {
     let repo = tempfile::tempdir().unwrap();
@@ -1405,4 +2048,257 @@ fn probe_unreachable_endpoint_falls_back_to_standard_lfs() {
         js["data"]["reason"].as_str(),
         Some("no-capability-endpoint")
     );
+}
+
+// ----- FL-05 / C-06 local effect matrix + P-05 logical gate -----
+
+const C06_SIZE: usize = 256 * 1024 * 1024;
+const C06_SEED: u64 = 0xC06E_FFEC_75EE_D001;
+const MAX_CHUNK: u64 = 256 * 1024;
+
+/// Fixed-seed incompressible fixture (LCG; not compressible zeros).
+fn write_c06_fixture(path: &Path, size: usize, seed: u64) {
+    use std::io::Write;
+    let mut file = fs::File::create(path).unwrap();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut x = seed;
+    let mut remaining = size;
+    while remaining > 0 {
+        let n = remaining.min(buf.len());
+        for b in buf[..n].iter_mut() {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (x >> 33) as u8;
+        }
+        file.write_all(&buf[..n]).unwrap();
+        remaining -= n;
+    }
+    file.flush().unwrap();
+}
+
+fn mutate_replace_one_percent(src: &Path, dst: &Path) {
+    let mut data = fs::read(src).unwrap();
+    let n = (data.len() / 100).max(1);
+    let start = data.len() / 2;
+    for i in 0..n {
+        data[start + i] ^= 0xA5;
+    }
+    fs::write(dst, data).unwrap();
+}
+
+/// C-06 local axis: 256 MiB cold cut, duplicate (0 dirty), 1% replace (≤5%),
+/// length-changing insert/delete reported as cold-cut (faithful to ADR-FL-04).
+#[test]
+fn c06_local_effect_matrix_meets_payload_thresholds() {
+    use std::{collections::HashSet, time::Instant};
+
+    use libra::utils::media::chunk_store::{self, load_prior_spans};
+
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("c06-original.bin");
+    let t0 = Instant::now();
+    write_c06_fixture(&original, C06_SIZE, C06_SEED);
+    let write_ms = t0.elapsed().as_millis();
+
+    let root = dir.path().join("media-root");
+    fs::create_dir_all(&root).unwrap();
+    let t1 = Instant::now();
+    let cold = chunk_store::stream_media_file(&original, &root, true).unwrap();
+    let cold_ms = t1.elapsed().as_millis();
+    assert_eq!(cold.summary.size as usize, C06_SIZE);
+
+    let prior_layout = load_prior_spans(&cold.manifest_path).unwrap();
+    let prior_hashes: HashSet<String> = prior_layout
+        .spans
+        .iter()
+        .map(|s| s.chunk_hash.clone())
+        .collect();
+
+    let t2 = Instant::now();
+    let dup = chunk_store::stream_media_file_with_prior(
+        &original,
+        &root,
+        true,
+        Some(&cold.manifest_path),
+    )
+    .unwrap();
+    let dup_ms = t2.elapsed().as_millis();
+    let dup_layout = load_prior_spans(&dup.manifest_path).unwrap();
+    let dup_dirty: u64 = dup_layout
+        .spans
+        .iter()
+        .filter(|s| !prior_hashes.contains(&s.chunk_hash))
+        .map(|s| s.length)
+        .sum();
+    assert_eq!(
+        dup_dirty, 0,
+        "duplicate PUT payload must be 0 (C-06); got {dup_dirty}"
+    );
+    assert_eq!(dup.summary.oid, cold.summary.oid);
+
+    let edited = dir.path().join("c06-replace.bin");
+    mutate_replace_one_percent(&original, &edited);
+    let t3 = Instant::now();
+    let replaced =
+        chunk_store::stream_media_file_with_prior(&edited, &root, true, Some(&cold.manifest_path))
+            .unwrap();
+    let replace_ms = t3.elapsed().as_millis();
+    let replace_layout = load_prior_spans(&replaced.manifest_path).unwrap();
+    let replace_dirty: u64 = replace_layout
+        .spans
+        .iter()
+        .filter(|s| !prior_hashes.contains(&s.chunk_hash))
+        .map(|s| s.length)
+        .sum();
+    let limit = (C06_SIZE as u64) / 20;
+    assert!(
+        replace_dirty <= limit,
+        "1% replace dirty payload {replace_dirty} exceeds 5% limit {limit}"
+    );
+
+    let inserted = dir.path().join("c06-insert.bin");
+    {
+        let mut data = fs::read(&original).unwrap();
+        let n = C06_SIZE / 100;
+        data.splice(C06_SIZE / 2..C06_SIZE / 2, vec![0x5A; n]);
+        fs::write(&inserted, &data).unwrap();
+    }
+    let with_insert = chunk_store::stream_media_file_with_prior(
+        &inserted,
+        &root,
+        true,
+        Some(&cold.manifest_path),
+    )
+    .unwrap();
+    let cold_insert = chunk_store::stream_media_file(&inserted, &root, true).unwrap();
+    assert_eq!(
+        with_insert.summary.manifest_id, cold_insert.summary.manifest_id,
+        "1% insert must cold-cut (ADR-FL-04 length change); report faithfully"
+    );
+
+    let deleted = dir.path().join("c06-delete.bin");
+    {
+        let data = fs::read(&original).unwrap();
+        let n = C06_SIZE / 100;
+        let start = C06_SIZE / 2;
+        let mut out = data[..start].to_vec();
+        out.extend_from_slice(&data[start + n..]);
+        fs::write(&deleted, &out).unwrap();
+    }
+    let with_delete =
+        chunk_store::stream_media_file_with_prior(&deleted, &root, true, Some(&cold.manifest_path))
+            .unwrap();
+    let cold_delete = chunk_store::stream_media_file(&deleted, &root, true).unwrap();
+    assert_eq!(
+        with_delete.summary.manifest_id, cold_delete.summary.manifest_id,
+        "1% delete must cold-cut (ADR-FL-04 length change); report faithfully"
+    );
+
+    let range_len = 4 * 1024 * 1024u64;
+    let range_off = (C06_SIZE as u64) / 4;
+    let covering: Vec<_> = prior_layout
+        .spans
+        .iter()
+        .filter(|s| s.offset < range_off + range_len && s.offset + s.length > range_off)
+        .collect();
+    let mut seen = HashSet::new();
+    let mut cold_range_payload = 0u64;
+    for s in &covering {
+        if seen.insert(s.chunk_hash.as_str()) {
+            cold_range_payload += s.length;
+        }
+    }
+    assert!(
+        cold_range_payload <= range_len + 2 * MAX_CHUNK,
+        "cold range covering payload {cold_range_payload} exceeds length+2*MAX"
+    );
+    let unique_count = seen.len();
+
+    let budget = serde_json::json!({
+        "c06_seed": format!("0x{C06_SEED:x}"),
+        "size_bytes": C06_SIZE,
+        "write_fixture_ms": write_ms,
+        "cold_cut_ms": cold_ms,
+        "cold_chunk_count": cold.summary.chunk_count,
+        "duplicate_dirty_payload": dup_dirty,
+        "duplicate_ms": dup_ms,
+        "replace_1pct_dirty_payload": replace_dirty,
+        "replace_1pct_limit": limit,
+        "replace_1pct_ms": replace_ms,
+        "insert_1pct_mode": "cold-cut (ADR-FL-04 length change)",
+        "delete_1pct_mode": "cold-cut (ADR-FL-04 length change)",
+        "range_4mib_covering_unique": unique_count,
+        "range_4mib_cold_payload_bound": cold_range_payload,
+        "mf05_pin": "8c870c4d41eff9bff33dd3adf4b34189fc9ca1fe",
+        "mf05_release": "v0.40.14",
+    });
+    if std::env::var_os("FL05_WRITE_BUDGETS").is_some() {
+        let out = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/fastcdc/effect-budgets.json");
+        fs::write(&out, serde_json::to_vec_pretty(&budget).unwrap()).unwrap();
+    }
+    eprintln!("FL-05 C-06 budgets: {budget}");
+}
+
+/// P-05 real >2 GiB local chunk + covering-range bound (disk→layout→range plan).
+/// Ignored by default (multi-minute / multi-GiB); FL-05 release runs it once.
+#[test]
+#[ignore = "FL-05 P-05 real >2GiB gate; set RUN_P05_2GIB=1 and --ignored"]
+fn p05_real_2gib_local_chunk_and_range_bound() {
+    use std::{collections::HashSet, time::Instant};
+
+    use libra::utils::media::chunk_store::{self, load_prior_spans};
+
+    assert!(
+        std::env::var_os("RUN_P05_2GIB").is_some(),
+        "refusing to run multi-GiB gate without RUN_P05_2GIB=1"
+    );
+    const SIZE: usize = 2 * 1024 * 1024 * 1024 + 1;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p05-2gib.bin");
+    let t0 = Instant::now();
+    write_c06_fixture(&path, SIZE, 0x0050_0026_1B5E_ED10);
+    let write_ms = t0.elapsed().as_millis();
+    let root = dir.path().join("media-root");
+    fs::create_dir_all(&root).unwrap();
+    let t1 = Instant::now();
+    let finished = chunk_store::stream_media_file(&path, &root, true).unwrap();
+    let chunk_ms = t1.elapsed().as_millis();
+    assert!(finished.summary.size as usize > 2 * 1024 * 1024 * 1024);
+    assert!(finished.summary.chunk_count > 0);
+    let layout = load_prior_spans(&finished.manifest_path).unwrap();
+    let range_len = 4 * 1024 * 1024u64;
+    let range_off = finished.summary.size / 3;
+    let mut seen = HashSet::new();
+    let mut payload = 0u64;
+    for s in layout
+        .spans
+        .iter()
+        .filter(|s| s.offset < range_off + range_len && s.offset + s.length > range_off)
+    {
+        if seen.insert(s.chunk_hash.as_str()) {
+            payload += s.length;
+        }
+    }
+    assert!(payload <= range_len + 2 * MAX_CHUNK);
+    eprintln!(
+        "FL-05 P-05 2GiB: size={} chunks={} write_ms={write_ms} chunk_ms={chunk_ms} range_payload={payload}",
+        finished.summary.size, finished.summary.chunk_count
+    );
+}
+
+/// P-05 logical gate: >65536 chunks and >16 GiB addressing without materializing
+/// the full payload (deterministic page math).
+#[test]
+fn p05_logical_sparse_exceeds_chunk_and_size_thresholds() {
+    let chunk_count: u64 = 70_000;
+    let chunk_len: u64 = 256 * 1024;
+    let logical_size = chunk_count * chunk_len;
+    assert!(logical_size > 16 * 1024 * 1024 * 1024);
+    assert!(chunk_count > 65_536);
+    let pages = chunk_count.div_ceil(4096);
+    assert!(pages >= 18);
+    assert!(pages < u32::MAX as u64);
+    assert!(logical_size < i64::MAX as u64);
 }

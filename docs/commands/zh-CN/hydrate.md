@@ -1,6 +1,6 @@
 # libra hydrate
 
-`libra hydrate <path>...` **按需** 物化工作树内容（lore.md 3.3）。这是 Lore “hydrating VFS”的诚实、平台可移植 v1：一个显式命令，而不是透明的 FUSE-on-access 文件系统（后者仍是 `worktree-fuse` 后续项）。只处理 whole-object — 没有 FastCDC range。
+`libra hydrate <path>...` **按需** 物化工作树内容（lore.md 3.3）。这是 Lore “hydrating VFS”的诚实、平台可移植 v1：一个显式命令，而不是透明的 FUSE-on-access 文件系统（后者仍是 `worktree-fuse` 后续项）。只处理 whole-object — 没有 FastCDC range。认证 Media 字节范围导出到独立文件请用 [`libra media fetch`](media.md)（需 `fastcdc`）。
 
 ## 兼容性
 

@@ -1043,11 +1043,255 @@ pub fn stream_media_file(
     media_root: &Path,
     store_chunks: bool,
 ) -> Result<StreamOutcome, MediaStoreError> {
+    stream_media_file_with_prior(path, media_root, store_chunks, None)
+}
+
+/// Like [`stream_media_file`], optionally applying ADR-FL-04 prior coherence.
+///
+/// `prior_manifest` may be a paged summary path/directory or a whole
+/// [`MediaManifest`] JSON file. A structurally illegal prior fails before any
+/// new cache layout is published. A valid prior whose size differs from the
+/// source falls back to a cold cut. Same-length priors reuse only hash-matched
+/// spans and re-chunk dirty regions (absorbing neighbors or cold-cutting when
+/// a non-tail fragment would be below [`chunker::MIN_SIZE`]).
+pub fn stream_media_file_with_prior(
+    path: &Path,
+    media_root: &Path,
+    store_chunks: bool,
+    prior_manifest: Option<&Path>,
+) -> Result<StreamOutcome, MediaStoreError> {
     let media_oid =
         crate::utils::lfs::calc_lfs_file_hash(path).map_err(|source| io_err(path, source))?;
     let media_size = std::fs::metadata(path)
         .map_err(|source| io_err(path, source))?
         .len();
+    let prior_spans = match prior_manifest {
+        Some(prior_path) => Some(load_prior_spans(prior_path)?),
+        None => None,
+    };
+    let planned = match prior_spans {
+        Some(prior) if prior.size != media_size => None,
+        Some(prior) => {
+            let mut file = File::open(path).map_err(|source| io_err(path, source))?;
+            chunker::rechunk_with_prior(&mut file, media_size, &prior.spans)
+                .map_err(|source| io_err(path, source))?
+        }
+        None => None,
+    };
+    match planned {
+        Some(chunks) => commit_chunk_plan(
+            path,
+            media_root,
+            store_chunks,
+            &media_oid,
+            media_size,
+            &chunks,
+        ),
+        None => cold_cut_stream(path, media_root, store_chunks, &media_oid, media_size),
+    }
+}
+
+pub struct PriorLayout {
+    pub size: u64,
+    pub spans: Vec<chunker::PriorSpan>,
+}
+
+/// Load and structurally validate a prior layout. Does not compare bytes.
+pub fn load_prior_spans(prior_path: &Path) -> Result<PriorLayout, MediaStoreError> {
+    let (summary_dir, summary) = resolve_prior_summary(prior_path)?;
+    if let Some(summary) = summary {
+        summary.validate().map_err(map_manifest)?;
+        let mut spans = Vec::with_capacity(summary.chunk_count as usize);
+        let mut covered = 0u64;
+        for page_no in 0..summary.page_count {
+            let page_path = summary_dir.join("pages").join(format!("{page_no:08}.json"));
+            let text = read_envelope_file(&page_path)?;
+            let page = ManifestPage::from_json(&text).map_err(map_manifest)?;
+            if page.page_no != page_no {
+                return Err(invalid(format!(
+                    "prior page_no {} does not match {page_no}",
+                    page.page_no
+                )));
+            }
+            page.validate().map_err(map_manifest)?;
+            for entry in page.entries {
+                if entry.offset != covered {
+                    return Err(invalid(format!(
+                        "prior chunk offset {} breaks contiguity (expected {covered})",
+                        entry.offset
+                    )));
+                }
+                covered = entry
+                    .offset
+                    .checked_add(entry.length)
+                    .ok_or_else(|| invalid("prior chunk offset overflow"))?;
+                spans.push(chunker::PriorSpan {
+                    offset: entry.offset,
+                    length: entry.length,
+                    chunk_hash: entry.chunk_hash,
+                });
+            }
+        }
+        if covered != summary.size {
+            return Err(invalid(format!(
+                "prior chunk lengths sum to {covered} but size is {}",
+                summary.size
+            )));
+        }
+        if spans.len() as u64 != summary.chunk_count {
+            return Err(invalid(format!(
+                "prior chunk_count {} does not match {} entries",
+                summary.chunk_count,
+                spans.len()
+            )));
+        }
+        return Ok(PriorLayout {
+            size: summary.size,
+            spans,
+        });
+    }
+    // Whole-file MediaManifest JSON (tests / compact layouts).
+    let text = read_envelope_file(prior_path)?;
+    let manifest = MediaManifest::from_json(&text).map_err(map_manifest)?;
+    let spans = manifest
+        .chunks
+        .iter()
+        .map(|entry| chunker::PriorSpan {
+            offset: entry.offset,
+            length: entry.length,
+            chunk_hash: entry.chunk_hash.clone(),
+        })
+        .collect();
+    Ok(PriorLayout {
+        size: manifest.media_size,
+        spans,
+    })
+}
+
+fn resolve_prior_summary(
+    prior_path: &Path,
+) -> Result<(PathBuf, Option<ManifestSummary>), MediaStoreError> {
+    let summary_file = if prior_path.is_dir() {
+        prior_path.join("summary.json")
+    } else if prior_path
+        .file_name()
+        .is_some_and(|name| name == "summary.json")
+    {
+        prior_path.to_path_buf()
+    } else {
+        // Not a summary path — caller may treat it as a whole MediaManifest.
+        return Ok((PathBuf::new(), None));
+    };
+    if !summary_file.is_file() {
+        return Err(invalid(format!(
+            "prior manifest summary '{}' is missing",
+            summary_file.display()
+        )));
+    }
+    let text = read_envelope_file(&summary_file)?;
+    let summary = ManifestSummary::from_json(&text).map_err(map_manifest)?;
+    Ok((
+        summary_file
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| invalid("prior summary has no parent directory"))?,
+        Some(summary),
+    ))
+}
+
+fn cold_cut_stream(
+    path: &Path,
+    media_root: &Path,
+    store_chunks: bool,
+    media_oid: &str,
+    media_size: u64,
+) -> Result<StreamOutcome, MediaStoreError> {
+    let (manifest_partial, index_partial, mut partial) = begin_partial_dirs(media_root, media_oid)?;
+    let mut writer = ManifestWriter::create(
+        &manifest_partial,
+        &index_partial,
+        media_oid,
+        media_size,
+        manifest::local_created_by(),
+    )?;
+    let store = MediaChunkStore::at(media_root.join("chunks"));
+    let file = File::open(path).map_err(|source| io_err(path, source))?;
+    chunker::visit_chunks(
+        std::io::BufReader::new(file),
+        |chunk, data| -> Result<(), MediaStoreError> {
+            if store_chunks {
+                store.put_chunk(data)?;
+            }
+            writer.push(entry_from_chunk(chunk))?;
+            Ok(())
+        },
+    )?;
+    finish_partial(
+        media_root,
+        media_oid,
+        &manifest_partial,
+        &index_partial,
+        &mut partial,
+        writer,
+    )
+}
+
+fn commit_chunk_plan(
+    path: &Path,
+    media_root: &Path,
+    store_chunks: bool,
+    media_oid: &str,
+    media_size: u64,
+    chunks: &[chunker::Chunk],
+) -> Result<StreamOutcome, MediaStoreError> {
+    let (manifest_partial, index_partial, mut partial) = begin_partial_dirs(media_root, media_oid)?;
+    let mut writer = ManifestWriter::create(
+        &manifest_partial,
+        &index_partial,
+        media_oid,
+        media_size,
+        manifest::local_created_by(),
+    )?;
+    let store = MediaChunkStore::at(media_root.join("chunks"));
+    let mut file = File::open(path).map_err(|source| io_err(path, source))?;
+    for chunk in chunks {
+        if store_chunks {
+            let data = chunker::read_span(&mut file, chunk.offset, chunk.length)
+                .map_err(|source| io_err(path, source))?;
+            if sha256_hex(&data) != chunk.chunk_hash {
+                return Err(invalid(
+                    "planned chunk hash does not match source bytes".to_string(),
+                ));
+            }
+            store.put_chunk(&data)?;
+        }
+        writer.push(entry_from_chunk(chunk))?;
+    }
+    finish_partial(
+        media_root,
+        media_oid,
+        &manifest_partial,
+        &index_partial,
+        &mut partial,
+        writer,
+    )
+}
+
+fn entry_from_chunk(chunk: &chunker::Chunk) -> ChunkEntry {
+    ChunkEntry {
+        offset: chunk.offset,
+        length: chunk.length,
+        chunk_hash: chunk.chunk_hash.clone(),
+        encoded_length: chunk.length,
+        compression: manifest::COMPRESSION_NONE.to_string(),
+        checksum: None,
+    }
+}
+
+fn begin_partial_dirs(
+    media_root: &Path,
+    media_oid: &str,
+) -> Result<(PathBuf, PathBuf, PartialDirs), MediaStoreError> {
     let manifest_partial = media_root
         .join("manifests")
         .join(format!(".partial-{media_oid}"));
@@ -1062,50 +1306,112 @@ pub fn stream_media_file(
     if index_partial.exists() {
         std::fs::remove_dir_all(&index_partial).map_err(|source| io_err(&index_partial, source))?;
     }
-    let mut partial = PartialDirs {
+    let partial = PartialDirs {
         paths: vec![manifest_partial.clone(), index_partial.clone()],
         committed: false,
     };
     std::fs::create_dir_all(manifest_partial.join("pages"))
         .map_err(|source| io_err(&manifest_partial, source))?;
-    let mut writer = ManifestWriter::create(
-        &manifest_partial,
-        &index_partial,
-        &media_oid,
-        media_size,
-        manifest::local_created_by(),
-    )?;
-    let store = MediaChunkStore::at(media_root.join("chunks"));
-    let file = File::open(path).map_err(|source| io_err(path, source))?;
-    chunker::visit_chunks(
-        std::io::BufReader::new(file),
-        |chunk, data| -> Result<(), MediaStoreError> {
-            if store_chunks {
-                store.put_chunk(data)?;
-            }
-            writer.push(ChunkEntry {
-                offset: chunk.offset,
-                length: chunk.length,
-                chunk_hash: chunk.chunk_hash.clone(),
-                encoded_length: chunk.length,
-                compression: manifest::COMPRESSION_NONE.to_string(),
-                checksum: None,
-            })?;
-            Ok(())
-        },
-    )?;
+    Ok((manifest_partial, index_partial, partial))
+}
+
+fn finish_partial(
+    media_root: &Path,
+    media_oid: &str,
+    manifest_partial: &Path,
+    index_partial: &Path,
+    partial: &mut PartialDirs,
+    writer: ManifestWriter,
+) -> Result<StreamOutcome, MediaStoreError> {
     let finished = writer.finish()?;
     let index_final = index_dir_for(media_root, &finished.summary.manifest_id);
-    let manifest_final = media_root.join("manifests").join(&media_oid);
-    replace_dir(&index_partial, &index_final)?;
-    replace_dir(&manifest_partial, &manifest_final)?;
+    let manifest_final = media_root.join("manifests").join(media_oid);
+    replace_dir(index_partial, &index_final)?;
+    replace_dir(manifest_partial, &manifest_final)?;
     partial.committed = true;
     Ok(StreamOutcome {
-        manifest_path: summary_path(media_root, &media_oid),
+        manifest_path: summary_path(media_root, media_oid),
         summary: finished.summary,
         unique_chunks: finished.unique_chunks,
         max_buffered_entries: finished.max_buffered_entries,
     })
+}
+
+/// Verify a cached layout still matches `path` (size, full-file oid, per-chunk
+/// hashes). Used before prepare so a changed source fails closed without a
+/// remote submit. Missing/evicted pages return `Ok(None)` so upload may cold-cut.
+pub fn verify_cached_layout(
+    media_root: &Path,
+    oid: &str,
+    size: u64,
+    path: &Path,
+) -> Result<Option<ManifestSummary>, MediaStoreError> {
+    let summary = match load_summary(media_root, oid) {
+        Ok(summary) => summary,
+        Err(MediaStoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+    if summary.oid != oid || summary.size != size {
+        return Ok(None);
+    }
+    let actual_oid =
+        crate::utils::lfs::calc_lfs_file_hash(path).map_err(|source| io_err(path, source))?;
+    let actual_size = std::fs::metadata(path)
+        .map_err(|source| io_err(path, source))?
+        .len();
+    if actual_oid != oid || actual_size != size {
+        return Err(invalid(
+            "LFS source changed before FastCDC prepare".to_string(),
+        ));
+    }
+    let mut file = File::open(path).map_err(|source| io_err(path, source))?;
+    let mut covered = 0u64;
+    for page_no in 0..summary.page_count {
+        let page = match load_local_page(media_root, oid, &summary.manifest_id, page_no) {
+            Ok(page) => page,
+            Err(MediaStoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
+        if page.page_no != page_no {
+            return Err(invalid(format!(
+                "stored page_no {} does not match {page_no}",
+                page.page_no
+            )));
+        }
+        for entry in &page.entries {
+            if entry.offset != covered {
+                return Err(invalid(format!(
+                    "cached chunk offset {} breaks contiguity (expected {covered})",
+                    entry.offset
+                )));
+            }
+            let hash = chunker::hash_span(&mut file, entry.offset, entry.length)
+                .map_err(|source| io_err(path, source))?;
+            if hash != entry.chunk_hash {
+                return Err(invalid(
+                    "LFS source changed before FastCDC prepare".to_string(),
+                ));
+            }
+            covered = entry
+                .offset
+                .checked_add(entry.length)
+                .ok_or_else(|| invalid("chunk offset overflow"))?;
+        }
+    }
+    if covered != size {
+        return Err(invalid(format!(
+            "cached layout covers {covered} bytes but size is {size}"
+        )));
+    }
+    Ok(Some(summary))
 }
 
 struct ManifestWriter {
@@ -1397,6 +1703,104 @@ pub fn reassemble_paged(
     Ok(())
 }
 
+/// ADR-FL-03 range bounds: zero length requires `offset ≤ size`; any positive
+/// span must fit entirely inside `[0, size)` without overflow.
+pub fn validate_byte_range(size: u64, offset: u64, length: u64) -> Result<(), MediaStoreError> {
+    if length == 0 {
+        if offset > size {
+            return Err(invalid(format!(
+                "range offset {offset} is past object size {size}"
+            )));
+        }
+        return Ok(());
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| invalid("range offset+length overflow"))?;
+    if end > size {
+        return Err(invalid(format!(
+            "range [{offset}, {end}) extends past object size {size}"
+        )));
+    }
+    Ok(())
+}
+
+/// Write a byte slice assembled from covering chunks to a new file.
+///
+/// Does not modify hydrate state, the tracked pointer, or a whole-object LFS
+/// cache entry. The destination must not exist (including as a symlink); the
+/// publish uses same-directory temp + hard-link no-clobber semantics.
+pub fn write_range_export(
+    store: &MediaChunkStore,
+    covering: &[ChunkEntry],
+    offset: u64,
+    length: u64,
+    dest: &Path,
+) -> Result<(), MediaStoreError> {
+    let io_error = |source| MediaStoreError::Io {
+        path: dest.display().to_string(),
+        source,
+    };
+    let target = std::path::absolute(dest).map_err(io_error)?;
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut writer = crate::utils::atomic_stream::StreamingAtomicFile::new_in(
+        parent,
+        atomic_write::sync_data_enabled(),
+    )
+    .map_err(io_error)?;
+    if length == 0 {
+        return writer.persist_create_new(&target).map_err(io_error);
+    }
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| invalid("range offset+length overflow"))?;
+    let mut written = 0u64;
+    let mut expected = covering.first().map(|entry| entry.offset);
+    for entry in covering {
+        if let Some(want) = expected
+            && entry.offset != want
+        {
+            return Err(invalid(format!(
+                "covering chunk offset {} breaks contiguity (expected {want})",
+                entry.offset
+            )));
+        }
+        let chunk_end = entry
+            .offset
+            .checked_add(entry.length)
+            .ok_or_else(|| invalid("chunk offset overflow"))?;
+        if chunk_end <= offset || entry.offset >= end {
+            expected = Some(chunk_end);
+            continue;
+        }
+        let bytes = store.get_chunk(&entry.chunk_hash)?;
+        if bytes.len() as u64 != entry.length {
+            return Err(io_error(std::io::Error::other(
+                "chunk length does not match manifest",
+            )));
+        }
+        let skip = offset.saturating_sub(entry.offset) as usize;
+        let take_end = (end.min(chunk_end) - entry.offset) as usize;
+        let slice = bytes
+            .get(skip..take_end)
+            .ok_or_else(|| invalid("range slice exceeds chunk bytes"))?;
+        writer.write_all(slice).map_err(io_error)?;
+        written = written
+            .checked_add(slice.len() as u64)
+            .ok_or_else(|| invalid("range write length overflow"))?;
+        expected = Some(chunk_end);
+    }
+    if written != length {
+        return Err(invalid(format!(
+            "range export wrote {written} bytes but requested {length}"
+        )));
+    }
+    writer.persist_create_new(&target).map_err(io_error)
+}
+
 #[cfg(test)]
 mod paging_tests {
     use super::*;
@@ -1588,5 +1992,128 @@ mod paging_tests {
         reassemble_paged(&root, &outcome.summary, &dest2).unwrap();
         assert_eq!(std::fs::read(dest2).unwrap(), b"libra-media-paging");
         assert!(root.join("index").join(LOCAL_INDEX_SCOPE).exists());
+    }
+
+    fn fixed_seq_bytes(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        let mut counter: u64 = 0;
+        while out.len() < len {
+            let mut h = ring::digest::Context::new(&ring::digest::SHA256);
+            h.update(b"libra-fastcdc-fixture");
+            h.update(&counter.to_le_bytes());
+            let raw = h.finish();
+            let take = (len - out.len()).min(raw.as_ref().len());
+            out.extend_from_slice(&raw.as_ref()[..take]);
+            counter += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn prior_same_length_edit_reuses_matching_spans_in_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("media");
+        let original = dir.path().join("orig.bin");
+        let edited = dir.path().join("edit.bin");
+        let bytes = fixed_seq_bytes(1_048_576);
+        std::fs::write(&original, &bytes).unwrap();
+        let prior = stream_media_file(&original, &root, true).unwrap();
+        let prior_path = prior.manifest_path.clone();
+
+        let mut edited_bytes = bytes.clone();
+        let cold = chunker::chunk_bytes(&bytes);
+        let mid = &cold[cold.len() / 2];
+        let flip = mid.offset as usize + mid.length as usize / 2;
+        edited_bytes[flip] ^= 0xff;
+        std::fs::write(&edited, &edited_bytes).unwrap();
+
+        let coherent =
+            stream_media_file_with_prior(&edited, &root, true, Some(&prior_path)).unwrap();
+        // Coherent layout is stored under the new oid and must cover the file.
+        assert_eq!(coherent.summary.size, edited_bytes.len() as u64);
+        assert_ne!(coherent.summary.oid, prior.summary.oid);
+        assert!(coherent.manifest_path.is_file());
+        let prior_page =
+            load_local_page(&root, &prior.summary.oid, &prior.summary.manifest_id, 0).unwrap();
+        let new_page = load_local_page(
+            &root,
+            &coherent.summary.oid,
+            &coherent.summary.manifest_id,
+            0,
+        )
+        .unwrap();
+        let reused = prior_page
+            .entries
+            .iter()
+            .filter(|old| {
+                new_page.entries.iter().any(|new| {
+                    new.offset == old.offset
+                        && new.length == old.length
+                        && new.chunk_hash == old.chunk_hash
+                })
+            })
+            .count();
+        assert!(
+            reused >= 1,
+            "same-length prior must reuse at least one matching span"
+        );
+        let verified =
+            verify_cached_layout(&root, &coherent.summary.oid, coherent.summary.size, &edited)
+                .unwrap()
+                .expect("cached coherent layout verifies");
+        assert_eq!(verified.manifest_id, coherent.summary.manifest_id);
+    }
+
+    #[test]
+    fn prior_length_change_or_absent_matches_cold_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("media");
+        let short = dir.path().join("short.bin");
+        let long = dir.path().join("long.bin");
+        std::fs::write(&short, fixed_seq_bytes(65_536)).unwrap();
+        std::fs::write(&long, fixed_seq_bytes(131_072)).unwrap();
+        let prior = stream_media_file(&short, &root, true).unwrap();
+        let with_prior =
+            stream_media_file_with_prior(&long, &root, true, Some(&prior.manifest_path)).unwrap();
+        let cold = stream_media_file(&long, &dir.path().join("cold"), true).unwrap();
+        assert_eq!(with_prior.summary.manifest_id, cold.summary.manifest_id);
+        assert_eq!(with_prior.summary.chunk_count, cold.summary.chunk_count);
+
+        let none =
+            stream_media_file_with_prior(&long, &dir.path().join("none"), true, None).unwrap();
+        assert_eq!(none.summary.manifest_id, cold.summary.manifest_id);
+    }
+
+    #[test]
+    fn illegal_prior_fails_without_publishing_new_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("media");
+        let source = dir.path().join("blob.bin");
+        std::fs::write(&source, fixed_seq_bytes(65_536)).unwrap();
+        let oid = crate::utils::lfs::calc_lfs_file_hash(&source).unwrap();
+        let bad_prior = dir.path().join("bad-prior.json");
+        std::fs::write(&bad_prior, b"{\"not\":\"a-manifest\"}").unwrap();
+        let err = match stream_media_file_with_prior(&source, &root, true, Some(&bad_prior)) {
+            Ok(_) => panic!("illegal prior must fail"),
+            Err(err) => err,
+        };
+        let message = format!("{err}");
+        assert!(
+            message.contains("malformed")
+                || message.contains("serialize")
+                || message.contains("manifest")
+                || message.contains("invalid"),
+            "{err}"
+        );
+        assert!(
+            !summary_path(&root, &oid).exists(),
+            "illegal prior must not publish a new cache layout"
+        );
+        assert!(
+            !root
+                .join("manifests")
+                .join(format!(".partial-{oid}"))
+                .exists()
+        );
     }
 }

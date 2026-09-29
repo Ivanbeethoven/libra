@@ -29,10 +29,11 @@ code against active data.
 
 | Subcommand | Description | Example |
 |---|---|---|
-| `chunk <path> [--store]` | FastCDC-chunk a file and emit its manifest; `--store` persists chunks + manifest under `.libra/media/fastcdc-v2020-32k`. | `libra media chunk big.psd --store` |
+| `chunk <path> [--store] [--prior-manifest <file>]` | FastCDC-chunk a file and emit its manifest; `--store` persists chunks + manifest under `.libra/media/fastcdc-v2020-32k`. `--prior-manifest` (requires `--store`) applies ADR-FL-04 same-length coherence: reuse only hash-matched prior spans, re-chunk dirty regions, cold-cut on length change; an illegal prior fails without publishing a new cache layout. | `libra media chunk edit.psd --prior-manifest old/summary.json --store` |
 | `inspect <manifest>` | Validate a paged manifest summary (or one page envelope) and print the summary. Does not dump every chunk. | `libra media inspect .libra/media/fastcdc-v2020-32k/manifests/<oid>/summary.json` |
 | `verify <path> \| --media-oid <oid>` | Reassemble from the local chunk store and verify the full `media_oid` (never publishes a corrupt file). | `libra media verify big.psd` |
 | `probe [--remote <name>]` | Probe the remote's media capability endpoint and report the transfer decision (chunked vs standard-LFS fallback). | `libra media probe --remote origin` |
+| `fetch <path> --offset <u64> --length <u64> --output <file> [--remote <name>]` | Export a byte range from a finalized Media object into a **new** fragment file (ADR-FL-03). Parses the LFS/Media pointer at `path`, pins `manifest_id`, fetches covering pages only, and GETs the unique covering hashes missing from a valid local cache. Refuses to overwrite an existing target or symlink; does not mutate hydrate state, the tracked pointer, or the whole-object LFS cache. Zero `length` is allowed when `offset ≤ size`. Explicit range export never falls back to whole-object LFS. JSON output states the C-07 trust boundary: authenticated covering chunks do not independently prove the full-object oid/SHA-256. Unlike [`hydrate`](hydrate.md), this writes a separate slice file rather than replacing a tracked path. | `libra media fetch asset.bin --offset 0 --length 4096 --output slice.bin` |
 | `--json` | Structured JSON envelope on stdout (global flag). | `libra --json media chunk big.psd` |
 
 ## Safe fallback
@@ -50,7 +51,9 @@ Actual LFS transfers also apply `lfs.fastcdc`. Before a media transfer starts,
 a missing capability endpoint, an old algorithm, or insufficient paging limits
 (`manifest_paging` must be `v1`, with page and envelope budgets of 4096 entries
 and 1 MiB) stay on standard LFS. Chunk-only advertisements use basic LFS
-instead. `range_read=false` does not block a full chunked transfer. After the
+instead. `range_read=false` does not block a full chunked transfer or a
+covering-chunk `media fetch`. Explicit range export never falls back to
+whole-object LFS. After the
 transfer has started, authentication, hash, and protocol failures fail closed
 and do not silently upload or download the whole object. A monoengine server built with `--features fastcdc`
 implements the authenticated extension; other remotes retain the standard Git LFS
@@ -128,6 +131,18 @@ JSON fits in the 1 MiB envelope. A larger layout fails closed. Chunk-only
 uploads are not supported. Outside a Libra repository, the public LFS download
 client uses basic LFS instead of creating a repository cache.
 
+`media chunk --prior-manifest <file> --store` is the explicit prior-coherence
+entry (ADR-FL-04). `<file>` is a paged summary path/directory or a whole
+manifest JSON. Same-length edits compare each prior span to the new bytes at the
+same offset and reuse only matching hashes; dirty regions are re-chunked, and a
+non-tail fragment below 32 KiB absorbs neighboring reused spans or falls back to
+a full-file cold cut. A length change (normal insert/delete) cold-cuts without
+claiming historical-boundary optimization. A corrupt prior is an error and does
+not publish a new cache layout under the new oid. Upload prefers that cached
+layout: before prepare it re-checks source size, full-file oid, and per-chunk
+hashes and fails closed without a remote submit when the source changed; a
+missing/evicted cache may cold-cut.
+
 The initial extension isolates chunks by authenticated user and repository;
 another user's data is fetched through the standard full-object fallback. It
 requires Bearer access tokens and does not introduce a public chunk-hash API.
@@ -173,3 +188,11 @@ libra media verify big.psd                # reassemble from the store and verify
 libra media probe --remote origin         # capability-probe; falls back to standard LFS
 libra --json media chunk big.psd          # structured JSON output for agents
 ```
+
+## Effect evidence (FL-05)
+
+Local C-06 budgets for a fixed-seed 256 MiB fixture (duplicate dirty payload,
+1% same-length replace ≤ 5%, length-changing edits reported as cold-cut) live
+in `tests/fixtures/fastcdc/effect-budgets.json`. Real >2 GiB chunk/range bound
+is the ignored `p05_real_2gib_local_chunk_and_range_bound` gate.
+

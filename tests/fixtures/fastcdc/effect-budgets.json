@@ -1,0 +1,25 @@
+{
+  "c06_seed": "0xc06effec75eed001",
+  "cold_chunk_count": 3065,
+  "cold_cut_ms": 3152,
+  "delete_1pct_mode": "cold-cut (ADR-FL-04 length change)",
+  "duplicate_dirty_payload": 0,
+  "duplicate_ms": 740,
+  "insert_1pct_mode": "cold-cut (ADR-FL-04 length change)",
+  "mf05_pin": "8c870c4d41eff9bff33dd3adf4b34189fc9ca1fe",
+  "mf05_release": "v0.40.14",
+  "range_4mib_cold_payload_bound": 4318376,
+  "range_4mib_covering_unique": 47,
+  "replace_1pct_dirty_payload": 2754222,
+  "replace_1pct_limit": 13421772,
+  "replace_1pct_ms": 740,
+  "size_bytes": 268435456,
+  "write_fixture_ms": 1449,
+  "p05_real_2gib": {
+    "size_bytes": 2147483649,
+    "chunk_count": 24563,
+    "write_ms": 11509,
+    "chunk_ms": 25721,
+    "range_4mib_payload": 4235768
+  }
+}

@@ -8,7 +8,7 @@
 
 ## 对比 Git 与兼容性
 
-`intentionally-different`：`media chunk/inspect/verify/probe` 是 Libra 扩展。
+`intentionally-different`：`media chunk/inspect/verify/probe/fetch` 是 Libra 扩展。
 默认构建仍使用标准 LFS；启用功能后，远端没有兼容能力或 manifest 时回退完整对象。
 `lfs.fastcdc=false` 可按仓库关闭传输扩展。所有远端现在都保留仓库路径，
 例如 `/project/demo.git/info/lfs`。这不是标准 Git FastCDC 互通。
@@ -24,6 +24,10 @@
   `index/local/<manifest_id>/`，可删除后从页重建，不写全局配置库。
   旧 `.libra/media/{chunks,manifests}`（`fastcdc-v1`）不读取、不写入、不删除。
   `media chunk` / `inspect` / `verify` 不构造全文件 chunk `Vec` 或整包 JSON。
+  `--prior-manifest`（须配合 `--store`）按 ADR-FL-04 做同长度 coherence：合法
+  prior 逐块与新字节比较，只复用匹配 hash；长度变化冷切；非法 prior 失败且不
+  发布新缓存。`MediaClient::upload` 优先消费该缓存布局，prepare 前重验源
+  size/oid/逐块 hash，变化则失败关闭。
 - `capability` 在仓库 LFS URL 后追加 `libra/media/v1/capabilities`。
   协商要求 `manifest_paging=v1`、`supports_manifest_id_read`、`batch_exists`、
   标准 LFS fallback，以及页/信封/块限额。`range_read=false` 不阻止完整分块传输。
@@ -39,6 +43,13 @@
 - 下载固定 `manifest_id`：`by-media` 与 `finalized/{id}` 的 id/oid/size 必须一致，
   页与块都走 `finalized/{id}/...`。按 offset/length 取块，不使用等长除法。
   缓存块读取时重算 SHA-256；远端坏块或坏清单拒绝发布。
+- `media fetch <path> --offset --length --output`（ADR-FL-03）从已 finalize 的 Media
+  导出字节片段到**新文件**：解析 LFS 指针取得 oid/size，固定 `manifest_id`，
+  用 `finalized/{id}/pages?offset&length` 取覆盖页，只 GET 覆盖集合减去有效缓存的
+  唯一 hash；同目录 temp + hard-link 无覆盖提交，拒绝已存在目标与 symlink。
+  零 length 允许 `offset≤size`；溢出 EOF 拒绝。显式范围导出禁止整对象 LFS fallback。
+  JSON/help 标明 C-07：认证摘要与覆盖块不能独立证明全文件 oid/SHA-256。
+  不改 hydrate、tracked 指针、index 或完整 LFS 缓存。
 - `chunk_store::reassemble_paged` 使用既有 `StreamingAtomicFile`，独占临时文件、
   错误时自动清理、完整校验后原子覆盖目标。
 - `LFSClient::upload_object/download_object` 的新调用严格在 feature gate 内。
@@ -60,7 +71,7 @@
 | GET | /tasks/{task_id} |
 | GET | /manifests/by-media/{oid} |
 | GET | /finalized/{id} |
-| GET | /finalized/{id}/pages |
+| GET | /finalized/{id}/pages |  # 可选 ?offset&length 覆盖页；或 ?cursor=
 | GET | /finalized/{id}/chunks/{hash} |
 
 `POST manifests` 的规范请求体是 summary（version、algorithm、hash_algorithm、oid、size、
@@ -102,6 +113,14 @@ Media 拒绝读取后独立目标文件须保持原内容，随后标准 LFS 下
 
 本次交付传输链路，不宣称完成 Lore §6 的全部生产门禁。
 共享仓库 ACL、自动孤儿块 GC、quota、服务端 fsck/heal、obliteration、
-chunk-only 策略、字节范围水合、跨租户 dedup 均未开放。
+chunk-only 策略、透明字节范围水合（FUSE）、跨租户 dedup 均未开放；显式 `media fetch` 片段导出已交付。
 Pending 描述符 24 小时到期，过期数据不会自动回收；部署方需明确保留策略，
 不得对仍被 Finalized manifest 共享的块设置无条件生命周期删除。
+
+## Effect evidence (FL-05)
+
+Local C-06 budgets for a fixed-seed 256 MiB fixture (duplicate dirty payload,
+1% same-length replace ≤ 5%, length-changing edits reported as cold-cut) live
+in `tests/fixtures/fastcdc/effect-budgets.json`. Real >2 GiB chunk/range bound
+is the ignored `p05_real_2gib_local_chunk_and_range_bound` gate.
+

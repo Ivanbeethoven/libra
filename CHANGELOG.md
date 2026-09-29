@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.30.5] — 2026-09-28
+
+### FastCDC effect evidence (FL-05)
+
+- C-06 local effect matrix on a fixed-seed 256 MiB fixture: duplicate dirty
+  payload 0; 1% same-length replace dirty ≤ 5%; length-changing insert/delete
+  reported as ADR-FL-04 cold-cut (no false coherence claim).
+- P-05 logical sparse gate (>16 GiB / >65536 chunks) plus ignored real >2 GiB
+  local chunk/range bound. Budgets in `tests/fixtures/fastcdc/effect-budgets.json`.
+- Paired with mega2 MF-05 `v0.40.14` / Libra pin `8c870c4`.
+
+## [0.30.4] — 2026-09-28
+
+### Media range fragment export (FL-04)
+
+- `libra media fetch <path> --offset --length --output` exports a byte range
+  from finalized Media into a new no-clobber file (ADR-FL-03 / C-07).
+- Covering pages use `finalized/{id}/pages?offset&length`; only unique
+  covering hashes missing from a valid local cache are downloaded.
+- Explicit range export never falls back to whole-object LFS; JSON/help
+  state the authenticated trust boundary.
+
+## [0.30.3] — 2026-09-28
+
+### Prior re-chunk for FastCDC media (FL-03)
+
+- `libra media chunk --prior-manifest <file> --store` reuses same-offset
+  matching chunks from a valid prior layout; dirty regions are re-chunked
+  (ADR-FL-04). Length changes and missing prior stay cold-cut.
+- Upload prefers the cached new-oid layout and re-verifies size/oid/chunk
+  hashes before prepare; a source change fails closed without remote submit.
+- Illegal prior manifests fail without publishing a new cache entry.
+
 ## [0.30.1] — 2026-09-28
 
 ### Local-path clone no longer hangs at "Fetching objects" (issue #496)

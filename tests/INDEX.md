@@ -43,7 +43,7 @@
 | `compat_release_rclone_env_guard` | 1 | Guards release workflow never exports bare `RCLONE_*` option variables in YAML, POSIX shell, or PowerShell assignments, while permitting only the configured `RCLONE_CONFIG_R2_*` remote namespace | `.github/workflows/release.yml` |
 | `compat_branch_lossy_wrapper_guard` | 1 | Guards branch-name lossy conversion wrapper | `src/internal/branch.rs` |
 | `compat_lfs_client_production_unwrap_guard` | 1 | Bans `unwrap()/expect()` in `internal/protocol/lfs_client.rs` | `src/internal/protocol/lfs_client.rs` |
-| `media_fastcdc_test` | 1 / manual interop | Feature-gated chunk/cache/verify/probe tests; ignored `monoengine_fastcdc_http_interop` exercises real HTTP upload, dedup, resume and download (requires `MONOENGINE_FASTCDC_READY_FILE`) | `src/utils/media/`, `src/internal/protocol/lfs_client.rs` |
+| `media_fastcdc_test` | 1 / manual interop | Feature-gated chunk/cache/verify/probe + FL-05 C-06 local effect matrix (`effect-budgets.json`); ignored `monoengine_fastcdc_http_interop` (MF-05 ready-file) and `p05_real_2gib_local_chunk_and_range_bound` | `src/utils/media/`, `src/internal/protocol/lfs_client.rs` |
 | `compat_config_production_unwrap_guard` | 1 | Bans `unwrap()/expect()` in `internal/config.rs` | `src/internal/config.rs` |
 | `compat_head_production_unwrap_guard` | 1 | Bans `unwrap()/expect()` in `internal/head.rs` | `src/internal/head.rs` |
 | `compat_util_production_unwrap_guard` | 1 | Bans `unwrap()/expect()` in `common_utils.rs` / `utils/` | `src/common_utils.rs`, `src/utils/` |
