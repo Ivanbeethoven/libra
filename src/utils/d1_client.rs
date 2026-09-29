@@ -611,11 +611,31 @@ impl D1Client {
             };
 
             if !status.is_success() {
-                // Do NOT echo the response body: it can carry SQL fragments,
-                // identifiers, or backend detail that must not reach logs/errors.
+                // Surface the D1-provided error message (if any) so callers can
+                // detect backend constraints (e.g. a UNIQUE violation on the
+                // repositories.name column) instead of only seeing a bare
+                // status. The body is parsed into the D1 response envelope
+                // (`errors[].message`) rather than echoed raw, keeping the
+                // redaction boundary intact.
+                let d1_message = match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(v) => v
+                        .get("errors")
+                        .and_then(|e| e.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    Err(_) => String::new(),
+                };
+                let message = if d1_message.is_empty() {
+                    format!("D1 API error (HTTP {})", status.as_u16())
+                } else {
+                    d1_message
+                };
                 return RetryOutcome::Done(Err(D1Error {
                     code: i32::from(status.as_u16()),
-                    message: format!("D1 API error (HTTP {})", status.as_u16()),
+                    message,
                 }));
             }
 
