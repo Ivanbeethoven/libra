@@ -97,6 +97,8 @@
 
 **一般说明：** 这些是 CI/环境/受保护协议工作。用户侧需先配置受保护 `cloud-live-write` environment、七项 secret 迁离 repo 级、四项 vars；本地只做 fake/mock/default C。
 
+**用户侧配置进度（2026-09-30 实测 @ `72d0518`）：** ①两个受保护环境已按 GC-CM-14 规格创建并读回核验——`cloud-live-write` 分页策略全集恰为 `{tag: v*}`、`cloud-live-recovery` 恰为 `{branch: cloud-live-recovery/probe-auth}`（均单页无额外 pattern，`reviewers: null`，secrets 迁移前为空）；②四项 vars 已由发布者预置（远端读回确认）；③**七项 secret 迁移仍未做**，且按 GC-CM-14 自身顺序「七项真实 Cloud 凭据只在最终 `v1` 与两环境规则均已固定并验证后迁移」，它被 CLEANUP 卡（`v1` 固定 ref + S17 rulesets）阻断，非本计划可越序执行。诚实记录：environments REST API 不暴露 `can_admins_bypass` 字段，本项按计划自身「不能把创建时授权误称为 no-bypass」的口径留待 ruleset 层（S17）全量读回核验；recovery 策略在 CLEANUP 后切换为 `{branch: cloud-live-recovery/v1}`。
+
 ### G-3a FIX-CM-LIVE-GATE（接线）
 - [ ] `tests/cloud_live_no_skip.sh`（已存在，`--self-test` 全绿）接入 `live-compat.yml` 的 `Run live cloud tests` 步骤，替换旧 `skip=true` 分支。
 - [ ] 真实 run 用 JSON list 钉 selected count、no-skip 核 run/pass、保留原始日志。
