@@ -19,7 +19,17 @@
 #                          per GC-CM-15; R2 prefix is exactly `<repo_id>/`).
 #   slots.json          — machine-readable array (for tests honoring the JsonL
 #                         manifest convention).
-#   manifest.json       — global write-manifest envelope (schema + run + slots).
+#   manifest.json       — prepare-time run/slot record, schema
+#                         `libra-cloud-live-prepare-v1`. This is NOT the GC-CM-15
+#                         `libra-cloud-live-manifest-v1` envelope: that one is
+#                         HMAC'd with `mac_key_id` and carries the resources /
+#                         global_preimage / backup / local_restore /
+#                         restore_target_slots fields, so passing this file to
+#                         `validate_manifest_schema` is expected to fail.
+#
+# Env:
+#   LIBRA_CLOUD_LIVE_SLOT_TTL_SECONDS — how far in the future the minted slot and
+#                                       run deadlines are set (default 3600).
 #
 # The script is idempotent: re-running with the same --slots-dir refuses to
 # overwrite an existing slots.json unless --force is passed.
@@ -47,14 +57,18 @@ if [ -f "$slots_dir/slots.json" ] && [ "$force" -eq 0 ]; then
   exit 0
 fi
 
-now_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The deadline must be in the FUTURE: `slot_is_live` treats an already-passed
+# `expires_at` as dead, so minting slots with `now` would hand out slots that are
+# expired on arrival and make the GC-CM-15 deadline gate reject every run.
+ttl_seconds="${LIBRA_CLOUD_LIVE_SLOT_TTL_SECONDS:-3600}"
+expires_utc="$(python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$ttl_seconds")"
 owner="${LIBRA_CLOUD_LIVE_OWNER:-genedna}"
 run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 
-python3 - "$slots_dir" "$count" "$now_utc" "$owner" "$run_uuid" <<'PY'
+python3 - "$slots_dir" "$count" "$expires_utc" "$owner" "$run_uuid" <<'PY'
 import json, sys, uuid, os
 
-slots_dir, count, now_utc, owner, run_uuid = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+slots_dir, count, expires_utc, owner, run_uuid = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 slots = []
 for i in range(count):
     slot_id = str(uuid.uuid4())
@@ -65,12 +79,20 @@ for i in range(count):
         "repo_name": f"slot-{i}",
         "r2_prefix": f"{repo_id}/",
         "owner": owner,
-        "expires_at": now_utc,
+        "expires_at": expires_utc,
     })
+
+# GC-CM-15 canonical ordering: `validate_writer_slots` rejects any payload whose
+# repo_ids are not strictly ascending, and the minted UUIDs are random, so the
+# slots must be sorted before they are written. Re-number `repo_name` afterwards
+# so the label matches the slot's index in every emitted artifact.
+slots.sort(key=lambda s: s["repo_id"])
+for i, s in enumerate(slots):
+    s["repo_name"] = f"slot-{i}"
 
 manifest = {
     "schema": "libra-cloud-live-prepare-v1",
-    "run": {"uuid": run_uuid, "owner": owner, "expires_at": now_utc},
+    "run": {"uuid": run_uuid, "owner": owner, "expires_at": expires_utc},
     "writer_slots": slots,
 }
 
@@ -94,3 +116,4 @@ print(json.dumps({"slot_ids": [s["slot_id"] for s in slots],
 PY
 
 echo "SLOTS_DIR=$slots_dir"
+echo "SLOT_DEADLINE_UTC=$expires_utc"
