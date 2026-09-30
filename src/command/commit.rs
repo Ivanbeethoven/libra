@@ -1,7 +1,7 @@
 //! Commit command that collects staged changes, builds tree and commit objects, validates messages (including GPG), and updates HEAD/refs.
 
+use std::collections::HashMap;
 use std::{
-    collections::HashSet,
     io::{IsTerminal, Read, Write},
     path::PathBuf,
     str::FromStr,
@@ -1023,8 +1023,10 @@ async fn run_commit_with_index(
     // every nested status/diff/index consumer observes the preview while the live
     // index remains untouched on success, error, cancellation, or panic.
     let prepared = async {
+        let __t = std::time::Instant::now();
         let original_index =
             Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        eprintln!("COMMIT_PHASE index_load+validate1_setup {}us", __t.elapsed().as_micros());
         tree_plumbing::validate_index_objects(&original_index)
             .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
 
@@ -1043,8 +1045,10 @@ async fn run_commit_with_index(
         // index. Dry-run auto-stage intentionally keeps those blobs ephemeral;
         // the original index was validated above before its temporary rewrite.
         if !dry_run {
+            let __t2 = std::time::Instant::now();
             tree_plumbing::validate_index_objects(&index)
                 .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
+            eprintln!("COMMIT_PHASE validate2 {}ms", __t2.elapsed().as_millis());
         }
 
         // Skip empty commit check for --amend operations
@@ -1054,9 +1058,11 @@ async fn run_commit_with_index(
         }
 
         // Verify staged changes relative to HEAD (skip for --amend)
+        let __t3 = std::time::Instant::now();
         let staged_changes = status::changes_to_be_committed_safe()
             .await
             .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
+        eprintln!("COMMIT_PHASE staged_changes {}ms", __t3.elapsed().as_millis());
         if staged_changes.is_empty() && !args.allow_empty && !is_amend {
             return Err(CommitError::NothingToCommit);
         }
@@ -1143,7 +1149,9 @@ async fn run_commit_with_index(
     .await?;
 
     // Create tree
+    let __t4 = std::time::Instant::now();
     let tree = create_tree_with_persistence(&index, &storage, "".into(), !dry_run).await?;
+    eprintln!("COMMIT_PHASE create_tree {}ms", __t4.elapsed().as_millis());
 
     // Create author and committer signatures
     let reuse_author = load_reused_commit_author(&args).await?;
@@ -2478,6 +2486,18 @@ async fn create_tree_with_persistence(
     current_root: PathBuf,
     persist: bool,
 ) -> Result<Tree, CommitError> {
+    create_tree_subset(index, storage, current_root, &[], persist).await
+}
+
+/// Build the subtree for `current_root` from `subset` — the index paths known to
+/// live under it — instead of rescanning the whole index at every node.
+async fn create_tree_subset(
+    index: &Index,
+    storage: &ClientStorage,
+    current_root: PathBuf,
+    subset: &[PathBuf],
+    persist: bool,
+) -> Result<Tree, CommitError> {
     // blob created when add file to index
     let get_blob_entry = |path: &PathBuf| -> Result<TreeItem, CommitError> {
         let name = util::path_to_string(path);
@@ -2503,54 +2523,66 @@ async fn create_tree_with_persistence(
     };
 
     let mut tree_items: Vec<TreeItem> = Vec::new();
-    let mut processed_path: HashSet<String> = HashSet::new();
-    let path_entries: Vec<PathBuf> = index
-        .tracked_entries(0)
-        .iter()
-        .map(|file| PathBuf::from(file.name.clone()))
-        .filter(|path| path.starts_with(&current_root))
-        .collect();
-    for path in path_entries.iter() {
-        let in_current_path = path
+    // Group the index entries by their next path component ONCE, then recurse into
+    // each group's slice. The previous shape re-filtered the FULL entry list for
+    // every subtree node: ~10.5k tree nodes x 50k entries = ~5e8 path comparisons on
+    // a 50k-file repo, measured at ~50 s per commit regardless of how many files
+    // changed. Grouping makes the total work linear in the entry count.
+    let mut path_entries: Vec<PathBuf> = subset.to_vec();
+    if path_entries.is_empty() {
+        path_entries = index
+            .tracked_entries(0)
+            .iter()
+            .map(|file| PathBuf::from(file.name.clone()))
+            .filter(|path| path.starts_with(&current_root))
+            .collect();
+    }
+
+    let root_depth = current_root.components().count();
+    let mut direct: Vec<&PathBuf> = Vec::new();
+    let mut subtrees: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for path in &path_entries {
+        let is_direct = path
             .parent()
             .ok_or_else(|| CommitError::TreeCreation(format!("invalid path: {:?}", path)))?
             == current_root;
-        if in_current_path {
-            let item = get_blob_entry(path)?;
-            tree_items.push(item);
+        if is_direct {
+            direct.push(path);
         } else {
-            if path.components().count() == 1 {
-                continue;
-            }
-            // next level tree
-            let process_path = path
+            let component = path
                 .components()
-                .nth(current_root.components().count())
+                .nth(root_depth)
                 .ok_or_else(|| {
                     CommitError::TreeCreation("failed to get next path component".to_string())
                 })?
                 .as_os_str()
                 .to_str()
                 .ok_or_else(|| CommitError::TreeCreation("invalid path component".to_string()))?;
-
-            if processed_path.contains(process_path) {
-                continue;
-            }
-            processed_path.insert(process_path.to_string());
-
-            let sub_tree = Box::pin(create_tree_with_persistence(
-                index,
-                storage,
-                current_root.clone().join(process_path),
-                persist,
-            ))
-            .await?;
-            tree_items.push(TreeItem {
-                name: process_path.to_string(),
-                mode: TreeItemMode::Tree,
-                id: sub_tree.id,
-            });
+            subtrees
+                .entry(component.to_string())
+                .or_default()
+                .push(path.clone());
         }
+    }
+
+    for path in &direct {
+        let item = get_blob_entry(path)?;
+        tree_items.push(item);
+    }
+    for (component, subset) in subtrees {
+        let sub_tree = Box::pin(create_tree_subset(
+            index,
+            storage,
+            current_root.clone().join(&component),
+            &subset,
+            persist,
+        ))
+        .await?;
+        tree_items.push(TreeItem {
+            name: component,
+            mode: TreeItemMode::Tree,
+            id: sub_tree.id,
+        });
     }
     crate::utils::tree::sort_tree_items_for_git(&mut tree_items);
     let tree = {

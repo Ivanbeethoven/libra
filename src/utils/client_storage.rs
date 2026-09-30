@@ -1766,6 +1766,34 @@ impl ClientStorage {
         self.block_on_storage(async move { storage.get(&hash).await.map(|(_, t)| t) })
     }
 
+    /// Resolve the types of many objects in ONE runtime entry.
+    ///
+    /// The single-object [`Self::get_object_type`] crosses the async boundary per
+    /// call, and on a 50k-file index `validate_index_objects` used to pay that cost
+    /// 100k times (the validation runs twice per commit) — measured at ~50 s, the
+    /// whole commit. This batch crosses the boundary once and resolves the set
+    /// inside; missing hashes are simply omitted, and the caller's existing
+    /// per-object fallback keeps the error surface unchanged.
+    pub fn get_object_types_bounded_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        let storage = self.storage.clone();
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move {
+            let mut out: HashMap<ObjectHash, ObjectType> = HashMap::with_capacity(hashes.len());
+            for hash in &hashes {
+                if out.contains_key(hash) {
+                    continue;
+                }
+                if let Ok((_, object_type)) = storage.get(hash).await {
+                    out.insert(*hash, object_type);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Convenience wrapper: returns whether `obj_id` resolves to an object of the
     /// requested type. Returns `false` on any read error (rather than propagating)
     /// because callers typically use this in match arms where missing-or-wrong-type
