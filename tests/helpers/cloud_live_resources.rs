@@ -154,10 +154,12 @@ pub fn build_global_manifest(slots: &[WriterSlot]) -> serde_json::Value {
 }
 
 /// Deadline helper: reject a slot whose `expires_at` has already passed.
+///
+/// An `expires_at` that cannot be parsed is reported as NOT live. This gates
+/// writes against a real cloud resource, so an unknown deadline must fail closed
+/// rather than silently authorise an unbounded write window.
 pub fn slot_is_live(slot: &WriterSlot) -> bool {
-    parse_rfc3339(&slot.expires_at)
-        .map(|exp| SystemTime::now() < exp)
-        .unwrap_or(true)
+    parse_rfc3339(&slot.expires_at).is_some_and(|exp| SystemTime::now() < exp)
 }
 
 fn parse_rfc3339(s: &str) -> Option<SystemTime> {
@@ -213,6 +215,15 @@ pub fn authorized_cleanup_scope(
                 "writer slot r2_prefix must be exactly `{expected}`"
             ));
         }
+        // The manifest is caller-supplied JSON and this scope carries delete
+        // authority, so a writer slot may only name a pre-registered slot -- the
+        // same constraint the restore targets below already enforce. Otherwise a
+        // manifest could add an arbitrary D1 repo ID to the deletion scope.
+        if !registered.contains(repo_id) {
+            return Err(format!(
+                "writer slot references unregistered repo_id `{repo_id}`; refusing cleanup (GC-CM-15)"
+            ));
+        }
         d1_repo_ids.insert(repo_id.to_string());
         r2_prefixes.push(prefix.to_string());
     }
@@ -224,7 +235,7 @@ pub fn authorized_cleanup_scope(
             .ok_or_else(|| "restore_target_slots entry missing source_repo_id".to_string())?;
         if !registered.contains(source_repo_id) {
             return Err(format!(
-                "restore target references unregistered source repo_id `{source_repo_id}`;                  refusing cleanup (GC-CM-15)"
+                "restore target references unregistered source repo_id `{source_repo_id}`; refusing cleanup (GC-CM-15)"
             ));
         }
         d1_repo_ids.insert(source_repo_id.to_string());
@@ -242,13 +253,17 @@ pub fn reject_unregistered_sink_write(
     r2_prefix: &str,
     slots: &[WriterSlot],
 ) -> Result<(), String> {
-    if repo_id.starts_with("test-repo-") || repo_id.starts_with("libra") {
-        // Registered names must be pre-allocated writer slots.
-        if !slots.iter().any(|s| s.repo_id == repo_id) {
-            return Err(format!(
-                "sink write for unregistered repo_id `{repo_id}`;                  run tests/cloud_live_prepare.sh to pre-allocate writer slots"
-            ));
-        }
+    // Fail closed for every repo ID: a sink write is authorised only when the
+    // ID is one of the pre-allocated writer slots. Do NOT gate this behind a
+    // name prefix such as `test-repo-`; an unregistered ID that happens to fall
+    // outside that family (for example a real user repository) must still be
+    // rejected, otherwise the guard fails open for exactly the writes it exists
+    // to stop.
+    if !slots.iter().any(|s| s.repo_id == repo_id) {
+        return Err(format!(
+            "sink write for unregistered repo_id `{repo_id}`; run tests/cloud_live_prepare.sh \
+             to pre-allocate writer slots"
+        ));
     }
     if !slots.iter().any(|s| r2_prefix.starts_with(&s.r2_prefix)) {
         return Err(format!(
@@ -307,10 +322,32 @@ mod tests {
         });
         assert!(authorized_cleanup_scope(&bad, &slots).is_err());
 
+        // An unregistered writer slot must not be able to widen the D1 delete
+        // scope through the (caller-supplied) manifest.
+        let widened = serde_json::json!({
+            "writer_slots":[{"repo_id":"prod-users","r2_prefix":"prod-users/"}],
+            "restore_target_slots":[]
+        });
+        assert!(authorized_cleanup_scope(&widened, &slots).is_err());
+
         // Sink guard rejects unregistered repo / out-of-scope prefix.
         assert!(reject_unregistered_sink_write("test-repo-a", "test-repo-a/", &slots).is_ok());
         assert!(reject_unregistered_sink_write("test-repo-X", "test-repo-a/", &slots).is_err());
         assert!(reject_unregistered_sink_write("test-repo-a", "outside/", &slots).is_err());
+
+        // Regression: an unregistered ID outside the `test-repo-`/`libra` name
+        // families (for example a real user repo) must not bypass the check.
+        for bypass in [
+            "prod-users",
+            "acme-monorepo",
+            "user-repo-123",
+            "libra-tools",
+        ] {
+            assert!(
+                reject_unregistered_sink_write(bypass, "test-repo-a/", &slots).is_err(),
+                "unregistered repo_id `{bypass}` must be rejected by the sink guard"
+            );
+        }
     }
 
     #[test]
@@ -330,5 +367,32 @@ mod tests {
     fn rfc3339_parsing_rejects_and_accepts() {
         assert!(parse_rfc3339("2099-01-01T00:00:00Z").is_some());
         assert!(parse_rfc3339("not-a-date").is_none());
+    }
+
+    #[test]
+    fn slot_deadline_fails_closed_on_unparseable_expiry() {
+        let base = WriterSlot {
+            slot_id: "s".into(),
+            repo_id: "test-repo-a".into(),
+            repo_name: "a".into(),
+            r2_prefix: "test-repo-a/".into(),
+            owner: "o".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+        };
+        assert!(slot_is_live(&base), "a future expiry is live");
+        let expired = WriterSlot {
+            expires_at: "2000-01-01T00:00:00Z".into(),
+            ..base.clone()
+        };
+        assert!(!slot_is_live(&expired), "a past expiry is not live");
+        // An unparseable deadline must not authorise the slot.
+        let malformed = WriterSlot {
+            expires_at: "not-a-date".into(),
+            ..base.clone()
+        };
+        assert!(
+            !slot_is_live(&malformed),
+            "an unknown expiry must fail closed, not authorise an unbounded write window"
+        );
     }
 }

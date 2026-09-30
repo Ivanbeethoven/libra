@@ -199,17 +199,25 @@ pub fn validate_manifest_schema(payload: &serde_json::Value) -> Result<(), Strin
 }
 
 fn is_rfc3339_utc(s: &str) -> bool {
-    let s = s.strip_suffix('Z').unwrap_or(s);
+    // The explicit UTC designator is REQUIRED: a naive timestamp would silently be
+    // interpreted as UTC, so an expiry written in local time would be read as a
+    // different instant than its author intended.
+    let Some(s) = s.strip_suffix('Z') else {
+        return false;
+    };
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").is_ok()
 }
 
-/// Validate the one-time grant (GC-CM-17) against the expected run.
+/// Validate the one-time grant (GC-CM-17) against the expected run. `expect_nonce`
+/// is the one-time nonce the grant must carry; binding it is what makes the grant
+/// single-use rather than merely well-shaped.
 pub fn validate_grant(
     grant: &serde_json::Value,
     expect_run_id: i64,
     expect_attempt: i64,
     expect_ref: &str,
     expect_head_sha: &str,
+    expect_nonce: &str,
 ) -> Result<(), String> {
     let obj = grant
         .as_object()
@@ -250,10 +258,14 @@ pub fn validate_grant(
     obj.get("owner")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "grant.owner missing".to_string())?;
-    if let Some(expires) = obj.get("expires_at").and_then(serde_json::Value::as_str)
-        && !is_rfc3339_utc(expires)
-    {
-        return Err("grant.expires_at must be UTC no-fractional".to_string());
+    if let Some(expires) = obj.get("expires_at").and_then(serde_json::Value::as_str) {
+        if !is_rfc3339_utc(expires) {
+            return Err("grant.expires_at must be UTC no-fractional".to_string());
+        }
+    } else {
+        // `expires_at` is REQUIRED: silently tolerating an absent expiry would
+        // authorise an unbounded write window on a one-time grant.
+        return Err("grant.expires_at missing".to_string());
     }
     if run_id != expect_run_id {
         return Err(format!("grant.run_id {run_id} != expected {expect_run_id}"));
@@ -271,7 +283,12 @@ pub fn validate_grant(
             "grant.head_sha `{head_sha}` != expected `{expect_head_sha}`"
         ));
     }
-    let _ = nonce;
+    // Bind the grant to the expected one-time nonce (GC-CM-17). Without this
+    // comparison the grant is replayable: any run/attempt pair sharing the
+    // run/attempt/ref/SHA tuple would be authorised by the same nonce.
+    if nonce != expect_nonce {
+        return Err("grant.nonce does not match the expected one-time nonce".to_string());
+    }
     Ok(())
 }
 
@@ -374,19 +391,56 @@ mod tests {
 
     #[test]
     fn grant_matches_run_or_fails_closed() {
+        let nonce = "ab".repeat(32);
         let g = serde_json::json!({
             "schema": GRANT_SCHEMA, "mode":"write", "run_id":42, "attempt":1,
             "ref":"refs/tags/v0.30.8","head_sha":"a".repeat(40),
-            "nonce":"ab".repeat(32), "owner":"genedna","expires_at":"2099-01-01T00:00:00Z"
+            "nonce": nonce, "owner":"genedna","expires_at":"2099-01-01T00:00:00Z"
         });
-        assert!(validate_grant(&g, 42, 1, "refs/tags/v0.30.8", &"a".repeat(40)).is_ok());
+        assert!(validate_grant(&g, 42, 1, "refs/tags/v0.30.8", &"a".repeat(40), &nonce).is_ok());
         assert!(
-            validate_grant(&g, 43, 1, "refs/tags/v0.30.8", &"a".repeat(40)).is_err(),
+            validate_grant(&g, 43, 1, "refs/tags/v0.30.8", &"a".repeat(40), &nonce).is_err(),
             "run mismatch must fail"
         );
         assert!(
-            validate_grant(&g, 42, 1, "refs/heads/main", &"a".repeat(40)).is_err(),
+            validate_grant(&g, 42, 1, "refs/heads/main", &"a".repeat(40), &nonce).is_err(),
             "ref mismatch must fail"
+        );
+        assert!(
+            validate_grant(
+                &g,
+                42,
+                1,
+                "refs/tags/v0.30.8",
+                &"a".repeat(40),
+                &"cd".repeat(32)
+            )
+            .is_err(),
+            "nonce mismatch must fail: the grant is one-time"
+        );
+
+        // An absent expiry must not authorise an unbounded write window.
+        let mut no_expiry = g.clone();
+        no_expiry.as_object_mut().unwrap().remove("expires_at");
+        assert!(
+            validate_grant(
+                &no_expiry,
+                42,
+                1,
+                "refs/tags/v0.30.8",
+                &"a".repeat(40),
+                &nonce
+            )
+            .is_err(),
+            "a grant without expires_at must fail closed"
+        );
+
+        // A naive (non-UTC-designated) expiry must be rejected.
+        let mut naive = g.clone();
+        naive["expires_at"] = serde_json::json!("2099-01-01T00:00:00");
+        assert!(
+            validate_grant(&naive, 42, 1, "refs/tags/v0.30.8", &"a".repeat(40), &nonce).is_err(),
+            "an expiry without the UTC designator must be rejected"
         );
     }
 
