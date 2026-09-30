@@ -1170,6 +1170,22 @@ async fn run_commit_with_index(
     let tree = create_tree_with_persistence(&index, &storage, "".into(), !dry_run).await?;
     eprintln!("COMMIT_PHASE create_tree {}ms", __t4.elapsed().as_millis());
 
+    // Sidecar for the NEXT commit's staged-changes diff: at this point the index
+    // IS the committed state, so a copy of it plus the tree it produced lets
+    // `changes_to_be_committed_safe` diff index-against-index instead of
+    // materializing every tree object (measured 203 ms -> tens of ms on a 50k
+    // repo; the tree walk crosses the FUSE mount on a ScorpioFS worktree).
+    // Keyed by tree oid, so it self-invalidates whenever HEAD moves.
+    if !dry_run {
+        let sidecar = crate::utils::path::index().with_file_name("committed-index");
+        let meta = crate::utils::path::index().with_file_name("committed-index.tree");
+        if let Err(e) = index.to_file(&sidecar) {
+            tracing::warn!(error = %e, "committed-index sidecar write failed; next commit falls back to a tree walk");
+        } else if let Err(e) = std::fs::write(&meta, tree.id.to_string()) {
+            tracing::warn!(error = %e, "committed-index meta write failed; next commit falls back to a tree walk");
+        }
+    }
+
     // Create author and committer signatures
     let reuse_author = load_reused_commit_author(&args).await?;
     let (mut author, committer, committer_identity) =

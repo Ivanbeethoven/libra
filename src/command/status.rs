@@ -4696,6 +4696,49 @@ pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
         None => return Ok(changes),
     };
     let commit = Commit::load(&head_commit);
+
+    // Fast path: the committed-index sidecar (written by the last commit, keyed by
+    // the tree oid) makes this a pure index-against-index diff — no tree object is
+    // read. On a ScorpioFS worktree the tree walk crosses the FUSE mount; measured
+    // 203 ms for 50k files, and it is pure overhead for the common "what did I
+    // stage since the last commit" question.
+    {
+        let sidecar = crate::utils::path::index().with_file_name("committed-index");
+        let meta = crate::utils::path::index().with_file_name("committed-index.tree");
+        let key_matches = std::fs::read_to_string(&meta)
+            .map(|txt| txt.trim() == commit.tree_id.to_string())
+            .unwrap_or(false);
+        if key_matches && let Ok(head_index) = Index::load(&sidecar) {
+            for entry in head_index.tracked_entries(0) {
+                match index.get(&entry.name, 0) {
+                    Some(current) => {
+                        let content_changed = current.hash != entry.hash;
+                        let mode_changed = index_mode_to_tree_item_mode(current.mode)
+                            != index_mode_to_tree_item_mode(entry.mode);
+                        if content_changed || mode_changed {
+                            changes.modified.push(std::path::PathBuf::from(&entry.name));
+                        }
+                    }
+                    None => changes.deleted.push(std::path::PathBuf::from(&entry.name)),
+                }
+            }
+            let head_names: HashSet<&str> = head_index
+                .tracked_entries(0)
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect();
+            changes.new = tracked_files
+                .into_iter()
+                .filter(|path| {
+                    path.to_str()
+                        .map(|s| !head_names.contains(s))
+                        .unwrap_or(true)
+                })
+                .collect();
+            return Ok(changes);
+        }
+    }
+
     let tree = Tree::load(&commit.tree_id);
     let tree_files = tree.get_plain_items_with_mode();
 
