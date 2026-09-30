@@ -2497,6 +2497,16 @@ pub async fn create_tree(
     create_tree_with_persistence(index, storage, current_root, true).await
 }
 
+
+/// Sub-phase timers for create_tree, printed by the outermost invocation.
+/// Temporary instrumentation for the FUSE-worktree commit investigation.
+static CT_GROUP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_ENTRY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_SERIALIZE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_PERSIST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_TREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_DEPTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn create_tree_with_persistence(
     index: &Index,
     storage: &ClientStorage,
@@ -2555,6 +2565,7 @@ async fn create_tree_subset(
             .collect();
     }
 
+    let __tg = std::time::Instant::now();
     let root_depth = current_root.components().count();
     let mut direct: Vec<&PathBuf> = Vec::new();
     let mut subtrees: HashMap<String, Vec<PathBuf>> = HashMap::new();
@@ -2582,6 +2593,8 @@ async fn create_tree_subset(
         }
     }
 
+    CT_GROUP_US.fetch_add(__tg.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let __te = std::time::Instant::now();
     for path in &direct {
         let item = get_blob_entry(path)?;
         tree_items.push(item);
@@ -2601,6 +2614,8 @@ async fn create_tree_subset(
             id: sub_tree.id,
         });
     }
+    CT_ENTRY_US.fetch_add(__te.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let __ts = std::time::Instant::now();
     crate::utils::tree::sort_tree_items_for_git(&mut tree_items);
     let tree = {
         // `from_tree_items` can't create empty tree, so use `from_bytes` instead
@@ -2615,9 +2630,35 @@ async fn create_tree_subset(
             })?
         }
     };
+    CT_SERIALIZE_US.fetch_add(__ts.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    CT_TREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if persist {
-        save_object_to_storage(storage, &tree, &tree.id)
-            .map_err(|e| CommitError::TreeCreation(format!("failed to save tree object: {}", e)))?;
+        let __tp = std::time::Instant::now();
+        // Content-addressed: an object already present is byte-identical, so the
+        // write would be a no-op. On a ScorpioFS worktree it is not free — every
+        // write crosses the FUSE mount (~10 ms each, measured) — and a commit only
+        // introduces trees along the changed spine while this function rebuilds
+        // every subtree in memory (serialization is 23 ms for the whole fixture).
+        // Skipping what already exists is what git gets for free by reusing the
+        // parent commit's tree objects. Measured: 452 persists (4.86 s) -> the
+        // handful that are genuinely new.
+        if !storage.exist(&tree.id) {
+            save_object_to_storage(storage, &tree, &tree.id)
+                .map_err(|e| CommitError::TreeCreation(format!("failed to save tree object: {}", e)))?;
+        }
+        CT_PERSIST_US.fetch_add(__tp.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    // The outermost call (depth 0) prints the accumulated breakdown.
+    if current_root.as_os_str().is_empty() {
+        let g = CT_GROUP_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let e = CT_ENTRY_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let se = CT_SERIALIZE_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let pe = CT_PERSIST_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let n = CT_TREES.swap(0, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "COMMIT_PHASE create_tree breakdown: trees={n} group={}ms entry={}ms serialize={}ms persist={}ms",
+            g / 1000, e / 1000, se / 1000, pe / 1000
+        );
     }
     Ok(tree)
 }
