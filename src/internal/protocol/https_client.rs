@@ -417,6 +417,7 @@ impl HttpsClient {
         want: &[String],
         shallow: &[String],
         depth: Option<usize>,
+        filter: Option<&str>,
     ) -> Result<FetchStream, IoError> {
         // POST $GIT_URL/git-upload-pack HTTP/1.0
         // INVARIANT: "git-upload-pack" is a valid relative URL onto self.url.
@@ -424,7 +425,7 @@ impl HttpsClient {
             .url
             .join("git-upload-pack")
             .expect("'git-upload-pack' is a valid relative URL");
-        let body = generate_upload_pack_content(have, want, shallow, depth);
+        let body = generate_upload_pack_content(have, want, shallow, depth, filter);
         tracing::debug!("fetch_objects with body: {:?}", body);
 
         let res = BasicAuth::send(|| async {

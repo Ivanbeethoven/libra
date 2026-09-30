@@ -3402,6 +3402,7 @@ async fn clone_into_destination(
         // `--deps-of` needs the dependency graph to compute the closure, so it
         // implies `--notes`; a plain clone never fetches notes (Git parity).
         !args.deps_of.is_empty(),
+        args.filter.clone(),
         &child_output,
     )
     .await

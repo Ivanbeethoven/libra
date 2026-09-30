@@ -468,6 +468,7 @@ impl LocalClient {
         want: &[String],
         shallow: &[String],
         depth: Option<usize>,
+        _filter: Option<&str>,
     ) -> Result<FetchStream, IoError> {
         match self.source_type {
             RepoType::GitRepo => {
@@ -1384,7 +1385,7 @@ mod tests {
 
         let want = vec![head];
         let have = Vec::new();
-        let stream = client.fetch_objects(&have, &want, &[], None).await.unwrap();
+        let stream = client.fetch_objects(&have, &want, &[], None, None).await.unwrap();
         let mut reader = StreamReader::new(stream);
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
@@ -1399,7 +1400,7 @@ mod tests {
 
         let client = LocalClient::from_path(repo_dir.path()).unwrap();
         let want = vec!["not-a-valid-hash".to_string()];
-        let error = match client.fetch_objects(&[], &want, &[], None).await {
+        let error = match client.fetch_objects(&[], &want, &[], None, None).await {
             Ok(_) => panic!("invalid want should fail instead of returning an empty pack"),
             Err(error) => error,
         };

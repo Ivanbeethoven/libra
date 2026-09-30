@@ -281,6 +281,7 @@ impl SshClient {
         want: &[String],
         shallow: &[String],
         depth: Option<usize>,
+        filter: Option<&str>,
     ) -> Result<FetchStream, IoError> {
         let mut child = self.spawn_service(ServiceType::UploadPack).await?;
         let advertisement = {
@@ -303,7 +304,7 @@ impl SshClient {
         }
 
         // Send the upload-pack request
-        let body = generate_upload_pack_content(have, want, shallow, depth);
+        let body = generate_upload_pack_content(have, want, shallow, depth, filter);
         let mut stdin = child
             .stdin
             .take()

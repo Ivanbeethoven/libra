@@ -207,12 +207,21 @@ impl RemoteClient {
         want: &[String],
         shallow: &[String],
         depth: Option<usize>,
+        filter: Option<&str>,
     ) -> Result<FetchStream, IoError> {
         match self {
-            RemoteClient::Http(client) => client.fetch_objects(have, want, shallow, depth).await,
-            RemoteClient::Local(client) => client.fetch_objects(have, want, shallow, depth).await,
-            RemoteClient::Git(client) => client.fetch_objects(have, want, shallow, depth).await,
-            RemoteClient::Ssh(client) => client.fetch_objects(have, want, shallow, depth).await,
+            RemoteClient::Http(client) => {
+                client.fetch_objects(have, want, shallow, depth, filter).await
+            }
+            RemoteClient::Local(client) => {
+                client.fetch_objects(have, want, shallow, depth, filter).await
+            }
+            RemoteClient::Git(client) => {
+                client.fetch_objects(have, want, shallow, depth, filter).await
+            }
+            RemoteClient::Ssh(client) => {
+                client.fetch_objects(have, want, shallow, depth, filter).await
+            }
         }
     }
 }
@@ -1180,7 +1189,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
             }
             results.push(
                 fetch_repository_with_result(
-                    remote, None, false, depth, dry_run, tag_cli, force, prune, notes, output,
+                    remote, None, false, depth, dry_run, tag_cli, force, prune, notes, None, output,
                 )
                 .await
                 .map_err(CliError::from)?,
@@ -1253,6 +1262,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         force,
         prune,
         notes,
+        None,
         output,
     )
     .await
@@ -1740,6 +1750,7 @@ pub async fn fetch_repository(
         single_branch,
         depth,
         None,
+        None,
         &OutputConfig::default(),
     )
     .await
@@ -1754,6 +1765,7 @@ pub async fn fetch_repository_safe(
     single_branch: bool,
     depth: Option<usize>,
     tag_cli: Option<TagFetchMode>,
+    filter: Option<String>,
     output: &OutputConfig,
 ) -> Result<(), FetchError> {
     fetch_repository_with_result(
@@ -1766,6 +1778,7 @@ pub async fn fetch_repository_safe(
         false,
         false,
         false,
+        filter,
         output,
     )
     .await
@@ -1789,6 +1802,7 @@ pub(crate) async fn fetch_repository_with_result(
     force: bool,
     prune: bool,
     notes: bool,
+    filter: Option<String>,
     output: &OutputConfig,
 ) -> Result<FetchRepositoryResult, FetchError> {
     if single_branch {
@@ -1981,7 +1995,7 @@ pub(crate) async fn fetch_repository_with_result(
     let shallow_boundaries = read_shallow_boundaries()?;
     let shallow = shallow_boundaries.iter().cloned().collect::<Vec<_>>();
     let mut result_stream = remote_client
-        .fetch_objects(&have, &want, &shallow, depth)
+        .fetch_objects(&have, &want, &shallow, depth, filter.as_deref())
         .await
         .map_err(|source| FetchError::FetchObjects {
             remote: remote_config.url.clone(),
