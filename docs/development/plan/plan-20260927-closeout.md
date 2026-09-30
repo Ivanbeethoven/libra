@@ -100,8 +100,10 @@
 **用户侧配置进度（2026-09-30 实测 @ `72d0518`）：** ①两个受保护环境已按 GC-CM-14 规格创建并读回核验——`cloud-live-write` 分页策略全集恰为 `{tag: v*}`、`cloud-live-recovery` 恰为 `{branch: cloud-live-recovery/probe-auth}`（均单页无额外 pattern，`reviewers: null`，secrets 迁移前为空）；②四项 vars 已由发布者预置（远端读回确认）；③**七项 secret 迁移仍未做**，且按 GC-CM-14 自身顺序「七项真实 Cloud 凭据只在最终 `v1` 与两环境规则均已固定并验证后迁移」，它被 CLEANUP 卡（`v1` 固定 ref + S17 rulesets）阻断，非本计划可越序执行。诚实记录：environments REST API 不暴露 `can_admins_bypass` 字段，本项按计划自身「不能把创建时授权误称为 no-bypass」的口径留待 ruleset 层（S17）全量读回核验；recovery 策略在 CLEANUP 后切换为 `{branch: cloud-live-recovery/v1}`。
 
 ### G-3a FIX-CM-LIVE-GATE（接线）
-- [ ] `tests/cloud_live_no_skip.sh`（已存在，`--self-test` 全绿）接入 `live-compat.yml` 的 `Run live cloud tests` 步骤，替换旧 `skip=true` 分支。
+- [x] `tests/cloud_live_no_skip.sh`（已存在，`--self-test` 全绿）接入 `live-compat.yml` 的 `Run live cloud tests` 步骤，替换旧 `skip=true` 分支。
 - [ ] 真实 run 用 JSON list 钉 selected count、no-skip 核 run/pass、保留原始日志。
+
+**G-3a 接线与实跑证据（2026-09-30 @ `b600e60`）：** ①接线落地：run 步从 libtest `cargo test` 切换为 `tests/cloud_live_no_skip.sh 22` 包裹的 `cargo nextest run --features test-live-cloud … --test-threads=1 --success-output immediate`；钉数 22 由本地 nextest JSON list 实测（`cloud_storage_backup_test` 21 + `agent_cloud_tombstone_test` 1，与末次绿 run 的两条 libtest 结果行 21+1 吻合），并写入 `tests/compat/live_compat_workflow.rs` 强制与 workflow 两处同步改；secret-presence gate 步保留（fork 友好），新增 always() 的日志保留步。②两次真实 dispatch（run `36735477891`、`36736862061`，均 @ `b600e60`）实测验证门生效：无任何 skip 标记漏网、钉数与选中集一致、失败即 exit 100 非零 + 明确诊断 + 完整日志由保留步回显。③两次失败根因同属 **runner→`api.cloudflare.com` 网络降级**（run 1：tombstone 在 D1 list-sessions 传输失败 `D1Error 2001`；run 2：tombstone **通过**，`cloud_agent_capture_roundtrip` 在 restore 阶段报 `LBR-NET-002` 同类传输失败；另 run 2 为全量冷编译，解释了时长）。该项与代码/接线无关，故第 2 项保持未勾，待 runner→Cloudflare 连通性恢复后的下一次 cron（04:30 UTC）自动重试取绿。
 
 ### G-3b FIX-CM-CLOUD-RECOVERY-AUTH
 - [ ] 新建 `cloud-live-recover.yml`（GC-CM-14：AUTH 期仅 `probe-auth`、CLEANUP 后仅 `cloud-live-recovery/v1`）。
