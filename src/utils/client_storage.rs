@@ -4875,7 +4875,7 @@ mod tests {
     /// `storage/load_cost.rs` and `storage/tiered.rs`, so exercise those
     /// paths end-to-end instead of matching hand-written strings.
     #[test]
-    #[serial]
+    #[serial(hash_kind)]
     fn classify_read_failure_pins_storage_messages() -> Result<(), GitError> {
         let _guard = set_hash_kind_for_test(HashKind::Sha1);
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4958,7 +4958,7 @@ mod tests {
     /// possible regression check that the synchronous facade and its blocking-on-
     /// runtime bridge are wired up correctly.
     #[test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     fn test_content_store() {
         let content = "Hello, world!";
         let blob = Blob::from_content(content);
@@ -5307,7 +5307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn legacy_scratch_cannot_starve_a_real_repair_marker() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -5366,7 +5366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn malformed_final_repair_filename_fails_closed_but_legacy_scratch_is_scavenged() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -5403,7 +5403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn repair_rejects_marker_oid_from_the_wrong_repository_hash_format() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -5436,7 +5436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn repair_accepts_marker_oid_matching_sha256_repository_format() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -5473,7 +5473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn repair_scavenges_bounded_stale_staging_files() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -5507,7 +5507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn agent_indexing_fails_before_enqueue_when_marker_cannot_be_persisted() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -5883,7 +5883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn deletion_fence_refuses_an_oid_with_a_durable_marker() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
@@ -5965,7 +5965,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
+    #[serial(cwd, env, hash_kind)]
     async fn deletion_fence_blocks_new_marker_publication_until_released() {
         let storage = tempdir().expect("create storage dir");
         let db_path = storage.path().join(crate::utils::util::DATABASE);
