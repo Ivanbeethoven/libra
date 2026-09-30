@@ -127,8 +127,34 @@ pub fn validate_index_objects_with(
     index: &Index,
     missing_ok: bool,
 ) -> Result<(), TreePlumbingError> {
+    validate_index_objects_filtered(index, missing_ok, None)
+}
+
+/// Validate only the named stage-0 entries.
+///
+/// Used by the commit path on a ScorpioFS worktree, where every object read
+/// crosses the FUSE mount: scanning the whole index costs one mount round trip
+/// per entry (measured 23 s per pass on a 124k-file fixture, twice per commit),
+/// while the entries this commit introduces are a handful. Non-staged entries
+/// were validated when they entered the index; whole-index integrity checking
+/// is `libra fsck`'s job, and git's own commit performs no such scan at all.
+pub fn validate_index_objects_subset(
+    index: &Index,
+    names: &std::collections::HashSet<String>,
+) -> Result<(), TreePlumbingError> {
+    validate_index_objects_filtered(index, false, Some(names))
+}
+
+fn validate_index_objects_filtered(
+    index: &Index,
+    missing_ok: bool,
+    only: Option<&std::collections::HashSet<String>>,
+) -> Result<(), TreePlumbingError> {
     let storage = util::objects_storage();
-    let entries = index.tracked_entries(0);
+    let mut entries = index.tracked_entries(0);
+    if let Some(names) = only {
+        entries.retain(|entry| names.contains(&entry.name));
+    }
 
     // Fast path: one batched type probe resolves every entry that is present and
     // correctly typed — in a healthy repository, the whole index. Local storage

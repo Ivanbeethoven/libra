@@ -1024,11 +1024,9 @@ async fn run_commit_with_index(
     // index remains untouched on success, error, cancellation, or panic.
     let prepared = async {
         let __t = std::time::Instant::now();
-        let original_index =
+        let _original_index =
             Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
         eprintln!("COMMIT_PHASE index_load+validate1_setup {}us", __t.elapsed().as_micros());
-        tree_plumbing::validate_index_objects(&original_index)
-            .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
 
         let auto_stage_applied = if args.all {
             auto_stage_tracked_changes(!dry_run, dry_run && message_settings.verbose)?
@@ -1040,16 +1038,6 @@ async fn run_commit_with_index(
             Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
         let storage = ClientStorage::init(path::objects());
         let tracked_entries = index.tracked_entries(0);
-
-        // A real commit persists each auto-staged blob and validates the final
-        // index. Dry-run auto-stage intentionally keeps those blobs ephemeral;
-        // the original index was validated above before its temporary rewrite.
-        if !dry_run {
-            let __t2 = std::time::Instant::now();
-            tree_plumbing::validate_index_objects(&index)
-                .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
-            eprintln!("COMMIT_PHASE validate2 {}ms", __t2.elapsed().as_millis());
-        }
 
         // Skip empty commit check for --amend operations
         if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
@@ -1065,6 +1053,35 @@ async fn run_commit_with_index(
         eprintln!("COMMIT_PHASE staged_changes {}ms", __t3.elapsed().as_millis());
         if staged_changes.is_empty() && !args.allow_empty && !is_amend {
             return Err(CommitError::NothingToCommit);
+        }
+
+        // Validate ONLY the entries this commit introduces.
+        //
+        // This used to scan the entire index, twice per commit. On a ScorpioFS
+        // worktree every object read crosses the FUSE mount, so that cost is one
+        // round trip per entry — measured 23 s per pass on a 124k-file fixture,
+        // 46 s of a 54 s commit — while the entries actually being committed are
+        // a handful. Entries that are not staged were validated when they entered
+        // the index (their own add/commit), whole-index integrity checking is
+        // `libra fsck`'s job, and git's own commit performs no such scan at all.
+        //
+        // Dry-run keeps its blobs ephemeral, so validation is skipped there as
+        // before.
+        if !dry_run {
+            let __tv = std::time::Instant::now();
+            let staged_names: std::collections::HashSet<String> = staged_changes
+                .new
+                .iter()
+                .chain(staged_changes.modified.iter())
+                .map(|path| crate::utils::util::path_to_string(path))
+                .collect();
+            tree_plumbing::validate_index_objects_subset(&index, &staged_names)
+                .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
+            eprintln!(
+                "COMMIT_PHASE validate_staged {}ms (entries={})",
+                __tv.elapsed().as_millis(),
+                staged_names.len()
+            );
         }
 
         // Complete status collection before the pre-commit hook or commit/tree/ref
