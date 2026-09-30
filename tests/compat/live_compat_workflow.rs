@@ -5,6 +5,13 @@
 //! contract that `compat-live-cloud` is manual/scheduled, secret-gated, and
 //! absent from `base.yml`; the former Code-era live AI job and its deleted
 //! targets (plan-20260920) must not silently return.
+//!
+//! plan-20260927 G-3a: the live run is wrapped in
+//! `tests/cloud_live_no_skip.sh <expected-count> ...` (fail-closed on test
+//! skip markers, run/pass count drift, or a missing Nextest summary) with
+//! `cargo nextest run --success-output immediate`; the pinned selected count
+//! and the wrapper invocation are locked here so drift needs a conscious
+//! two-place update.
 
 use std::{fs, path::PathBuf};
 
@@ -26,6 +33,12 @@ fn live_compat_workflow_is_optional_and_secret_gated() {
         "--features test-live-cloud",
         "--test cloud_storage_backup_test",
         "--test agent_cloud_tombstone_test",
+        // plan-20260927 G-3a: the no-skip wrapper replaces the bare libtest
+        // run; the pinned count must match the nextest JSON list selection.
+        "tests/cloud_live_no_skip.sh 22",
+        "cargo nextest run --features test-live-cloud",
+        "--success-output immediate",
+        "Retain live gate log",
     ] {
         assert!(
             live.contains(required),

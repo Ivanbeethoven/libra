@@ -90,7 +90,32 @@ jobs:
           # cloud_storage_backup_test: `libra cloud` D1 index + R2 object round trip.
           # agent_cloud_tombstone_test: D1 agent-capture mirror tombstone propagation.
           # storage_r2_test is L1 in-memory and already runs in base.yml.
-          cargo test --features test-live-cloud \
-            --test cloud_storage_backup_test \
-            --test agent_cloud_tombstone_test \
-            -- --test-threads=1 --nocapture
+          #
+          # plan-20260927 G-3a: the run is wrapped in tests/cloud_live_no_skip.sh,
+          # which fail-closes on a test-reported live-cloud skip marker, a run/pass
+          # mismatch against the JSON-list-pinned selection (22), or a missing
+          # Nextest summary; the full wrapped-command log is kept at the printed
+          # cloud-live-log= path and echoed by the Retain live gate log step.
+          # The selected count is pinned from `cargo nextest list --message-format
+          # json --features test-live-cloud --test cloud_storage_backup_test
+          # --test agent_cloud_tombstone_test` (21 + 1 = 22); count drift must be
+          # re-pinned here and in tests/compat/live_compat_workflow.rs together.
+          if ! cargo nextest --version >/dev/null 2>&1; then
+            cargo install cargo-nextest --locked --version 0.9.143
+          fi
+          sh tests/cloud_live_no_skip.sh 22 \
+            cargo nextest run --features test-live-cloud \
+              --test cloud_storage_backup_test \
+              --test agent_cloud_tombstone_test \
+              --test-threads=1 --success-output immediate
+
+      - name: Retain live gate log
+        if: always()
+        run: |
+          f=$(ls -t "${TMPDIR:-/tmp}"/libra-cloud-live.* 2>/dev/null | head -n 1 || true)
+          if [ -n "$f" ] && [ -f "$f" ]; then
+            echo "retaining live gate log: $f"
+            cat "$f"
+          else
+            echo "no libra-cloud-live gate log found (gate skipped or not reached)"
+          fi
