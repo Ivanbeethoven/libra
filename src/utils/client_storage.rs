@@ -1766,6 +1766,36 @@ impl ClientStorage {
         self.block_on_storage(async move { storage.get(&hash).await.map(|(_, t)| t) })
     }
 
+    /// Write each object that is not already present, in ONE runtime entry.
+    ///
+    /// The per-object [`Self::put`] crosses the async boundary and performs an
+    /// unconditional write; on a ScorpioFS worktree every write crosses the FUSE
+    /// mount, and a commit only introduces objects along the changed spine while
+    /// rebuilding every subtree in memory. This checks presence and writes only
+    /// the missing ones, all inside a single boundary crossing.
+    ///
+    /// Returns how many objects were actually written.
+    pub fn put_missing_batch(
+        &self,
+        objects: Vec<(ObjectHash, Vec<u8>, ObjectType)>,
+    ) -> Result<usize, GitError> {
+        let storage = self.storage.clone();
+        self.block_on_storage(async move {
+            let mut written = 0usize;
+            for (hash, data, obj_type) in objects {
+                if storage.exist(&hash).await {
+                    continue;
+                }
+                storage
+                    .put(&hash, &data, obj_type)
+                    .await
+                    .map_err(|e| GitError::IOError(std::io::Error::other(e.to_string())))?;
+                written += 1;
+            }
+            Ok(written)
+        })
+    }
+
     /// Resolve the types of many objects in ONE runtime entry.
     ///
     /// The single-object [`Self::get_object_type`] crosses the async boundary per

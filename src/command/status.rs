@@ -4677,12 +4677,20 @@ pub async fn changes_to_be_committed() -> Changes {
 }
 
 pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
-    let mut changes = Changes::default();
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
+    changes_to_be_committed_with_index(&index).await
+}
+
+/// [`changes_to_be_committed_safe`] with an already-loaded index.
+///
+/// The commit path holds the index and used to pay a third full parse (28 ms for
+/// 50k entries) just to hand it over and get it back.
+pub async fn changes_to_be_committed_with_index(index: &Index) -> Result<Changes, StatusError> {
+    let mut changes = Changes::default();
     let head_commit = Head::current_commit().await;
     let tracked_files = index.tracked_files();
 

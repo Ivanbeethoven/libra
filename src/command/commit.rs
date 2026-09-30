@@ -1047,7 +1047,7 @@ async fn run_commit_with_index(
 
         // Verify staged changes relative to HEAD (skip for --amend)
         let __t3 = std::time::Instant::now();
-        let staged_changes = status::changes_to_be_committed_safe()
+        let staged_changes = status::changes_to_be_committed_with_index(&index)
             .await
             .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
         eprintln!("COMMIT_PHASE staged_changes {}ms", __t3.elapsed().as_millis());
@@ -1177,13 +1177,39 @@ async fn run_commit_with_index(
     // repo; the tree walk crosses the FUSE mount on a ScorpioFS worktree).
     // Keyed by tree oid, so it self-invalidates whenever HEAD moves.
     if !dry_run {
-        let sidecar = crate::utils::path::index().with_file_name("committed-index");
-        let meta = crate::utils::path::index().with_file_name("committed-index.tree");
-        if let Err(e) = index.to_file(&sidecar) {
-            tracing::warn!(error = %e, "committed-index sidecar write failed; next commit falls back to a tree walk");
-        } else if let Err(e) = std::fs::write(&meta, tree.id.to_string()) {
-            tracing::warn!(error = %e, "committed-index meta write failed; next commit falls back to a tree walk");
-        }
+        // Written on a worker thread and published atomically (temp + rename): the
+        // serialization is ~5 MB for a 50k index and must not sit on the commit's
+        // critical path. A crash before the rename leaves the previous sidecar in
+        // place, whose key no longer matches HEAD -> the next diff falls back to
+        // the tree walk, which is always correct.
+        let index_path = crate::utils::path::index();
+        let sidecar = index_path.with_file_name("committed-index");
+        let meta = index_path.with_file_name("committed-index.tree");
+        let tree_key = tree.id.to_string();
+        std::thread::spawn(move || {
+            // Reload from disk rather than cloning: the on-disk index equals the
+            // committed state at this point (nothing mutates it after tree
+            // creation), and `Index` is not `Clone`.
+            let snapshot = match Index::load(&index_path) {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    tracing::warn!(error = %e, "committed-index snapshot load failed; next commit falls back to a tree walk");
+                    return;
+                }
+            };
+            let tmp = sidecar.with_extension("tmp");
+            if let Err(e) = snapshot.to_file(&tmp) {
+                tracing::warn!(error = %e, "committed-index sidecar write failed; next commit falls back to a tree walk");
+                return;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &sidecar) {
+                tracing::warn!(error = %e, "committed-index sidecar rename failed");
+                return;
+            }
+            if let Err(e) = std::fs::write(&meta, tree_key) {
+                tracing::warn!(error = %e, "committed-index meta write failed; next commit falls back to a tree walk");
+            }
+        });
     }
 
     // Create author and committer signatures
@@ -2529,7 +2555,20 @@ async fn create_tree_with_persistence(
     current_root: PathBuf,
     persist: bool,
 ) -> Result<Tree, CommitError> {
-    create_tree_subset(index, storage, current_root, &[], persist).await
+    let mut pending: Vec<(ObjectHash, Vec<u8>)> = Vec::new();
+    let tree = create_tree_subset(index, storage, current_root, &[], persist, &mut pending).await?;
+    if persist && !pending.is_empty() {
+        // One runtime crossing for every tree object the commit introduces, instead
+        // of one exist()+put() round trip per subtree (822 crossings for a 50k repo).
+        let objects = pending
+            .into_iter()
+            .map(|(id, data)| (id, data, ObjectType::Tree))
+            .collect();
+        storage
+            .put_missing_batch(objects)
+            .map_err(|e| CommitError::TreeCreation(format!("failed to save tree objects: {e}")))?;
+    }
+    Ok(tree)
 }
 
 /// Build the subtree for `current_root` from `subset` — the index paths known to
@@ -2540,6 +2579,7 @@ async fn create_tree_subset(
     current_root: PathBuf,
     subset: &[PathBuf],
     persist: bool,
+    pending: &mut Vec<(ObjectHash, Vec<u8>)>,
 ) -> Result<Tree, CommitError> {
     // blob created when add file to index
     let get_blob_entry = |path: &PathBuf| -> Result<TreeItem, CommitError> {
@@ -2622,6 +2662,7 @@ async fn create_tree_subset(
             current_root.clone().join(&component),
             &subset,
             persist,
+            pending,
         ))
         .await?;
         tree_items.push(TreeItem {
@@ -2650,18 +2691,14 @@ async fn create_tree_subset(
     CT_TREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if persist {
         let __tp = std::time::Instant::now();
-        // Content-addressed: an object already present is byte-identical, so the
-        // write would be a no-op. On a ScorpioFS worktree it is not free — every
-        // write crosses the FUSE mount (~10 ms each, measured) — and a commit only
-        // introduces trees along the changed spine while this function rebuilds
-        // every subtree in memory (serialization is 23 ms for the whole fixture).
-        // Skipping what already exists is what git gets for free by reusing the
-        // parent commit's tree objects. Measured: 452 persists (4.86 s) -> the
-        // handful that are genuinely new.
-        if !storage.exist(&tree.id) {
-            save_object_to_storage(storage, &tree, &tree.id)
-                .map_err(|e| CommitError::TreeCreation(format!("failed to save tree object: {}", e)))?;
-        }
+        // Defer the write to the top-level flush, which checks existence for every
+        // tree in ONE runtime crossing. Content-addressed storage means an object
+        // already present is byte-identical, so only the changed spine is written
+        // — what git gets for free by reusing the parent commit's tree objects.
+        let data = tree
+            .to_data()
+            .map_err(|e| CommitError::TreeCreation(format!("failed to serialize tree: {e}")))?;
+        pending.push((tree.id, data));
         CT_PERSIST_US.fetch_add(__tp.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     // The outermost call (depth 0) prints the accumulated breakdown.
