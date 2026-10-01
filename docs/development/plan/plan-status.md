@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-01 06:05:33 UTC（Issue #574 维护者评论已确认 Operation Log v2 契约、branch/tag/remote/reflog/notes 五个命令族的查询/变更边界及 debug 性能门；log/rev-list 历史遍历交由 #478，快照 stat 短路与锁清理不在本计划。PR #586 已合入 branch 查询分类的初步实现；QP-00/QP-01 仍为 `pending`，计划评审未通过前不得启动。其余状态沿用 2026-10-01 04:33:14 UTC 快照，未逐项复核。）
+> **当前快照：** 2026-10-01 10:50:15 UTC（Issue #574 维护者确认范围为 branch/tag/remote/reflog/notes 纯查询分类；PR #586 已合入 v0.30.9，PR #587 代码与网站已合入，v0.30.10 仍 `remote-pending`。QP-00 的 debug 基线/性能验收未完成；QP-01 计划卡仍 `pending`（代码已先行合入；待 QP-00 与计划评审后只做验收/发布收口，不重复实现）。log/rev-list 交由 #478，快照 stat 短路排除。其余状态沿用 2026-10-01 08:21:46 UTC 快照，未逐项复核。）
 
 ---
 
@@ -85,7 +85,7 @@
 | [`issues/451.md`](issues/451.md) | RFC：version-aware M2 Episode memory | 未启动 | RFC-01..RFC-04（4 卡） |
 | [`issues/468.md`](issues/468.md) | Data collection and refinement | 未启动 | DC-01..DC-04（4 卡） |
 | [`issues/500.md`](issues/500.md) | Feature：Centralized Storage for Libra Statistics Data | 未启动 | CS-01..CS-04（4 卡） |
-| [`issues/574.md`](issues/574.md) | 大型仓库五个命令族纯查询的 Operation Log v2 分类与 debug 性能基线 | **未启动（计划待评审）** | QP-00/QP-01 均 `pending`；维护者已确认五命令族查询/变更矩阵与 Operation Log v2 契约；QP-01 受 `DEP-QP-01` 的 `src/cli.rs` 跨计划串行门控；log/rev-list 全遍历交 #478；快照 stat 短路与锁清理排除。PR #586 已合入 branch 查询分类初步实现，不代表 QP-00/QP-01 已验收。 |
+| [`issues/574.md`](issues/574.md) | 五个命令族纯查询的 Operation Log v2 分类与 debug 性能验收 | **未启动（计划待评审；范围内实现已先行合入）** | QP-00 `pending`（计划评审后记录维护者确认的 debug 基线、矩阵与性能门）；QP-01 `pending`（分类实现已由 #586 `done/complete` v0.30.9、#587 合入但 v0.30.10 `remote-pending`；本计划卡待 QP-00 与计划评审后核验契约/性能并收口，不重复实现）；log/rev-list 移交 #478；快照 stat 短路与锁清理排除。 |
 | [`issues/577.md`](issues/577.md) | SSH 公钥认证失败误报 pkt-line 协议错误与配置文档 | **已收口** | 2026-09-27：SA-02/SA-01 均为 `done` / `complete`；PR #578 合并为 `5eb833f9`，v0.24.1 发布与 8/8 release jobs 全绿；网站 `cf@667d7da8`、Worker `c7011920` 和七个生产页验证完成；Issue #577 CLOSED |
 | [`issues/582.md`](issues/582.md) | Git 相容的互動式 SSH 主機金鑰確認 | **已收口** | HKT-00 `done/complete`（no-release 設計與 HP-17／DEFER-07 移交）；HKT-01 `done/complete`（首次 clone 的 host-key policy cascade）；HKT-02 `done/complete`（受限 human-terminal unknown-host confirmation）；聚合发布 `v0.29.1`；全量 nextest 8271/8271 绿
 
@@ -405,7 +405,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 | DEP-CP-05 | Contract/file exclusion | issues/476/478/480 command evolution and overlapping files | Refresh actual parameters and reserve conflicting files |
 | DEP-CP-06 | Agent read contract | plan-20260819 models and identity-scoped readers | Verify before CP-13..15; does not block static stage |
 | DEP-AD-12 / DEP-CLI-mirror | 跨计划写集互斥 | `src/cli.rs` 三态串行：plan-20260918 OI-05、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、issues/483 CO-03/04、issues/574 QP-01 | 生效；各卡开工前须核对 |
-| DEP-QP-01 | 跨计划写集互斥 | issues/574 QP-01 与 issues/483 CO-03/04、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、plan-20260918 OI-05 共用 `src/cli.rs` 中央 census，镜像 `DEP-AD-12 / DEP-CLI-mirror` | 生效；QP-01 计划评审 PASS 后仍须开工前核实三态窗口 |
+| DEP-QP-01 | 跨计划写集互斥 | issues/574 QP-01 与 issues/483 CO-03/04、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、plan-20260918 OI-05 共用 `src/cli.rs` 中央 census，镜像 `DEP-AD-12 / DEP-CLI-mirror` | 生效；QP-01 开工前须核实三态窗口 |
 | DEP-GCX-02 | 跨计划写集互斥 | plan-20260919 与 plan-20260918 的 `COMPATIBILITY.md`/docs/网站页串行 | 生效 |
 | DEP-FL-04 | 跨计划前置 | plan-20260913 依赖 plan-20260907 完整收口 | plan-20260907 未启动 |
 | DEP-CC-05 | 跨计划前置 | plan-20260905 CC-02..06 依赖 plan-20260904 全部非延后卡完成 | plan-20260904 未启动 |
