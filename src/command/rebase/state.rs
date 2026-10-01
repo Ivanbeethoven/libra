@@ -1,8 +1,6 @@
 //! Rebase state persistence: the merge/autostash sidecar, scope-aware ref
 //! updates and GC roots shared by the interactive and replay drivers.
 #![allow(unused_imports)]
-use super::*;
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
@@ -24,6 +22,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::*;
 use crate::{
     cli_error,
     command::{editor, load_object, merge, rebase_todo, save_object, status, switch},
@@ -47,7 +46,6 @@ use crate::{
         path, util, worktree,
     },
 };
-
 
 pub struct RebaseState {
     /// Original branch name being rebased
@@ -595,7 +593,10 @@ impl RebaseState {
         }))
     }
 
-    pub(super) async fn save_with_conn<C: ConnectionTrait>(db: &C, state: &RebaseState) -> Result<(), String> {
+    pub(super) async fn save_with_conn<C: ConnectionTrait>(
+        db: &C,
+        state: &RebaseState,
+    ) -> Result<(), String> {
         // Part C W1 (§C.4.2): scoped DELETE — never the whole table, which
         // would clobber another worktree's in-progress rebase.
         let delete_stmt = Statement::from_sql_and_values(
@@ -677,7 +678,9 @@ impl RebaseState {
         Ok(())
     }
 
-    pub(super) async fn migrate_legacy_state<C: ConnectionTrait>(db: &C) -> Result<Option<Self>, String> {
+    pub(super) async fn migrate_legacy_state<C: ConnectionTrait>(
+        db: &C,
+    ) -> Result<Option<Self>, String> {
         if Self::legacy_rebase_dir_present().is_none() {
             return Ok(None);
         }

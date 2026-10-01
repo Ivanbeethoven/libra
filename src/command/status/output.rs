@@ -24,8 +24,7 @@ use git_internal::{
 };
 use serde::Serialize;
 
-use super::*;
-use super::fail_closed_on_io_blocked;
+use super::{fail_closed_on_io_blocked, *};
 use crate::{
     command::calc_file_blob_hash,
     internal::{
@@ -2395,6 +2394,5 @@ fn write_branch_info_v2(
 // ---------------------------------------------------------------------------
 // Upstream tracking resolution
 // ---------------------------------------------------------------------------
-
 
 // end status output section

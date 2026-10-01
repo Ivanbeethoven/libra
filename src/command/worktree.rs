@@ -13,10 +13,7 @@ use clap::{Parser, Subcommand};
 use serde::Serialize;
 
 use crate::{
-    internal::{
-        sequencer::WorktreeControl,
-        workspace::RepoIdentity,
-    },
+    internal::{sequencer::WorktreeControl, workspace::RepoIdentity},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
@@ -24,30 +21,27 @@ use crate::{
     },
 };
 
-#[path = "worktree/lock.rs"]
-mod lock;
-#[path = "worktree/registry.rs"]
-mod registry;
 #[path = "worktree/doctor.rs"]
 mod doctor;
+#[path = "worktree/lock.rs"]
+mod lock;
 #[path = "worktree/operations.rs"]
 mod operations;
+#[path = "worktree/registry.rs"]
+mod registry;
 
 pub(crate) use doctor::*;
-pub(crate) use operations::*;
-
 pub(crate) use lock::acquire_registry_lock_async;
+pub(crate) use operations::*;
 pub(crate) use registry::{
-    DETACHED_MARKER, WorktreeEntry, WorktreeEntryState, WorktreeState,
-    local_gitdir_for_scope, registry_knows_linked_worktree,
-    registry_knows_linked_worktree_in_storage,
+    DETACHED_MARKER, WorktreeEntry, WorktreeEntryState, WorktreeState, local_gitdir_for_scope,
+    registry_knows_linked_worktree, registry_knows_linked_worktree_in_storage,
 };
 #[cfg(test)]
 use registry::{REGISTRY_SCHEMA_VERSION, WorktreeStateV1};
 use registry::{
-    RegistryShape, canonicalize, ensure_main_entry, find_entry,
-    load_state, load_state_for_repair, load_state_readonly,
-    normalize_v2_ids, save_state, state_path, write_state,
+    RegistryShape, canonicalize, ensure_main_entry, find_entry, load_state, load_state_for_repair,
+    load_state_readonly, normalize_v2_ids, save_state, state_path, write_state,
 };
 
 /// `--help` examples shown in `libra worktree --help` output.
@@ -171,6 +165,8 @@ pub enum WorktreeSubcommand {
         delete_dir: bool,
     },
     /// Unmount a FUSE task worktree mountpoint.
+    #[cfg(unix)]
+    #[clap(alias = "unmount", about = "Unmount a FUSE worktree mountpoint")]
     Umount {
         /// Filesystem path of the FUSE mountpoint or its task worktree root.
         path: String,
@@ -201,7 +197,7 @@ pub enum WorktreeSubcommand {
         /// Explicitly attribute one legacy unscoped capture session to this
         /// workspace. Requires a workspace id and --confirm; the default
         /// doctor command remains strictly read-only.
-             #[arg(
+        #[arg(
              long,
              value_name = "SESSION_ID",
              requires = "workspace_id",
@@ -213,7 +209,7 @@ pub enum WorktreeSubcommand {
         /// (W0 §C.4.1.1: since info files became worktree-local they apply
         /// only to main; adoption is explicit and per-worktree, never
         /// automatic). Requires --confirm.
-             #[arg(
+        #[arg(
              long,
              value_name = "WORKTREE_PATH",
              conflicts_with_all = [
@@ -225,7 +221,7 @@ pub enum WorktreeSubcommand {
         /// Delete the repository's common `.libra/info/exclude` and
         /// `info/attributes` (explicit clear for rules that should no longer
         /// apply anywhere). Requires --confirm.
-             #[arg(
+        #[arg(
              long,
              conflicts_with_all = [
                  "workspace_id", "limit", "cursor", "adopt_capture_session", "adopt_info_to",
@@ -237,7 +233,7 @@ pub enum WorktreeSubcommand {
         /// current `libra.repoid` onto the canonical repository identity
         /// (plan-20260715 W4-07). Migrations never do this; requires
         /// --confirm.
-             #[arg(
+        #[arg(
              long,
              value_name = "LEGACY_PROJECT_ID",
              conflicts_with_all = [
@@ -248,7 +244,7 @@ pub enum WorktreeSubcommand {
         adopt_approved_project: Option<String>,
         /// Delete Always approvals under a legacy (non-canonical) `project_id`
         /// without adopting them. Requires --confirm.
-             #[arg(
+        #[arg(
              long,
              value_name = "LEGACY_PROJECT_ID",
              conflicts_with_all = [
@@ -647,7 +643,10 @@ fn reject_bare_repository_impl(
 
 pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResult<()> {
     let command = args.command;
+    #[cfg(unix)]
     let needs_repo = !matches!(&command, WorktreeSubcommand::Umount { .. });
+    #[cfg(not(unix))]
+    let needs_repo = true;
     // W0 §C.11: `doctor` skips the migration-applying open below. It is a
     // read-only diagnostic, and applying migrations is a write — the one
     // command you want available on a repository you have not yet decided to
@@ -750,8 +749,6 @@ pub async fn execute_safe(args: WorktreeArgs, output: &OutputConfig) -> CliResul
             let result = umount_fuse_path(path, cleanup).map_err(WorktreeError::into_cli_error)?;
             render_umount_fuse_path(&result, output)
         }
-        #[cfg(not(unix))]
-        WorktreeSubcommand::Umount { .. } => Ok(()),
         WorktreeSubcommand::Doctor {
             workspace_id,
             limit,
@@ -1441,10 +1438,25 @@ impl ScopeDiagnostic {
 #[cfg(unix)]
 #[cfg(all(test, unix))]
 mod tests {
-    use tempfile::tempdir;
     use std::fs;
 
+    use clap::Parser;
+    use tempfile::tempdir;
+
     use super::*;
+
+    #[test]
+    fn unmount_alias_parses_as_umount() {
+        let args = WorktreeArgs::try_parse_from(["worktree", "unmount", "/tmp/mount", "--cleanup"])
+            .expect("documented alias `unmount` must parse");
+        match args.command {
+            WorktreeSubcommand::Umount { path, cleanup } => {
+                assert_eq!(path, "/tmp/mount");
+                assert!(cleanup);
+            }
+            other => panic!("unmount alias parsed as {other:?}"),
+        }
+    }
 
     #[test]
     fn registry_parse_accepts_v2_shape() {

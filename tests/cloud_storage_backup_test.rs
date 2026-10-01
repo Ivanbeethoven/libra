@@ -1831,6 +1831,15 @@ async fn fsck_heal_restores_object_from_durable_tier() {
         .join(&commit_hash[0..2])
         .join(&commit_hash[2..]);
 
+    // Ensure every reachable object (commit/tree/blob, incl. the small blob
+    // whose bytes are not guaranteed to be write-through-copied to the durable
+    // tier during commit) is uploaded to R2 before deleting the local copies.
+    // `cloud sync` iterates the object_index (is_synced=0) and uploads each.
+    assert!(
+        run(&["cloud", "sync"]).status.success(),
+        "cloud sync before fsck --heal uploads the full object graph to R2"
+    );
+
     // Delete ALL local loose objects (commit + tree + blob) so they remain only
     // in R2. `fsck --heal` must then re-fetch the whole reachable graph across
     // MULTIPLE discovery rounds (healing the commit reveals its tree, which

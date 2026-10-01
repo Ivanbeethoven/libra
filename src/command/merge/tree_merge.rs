@@ -1,8 +1,6 @@
 //! Merge tree arbitration: the three-way/octopus tree walk, item-map
 //! comparison and blob-index staging, owned by the merge command.
 #![allow(unused_imports)]
-use super::*;
-
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::{OsStr, OsString},
@@ -13,7 +11,19 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// Preserve the existing command::merge type path for downstream callers.
+#[allow(unused_imports)]
+pub(crate) use autostash::StoppedMerge;
+pub(crate) use autostash::{
+    MergeAutostash, conclude_merge_after_commit, conclude_stopped_merge, snapshot_stopped_merge,
+};
+use autostash::{
+    preflight_held_autostash, prepare_merge_autostash, resolve_pending_autostash,
+    resolve_pending_autostash_with, store_pending_autostash, verify_autostash_ownership,
+};
 use clap::{Parser, ValueEnum};
+pub(crate) use conflict::*;
+pub(crate) use content::*;
 use git_internal::{
     hash::ObjectHash,
     internal::{
@@ -27,11 +37,15 @@ use git_internal::{
     },
 };
 use serde::{Deserialize, Serialize};
+pub(crate) use state::{
+    MergeState, merge_in_progress, merge_state_for_pseudo_refs, merge_state_gc_oids,
+};
+pub(crate) use workdir::*;
 
 use super::{
     get_target_commit, load_object, load_object_raw, rename_detect, reset,
     restore::{self, RestoreArgs},
-    save_object, status, switch,
+    save_object, status, switch, *,
 };
 use crate::{
     command::{
@@ -59,30 +73,6 @@ use crate::{
         output::{OutputConfig, emit_json_data},
         path, util, worktree,
     },
-};
-
-
-
-
-
-
-
-pub(crate) use conflict::*;
-pub(crate) use content::*;
-pub(crate) use workdir::*;
-
-// Preserve the existing command::merge type path for downstream callers.
-#[allow(unused_imports)]
-pub(crate) use autostash::StoppedMerge;
-pub(crate) use autostash::{
-    MergeAutostash, conclude_merge_after_commit, conclude_stopped_merge, snapshot_stopped_merge,
-};
-use autostash::{
-    preflight_held_autostash, prepare_merge_autostash, resolve_pending_autostash,
-    resolve_pending_autostash_with, store_pending_autostash, verify_autostash_ownership,
-};
-pub(crate) use state::{
-    MergeState, merge_in_progress, merge_state_for_pseudo_refs, merge_state_gc_oids,
 };
 
 pub(crate) fn automatic_merge_tree(

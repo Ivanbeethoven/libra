@@ -2,8 +2,6 @@
 //! These renderers consume the `DiffOutput` produced by the compare pipeline and never
 //! re-scan or re-compare repository state.
 #![allow(unused_imports)]
-use super::*;
-use crate::utils::{output::emit_json_data, pager::Pager};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::{
@@ -39,6 +37,8 @@ use serde::Serialize;
 use similar::{Algorithm, ChangeTag, TextDiff};
 use tempfile::NamedTempFile;
 
+use super::*;
+use crate::utils::{output::emit_json_data, pager::Pager};
 #[cfg(test)]
 use crate::{
     command::{
@@ -85,7 +85,11 @@ pub(super) fn render_word_diff(
     }
 }
 
-pub(super) fn render_word_changes(changes: &[(ChangeTag, &str)], mode: WordDiffMode, color: bool) -> String {
+pub(super) fn render_word_changes(
+    changes: &[(ChangeTag, &str)],
+    mode: WordDiffMode,
+    color: bool,
+) -> String {
     if mode == WordDiffMode::Porcelain {
         return render_word_porcelain(changes);
     }
@@ -530,7 +534,11 @@ pub(super) fn format_unified_diff(result: &DiffOutput) -> String {
         .join("\n")
 }
 
-pub(super) fn maybe_colorize_diff(diff_text: &str, should_colorize: bool, color_moved: bool) -> String {
+pub(super) fn maybe_colorize_diff(
+    diff_text: &str,
+    should_colorize: bool,
+    color_moved: bool,
+) -> String {
     if should_colorize {
         colorize_diff(diff_text, color_moved)
     } else {

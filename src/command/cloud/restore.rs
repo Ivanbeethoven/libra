@@ -1,7 +1,5 @@
 //! Cloud restore: object/metadata/Agent-catalog recovery from D1/R2 backends.
 #![allow(unused_imports)]
-use super::*;
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
@@ -9,16 +7,20 @@ use std::{
     sync::Arc,
 };
 
+use agent_capture::*;
 use clap::{Parser, Subcommand};
 use git_internal::hash::ObjectHash;
+use object_format::{REBACKUP_HINT, resolve_cloud_repository_kind};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Schema, Set,
     TransactionTrait, sea_query::Expr,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+pub(crate) use sync::run_cloud_sync;
 use uuid::Uuid;
 
+use super::*;
 use crate::{
     cli_error,
     command::restore::{self as restore_cmd, RestoreArgs as RestoreWorktreeArgs},
@@ -43,12 +45,6 @@ use crate::{
         util,
     },
 };
-
-
-use agent_capture::*;
-use object_format::{REBACKUP_HINT, resolve_cloud_repository_kind};
-pub(crate) use sync::run_cloud_sync;
-
 
 pub(crate) fn render_cloud_restore_output(
     result: &CloudRestoreOutput,

@@ -1,8 +1,6 @@
 //! Merge worktree writes: file/symlink materialization, path-clearing and
 //! untracked-conflict fences shared by the tree-arbitration drivers.
 #![allow(unused_imports)]
-use super::*;
-
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -14,6 +12,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+// Preserve the existing command::merge type path for downstream callers.
+#[allow(unused_imports)]
+pub(crate) use autostash::StoppedMerge;
+pub(crate) use autostash::{
+    MergeAutostash, conclude_merge_after_commit, conclude_stopped_merge, snapshot_stopped_merge,
+};
+use autostash::{
+    preflight_held_autostash, prepare_merge_autostash, resolve_pending_autostash,
+    resolve_pending_autostash_with, store_pending_autostash, verify_autostash_ownership,
+};
 use clap::{Parser, ValueEnum};
 use git_internal::{
     hash::ObjectHash,
@@ -28,11 +36,14 @@ use git_internal::{
     },
 };
 use serde::{Deserialize, Serialize};
+pub(crate) use state::{
+    MergeState, merge_in_progress, merge_state_for_pseudo_refs, merge_state_gc_oids,
+};
 
 use super::{
     get_target_commit, load_object, load_object_raw, rename_detect, reset,
     restore::{self, RestoreArgs},
-    save_object, status, switch,
+    save_object, status, switch, *,
 };
 use crate::{
     command::{
@@ -62,20 +73,6 @@ use crate::{
     },
 };
 
-// Preserve the existing command::merge type path for downstream callers.
-#[allow(unused_imports)]
-pub(crate) use autostash::StoppedMerge;
-pub(crate) use autostash::{
-    MergeAutostash, conclude_merge_after_commit, conclude_stopped_merge, snapshot_stopped_merge,
-};
-use autostash::{
-    preflight_held_autostash, prepare_merge_autostash, resolve_pending_autostash,
-    resolve_pending_autostash_with, store_pending_autostash, verify_autostash_ownership,
-};
-pub(crate) use state::{
-    MergeState, merge_in_progress, merge_state_for_pseudo_refs, merge_state_gc_oids,
-};
-
 pub(crate) fn write_workdir_entry(
     workdir: &Path,
     relative: &Path,
@@ -93,7 +90,11 @@ pub(crate) fn write_workdir_entry(
     )
 }
 
-pub(crate) fn write_workdir_symlink(workdir: &Path, relative: &Path, content: &[u8]) -> Result<(), String> {
+pub(crate) fn write_workdir_symlink(
+    workdir: &Path,
+    relative: &Path,
+    content: &[u8],
+) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
@@ -121,7 +122,9 @@ pub(crate) fn write_workdir_symlink(workdir: &Path, relative: &Path, content: &[
     }
 }
 
-pub(crate) fn worktree_paths_to_write(merged_items: &HashMap<PathBuf, MergeTreeEntry>) -> Vec<PathBuf> {
+pub(crate) fn worktree_paths_to_write(
+    merged_items: &HashMap<PathBuf, MergeTreeEntry>,
+) -> Vec<PathBuf> {
     merged_items
         .iter()
         .filter(|(_, entry)| entry.mode != TreeItemMode::Commit)
@@ -161,7 +164,11 @@ pub(crate) fn ensure_no_untracked_conflicts(
 }
 
 #[cfg(not(unix))]
-pub(crate) fn write_workdir_file(workdir: &Path, relative: &Path, content: &[u8]) -> Result<(), String> {
+pub(crate) fn write_workdir_file(
+    workdir: &Path,
+    relative: &Path,
+    content: &[u8],
+) -> Result<(), String> {
     write_workdir_file_with_mode(workdir, relative, content, false)
 }
 

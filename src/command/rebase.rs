@@ -1,10 +1,6 @@
 //! Rebase implementation that parses onto/branch arguments, replays commits onto a new base, handles conflicts, and updates branch refs.
 
 mod state;
-use self::state::*;
-pub use state::RebaseState;
-pub(crate) use state::{RebaseAuxState, held_autostash_oid_in_gitdir, rebase_aux_gc_oids};
-
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -21,11 +17,12 @@ use git_internal::{
         tree::{Tree, TreeItemMode},
     },
 };
-use sea_orm::{
-    ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
-};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 use serde::Serialize;
+pub use state::RebaseState;
+pub(crate) use state::{RebaseAuxState, held_autostash_oid_in_gitdir, rebase_aux_gc_oids};
 
+use self::state::*;
 use crate::{
     cli_error,
     command::{editor, load_object, merge, rebase_todo, save_object, status, switch},
