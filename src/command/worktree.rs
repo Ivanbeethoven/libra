@@ -1770,7 +1770,7 @@ async fn add_scorpiofs_worktree(
         ))
     })?;
 
-    let client = reqwest::Client::new();
+    let client = crate::command::sync::http();
     // Worktree v2 attach: one call provisions the mount with its lower pinned from
     // the first request (no tip-drift window before the base binding), and the
     // daemon never touches VCS metadata — Libra writes `.libra` through the mount
@@ -1929,7 +1929,7 @@ pub(crate) async fn fork_scorpiofs_worktree(
         .unwrap_or_else(|_| "http://127.0.0.1:2725/antares".to_string())
         .trim_end_matches('/')
         .to_string();
-    let client = reqwest::Client::new();
+    let client = crate::command::sync::http();
     // Unique per attempt, same reasoning as the attach path: a deterministic id
     // would idempotently re-attach a stale fork of the same target path.
     let fork_nonce = uuid::Uuid::new_v4();

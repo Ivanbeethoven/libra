@@ -1,5 +1,6 @@
 //! Utilities module aggregator exposing storage, path, object, LFS, D1 client, and testing helpers.
 
+pub mod fast_index;
 pub mod error;
 #[cfg(unix)]
 pub mod fuse;
@@ -37,6 +38,7 @@ pub mod test;
 pub mod text;
 pub mod thin_pack;
 pub mod tree;
+pub mod tree_cache;
 pub mod tree_attributes;
 pub mod util;
 pub mod worktree;

@@ -145,16 +145,72 @@ pub fn validate_index_objects_subset(
     validate_index_objects_filtered(index, false, Some(names))
 }
 
+/// [`validate_index_objects_subset`] over the index projection. Looks up only
+/// the staged names (O(staged)) instead of materializing the whole tracked list
+/// just to filter it down to a handful.
+pub fn validate_index_objects_subset_fast(
+    index: &crate::utils::fast_index::FastIndex,
+    names: &std::collections::HashSet<String>,
+) -> Result<(), TreePlumbingError> {
+    let entries: Vec<EntryRef<'_>> = names
+        .iter()
+        .filter_map(|name| index.get(name))
+        .map(EntryRef::Fast)
+        .collect();
+    validate_entries(&entries, false)
+}
+
+/// One tracked entry, from either index representation.
+enum EntryRef<'a> {
+    Fast(&'a crate::utils::fast_index::FastEntry),
+    Index(&'a IndexEntry),
+}
+
+impl EntryRef<'_> {
+    fn name(&self) -> &str {
+        match self {
+            EntryRef::Fast(entry) => &entry.name,
+            EntryRef::Index(entry) => &entry.name,
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        match self {
+            EntryRef::Fast(entry) => entry.mode,
+            EntryRef::Index(entry) => entry.mode,
+        }
+    }
+
+    fn hash(&self) -> ObjectHash {
+        match self {
+            EntryRef::Fast(entry) => entry.hash,
+            EntryRef::Index(entry) => entry.hash,
+        }
+    }
+}
+
 fn validate_index_objects_filtered(
     index: &Index,
     missing_ok: bool,
     only: Option<&std::collections::HashSet<String>>,
 ) -> Result<(), TreePlumbingError> {
+    let tracked = index.tracked_entries(0);
+    let entries: Vec<EntryRef<'_>> = match only {
+        Some(names) => tracked
+            .iter()
+            .filter(|entry| names.contains(&entry.name))
+            .map(|entry| EntryRef::Index(*entry))
+            .collect(),
+        None => tracked.iter().map(|entry| EntryRef::Index(*entry)).collect(),
+    };
+    validate_entries(&entries, missing_ok)
+}
+
+fn validate_entries(
+    entries: &[EntryRef<'_>],
+    missing_ok: bool,
+) -> Result<(), TreePlumbingError> {
     let storage = util::objects_storage();
-    let mut entries = index.tracked_entries(0);
-    if let Some(names) = only {
-        entries.retain(|entry| names.contains(&entry.name));
-    }
 
     // Fast path: one batched type probe resolves every entry that is present and
     // correctly typed — in a healthy repository, the whole index. Local storage
@@ -164,23 +220,25 @@ fn validate_index_objects_filtered(
     // that cannot probe cheaply) falls through to the per-object read below, so the
     // error surface and the `missing_ok` valve are unchanged.
     let probed = storage
-        .get_object_types_bounded_many(&entries.iter().map(|entry| entry.hash).collect::<Vec<_>>())
+        .get_object_types_bounded_many(&entries.iter().map(|entry| entry.hash()).collect::<Vec<_>>())
         .ok();
 
     for entry in entries.iter() {
-        let mode = index_mode_to_tree_mode(entry.mode, &entry.name)?;
+        let name = entry.name();
+        let hash = entry.hash();
+        let mode = index_mode_to_tree_mode(entry.mode(), name)?;
         let Some(expected) = expected_object_type(mode) else {
             continue;
         };
-        match probed.as_ref().and_then(|found| found.get(&entry.hash)) {
+        match probed.as_ref().and_then(|found| found.get(&hash)) {
             // Already answered with the expected type: nothing left to check.
             Some(actual) if *actual == expected => continue,
             // Answered with a different type: a real mismatch, reported exactly as
             // the slow path below reports it.
             Some(actual) => {
                 return Err(TreePlumbingError::WrongObjectType {
-                    path: entry.name.clone(),
-                    object: entry.hash,
+                    path: name.to_string(),
+                    object: hash,
                     expected,
                     actual: *actual,
                 });
@@ -189,7 +247,7 @@ fn validate_index_objects_filtered(
             // read produce the exact error, including the `missing_ok` exemption.
             None => {}
         }
-        let actual = match storage.get_object_type(&entry.hash) {
+        let actual = match storage.get_object_type(&hash) {
             Ok(actual) => actual,
             // PD-05: only "the object does not exist" is excusable, and only
             // for blob-typed entries; read/corruption failures stay fatal so
@@ -199,8 +257,8 @@ fn validate_index_objects_filtered(
             }
             Err(error) => {
                 return Err(TreePlumbingError::MissingOrUnreadableObject {
-                    path: entry.name.clone(),
-                    object: entry.hash,
+                    path: name.to_string(),
+                    object: hash,
                     expected,
                     detail: error.to_string(),
                 });
@@ -208,8 +266,8 @@ fn validate_index_objects_filtered(
         };
         if actual != expected {
             return Err(TreePlumbingError::WrongObjectType {
-                path: entry.name.clone(),
-                object: entry.hash,
+                path: name.to_string(),
+                object: hash,
                 expected,
                 actual,
             });

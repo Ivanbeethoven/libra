@@ -15,7 +15,13 @@ pub(crate) struct TrackedPaths {
 
 impl TrackedPaths {
     pub(crate) fn from_index(index: &Index, case_aliases_enabled: bool) -> Self {
-        let files = index.tracked_files();
+        Self::from_paths(index.tracked_files(), case_aliases_enabled)
+    }
+
+    /// Build from an already-materialized path list — the ScorpioFS fast path
+    /// has the names from its sorted projection and must not pay an `Index`
+    /// (BTreeMap) rebuild just to re-extract them.
+    pub(crate) fn from_paths(files: Vec<PathBuf>, case_aliases_enabled: bool) -> Self {
         let top_level_dirs = files
             .iter()
             .filter_map(|path| top_level_dir(path))

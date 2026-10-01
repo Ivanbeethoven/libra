@@ -1023,10 +1023,9 @@ async fn run_commit_with_index(
     // every nested status/diff/index consumer observes the preview while the live
     // index remains untouched on success, error, cancellation, or panic.
     let prepared = async {
-        let __t = std::time::Instant::now();
-        let _original_index =
-            Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
-        eprintln!("COMMIT_PHASE index_load+validate1_setup {}us", __t.elapsed().as_micros());
+        // (The original-index preload and its full validation were removed: the
+        // validation is now staged-subset only, and the load itself was a third
+        // full parse of a 19 MB index — 292 ms at 174k entries — for nothing.)
 
         let auto_stage_applied = if args.all {
             auto_stage_tracked_changes(!dry_run, dry_run && message_settings.verbose)?
@@ -1034,20 +1033,26 @@ async fn run_commit_with_index(
             false
         };
 
-        let index =
-            Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        let __tl = std::time::Instant::now();
+        // The projection (sorted Vec), not an `Index`: every consumer below —
+        // the staged diff, the staged-subset validation, the incremental tree
+        // build, the committed snapshot — reads only (name, oid, mode), and an
+        // `Index` rebuild is a 174k-insert BTreeMap (~320 ms) against ~100 ms
+        // for this parse.
+        let index = crate::utils::fast_index::FastIndex::load(&path::index())
+            .map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        eprintln!("COMMIT_PHASE index_load {}ms", __tl.elapsed().as_millis());
         let storage = ClientStorage::init(path::objects());
-        let tracked_entries = index.tracked_entries(0);
 
         // Skip empty commit check for --amend operations
-        if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
+        if index.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
             // No files have ever been staged — distinct from "staged but unchanged"
             return Err(CommitError::NothingToCommitNoTracked);
         }
 
         // Verify staged changes relative to HEAD (skip for --amend)
         let __t3 = std::time::Instant::now();
-        let staged_changes = status::changes_to_be_committed_with_index(&index)
+        let staged_changes = status::changes_to_be_committed_with_fast_index(&index)
             .await
             .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
         eprintln!("COMMIT_PHASE staged_changes {}ms", __t3.elapsed().as_millis());
@@ -1075,7 +1080,7 @@ async fn run_commit_with_index(
                 .chain(staged_changes.modified.iter())
                 .map(|path| crate::utils::util::path_to_string(path))
                 .collect();
-            tree_plumbing::validate_index_objects_subset(&index, &staged_names)
+            tree_plumbing::validate_index_objects_subset_fast(&index, &staged_names)
                 .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
             eprintln!(
                 "COMMIT_PHASE validate_staged {}ms (entries={})",
@@ -1167,8 +1172,54 @@ async fn run_commit_with_index(
 
     // Create tree
     let __t4 = std::time::Instant::now();
-    let tree = create_tree_with_persistence(&index, &storage, "".into(), !dry_run).await?;
+    // Incremental build: only the directories on a staged-change path are
+    // rebuilt; every other subtree reuses the oid recorded for the parent
+    // commit (libra's cache-tree, see utils::tree_cache). A missing or stale
+    // cache degrades to the full rebuild, which is always correct.
+    let mut new_tree_cache: Option<crate::utils::tree_cache::TreeCache> = None;
+    let cache_path = crate::utils::path::index().with_file_name("committed-index.trees");
+    let tree = if dry_run {
+        // Previews only: materialize the full `Index` the recursive builder wants.
+        let full = crate::utils::fast_index::load(&crate::utils::path::index())
+            .map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        create_tree_with_persistence(&full, &storage, "".into(), false).await?
+    } else {
+        let head_tree = parents_commit_ids
+            .first()
+            .and_then(|id| load_object::<Commit>(id).ok())
+            .map(|commit| commit.tree_id);
+        let cache =
+            head_tree.and_then(|t| crate::utils::tree_cache::TreeCache::load(&cache_path, &t));
+        let changed = crate::utils::tree_cache::changed_dirs(
+            staged_changes
+                .new
+                .iter()
+                .chain(staged_changes.modified.iter())
+                .chain(staged_changes.deleted.iter()),
+        );
+        let mut pending: Vec<(ObjectHash, Vec<u8>)> = Vec::new();
+        let mut builder = crate::utils::tree_cache::IncrementalBuilder::new(
+            &index,
+            cache.as_ref(),
+            &changed,
+            true,
+            &mut pending,
+        );
+        let tree = builder.build().map_err(CommitError::TreeCreation)?;
+        new_tree_cache = Some(builder.into_new_cache(&tree));
+        if !pending.is_empty() {
+            let objects = pending
+                .into_iter()
+                .map(|(id, data)| (id, data, ObjectType::Tree))
+                .collect();
+            storage.put_missing_batch(objects).map_err(|e| {
+                CommitError::TreeCreation(format!("failed to save tree objects: {e}"))
+            })?;
+        }
+        tree
+    };
     eprintln!("COMMIT_PHASE create_tree {}ms", __t4.elapsed().as_millis());
+    let __t5 = std::time::Instant::now();
 
     // Sidecar for the NEXT commit's staged-changes diff: at this point the index
     // IS the committed state, so a copy of it plus the tree it produced lets
@@ -1177,39 +1228,25 @@ async fn run_commit_with_index(
     // repo; the tree walk crosses the FUSE mount on a ScorpioFS worktree).
     // Keyed by tree oid, so it self-invalidates whenever HEAD moves.
     if !dry_run {
-        // Written on a worker thread and published atomically (temp + rename): the
-        // serialization is ~5 MB for a 50k index and must not sit on the commit's
-        // critical path. A crash before the rename leaves the previous sidecar in
-        // place, whose key no longer matches HEAD -> the next diff falls back to
-        // the tree walk, which is always correct.
+        // A self-keyed snapshot of the projection the diff actually reads —
+        // `(name, oid, mode)` — written atomically (temp + rename), keyed by
+        // the tree oid so any HEAD move invalidates it. This used to be a full
+        // 19 MB copy of the index plus a separate fast-cache of that copy; the
+        // index copy was 19 MB of write-only I/O per commit.
+        // SYNCHRONOUS on purpose: this was briefly a detached thread, and a
+        // `libra commit` process exits long before a background thread finishes
+        // serialising the snapshot — it never appeared on disk, so every diff
+        // silently fell back to the tree walk.
         let index_path = crate::utils::path::index();
-        let sidecar = index_path.with_file_name("committed-index");
-        let meta = index_path.with_file_name("committed-index.tree");
-        let tree_key = tree.id.to_string();
-        std::thread::spawn(move || {
-            // Reload from disk rather than cloning: the on-disk index equals the
-            // committed state at this point (nothing mutates it after tree
-            // creation), and `Index` is not `Clone`.
-            let snapshot = match Index::load(&index_path) {
-                Ok(snapshot) => snapshot,
-                Err(e) => {
-                    tracing::warn!(error = %e, "committed-index snapshot load failed; next commit falls back to a tree walk");
-                    return;
-                }
-            };
-            let tmp = sidecar.with_extension("tmp");
-            if let Err(e) = snapshot.to_file(&tmp) {
-                tracing::warn!(error = %e, "committed-index sidecar write failed; next commit falls back to a tree walk");
-                return;
-            }
-            if let Err(e) = std::fs::rename(&tmp, &sidecar) {
-                tracing::warn!(error = %e, "committed-index sidecar rename failed");
-                return;
-            }
-            if let Err(e) = std::fs::write(&meta, tree_key) {
-                tracing::warn!(error = %e, "committed-index meta write failed; next commit falls back to a tree walk");
-            }
-        });
+        let committed = index_path.with_file_name("committed-files");
+        index.write_snapshot_to(&committed, &tree.id.to_string());
+        if let Some(cache) = new_tree_cache.take() {
+            cache.save(&cache_path);
+        }
+        // Retire the previous sidecar generation if it is still around.
+        for legacy in ["committed-index", "committed-index.tree", "committed-index.fastcache"] {
+            let _ = std::fs::remove_file(index_path.with_file_name(legacy));
+        }
     }
 
     // Create author and committer signatures
@@ -1493,8 +1530,11 @@ async fn run_commit_with_index(
 
     // INVARIANT: persist the commit object before moving HEAD so a crash after
     // ref update never points the branch at a missing object.
+    eprintln!("COMMIT_PHASE pre_write {}ms", __t5.elapsed().as_millis());
+    let __t6 = std::time::Instant::now();
     save_commit_object(&storage, &commit)?;
     update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
+    eprintln!("COMMIT_PHASE write_and_ref {}ms", __t6.elapsed().as_millis());
     if !skip_all_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
     }
@@ -2302,6 +2342,7 @@ pub async fn execute(args: CommitArgs) {
 /// nothing to commit, identity/signing setup fails, object writes fail, or HEAD
 /// cannot be updated.
 pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<()> {
+    let __t_entry = std::time::Instant::now();
     let preview = args.dry_run || args.porcelain;
     // Keep the large commit state machine off callers' stacks. In particular,
     // direct library consumers and Tokio's default-size worker/test threads
@@ -2327,6 +2368,10 @@ pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<
     if !preview {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_COMMIT).await;
     }
+    eprintln!(
+        "COMMIT_PHASE total_from_entry {}ms",
+        __t_entry.elapsed().as_millis()
+    );
     Ok(())
 }
 
