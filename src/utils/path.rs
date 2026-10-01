@@ -24,16 +24,62 @@ pub fn index() -> PathBuf {
     if let Ok(index_path) = INDEX_OVERRIDE.try_with(Clone::clone) {
         return index_path;
     }
-    // lore.md 2.1: the index is PER-WORKTREE — it lives in the local gitdir,
-    // not the shared/common storage (db/objects stay shared).
-    util::worktree_gitdir().join("index")
+    // lore.md 2.1: the index is PER-WORKTREE. For a LINKED worktree it lives in the
+    // COMMON storage's `worktrees/<id>/` — the same split git uses
+    // ($GIT_COMMON_DIR/worktrees/<id>/index) — which matters most on a ScorpioFS
+    // worktree, where the worktree's own `.libra` sits INSIDE the FUSE mount: the
+    // index is ~19 MB at 174k entries, measured at 290 ms per read and several
+    // hundred ms per write through the mount.
+    linked_index_for(util::worktree_gitdir())
 }
 
 pub fn try_index() -> io::Result<PathBuf> {
     if let Ok(index_path) = INDEX_OVERRIDE.try_with(Clone::clone) {
         return Ok(index_path);
     }
-    Ok(util::try_get_worktree_gitdir(None)?.join("index"))
+    Ok(linked_index_for(util::try_get_worktree_gitdir(None)?))
+}
+
+/// Resolve the per-worktree index path (see [`index`]). Infallible and idempotent:
+/// a linked worktree whose index still sits in its own gitdir (created before this
+/// split) is migrated once, on first touch.
+fn linked_index_for(gitdir: PathBuf) -> PathBuf {
+    let Ok(common) = std::fs::read_to_string(gitdir.join("commondir")) else {
+        return gitdir.join("index");
+    };
+    let common = common.trim();
+    if common.is_empty() {
+        return gitdir.join("index");
+    }
+    let common = if std::path::Path::new(common).is_absolute() {
+        PathBuf::from(common)
+    } else {
+        // git writes this relative to the gitdir
+        gitdir.join(common)
+    };
+    let Ok(id) = std::fs::read_to_string(gitdir.join("worktree_id")) else {
+        return gitdir.join("index");
+    };
+    let id = id.trim();
+    if id.is_empty() {
+        return gitdir.join("index");
+    }
+    let dir = common.join("worktrees").join(id);
+    let new_index = dir.join("index");
+    if !new_index.exists() {
+        let old_index = gitdir.join("index");
+        if old_index.exists() {
+            // One-time migration for worktrees created before the split; a rename
+            // through the mount is still cheaper than every later read paying it.
+            if std::fs::create_dir_all(&dir).is_ok()
+                && std::fs::rename(&old_index, &new_index).is_err()
+            {
+                let _ = std::fs::copy(&old_index, &new_index);
+            }
+        }
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    new_index
 }
 
 pub fn objects() -> PathBuf {
