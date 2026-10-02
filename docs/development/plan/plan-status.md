@@ -10,7 +10,7 @@
 > 4. 以「计划一览」表为权威，其余小节是它的展开视图；冲突时以任务卡自身 `Lifecycle / Acceptance` 与 `plan-long.md` 的日期索引交叉核对。
 > 5. 状态快照时间见本文件头，格式为 `YYYY-MM-DD HH:MM:SS UTC`（24 小时制、UTC、精确到秒）。每次更新必须把快照时间改成这次写入时的 UTC 时钟时间，便于多个 Agent 区分先后。已经写下的纯日期记录保持原样，不补写时间。
 >
-> **当前快照：** 2026-10-01 19:26:56 UTC（issues/574：**已收口**；BRL-01..05 `done`/`complete` v0.30.9..v0.30.13；BRL-05 PR #590 `ce2411d`，release 36910331385 8/8；DEFER-BRL-01..03 仍挂。）
+> **当前快照：** 2026-10-02 01:04:02 UTC（[`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) 连同本文件与 `plan-long.md` 的登记一起提交：计划级 Codex review 已 `PASS`（R15 全文 `PASS`、R16 差异确认 `PASS`；提交前按上游 v0.30.11–v0.30.13 复核锚点，R17 `FAIL` 的 1 个 P1 已修订，R18 差异确认 `PASS`；R2 后已按使用者批准登记 G-03 门族型豁免 EX-MN-01/02/03）；MN-01..MN-12 仍全部 `pending`，已登记「计划一览」「未启动的计划与卡」、DEFER 与跨计划依赖（MN-03 经 `DEP-MN-06` 进入 `DEP-AD-12 / DEP-CLI-mirror`）；其余沿用 2026-10-01 19:26:56 UTC 快照：issues/574：**已收口**；BRL-01..05 `done`/`complete` v0.30.9..v0.30.13；BRL-05 PR #590 `ce2411d`，release 36910331385 8/8；DEFER-BRL-01..03 仍挂。）
 
 ---
 
@@ -20,6 +20,7 @@
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
+| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | 横切（Mega2 browser 非交互操作 / 黑盒驱动） | 已排期 | 2026-10-01 成稿：为 `libra mega2 browser` 全部功能增加非交互操作（`--list`、目录建/删/移/改名、tag 列/建/删）以支持 Mega2 黑盒测试；MN-01..MN-12 全部 `pending`（MN-08 自 MN-04、MN-09 自 MN-06、MN-11 自 MN-03、MN-12 自 MN-08 拆出；MN-10 为新增的 URL 回显修复）；部分取代 plan-20260912 ADR-MB-02（保留唯一子命令 `browser`）；pin mega2@`8ff880c`；计划级 Codex review 已 `PASS`：R1–R14 `FAIL` 均已修订，R15 全文 `PASS`、R16 差异确认 `PASS`；提交前上游前移到 `7f810da`，R17 `FAIL` 已修订、R18 差异确认 `PASS`（R2 后登记使用者批准的 G-03 门族型豁免 EX-MN-01/02/03，R5 后 MN-11 并入 EX-MN-02）；`DEP-MN-03` 向 mega2 plan-20261001 的 Libra 域（`scripts/libra_smoke_storage_only.sh`，`BB-65` 起）交付 |
 | [`plan-20260924.md`](plan-20260924.md) | B（Agent Capture 通用架構前置） | 已排期 | ACF-01..09 全部 `pending`；Entire `main@9c06bfb13` 對標已完成；Claude R8 字面 `VERDICT: PASS`（P0/P1/P2=0）；是 0902/0904/0905/0911 production、0916 CAP-07 與 0923 DM-05 session consumer contract 的前置 |
 | [`plan-20260925.md`](plan-20260925.md) | B（Session Capture 决策中层） | **已收口** | SCAP-02 / SCAP-01 均为 `done`/`complete`（`v0.23.55` / `fa3849e`；D 组 release+CodeQL 全绿；2026-09-28 最终本地门 8241/8241 passed，本轮不 bump 版本） |
 | [`plan-20260923.md`](plan-20260923.md) | Cross-cutting (implemented CLI completion) | 已排期 | English static-first rewrite; CP-00..20 pending; CP-00 inventory precedes implementation approval; CP-06 static acceptance blocks all dynamic work; no implementation/release claimed |
@@ -97,6 +98,7 @@
 
 | 计划 | 全部待执行卡 | 开工前置条件 |
 |---|---|---|
+| [`plan-20261001-mega-browser-noninteractive.md`](plan-20261001-mega-browser-noninteractive.md) | MN-01..MN-12（全串行：MN-10 → 01 → 02 → 03 → 11 → 04 → 08 → 12 → 05 → 06 → 09 → 07） | 计划级 Codex review 已 `PASS`（R15–R18，ER-MN-03）；`DEP-MN-02`（`../libra-backend` 为 Git 且在 `cf`）核对；MN-03 起按 GC-MN-08 重核 `DEP-MN-01`（mega2@`8ff880c`）；MN-03 另需 `DEP-MN-06`（`src/cli.rs` 注释改动的三态窗口）；MN-07 另需 `DEP-MN-04`（可写的真实 mega2 storage-only 实例） |
 | [`plan-20260924.md`](plan-20260924.md) | ACF-01..ACF-09 | Claude 字面 `VERDICT: PASS`；ACF-01 重核 Entire/Libra pin 與 shared files clean |
 | [`plan-20260926.md`](plan-20260926.md) | DM-00..DM-13（14 卡，全部 pending） | R11 字面 `VERDICT: PASS`（`P0=0` / `P1=0`）。`DM-00` 保持 `pending`。`DEP-DM-06` 仍阻塞 `DM-05`（等 plan-20260924 的 `CTR-ACF-DM06-v1` 或 ACF-08 收口） |
 | [`plan-20260902.md`](plan-20260902.md) | OG-00..OG-15 | OG-00/04 以各自 review gate 為準；其余 production 卡等待 `DEP-ACF-MIRROR` |
@@ -373,6 +375,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 ### 5.4 其它计划
 
+- plan-20261001-mega-browser-noninteractive：`DEFER-MN-01..09`（按名称取 tag、非根 tag path 与 tag 的 target/tagger 字段、文件条目操作、组合 move/批处理/轮询、成功状态码与可配置超时、stable code 映射统一、`path/provision` 与 `import-repo/remove`、mega2 仓内的 Libra 黑盒用例（由 mega2 plan-20261001 `DEP-BB-04`/`DEFER-BB-03` 承接）、`DEP-MN-04` 超时后的 live 证据降级）。
 - plan-20260927：`DEFER-CM-01` 暂不机械拆分 `fetch.rs`、`push.rs`、`maintenance.rs`；生产职责本身继续增长或真实任务反复跨职责修改时，先重审源码与测试归属，再另立日期计划。
 - plan-20260923: DEFER-CP-01 additional shells; DEFER-CP-02 network suggestions; DEFER-CP-03 unimplemented underlying capabilities. Existing local Libra capabilities may not be hidden by these deferrals.
 - plan-20260925：`DEFER-SCAP-01` 已按用户指示删除，ID 不再复用；`DEFER-SCAP-03` 不引入 Entire git phase；`DEFER-SCAP-04` 不改 `docs/development/tracing/agent.md`，也不向其它计划派发该文件。owner 的 SessionStart/TurnStart 豁免已经存在，本计划不改。
@@ -392,6 +395,8 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 
 | DEP-ID | 类型 | 内容 | 现状 |
 |---|---|---|---|
+| DEP-MN-03 | 跨仓交付（outgoing） | plan-20261001-mega-browser-noninteractive 交付 `mega2 browser` 非交互操作、机器契约与 live 门；接收方是 mega2 plan-20261001 的 Libra 域（`scripts/libra_smoke_storage_only.sh`；`DEP-BB-04`/`DEFER-BB-03`；`BB-65` 起编号已预留）。Libra 仓内的测试不受 mega2 工具链规定约束；任何一方都不得向 mega2 的 curl + git smoke 脚本加入 libra 用例 | 未交付；MN-03、MN-11、MN-04、MN-08、MN-12、MN-05、MN-06、MN-09 进入 libra.tools stable 后由 MN-07 登记「已交付」并附版本号与 lightweight tag 分页观察；本仓不改 `../mega2/**` |
+| DEP-MN-05 | 跨计划信息移交（outgoing） | plan-20261001-mega-browser-noninteractive 新增的 `mega2 browser` 操作 flag 进入 plan-20260923 CP-19 的能力台账；双方无实现写集交集 | 生效（信息性，不阻塞任一方） |
 | DEP-SA-03 | Issue #577 与 plan-20260927 共享写集/发布窗口 | #577 SA-01 使用 `tests/command/mod.rs`、serial registry/nextest、版本面；与 CM/FIX 命中相同文件的实施和全部发布顺序串行，前卡推送后重基重测。SA-02 网站指南先行，其网站 `cf` 写集也须核对其它计划实际页面写集。 | **已解除（2026-09-27）**；#577 经两次主线重基、最终全量、PR #578、v0.24.1 和网站 D 门完成，SA-02/SA-01 均 `done`/`complete`。后续 CM/FIX 从已发布 main 重新核写集。 |
 | DEP-CM-01 / DEP-CM-02 / DEP-CM-03 | 命令写集、发布窗口与 Cloud L3 | 13 张 CM + 9 张 FIX，共 22 卡；开工前核实际同文件写集。FIX-CM-01 → CM-01，FIX-CM-04 → CM-04，CM-05 → CM-13，CM-07 → FIX-CM-08 → CM-08，CM-03/CM-13 → FIX-CM-LIVE-GATE → FIX-CM-CLOUD-RECOVERY-AUTH → FIX-CM-CLOUD-RECOVERY-CLEANUP → FIX-CM-CLOUD-REPO-SCOPE → FIX-CM-CLOUD-LIVE-SAFETY → CM-10 → CM-11。其它全部卡 C/T-5 等 scope FIX 独立发布。`tests/INDEX.md` 全写者按 FIX-CM-01 → CM-01 → CM-06 → CM-02 → CM-03 → CM-07 → FIX-CM-08 → CM-08 → CM-09 → CM-12 → CM-04 → CM-05 → CM-13 → FIX-CM-LIVE-GATE → FIX-CM-CLOUD-RECOVERY-AUTH → FIX-CM-CLOUD-RECOVERY-CLEANUP → FIX-CM-CLOUD-REPO-SCOPE → FIX-CM-CLOUD-LIVE-SAFETY → CM-10 → CM-11 串行发布，CM-03 → CM-10 另串行写 serial registry；`CM-Publisher` `/root` 精确暂存。真实 Cloud L3 只在受保护 release-SHA CI dispatch 写 job 执行，按安全卡/CM-10/CM-11 各自 `E-CM-L3-SAFETY/10/11` 证独立期望、D1/R2 只读、trigger 全 SQL 基线、全库加密备份 runner 外上传读回、global/逐例 manifest、限定补偿/清理。 | 生效；CM-01、CM-04 `blocked`/空，CM-06、CM-10 `in-progress`/空，其余 17 卡 `pending`/空，均未发布。用户精确期望已确认，四 vars API readback 4/4；D1 25 triggers 中 16 remote-existing/unmatched 尚待 owner 核签。DEP-CM-03 与三个 E 仍 `unknown`；本地仅 fake/mock/default C，不执行真实 D1/R2 写。 |
 | DEP-CM-04 | CM-07 网站 `cf` 开工基线 | 仅要求开工前只读核后端 VCS、远端 `cf` pre-SHA 与 `status.en.md` blob、隔离 clone、签名/DCO/普通推送配置权限和站点命令可用。网站页编辑、新源码锚点/porcelain-v2 修正、gen:docs/typecheck/build、签名推送、远端及实际部署证据，均为 CM-07 自身交付门；已推后失败按远端 post-SHA 条件化签名补偿，远端竞态/部署不确定进入 `remote-pending`。 | 开工基线未重核，网站未交付；DEP-CM-04 不要求先完成 CM-07 网站变更，避免自环；只 Git push 不算部署。 |
@@ -404,7 +409,7 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 | DEP-CP-04 | Release/window exclusion | Respect plan-20260921 REL-VG-01 file reservation | Verify before intersecting edits, not only before version bump |
 | DEP-CP-05 | Contract/file exclusion | issues/476/478/480 command evolution and overlapping files | Refresh actual parameters and reserve conflicting files |
 | DEP-CP-06 | Agent read contract | plan-20260819 models and identity-scoped readers | Verify before CP-13..15; does not block static stage |
-| DEP-AD-12 / DEP-CLI-mirror | 跨计划写集互斥 | `src/cli.rs` 三态串行：plan-20260918 OI-05、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、issues/483 CO-03/04 | 生效；OI-05 开工前必须核对 |
+| DEP-AD-12 / DEP-CLI-mirror | 跨计划写集互斥 | `src/cli.rs` 三态串行：plan-20260918 OI-05、plan-20260904 CX-30、plan-20260912 MB-03/05、plan-20260916 CAP-07、issues/483 CO-03/04、plan-20261001-mega-browser-noninteractive MN-03（仅改 `src/cli.rs:2006-2009` 注释，`DEP-MN-06`） | 生效；OI-05、MN-03 开工前必须核对 |
 | DEP-GCX-02 | 跨计划写集互斥 | plan-20260919 与 plan-20260918 的 `COMPATIBILITY.md`/docs/网站页串行 | 生效 |
 | DEP-FL-04 | 跨计划前置 | plan-20260913 依赖 plan-20260907 完整收口 | plan-20260907 未启动 |
 | DEP-CC-05 | 跨计划前置 | plan-20260905 CC-02..06 依赖 plan-20260904 全部非延后卡完成 | plan-20260904 未启动 |
