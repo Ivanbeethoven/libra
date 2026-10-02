@@ -1590,6 +1590,8 @@ async fn restore_to_commit(commit_hash: ObjectHash) -> CliResult<()> {
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_progress: false,
+    
+        seed_full_index: true,
     };
     restore::execute_to_output(restore_args).await?;
     Ok(())

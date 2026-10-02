@@ -315,6 +315,14 @@ pub struct RestoreArgs {
     /// Toggle pair with `--overlay`; the last one wins.
     #[clap(long = "no-overlay", overrides_with = "overlay")]
     pub no_overlay: bool,
+    /// Internal: this `--staged` restore rebuilds the WHOLE index from a
+    /// commit tree (worktree attach/fork seeding), so afterwards the index is
+    /// exactly that tree. On that contract the restore also publishes the
+    /// `committed-files` snapshot, letting the worktree's first status/commit
+    /// diff projections instead of walking every tree object (measured ~270 s
+    /// at 826k entries on a cold MST/2 lower). Never set from the CLI.
+    #[clap(skip)]
+    pub seed_full_index: bool,
 }
 
 pub async fn execute(args: RestoreArgs) {
@@ -467,7 +475,8 @@ async fn run_restore(mut args: RestoreArgs) -> Result<RestoreOutput, RestoreErro
     }
 
     let storage = util::objects_storage();
-    let mut target_blobs = resolve_target_blobs(source.as_deref(), staged, &storage).await?;
+    let (mut target_blobs, source_tree_id) =
+        resolve_target_blobs(source.as_deref(), staged, &storage).await?;
 
     // Unmerged guard: a plain restore must not silently act on a matched
     // unmerged path. Without an exemption this is a fatal error (Git's
@@ -506,8 +515,14 @@ async fn run_restore(mut args: RestoreArgs) -> Result<RestoreOutput, RestoreErro
         deleted_files.extend(deleted);
     }
     if staged {
-        let (restored, deleted) =
-            restore_index_tracked(&pathspecs, &target_blobs, overlay, &skipped_unmerged_paths)?;
+        let (restored, deleted) = restore_index_tracked(
+            &pathspecs,
+            &target_blobs,
+            overlay,
+            &skipped_unmerged_paths,
+            source_tree_id,
+            args.seed_full_index,
+        )?;
         let mut restored_seen: HashSet<String> = restored_files.iter().cloned().collect();
         let mut deleted_seen: HashSet<String> = deleted_files.iter().cloned().collect();
 
@@ -557,7 +572,7 @@ async fn resolve_target_blobs(
     source: Option<&str>,
     staged: bool,
     storage: &ClientStorage,
-) -> Result<Vec<(PathBuf, RestoreTarget)>, RestoreError> {
+) -> Result<(Vec<(PathBuf, RestoreTarget)>, Option<ObjectHash>), RestoreError> {
     const HEAD: &str = "HEAD";
 
     match source {
@@ -566,7 +581,7 @@ async fn resolve_target_blobs(
                 return Err(RestoreError::ResolveSource);
             }
             let index = Index::load(path::index()).map_err(|_| RestoreError::ReadIndex)?;
-            Ok(index
+            Ok((index
                 .tracked_entries(0)
                 .into_iter()
                 .map(|entry| {
@@ -575,7 +590,7 @@ async fn resolve_target_blobs(
                         RestoreTarget::new(entry.hash, index_mode_to_tree_item_mode(entry.mode)),
                     )
                 })
-                .collect())
+                .collect(), None))
         }
         Some(src) => {
             let commit = if src == HEAD {
@@ -594,12 +609,13 @@ async fn resolve_target_blobs(
             let tree_id = load_object::<Commit>(&commit)
                 .map_err(|_| RestoreError::ReadObject)?
                 .tree_id;
-            Ok(load_object::<Tree>(&tree_id)
+            let blobs = load_object::<Tree>(&tree_id)
                 .map_err(|_| RestoreError::ReadObject)?
                 .get_plain_items_with_mode()
                 .into_iter()
                 .map(|(path, hash, mode)| (path, RestoreTarget::new(hash, Some(mode))))
-                .collect())
+                .collect();
+            return Ok((blobs, Some(tree_id)));
         }
     }
 }
@@ -665,6 +681,8 @@ fn restore_index_tracked(
     target_blobs: &[(PathBuf, RestoreTarget)],
     overlay: bool,
     allowed_unmatched: &[PathBuf],
+    source_tree_id: Option<ObjectHash>,
+    full_restore: bool,
 ) -> Result<(Vec<String>, Vec<String>), RestoreError> {
     let target_map = preprocess_blobs(target_blobs);
 
@@ -717,9 +735,25 @@ fn restore_index_tracked(
         }
     }
 
-    index
-        .save(&idx_file)
+    // Buffered single-write save (byte-identical; 174k+ entry indexes save in
+    // ~1/3 the time of the per-entry-write `Index::save`), then publish the
+    // fast cache in step.
+    crate::utils::fast_index::write_index_fast(&index, &idx_file)
         .map_err(|_| RestoreError::WriteWorktree)?;
+    crate::utils::fast_index::FastIndex::from_index(&index).write_cache_to(&idx_file);
+    // A pathspec-free `--staged` restore from a commit makes the index exactly
+    // that commit's tree: publish the committed snapshot so the next status /
+    // commit diffs projections instead of walking every tree object (measured
+    // ~270 s at 826k entries — the walk dominated every command until a commit
+    // finally wrote the snapshot).
+    if full_restore
+        && let Some(tree_id) = source_tree_id
+    {
+        crate::utils::fast_index::FastIndex::from_index(&index).write_snapshot_to(
+            &idx_file.with_file_name("committed-files"),
+            &tree_id.to_string(),
+        );
+    }
 
     Ok((restored, deleted))
 }
@@ -776,13 +810,13 @@ pub async fn execute_checked(args: RestoreArgs) -> io::Result<()> {
         }
     };
 
-    let target_blobs: Vec<(PathBuf, RestoreTarget)> = {
+    let (target_blobs, source_tree_id): (Vec<(PathBuf, RestoreTarget)>, Option<ObjectHash>) = {
         match (source.as_ref(), target_commit) {
             (None, _) => {
                 assert!(!staged);
                 let index =
                     Index::load(path::index()).map_err(|e| io::Error::other(e.to_string()))?;
-                index
+                (index
                     .tracked_entries(0)
                     .into_iter()
                     .map(|entry| {
@@ -794,15 +828,15 @@ pub async fn execute_checked(args: RestoreArgs) -> io::Result<()> {
                             ),
                         )
                     })
-                    .collect()
+                    .collect(), None)
             }
             (Some(_), Some(commit)) => {
                 let tree_id = Commit::load(&commit).tree_id;
                 let tree = Tree::load(&tree_id);
-                tree.get_plain_items_with_mode()
+                (tree.get_plain_items_with_mode()
                     .into_iter()
                     .map(|(path, hash, mode)| (path, RestoreTarget::new(hash, Some(mode))))
-                    .collect()
+                    .collect(), Some(tree_id))
             }
             (Some(src), None) => {
                 if storage
@@ -832,8 +866,15 @@ pub async fn execute_checked(args: RestoreArgs) -> io::Result<()> {
             .map_err(|error| io::Error::other(error.to_string()))?;
     }
     if staged {
-        restore_index_tracked(&pathspecs, &target_blobs, false, &[])
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        restore_index_tracked(
+            &pathspecs,
+            &target_blobs,
+            false,
+            &[],
+            source_tree_id,
+            args.seed_full_index,
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
     }
     Ok(())
 }
@@ -899,7 +940,7 @@ pub async fn execute_checked_typed(args: RestoreArgs) -> Result<(), RestoreError
         restore_worktree_tracked(&pathspecs, &target_blobs, false, &[]).await?;
     }
     if staged {
-        restore_index_tracked(&pathspecs, &target_blobs, false, &[])?;
+        restore_index_tracked(&pathspecs, &target_blobs, false, &[], None, false)?;
     }
     Ok(())
 }

@@ -121,8 +121,17 @@ impl ReadToStringIfExists for std::path::Path {
     }
 }
 
+/// HTTP client for the local ScorpioFS daemon.
+///
+/// Proxy-free on purpose: the daemon is always reached on a loopback/local
+/// address, and a shell-configured `http_proxy` (common on dev machines) would
+/// otherwise route these requests through it — failing them (or timing them
+/// out) and silently degrading every fast path to its full-scan fallback.
 pub(crate) fn http() -> reqwest::Client {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 pub async fn execute_safe(args: SyncArgs, output: &OutputConfig) -> CliResult<()> {

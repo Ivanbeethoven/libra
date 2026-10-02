@@ -198,6 +198,7 @@ pub fn generate_upload_pack_content(
     want: &[String],
     shallow: &[String],
     depth: Option<usize>,
+    filter: Option<&str>,
 ) -> Bytes {
     let mut buf = BytesMut::new();
     let mut write_first_line = false;
@@ -246,6 +247,12 @@ pub fn generate_upload_pack_content(
         add_pkt_line_string(&mut buf, format!("deepen {d}\n").to_string());
     }
 
+    // Partial-clone filter, in git's wire position: after deepen, before the flush.
+    if let Some(spec) = filter {
+        add_pkt_line_string(&mut buf, format!("filter {spec}
+").to_string());
+    }
+
     buf.extend(b"0000");
     for h in have {
         add_pkt_line_string(&mut buf, format!("have {h}\n").to_string());
@@ -281,7 +288,7 @@ mod test {
     fn upload_pack_want_line_advertises_expected_capabilities() {
         let have: Vec<String> = Vec::new();
         let want = vec!["1".repeat(40)];
-        let body = generate_upload_pack_content(&have, &want, &[], None);
+        let body = generate_upload_pack_content(&have, &want, &[], None, None);
         let text = String::from_utf8_lossy(&body);
 
         // The first `want` line carries the capability list + agent string.

@@ -378,6 +378,7 @@ pub(crate) async fn run_pull(
         // `pull` does not prune; use `fetch --prune` or `remote prune`.
         false,
         args.notes,
+        None,
         &child_output,
     )
     .await

@@ -1064,7 +1064,7 @@ async fn fetch_remote_by_name(name: &str, output: &OutputConfig) -> Result<(), R
         .ok_or_else(|| RemoteError::NoUrlConfigured {
             name: name.to_string(),
         })?;
-    fetch::fetch_repository_safe(remote_config, None, false, None, None, output).await?;
+    fetch::fetch_repository_safe(remote_config, None, false, None, None, None, output).await?;
     Ok(())
 }
 

@@ -1766,6 +1766,64 @@ impl ClientStorage {
         self.block_on_storage(async move { storage.get(&hash).await.map(|(_, t)| t) })
     }
 
+    /// Write each object that is not already present, in ONE runtime entry.
+    ///
+    /// The per-object [`Self::put`] crosses the async boundary and performs an
+    /// unconditional write; on a ScorpioFS worktree every write crosses the FUSE
+    /// mount, and a commit only introduces objects along the changed spine while
+    /// rebuilding every subtree in memory. This checks presence and writes only
+    /// the missing ones, all inside a single boundary crossing.
+    ///
+    /// Returns how many objects were actually written.
+    pub fn put_missing_batch(
+        &self,
+        objects: Vec<(ObjectHash, Vec<u8>, ObjectType)>,
+    ) -> Result<usize, GitError> {
+        let storage = self.storage.clone();
+        self.block_on_storage(async move {
+            let mut written = 0usize;
+            for (hash, data, obj_type) in objects {
+                if storage.exist(&hash).await {
+                    continue;
+                }
+                storage
+                    .put(&hash, &data, obj_type)
+                    .await
+                    .map_err(|e| GitError::IOError(std::io::Error::other(e.to_string())))?;
+                written += 1;
+            }
+            Ok(written)
+        })
+    }
+
+    /// Resolve the types of many objects in ONE runtime entry.
+    ///
+    /// The single-object [`Self::get_object_type`] crosses the async boundary per
+    /// call, and on a 50k-file index `validate_index_objects` used to pay that cost
+    /// 100k times (the validation runs twice per commit) — measured at ~50 s, the
+    /// whole commit. This batch crosses the boundary once and resolves the set
+    /// inside; missing hashes are simply omitted, and the caller's existing
+    /// per-object fallback keeps the error surface unchanged.
+    pub fn get_object_types_bounded_many(
+        &self,
+        hashes: &[ObjectHash],
+    ) -> Result<HashMap<ObjectHash, ObjectType>, GitError> {
+        let storage = self.storage.clone();
+        let hashes = hashes.to_vec();
+        self.block_on_storage(async move {
+            let mut out: HashMap<ObjectHash, ObjectType> = HashMap::with_capacity(hashes.len());
+            for hash in &hashes {
+                if out.contains_key(hash) {
+                    continue;
+                }
+                if let Ok((_, object_type)) = storage.get(hash).await {
+                    out.insert(*hash, object_type);
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// Convenience wrapper: returns whether `obj_id` resolves to an object of the
     /// requested type. Returns `false` on any read error (rather than propagating)
     /// because callers typically use this in match arms where missing-or-wrong-type

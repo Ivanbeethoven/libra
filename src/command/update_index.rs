@@ -146,10 +146,12 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
         updated += 1;
     }
 
-    index.save(&index_path).map_err(|error| {
+    crate::utils::fast_index::write_index_fast(&index, &index_path).map_err(|error| {
         CliError::fatal(format!("failed to save index: {error}"))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;
+    // Keep the fast cache in step with the index we just wrote (see add.rs).
+    crate::utils::fast_index::FastIndex::from_index(&index).write_cache_to(&index_path);
 
     if output.is_json() {
         emit_json_data(

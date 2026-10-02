@@ -969,7 +969,22 @@ async fn collect_status_data(
         .map_err(CliError::from)?,
     };
     let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
-    let unmerged = unmerged::collect(&worktree.index)
+    // Merge state (a cheap file probe) is resolved before the unmerged scan:
+    // stage>0 entries can only exist for a conflicted index, and the ScorpioFS
+    // fast path leaves the index lazy — so the load is paid only when a merge
+    // is actually in flight.
+    let merge_state_raw = merge::MergeState::load_optional_sync().map_err(|detail| {
+        CliError::fatal(format!("failed to inspect merge state: {detail}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    let mut maybe_index = worktree.index;
+    if merge_state_raw.is_some() && maybe_index.is_none() {
+        maybe_index = Some(load_status_index()?);
+    }
+    let unmerged = maybe_index
+        .as_ref()
+        .map(unmerged::collect)
+        .unwrap_or_default()
         .into_iter()
         .map(|entry| {
             let current_path = util::workdir_to_current(&entry.path);
@@ -988,7 +1003,6 @@ async fn collect_status_data(
         .collect();
     let mut io_blocked = worktree.io_blocked;
     let base_scan_blocked = !io_blocked.is_empty();
-    let mut maybe_index = Some(worktree.index);
 
     // Resolve rename detection (§B.5). Precedence: CLI flags always win —
     // `--no-renames` disables, `--find-renames[=N]`/`--renames` enable at the
@@ -1024,6 +1038,9 @@ async fn collect_status_data(
         // eager load is the dominant cost of a clean `status` (measured ~190ms
         // per run on a 2k-file mount), so skip it outright.
         if !(staged.deleted.is_empty() && staged.new.is_empty()) {
+            if maybe_index.is_none() {
+                maybe_index = Some(load_status_index()?);
+            }
             let head_blobs = head_oid
                 .as_ref()
                 .map(load_head_tree_blobs)
@@ -1053,8 +1070,13 @@ async fn collect_status_data(
         // deleted side to pair against.
         if extras.rename_untracked
             && !unstaged.deleted.is_empty()
-            && let Some(index_ref) = maybe_index.as_ref()
         {
+            if maybe_index.is_none() {
+                maybe_index = Some(load_status_index()?);
+            }
+            let index_ref = maybe_index
+                .as_ref()
+                .ok_or_else(|| CliError::internal("status index should be loaded"))?;
             let workdir = util::working_dir();
             let compiled_pathspecs = if args.pathspec.is_empty() {
                 None
@@ -1154,14 +1176,8 @@ async fn collect_status_data(
 
     // Resolve upstream tracking info
     let upstream = resolve_upstream_info(&head, head_oid.as_ref()).await?;
-    let merge_state = match merge::MergeState::load_optional_sync().map_err(|detail| {
-        CliError::fatal(format!("failed to inspect merge state: {detail}"))
-            .with_stable_code(StableErrorCode::IoReadFailed)
-    })? {
+    let merge_state = match merge_state_raw {
         Some(state) => {
-            if maybe_index.is_none() {
-                maybe_index = Some(load_status_index()?);
-            }
             let index = maybe_index
                 .as_ref()
                 .ok_or_else(|| CliError::internal("status index should be loaded"))?;
@@ -1176,6 +1192,9 @@ async fn collect_status_data(
         None => None,
     };
     let porcelain_v2 = if matches!(args.porcelain, Some(PorcelainVersion::V2)) {
+        if maybe_index.is_none() {
+            maybe_index = Some(load_status_index()?);
+        }
         let index = maybe_index
             .take()
             .ok_or_else(|| CliError::internal("porcelain v2 metadata should be loaded"))?;
@@ -4677,12 +4696,181 @@ pub async fn changes_to_be_committed() -> Changes {
 }
 
 pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
-    let mut changes = Changes::default();
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
-    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
-        path: index_path.clone(),
-        source,
+    // Fast path FIRST: with the committed-index sidecar present this is a merge of
+    // two sorted `Vec`s (~tens of ms at 174k entries) with no BTreeMap and no tree
+    // objects. Only a missing/stale sidecar falls through to the full path below,
+    // which loads the complete index and walks the HEAD tree (and then heals the
+    // sidecar).
+    if let Some(changes) = sidecar_merge_diff(&index_path).await {
+        return Ok(changes);
+    }
+    let index = crate::utils::fast_index::load(&index_path).map_err(|source| {
+        StatusError::IndexLoad {
+            path: index_path.clone(),
+            source,
+        }
     })?;
+    changes_to_be_committed_with_index(&index).await
+}
+
+/// The both-sides-FastIndex staged diff. `None` whenever the committed
+/// snapshot is absent, stale, or unreadable — callers then take the full path.
+async fn sidecar_merge_diff(index_path: &std::path::Path) -> Option<Changes> {
+    let head_commit = Head::current_commit().await?;
+    let commit = Commit::load(&head_commit);
+    let committed = index_path.with_file_name("committed-files");
+    let head =
+        crate::utils::fast_index::FastIndex::load_snapshot(&committed, &commit.tree_id.to_string())?;
+    let cur = crate::utils::fast_index::FastIndex::load(index_path).ok()?;
+
+    let mut changes = Changes::default();
+    let (mut i, mut j) = (0usize, 0usize);
+    let (a, b) = (cur.iter().collect::<Vec<_>>(), head.iter().collect::<Vec<_>>());
+    while i < a.len() && j < b.len() {
+        match a[i].name.as_str().cmp(b[j].name.as_str()) {
+            std::cmp::Ordering::Less => {
+                changes.new.push(std::path::PathBuf::from(&a[i].name));
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                changes.deleted.push(std::path::PathBuf::from(&b[j].name));
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                // Same index-format mode encoding on both sides: a raw compare is
+                // exactly the mode-change test.
+                if a[i].hash != b[j].hash || a[i].mode != b[j].mode {
+                    changes.modified.push(std::path::PathBuf::from(&a[i].name));
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    while i < a.len() {
+        changes.new.push(std::path::PathBuf::from(&a[i].name));
+        i += 1;
+    }
+    while j < b.len() {
+        changes.deleted.push(std::path::PathBuf::from(&b[j].name));
+        j += 1;
+    }
+    Some(changes)
+}
+
+/// [`changes_to_be_committed_safe`] over the index projection.
+///
+/// The commit path holds the projection, not an `Index`: this mirrors
+/// [`changes_to_be_committed_with_index`] — committed snapshot first, tree walk
+/// as the always-correct fallback — reading only `(name, oid, mode)`.
+pub async fn changes_to_be_committed_with_fast_index(
+    index: &crate::utils::fast_index::FastIndex,
+) -> Result<Changes, StatusError> {
+    use crate::utils::fast_index::FastIndex;
+
+    let mut changes = Changes::default();
+    let head_commit = Head::current_commit().await;
+    let Some(head_commit) = head_commit else {
+        changes.new = index
+            .iter()
+            .map(|entry| std::path::PathBuf::from(&entry.name))
+            .collect();
+        return Ok(changes);
+    };
+    let commit = Commit::load(&head_commit);
+
+    // Fast path: committed snapshot vs projection, both sorted — a linear merge.
+    {
+        let committed = crate::utils::path::index().with_file_name("committed-files");
+        if let Some(head_index) =
+            FastIndex::load_snapshot(&committed, &commit.tree_id.to_string())
+        {
+            let mut i = 0usize;
+            let mut j = 0usize;
+            let (a, b) = (index, &head_index);
+            while i < a.len() && j < b.len() {
+                let (an, bn) = (&a.entry(i).name, &b.entry(j).name);
+                match an.as_str().cmp(bn.as_str()) {
+                    std::cmp::Ordering::Less => {
+                        changes.new.push(std::path::PathBuf::from(an));
+                        i += 1;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        changes.deleted.push(std::path::PathBuf::from(bn));
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let (ae, be) = (a.entry(i), b.entry(j));
+                        if ae.hash != be.hash
+                            || index_mode_to_tree_item_mode(ae.mode)
+                                != index_mode_to_tree_item_mode(be.mode)
+                        {
+                            changes.modified.push(std::path::PathBuf::from(an));
+                        }
+                        i += 1;
+                        j += 1;
+                    }
+                }
+            }
+            while i < a.len() {
+                changes.new.push(std::path::PathBuf::from(&a.entry(i).name));
+                i += 1;
+            }
+            while j < b.len() {
+                changes.deleted.push(std::path::PathBuf::from(&b.entry(j).name));
+                j += 1;
+            }
+            return Ok(changes);
+        }
+    }
+
+    // Fallback: walk the HEAD tree and diff against the projection.
+    let tree = Tree::load(&commit.tree_id);
+    let tree_files = tree.get_plain_items_with_mode();
+    for (item_path, item_hash, item_mode) in tree_files.iter() {
+        let item_str = item_path
+            .to_str()
+            .ok_or_else(|| StatusError::InvalidPathEncoding {
+                path: item_path.clone(),
+            })?;
+        match index.get(item_str) {
+            Some(entry) => {
+                let content_changed = entry.hash != *item_hash;
+                let mode_changed =
+                    index_mode_to_tree_item_mode(entry.mode) != *item_mode;
+                if content_changed || mode_changed {
+                    changes.modified.push(item_path.clone());
+                }
+            }
+            None => changes.deleted.push(item_path.clone()),
+        }
+    }
+    let tree_files_set: HashSet<PathBuf> =
+        tree_files.into_iter().map(|(path, _, _)| path).collect();
+    changes.new = index
+        .iter()
+        .map(|entry| PathBuf::from(&entry.name))
+        .filter(|path| !tree_files_set.contains(path))
+        .collect();
+
+    // Self-heal, exactly like the `Index` variant.
+    if changes.modified.is_empty() && changes.new.is_empty() && changes.deleted.is_empty() {
+        if let Ok(index_path) = path::try_index() {
+            let committed = index_path.with_file_name("committed-files");
+            index.write_snapshot_to(&committed, &commit.tree_id.to_string());
+        }
+    }
+
+    Ok(changes)
+}
+
+/// [`changes_to_be_committed_safe`] with an already-loaded index.
+///
+/// The commit path holds the index and used to pay a third full parse (28 ms for
+/// 50k entries) just to hand it over and get it back.
+pub async fn changes_to_be_committed_with_index(index: &Index) -> Result<Changes, StatusError> {
+    let mut changes = Changes::default();
     let head_commit = Head::current_commit().await;
     let tracked_files = index.tracked_files();
 
@@ -4696,8 +4884,47 @@ pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
         None => return Ok(changes),
     };
     let commit = Commit::load(&head_commit);
+
+    // Fast path: the committed snapshot (written by the last commit, keyed by
+    // the tree oid) makes this a pure projection-against-projection diff — no
+    // tree object is read. On a ScorpioFS worktree the tree walk crosses the
+    // FUSE mount; measured 203 ms for 50k files, and it is pure overhead for
+    // the common "what did I stage since the last commit" question.
+    {
+        let committed = crate::utils::path::index().with_file_name("committed-files");
+        if let Some(head_index) = crate::utils::fast_index::FastIndex::load_snapshot(
+            &committed,
+            &commit.tree_id.to_string(),
+        ) {
+            for entry in head_index.iter() {
+                match index.get(&entry.name, 0) {
+                    Some(current) => {
+                        let content_changed = current.hash != entry.hash;
+                        let mode_changed = index_mode_to_tree_item_mode(current.mode)
+                            != index_mode_to_tree_item_mode(entry.mode);
+                        if content_changed || mode_changed {
+                            changes.modified.push(std::path::PathBuf::from(&entry.name));
+                        }
+                    }
+                    None => changes.deleted.push(std::path::PathBuf::from(&entry.name)),
+                }
+            }
+            changes.new = tracked_files
+                .into_iter()
+                .filter(|path| {
+                    path.to_str()
+                        .map(|s| head_index.get(s).is_none())
+                        .unwrap_or(true)
+                })
+                .collect();
+            return Ok(changes);
+        }
+    }
+
     let tree = Tree::load(&commit.tree_id);
     let tree_files = tree.get_plain_items_with_mode();
+    // (The self-heal write below needs the walk's result, so it happens after the
+    // change sets are computed.)
 
     for (item_path, item_hash, item_mode) in tree_files.iter() {
         let item_str = item_path
@@ -4727,6 +4954,18 @@ pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
         .filter(|path| !tree_files_set.contains(path))
         .collect();
 
+    // Self-heal: a clean staged set means the index IS the tree, so the
+    // in-memory projection is a valid committed snapshot. Publishing it here
+    // makes the NEXT diff (and commit) projection-vs-projection — one tree walk
+    // per fresh clone or HEAD move instead of one per command.
+    if changes.modified.is_empty() && changes.new.is_empty() && changes.deleted.is_empty() {
+        if let Ok(index_path) = path::try_index() {
+            let committed = index_path.with_file_name("committed-files");
+            crate::utils::fast_index::FastIndex::from_index(index)
+                .write_snapshot_to(&committed, &commit.tree_id.to_string());
+        }
+    }
+
     Ok(changes)
 }
 
@@ -4755,9 +4994,11 @@ fn changes_to_be_staged_with_policy_and_ignore_case(
 ) -> Result<Changes, StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
-    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
-        path: index_path.clone(),
-        source,
+    let index = crate::utils::fast_index::load(&index_path).map_err(|source| {
+        StatusError::IndexLoad {
+            path: index_path.clone(),
+            source,
+        }
     })?;
     let (mut visible, ignored) =
         changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)?;
@@ -4782,9 +5023,11 @@ pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
 ) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
-    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
-        path: index_path.clone(),
-        source,
+    let index = crate::utils::fast_index::load(&index_path).map_err(|source| {
+        StatusError::IndexLoad {
+            path: index_path.clone(),
+            source,
+        }
     })?;
     changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)
 }
@@ -4806,9 +5049,11 @@ pub(crate) fn changes_to_be_staged_split_force_with_ignore_case(
 ) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
-    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
-        path: index_path.clone(),
-        source,
+    let index = crate::utils::fast_index::load(&index_path).map_err(|source| {
+        StatusError::IndexLoad {
+            path: index_path.clone(),
+            source,
+        }
     })?;
     changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case)
 }

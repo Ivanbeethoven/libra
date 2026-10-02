@@ -19,7 +19,12 @@ use crate::utils::{path, util};
 pub(crate) struct StatusWorktreeChanges {
     pub(crate) unstaged: Changes,
     pub(crate) ignored_files: Vec<PathBuf>,
-    pub(crate) index: Index,
+    /// The index, when the scan already had one. The ScorpioFS fast path
+    /// deliberately leaves this `None`: it classifies the daemon's change set
+    /// without ever building an `Index` (a BTreeMap rebuild measured at ~290 ms
+    /// on 174k entries), and only rename detection / merge state / porcelain v2
+    /// need one — each of which loads it on demand.
+    pub(crate) index: Option<Index>,
     /// §B.3.3 accumulator protocol: paths the scan could not inspect
     /// (workdir-relative). Text formats fail closed on any entry; JSON
     /// reports the partial result plus `data.io_blocked[]`.
@@ -84,9 +89,130 @@ pub(crate) fn collect_status_worktree_changes(
     Ok(StatusWorktreeChanges {
         unstaged,
         ignored_files,
-        index,
+        index: Some(index),
         io_blocked,
     })
+}
+
+/// The daemon's upper-layer change set, classified against the index but **not**
+/// collapsed or filtered — the shared core behind every ScorpioFS fast path.
+pub(crate) struct ClassifiedUpperState {
+    /// Tracked paths whose upper content hashes differ from the index.
+    pub(crate) tracked_modified: Vec<PathBuf>,
+    ///Tracked paths with a whiteout in the upper layer.
+    pub(crate) tracked_deleted: Vec<PathBuf>,
+    /// Untracked paths present in the upper layer, as concrete files (never
+    /// collapsed to their parent directory).
+    pub(crate) untracked: Vec<PathBuf>,
+    /// The same, but matched by an ignore rule.
+    pub(crate) ignored: Vec<PathBuf>,
+    pub(crate) tracked: TrackedPaths,
+}
+
+/// Fetch and classify the upper layer's change set.
+///
+/// Returns `None` (callers fall back to the full scan) when not on a ScorpioFS
+/// mount, when the daemon is unreachable or pre-Worktree-v2, or when the response
+/// cannot be loaded.
+pub(crate) async fn scorpiofs_candidates(ignore_case: bool) -> Option<ClassifiedUpperState> {
+    let index_path = path::try_index().ok()?;
+    // The sorted projection, not an `Index`: classification only needs
+    // `get(name)` per changed path, and an `Index` rebuild is ~290 ms at 174k
+    // entries (BTreeMap) against ~100 ms for this parse.
+    let index = crate::utils::fast_index::FastIndex::load(&index_path).ok()?;
+    classify_upper_state(&index, ignore_case, true).await
+}
+
+async fn classify_upper_state(
+    index: &crate::utils::fast_index::FastIndex,
+    ignore_case: bool,
+    need_tracked: bool,
+) -> Option<ClassifiedUpperState> {
+    use crate::command::sync::{ScorpioState, current_mount_id, http, scorpio_endpoint};
+    use std::time::Duration;
+
+    let mount_id = current_mount_id()?;
+    let workdir = util::try_working_dir().ok()?;
+
+    let url = format!("{}/worktrees/{}/state", scorpio_endpoint(), mount_id);
+    // Bounded wait: these paths must stay fast even when the daemon is gone.
+    let response = http()
+        .get(&url)
+        .timeout(Duration::from_millis(800))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let state = response.json::<ScorpioState>().await.ok()?;
+
+    // `tracked` feeds untracked collapsing and case-fold aliasing — real work
+    // over 174k names. The `add` path never consults it, so it asks to skip it.
+    let tracked = if need_tracked {
+        TrackedPaths::from_paths(
+            index.iter().map(|e| PathBuf::from(&e.name)).collect(),
+            ignore_case,
+        )
+    } else {
+        TrackedPaths::from_paths(Vec::new(), ignore_case)
+    };
+    let mut candidates = ClassifiedUpperState {
+        tracked_modified: Vec::new(),
+        tracked_deleted: Vec::new(),
+        untracked: Vec::new(),
+        ignored: Vec::new(),
+        tracked,
+    };
+    for change in &state.changes {
+        let p = change.path.trim_start_matches("./");
+        // The `.libra` pointer is VCS metadata living in the upper layer; it
+        // never participates in status.
+        if p.is_empty() || p == ".libra" || p.starts_with(".libra/") {
+            continue;
+        }
+        let rel = PathBuf::from(p);
+        match change.kind.as_str() {
+            "deleted" => {
+                if index.get(p).is_some() {
+                    candidates.tracked_deleted.push(rel);
+                }
+            }
+            "added" | "modified" => {
+                if let Some(entry) = index.get(p) {
+                    // Ignore rules never apply to tracked files (Git semantics):
+                    // an edited `app.log` stays `modified` even when `*.log` is
+                    // ignored. Test the hash first, so a matching ignore rule
+                    // cannot silently swallow a real edit.
+                    // The daemon's hash is in the LOWER's content domain — a git
+                    // blob OID for dicfuse lowers, `sha256:<hex>` for MST/2 — so
+                    // a direct compare only works when the domains agree.
+                    // Otherwise hash the file itself as a git blob OID: one read
+                    // per path the daemon already flagged (normally a handful),
+                    // and it is what makes "edited, then committed" read clean
+                    // instead of permanently modified.
+                    let clean = match &change.content_hash {
+                        Some(h) if *h == entry.hash.to_string() => true,
+                        Some(h) if h.starts_with("sha256:") => {
+                            crate::command::calc_file_blob_hash(workdir.join(&rel))
+                                .map(|oid| oid == entry.hash)
+                                .unwrap_or(false)
+                        }
+                        _ => false,
+                    };
+                    if !clean {
+                        candidates.tracked_modified.push(rel);
+                    }
+                } else if util::check_gitignore(&workdir, &workdir.join(&rel)) {
+                    candidates.ignored.push(rel);
+                } else {
+                    candidates.untracked.push(rel);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(candidates)
 }
 
 /// ScorpioFS heuristic fast path: the mount's upper layer is the only writable
@@ -104,87 +230,68 @@ pub(crate) async fn scorpiofs_worktree_changes(
     include_ignored: bool,
     ignore_case: bool,
 ) -> Option<StatusWorktreeChanges> {
-    use crate::command::sync::{ScorpioState, current_mount_id, http, scorpio_endpoint};
-    use std::time::Duration;
-
     if matches!(untracked_mode, UntrackedFiles::All) {
         return None;
     }
-    let mount_id = current_mount_id()?;
-    let workdir = util::try_working_dir().ok()?;
-    let index_path = path::try_index().ok()?;
-    let index = Index::load(&index_path).ok()?;
+    let candidates = scorpiofs_candidates(ignore_case).await?;
+    let ClassifiedUpperState {
+        tracked_modified,
+        tracked_deleted,
+        mut untracked,
+        ignored,
+        tracked,
+    } = candidates;
 
-    let url = format!("{}/worktrees/{}/state", scorpio_endpoint(), mount_id);
-    // Bounded wait: status must stay fast even when the daemon is gone.
-    let response = http()
-        .get(&url)
-        .timeout(Duration::from_millis(800))
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let state = response.json::<ScorpioState>().await.ok()?;
-
-    let tracked = TrackedPaths::from_index(&index, ignore_case);
-    let mut unstaged = Changes::default();
-    let mut ignored_files = Vec::new();
-    for change in &state.changes {
-        let p = change.path.trim_start_matches("./");
-        // The `.libra` pointer is VCS metadata living in the upper layer; it
-        // never participates in status.
-        if p.is_empty() || p == ".libra" || p.starts_with(".libra/") {
-            continue;
-        }
-        let rel = PathBuf::from(p);
-        let is_tracked = index.tracked(p, 0);
-        match change.kind.as_str() {
-            "deleted" => {
-                if is_tracked {
-                    unstaged.deleted.push(rel);
-                }
-            }
-            "added" | "modified" => {
-                if is_tracked {
-                    // Ignore rules never apply to tracked files (Git semantics):
-                    // an edited `app.log` stays `modified` even when `*.log` is
-                    // ignored. Test the hash first, so a matching ignore rule
-                    // cannot silently swallow a real edit.
-                    // The daemon hashes upper content in the same git-blob-OID
-                    // domain as the index; a touch or reverted write hashes
-                    // back to the index value, which means clean.
-                    let clean = match (&change.content_hash, index.get(p, 0)) {
-                        (Some(h), Some(entry)) => *h == entry.hash.to_string(),
-                        _ => false,
-                    };
-                    if !clean {
-                        unstaged.modified.push(rel);
-                    }
-                } else {
-                    let absolute = workdir.join(&rel);
-                    if util::check_gitignore(&workdir, &absolute) {
-                        if include_ignored {
-                            ignored_files.push(rel);
-                        }
-                    } else if !matches!(untracked_mode, UntrackedFiles::No) {
-                        unstaged.new.push(rel);
-                    }
-                }
-            }
-            _ => {}
-        }
+    if matches!(untracked_mode, UntrackedFiles::No) {
+        untracked.clear();
     }
     if matches!(untracked_mode, UntrackedFiles::Normal) {
-        unstaged.new = collapse_untracked_directories(unstaged.new, &tracked);
+        untracked = collapse_untracked_directories(untracked, &tracked);
     }
     Some(StatusWorktreeChanges {
-        unstaged,
-        ignored_files,
-        index,
+        unstaged: Changes {
+            new: untracked,
+            modified: tracked_modified,
+            deleted: tracked_deleted,
+            renamed: Vec::new(),
+        },
+        ignored_files: if include_ignored { ignored } else { Vec::new() },
+        // Left lazy: this path never built an `Index`, and the caller loads one
+        // on demand for rename detection / merge state / porcelain v2.
+        index: None,
         io_blocked: Vec::new(),
     })
+}
+
+/// ScorpioFS fast path for staging (`add`): the same candidate set as
+/// [`scorpiofs_worktree_changes`], but with untracked paths left as concrete files.
+///
+/// `add` stages files, so a directory collapsed by the `Normal` untracked mode
+/// would be the wrong input. Returns `(visible, ignored)` in the shape
+/// `changes_to_be_staged_split_*` produces, or `None` to fall back to the full scan
+/// — which also covers `--untracked-files` never being in play here, since `add`
+/// always wants every untracked file.
+pub(crate) async fn scorpiofs_staged_candidates(
+    ignore_case: bool,
+    index: &Index,
+) -> Option<(Changes, Changes)> {
+    // The classifier works off the projection; building it from the caller's
+    // index is one name-cloning pass (~40 ms at 174k), far cheaper than the
+    // second full `Index` load this used to do.
+    let projection = crate::utils::fast_index::FastIndex::from_index(index);
+    let candidates = classify_upper_state(&projection, ignore_case, false).await?;
+    Some((
+        Changes {
+            new: candidates.untracked,
+            modified: candidates.tracked_modified,
+            deleted: candidates.tracked_deleted,
+            renamed: Vec::new(),
+        },
+        Changes {
+            new: candidates.ignored,
+            ..Changes::default()
+        },
+    ))
 }
 
 pub(crate) fn changes_to_current_directory(mut changes: Changes) -> Changes {

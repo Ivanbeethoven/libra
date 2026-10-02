@@ -1535,6 +1535,8 @@ async fn restore_to_commit(
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_progress: false,
+    
+        seed_full_index: true,
     };
     restore::execute_safe(restore_args, &output.child_output_config()).await?;
     Ok(())

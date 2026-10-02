@@ -180,13 +180,14 @@ impl GitClient {
         want: &[String],
         shallow: &[String],
         depth: Option<usize>,
+        filter: Option<&str>,
     ) -> Result<FetchStream, IoError> {
         let mut stream = self.open_stream().await?;
         let request = self.build_service_request(ServiceType::UploadPack);
         self.write_all_idle(&mut stream, &request).await?;
         self.read_advertisement(&mut stream).await?;
 
-        let body = generate_upload_pack_content(have, want, shallow, depth);
+        let body = generate_upload_pack_content(have, want, shallow, depth, filter);
         self.write_all_idle(&mut stream, &body).await?;
 
         // Read the pack with a per-read IDLE bound (the timer resets whenever

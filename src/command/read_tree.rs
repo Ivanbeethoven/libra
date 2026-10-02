@@ -72,10 +72,14 @@ pub async fn execute_safe(args: ReadTreeArgs, output: &OutputConfig) -> CliResul
         .clone()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(path::index);
-    index.save(&index_path).map_err(|error| {
+    crate::utils::fast_index::write_index_fast(&index, &index_path).map_err(|error| {
         CliError::fatal(format!("failed to save index: {error}"))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;
+    // Publish the fast cache alongside: this is the index `worktree add` seeds
+    // for a fresh worktree, and without the cache the first status/commit in
+    // that worktree pays the full 19 MB parse (~292 ms at 174k entries).
+    crate::utils::fast_index::FastIndex::from_index(&index).write_cache_to(&index_path);
 
     if output.is_json() {
         emit_json_data(

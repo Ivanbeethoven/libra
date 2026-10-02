@@ -1772,6 +1772,7 @@ async fn clone_cloud_publish_into_destination(
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_progress: false,
+            seed_full_index: true,
         })
         .await
         .map_err(|source| CloneError::CheckoutFailed { source })?;
@@ -3402,6 +3403,7 @@ async fn clone_into_destination(
         // `--deps-of` needs the dependency graph to compute the closure, so it
         // implies `--notes`; a plain clone never fetches notes (Git parity).
         !args.deps_of.is_empty(),
+        args.filter.clone(),
         &child_output,
     )
     .await
@@ -3744,6 +3746,7 @@ pub(crate) async fn setup_repository(
                 pathspec_from_file: None,
                 pathspec_file_nul: false,
                 no_progress: false,
+                seed_full_index: true,
             })
             .await
             .map_err(|source| CloneError::CheckoutFailed { source })?;

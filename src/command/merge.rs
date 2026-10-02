@@ -2244,6 +2244,8 @@ async fn apply_fast_forward_merge(
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_progress: false,
+        
+            seed_full_index: true,
         },
         &output.child_output_config(),
     )

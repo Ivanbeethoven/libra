@@ -38,6 +38,7 @@ use crate::{
     command::{
         read_worktree_blob_bytes,
         status::{self, Changes},
+        status_untracked,
     },
     internal::ai::automation::{VCS_EVENT_POST_ADD, dispatch_current_repo_vcs_event_to_history},
     utils::{
@@ -544,10 +545,12 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             .with_hint("maybe you wanted to say 'libra add .'?"));
     }
 
-    let mut index = Index::load(&index_path).map_err(|source| AddError::IndexLoad {
+    let __ta = std::time::Instant::now();
+    let mut index = crate::utils::fast_index::load(&index_path).map_err(|source| AddError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
+    eprintln!("ADD_PHASE index_load {}ms", __ta.elapsed().as_millis());
     let current_dir = env::current_dir().map_err(|source| AddError::Workdir { source })?;
     let ignore_case = crate::utils::path_case::effective_ignore_case()
         .await
@@ -560,18 +563,36 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         ignore_case,
     };
 
-    let (mut visible_changes, mut ignored_changes) = if args.force {
-        status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
-    } else {
-        status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
-            .map_err(|source| AddError::Status { source })?
-    };
+    // ScorpioFS heuristic fast path: on a mount the upper layer is the only
+    // writable surface, so the daemon's changed-path set IS the complete candidate
+    // set. That replaces the per-tracked-file stat storm and the whole-tree readdir
+    // with one bounded HTTP call (O(touched), not O(tree)) — the difference between
+    // seconds and minutes on a large monorepo. `--force` needs the ignored set folded
+    // in, which the fast path supplies too. Falls back to the full scan whenever the
+    // mount/daemon/state is unavailable, so behaviour off a mount is unchanged.
+    let __tc = std::time::Instant::now();
+    // The caller's index is borrowed: the candidates classifier needs one, and a
+    // second load would rebuild the whole `Index` (BTreeMap) for nothing.
+    let (mut visible_changes, mut ignored_changes) =
+        match status_untracked::scorpiofs_staged_candidates(ignore_case, &index).await {
+            Some(pair) => pair,
+            None => {
+                if args.force {
+                    status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+                        .map_err(|source| AddError::Status { source })?
+                } else {
+                    status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
+                        .map_err(|source| AddError::Status { source })?
+                }
+            }
+        };
+    eprintln!("ADD_PHASE candidates {}ms", __tc.elapsed().as_millis());
     if args.force {
         visible_changes.extend(ignored_changes.clone());
         ignored_changes = Changes::default();
     }
 
+    let __tp = std::time::Instant::now();
     let validated = validate_pathspecs(
         &args.pathspec,
         pathspec_ctx,
@@ -580,6 +601,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         &index,
         args.ignore_missing,
     )?;
+    eprintln!("ADD_PHASE pathspec {}ms", __tp.elapsed().as_millis());
 
     let mut add_output = AddOutput::empty(args.dry_run);
 
@@ -605,12 +627,15 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         } else {
             let refreshed = do_refresh_files(&mut index, &tracked_modified, &workdir)?;
             add_output.refreshed = refreshed.iter().map(|f| f.display().to_string()).collect();
-            index
-                .save(&index_path)
-                .map_err(|source| AddError::IndexSave {
+            crate::utils::fast_index::write_index_fast(&index, &index_path).map_err(|source| {
+                AddError::IndexSave {
                     path: index_path.clone(),
-                    source,
-                })?;
+                    source: git_internal::errors::GitError::IOError(source),
+                }
+            })?;
+            // Same reason as the main path below: keep the fast cache in step
+            // with the index we just wrote.
+            crate::utils::fast_index::FastIndex::from_index(&index).write_cache_to(&index_path);
         }
 
         return check_ignored_only_error(add_output);
@@ -800,6 +825,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     };
 
     // Stage each file (`--renormalize` force-rewrites instead of diffing).
+    let __ts = std::time::Instant::now();
     for file in &files {
         let staged = if args.renormalize {
             renormalize_entry(file, &mut index, &workdir)
@@ -827,6 +853,11 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
             }
         }
     }
+    eprintln!(
+        "ADD_PHASE stage_loop {}ms (files={})",
+        __ts.elapsed().as_millis(),
+        files.len()
+    );
 
     // `--chmod=(+|-)x`: force the executable bit on the matched regular files'
     // index entries, even ones with no content change (Git's `--chmod`).
@@ -840,12 +871,30 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         )?;
     }
 
-    index
-        .save(&index_path)
-        .map_err(|source| AddError::IndexSave {
-            path: index_path.clone(),
-            source,
+    // Nothing was staged (no entry added/updated/removed, no chmod): the index
+    // on disk is already correct, and rewriting it costs a 19 MB serialize +
+    // write (~400 ms at 174k entries) for byte-identical content. A plain
+    // `add -A` on a clean worktree is exactly this case.
+    let index_changed = !files.is_empty() || chmod_mode.is_some();
+    if index_changed {
+        let __tj = std::time::Instant::now();
+        crate::utils::fast_index::write_index_fast(&index, &index_path).map_err(|source| {
+            AddError::IndexSave {
+                path: index_path.clone(),
+                source: git_internal::errors::GitError::IOError(source),
+            }
         })?;
+        eprintln!("ADD_PHASE index_save {}ms", __tj.elapsed().as_millis());
+        // Publish the fast cache for the index we just wrote. Every index write
+        // invalidates the cache, and without this the NEXT command (status,
+        // commit) pays the full 19 MB parse — measured ~292 ms at 174k entries
+        // — inside its critical path. The index is already in memory here, so
+        // the cache costs only its serialization.
+        crate::utils::fast_index::FastIndex::from_index(&index).write_cache_to(&index_path);
+        eprintln!("ADD_PHASE fastcache {}ms", __tj.elapsed().as_millis());
+    } else {
+        eprintln!("ADD_PHASE index_save 0ms (unchanged; skipped)");
+    }
 
     check_ignored_only_error(add_output)
 }
@@ -1213,6 +1262,19 @@ fn validate_pathspecs(
         pathspec_ctx.ignore_case,
     )
     .map_err(|source| AddError::Pathspec { source })?;
+
+    // No pathspec (`add -A`/`add -u`): every candidate is selectable by
+    // definition and nothing can be unmatched. Building the candidate lists
+    // below means cloning 174k tracked PathBufs twice and walking them for
+    // matching — measured 329 ms at 174k files, all of it for a set of specs
+    // that is empty.
+    if raw_pathspecs.is_empty() {
+        return Ok(ValidatedPathspecs {
+            pathspecs,
+            ignored: Vec::new(),
+            missing: Vec::new(),
+        });
+    }
 
     let tracked_files = index.tracked_files();
     let change_candidates = collect_change_candidates(visible_changes);

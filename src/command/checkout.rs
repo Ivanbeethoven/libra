@@ -617,6 +617,8 @@ async fn restore_checkout_paths(args: CheckoutArgs) -> Result<CheckoutOutput, Ch
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_progress: false,
+    
+        seed_full_index: false,
     };
     let restore = restore::execute_to_output(restore_args)
         .await

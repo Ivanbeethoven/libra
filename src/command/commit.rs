@@ -1,7 +1,7 @@
 //! Commit command that collects staged changes, builds tree and commit objects, validates messages (including GPG), and updates HEAD/refs.
 
+use std::collections::HashMap;
 use std::{
-    collections::HashSet,
     io::{IsTerminal, Read, Write},
     path::PathBuf,
     str::FromStr,
@@ -1023,10 +1023,9 @@ async fn run_commit_with_index(
     // every nested status/diff/index consumer observes the preview while the live
     // index remains untouched on success, error, cancellation, or panic.
     let prepared = async {
-        let original_index =
-            Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
-        tree_plumbing::validate_index_objects(&original_index)
-            .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
+        // (The original-index preload and its full validation were removed: the
+        // validation is now staged-subset only, and the load itself was a third
+        // full parse of a 19 MB index — 292 ms at 174k entries — for nothing.)
 
         let auto_stage_applied = if args.all {
             auto_stage_tracked_changes(!dry_run, dry_run && message_settings.verbose)?
@@ -1034,31 +1033,60 @@ async fn run_commit_with_index(
             false
         };
 
-        let index =
-            Index::load(path::index()).map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        let __tl = std::time::Instant::now();
+        // The projection (sorted Vec), not an `Index`: every consumer below —
+        // the staged diff, the staged-subset validation, the incremental tree
+        // build, the committed snapshot — reads only (name, oid, mode), and an
+        // `Index` rebuild is a 174k-insert BTreeMap (~320 ms) against ~100 ms
+        // for this parse.
+        let index = crate::utils::fast_index::FastIndex::load(&path::index())
+            .map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        eprintln!("COMMIT_PHASE index_load {}ms", __tl.elapsed().as_millis());
         let storage = ClientStorage::init(path::objects());
-        let tracked_entries = index.tracked_entries(0);
-
-        // A real commit persists each auto-staged blob and validates the final
-        // index. Dry-run auto-stage intentionally keeps those blobs ephemeral;
-        // the original index was validated above before its temporary rewrite.
-        if !dry_run {
-            tree_plumbing::validate_index_objects(&index)
-                .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
-        }
 
         // Skip empty commit check for --amend operations
-        if tracked_entries.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
+        if index.is_empty() && !args.allow_empty && !is_amend && !auto_stage_applied {
             // No files have ever been staged — distinct from "staged but unchanged"
             return Err(CommitError::NothingToCommitNoTracked);
         }
 
         // Verify staged changes relative to HEAD (skip for --amend)
-        let staged_changes = status::changes_to_be_committed_safe()
+        let __t3 = std::time::Instant::now();
+        let staged_changes = status::changes_to_be_committed_with_fast_index(&index)
             .await
             .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
+        eprintln!("COMMIT_PHASE staged_changes {}ms", __t3.elapsed().as_millis());
         if staged_changes.is_empty() && !args.allow_empty && !is_amend {
             return Err(CommitError::NothingToCommit);
+        }
+
+        // Validate ONLY the entries this commit introduces.
+        //
+        // This used to scan the entire index, twice per commit. On a ScorpioFS
+        // worktree every object read crosses the FUSE mount, so that cost is one
+        // round trip per entry — measured 23 s per pass on a 124k-file fixture,
+        // 46 s of a 54 s commit — while the entries actually being committed are
+        // a handful. Entries that are not staged were validated when they entered
+        // the index (their own add/commit), whole-index integrity checking is
+        // `libra fsck`'s job, and git's own commit performs no such scan at all.
+        //
+        // Dry-run keeps its blobs ephemeral, so validation is skipped there as
+        // before.
+        if !dry_run {
+            let __tv = std::time::Instant::now();
+            let staged_names: std::collections::HashSet<String> = staged_changes
+                .new
+                .iter()
+                .chain(staged_changes.modified.iter())
+                .map(|path| crate::utils::util::path_to_string(path))
+                .collect();
+            tree_plumbing::validate_index_objects_subset_fast(&index, &staged_names)
+                .map_err(|error| CommitError::IndexObjectInvalid(error.to_string()))?;
+            eprintln!(
+                "COMMIT_PHASE validate_staged {}ms (entries={})",
+                __tv.elapsed().as_millis(),
+                staged_names.len()
+            );
         }
 
         // Complete status collection before the pre-commit hook or commit/tree/ref
@@ -1143,7 +1171,83 @@ async fn run_commit_with_index(
     .await?;
 
     // Create tree
-    let tree = create_tree_with_persistence(&index, &storage, "".into(), !dry_run).await?;
+    let __t4 = std::time::Instant::now();
+    // Incremental build: only the directories on a staged-change path are
+    // rebuilt; every other subtree reuses the oid recorded for the parent
+    // commit (libra's cache-tree, see utils::tree_cache). A missing or stale
+    // cache degrades to the full rebuild, which is always correct.
+    let mut new_tree_cache: Option<crate::utils::tree_cache::TreeCache> = None;
+    let cache_path = crate::utils::path::index().with_file_name("committed-index.trees");
+    let tree = if dry_run {
+        // Previews only: materialize the full `Index` the recursive builder wants.
+        let full = crate::utils::fast_index::load(&crate::utils::path::index())
+            .map_err(|e| CommitError::IndexLoad(e.to_string()))?;
+        create_tree_with_persistence(&full, &storage, "".into(), false).await?
+    } else {
+        let head_tree = parents_commit_ids
+            .first()
+            .and_then(|id| load_object::<Commit>(id).ok())
+            .map(|commit| commit.tree_id);
+        let cache =
+            head_tree.and_then(|t| crate::utils::tree_cache::TreeCache::load(&cache_path, &t));
+        let changed = crate::utils::tree_cache::changed_dirs(
+            staged_changes
+                .new
+                .iter()
+                .chain(staged_changes.modified.iter())
+                .chain(staged_changes.deleted.iter()),
+        );
+        let mut pending: Vec<(ObjectHash, Vec<u8>)> = Vec::new();
+        let mut builder = crate::utils::tree_cache::IncrementalBuilder::new(
+            &index,
+            cache.as_ref(),
+            &changed,
+            true,
+            &mut pending,
+        );
+        let tree = builder.build().map_err(CommitError::TreeCreation)?;
+        new_tree_cache = Some(builder.into_new_cache(&tree));
+        if !pending.is_empty() {
+            let objects = pending
+                .into_iter()
+                .map(|(id, data)| (id, data, ObjectType::Tree))
+                .collect();
+            storage.put_missing_batch(objects).map_err(|e| {
+                CommitError::TreeCreation(format!("failed to save tree objects: {e}"))
+            })?;
+        }
+        tree
+    };
+    eprintln!("COMMIT_PHASE create_tree {}ms", __t4.elapsed().as_millis());
+    let __t5 = std::time::Instant::now();
+
+    // Sidecar for the NEXT commit's staged-changes diff: at this point the index
+    // IS the committed state, so a copy of it plus the tree it produced lets
+    // `changes_to_be_committed_safe` diff index-against-index instead of
+    // materializing every tree object (measured 203 ms -> tens of ms on a 50k
+    // repo; the tree walk crosses the FUSE mount on a ScorpioFS worktree).
+    // Keyed by tree oid, so it self-invalidates whenever HEAD moves.
+    if !dry_run {
+        // A self-keyed snapshot of the projection the diff actually reads —
+        // `(name, oid, mode)` — written atomically (temp + rename), keyed by
+        // the tree oid so any HEAD move invalidates it. This used to be a full
+        // 19 MB copy of the index plus a separate fast-cache of that copy; the
+        // index copy was 19 MB of write-only I/O per commit.
+        // SYNCHRONOUS on purpose: this was briefly a detached thread, and a
+        // `libra commit` process exits long before a background thread finishes
+        // serialising the snapshot — it never appeared on disk, so every diff
+        // silently fell back to the tree walk.
+        let index_path = crate::utils::path::index();
+        let committed = index_path.with_file_name("committed-files");
+        index.write_snapshot_to(&committed, &tree.id.to_string());
+        if let Some(cache) = new_tree_cache.take() {
+            cache.save(&cache_path);
+        }
+        // Retire the previous sidecar generation if it is still around.
+        for legacy in ["committed-index", "committed-index.tree", "committed-index.fastcache"] {
+            let _ = std::fs::remove_file(index_path.with_file_name(legacy));
+        }
+    }
 
     // Create author and committer signatures
     let reuse_author = load_reused_commit_author(&args).await?;
@@ -1426,8 +1530,11 @@ async fn run_commit_with_index(
 
     // INVARIANT: persist the commit object before moving HEAD so a crash after
     // ref update never points the branch at a missing object.
+    eprintln!("COMMIT_PHASE pre_write {}ms", __t5.elapsed().as_millis());
+    let __t6 = std::time::Instant::now();
     save_commit_object(&storage, &commit)?;
     update_head_and_reflog(&commit.id.to_string(), &commit_message).await?;
+    eprintln!("COMMIT_PHASE write_and_ref {}ms", __t6.elapsed().as_millis());
     if !skip_all_hooks {
         run_advisory_repo_hook(RepoHook::PostCommit, &[], None, output).await;
     }
@@ -2235,6 +2342,7 @@ pub async fn execute(args: CommitArgs) {
 /// nothing to commit, identity/signing setup fails, object writes fail, or HEAD
 /// cannot be updated.
 pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<()> {
+    let __t_entry = std::time::Instant::now();
     let preview = args.dry_run || args.porcelain;
     // Keep the large commit state machine off callers' stacks. In particular,
     // direct library consumers and Tokio's default-size worker/test threads
@@ -2260,6 +2368,10 @@ pub async fn execute_safe(args: CommitArgs, output: &OutputConfig) -> CliResult<
     if !preview {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_COMMIT).await;
     }
+    eprintln!(
+        "COMMIT_PHASE total_from_entry {}ms",
+        __t_entry.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -2472,11 +2584,47 @@ pub async fn create_tree(
     create_tree_with_persistence(index, storage, current_root, true).await
 }
 
+
+/// Sub-phase timers for create_tree, printed by the outermost invocation.
+/// Temporary instrumentation for the FUSE-worktree commit investigation.
+static CT_GROUP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_ENTRY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_SERIALIZE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_PERSIST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_TREES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CT_DEPTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn create_tree_with_persistence(
     index: &Index,
     storage: &ClientStorage,
     current_root: PathBuf,
     persist: bool,
+) -> Result<Tree, CommitError> {
+    let mut pending: Vec<(ObjectHash, Vec<u8>)> = Vec::new();
+    let tree = create_tree_subset(index, storage, current_root, &[], persist, &mut pending).await?;
+    if persist && !pending.is_empty() {
+        // One runtime crossing for every tree object the commit introduces, instead
+        // of one exist()+put() round trip per subtree (822 crossings for a 50k repo).
+        let objects = pending
+            .into_iter()
+            .map(|(id, data)| (id, data, ObjectType::Tree))
+            .collect();
+        storage
+            .put_missing_batch(objects)
+            .map_err(|e| CommitError::TreeCreation(format!("failed to save tree objects: {e}")))?;
+    }
+    Ok(tree)
+}
+
+/// Build the subtree for `current_root` from `subset` — the index paths known to
+/// live under it — instead of rescanning the whole index at every node.
+async fn create_tree_subset(
+    index: &Index,
+    storage: &ClientStorage,
+    current_root: PathBuf,
+    subset: &[PathBuf],
+    persist: bool,
+    pending: &mut Vec<(ObjectHash, Vec<u8>)>,
 ) -> Result<Tree, CommitError> {
     // blob created when add file to index
     let get_blob_entry = |path: &PathBuf| -> Result<TreeItem, CommitError> {
@@ -2503,55 +2651,73 @@ async fn create_tree_with_persistence(
     };
 
     let mut tree_items: Vec<TreeItem> = Vec::new();
-    let mut processed_path: HashSet<String> = HashSet::new();
-    let path_entries: Vec<PathBuf> = index
-        .tracked_entries(0)
-        .iter()
-        .map(|file| PathBuf::from(file.name.clone()))
-        .filter(|path| path.starts_with(&current_root))
-        .collect();
-    for path in path_entries.iter() {
-        let in_current_path = path
+    // Group the index entries by their next path component ONCE, then recurse into
+    // each group's slice. The previous shape re-filtered the FULL entry list for
+    // every subtree node: ~10.5k tree nodes x 50k entries = ~5e8 path comparisons on
+    // a 50k-file repo, measured at ~50 s per commit regardless of how many files
+    // changed. Grouping makes the total work linear in the entry count.
+    let mut path_entries: Vec<PathBuf> = subset.to_vec();
+    if path_entries.is_empty() {
+        path_entries = index
+            .tracked_entries(0)
+            .iter()
+            .map(|file| PathBuf::from(file.name.clone()))
+            .filter(|path| path.starts_with(&current_root))
+            .collect();
+    }
+
+    let __tg = std::time::Instant::now();
+    let root_depth = current_root.components().count();
+    let mut direct: Vec<&PathBuf> = Vec::new();
+    let mut subtrees: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for path in &path_entries {
+        let is_direct = path
             .parent()
             .ok_or_else(|| CommitError::TreeCreation(format!("invalid path: {:?}", path)))?
             == current_root;
-        if in_current_path {
-            let item = get_blob_entry(path)?;
-            tree_items.push(item);
+        if is_direct {
+            direct.push(path);
         } else {
-            if path.components().count() == 1 {
-                continue;
-            }
-            // next level tree
-            let process_path = path
+            let component = path
                 .components()
-                .nth(current_root.components().count())
+                .nth(root_depth)
                 .ok_or_else(|| {
                     CommitError::TreeCreation("failed to get next path component".to_string())
                 })?
                 .as_os_str()
                 .to_str()
                 .ok_or_else(|| CommitError::TreeCreation("invalid path component".to_string()))?;
-
-            if processed_path.contains(process_path) {
-                continue;
-            }
-            processed_path.insert(process_path.to_string());
-
-            let sub_tree = Box::pin(create_tree_with_persistence(
-                index,
-                storage,
-                current_root.clone().join(process_path),
-                persist,
-            ))
-            .await?;
-            tree_items.push(TreeItem {
-                name: process_path.to_string(),
-                mode: TreeItemMode::Tree,
-                id: sub_tree.id,
-            });
+            subtrees
+                .entry(component.to_string())
+                .or_default()
+                .push(path.clone());
         }
     }
+
+    CT_GROUP_US.fetch_add(__tg.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let __te = std::time::Instant::now();
+    for path in &direct {
+        let item = get_blob_entry(path)?;
+        tree_items.push(item);
+    }
+    for (component, subset) in subtrees {
+        let sub_tree = Box::pin(create_tree_subset(
+            index,
+            storage,
+            current_root.clone().join(&component),
+            &subset,
+            persist,
+            pending,
+        ))
+        .await?;
+        tree_items.push(TreeItem {
+            name: component,
+            mode: TreeItemMode::Tree,
+            id: sub_tree.id,
+        });
+    }
+    CT_ENTRY_US.fetch_add(__te.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    let __ts = std::time::Instant::now();
     crate::utils::tree::sort_tree_items_for_git(&mut tree_items);
     let tree = {
         // `from_tree_items` can't create empty tree, so use `from_bytes` instead
@@ -2566,9 +2732,31 @@ async fn create_tree_with_persistence(
             })?
         }
     };
+    CT_SERIALIZE_US.fetch_add(__ts.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    CT_TREES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if persist {
-        save_object_to_storage(storage, &tree, &tree.id)
-            .map_err(|e| CommitError::TreeCreation(format!("failed to save tree object: {}", e)))?;
+        let __tp = std::time::Instant::now();
+        // Defer the write to the top-level flush, which checks existence for every
+        // tree in ONE runtime crossing. Content-addressed storage means an object
+        // already present is byte-identical, so only the changed spine is written
+        // — what git gets for free by reusing the parent commit's tree objects.
+        let data = tree
+            .to_data()
+            .map_err(|e| CommitError::TreeCreation(format!("failed to serialize tree: {e}")))?;
+        pending.push((tree.id, data));
+        CT_PERSIST_US.fetch_add(__tp.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    // The outermost call (depth 0) prints the accumulated breakdown.
+    if current_root.as_os_str().is_empty() {
+        let g = CT_GROUP_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let e = CT_ENTRY_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let se = CT_SERIALIZE_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let pe = CT_PERSIST_US.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let n = CT_TREES.swap(0, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "COMMIT_PHASE create_tree breakdown: trees={n} group={}ms entry={}ms serialize={}ms persist={}ms",
+            g / 1000, e / 1000, se / 1000, pe / 1000
+        );
     }
     Ok(tree)
 }

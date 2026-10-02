@@ -127,14 +127,127 @@ pub fn validate_index_objects_with(
     index: &Index,
     missing_ok: bool,
 ) -> Result<(), TreePlumbingError> {
+    validate_index_objects_filtered(index, missing_ok, None)
+}
+
+/// Validate only the named stage-0 entries.
+///
+/// Used by the commit path on a ScorpioFS worktree, where every object read
+/// crosses the FUSE mount: scanning the whole index costs one mount round trip
+/// per entry (measured 23 s per pass on a 124k-file fixture, twice per commit),
+/// while the entries this commit introduces are a handful. Non-staged entries
+/// were validated when they entered the index; whole-index integrity checking
+/// is `libra fsck`'s job, and git's own commit performs no such scan at all.
+pub fn validate_index_objects_subset(
+    index: &Index,
+    names: &std::collections::HashSet<String>,
+) -> Result<(), TreePlumbingError> {
+    validate_index_objects_filtered(index, false, Some(names))
+}
+
+/// [`validate_index_objects_subset`] over the index projection. Looks up only
+/// the staged names (O(staged)) instead of materializing the whole tracked list
+/// just to filter it down to a handful.
+pub fn validate_index_objects_subset_fast(
+    index: &crate::utils::fast_index::FastIndex,
+    names: &std::collections::HashSet<String>,
+) -> Result<(), TreePlumbingError> {
+    let entries: Vec<EntryRef<'_>> = names
+        .iter()
+        .filter_map(|name| index.get(name))
+        .map(EntryRef::Fast)
+        .collect();
+    validate_entries(&entries, false)
+}
+
+/// One tracked entry, from either index representation.
+enum EntryRef<'a> {
+    Fast(&'a crate::utils::fast_index::FastEntry),
+    Index(&'a IndexEntry),
+}
+
+impl EntryRef<'_> {
+    fn name(&self) -> &str {
+        match self {
+            EntryRef::Fast(entry) => &entry.name,
+            EntryRef::Index(entry) => &entry.name,
+        }
+    }
+
+    fn mode(&self) -> u32 {
+        match self {
+            EntryRef::Fast(entry) => entry.mode,
+            EntryRef::Index(entry) => entry.mode,
+        }
+    }
+
+    fn hash(&self) -> ObjectHash {
+        match self {
+            EntryRef::Fast(entry) => entry.hash,
+            EntryRef::Index(entry) => entry.hash,
+        }
+    }
+}
+
+fn validate_index_objects_filtered(
+    index: &Index,
+    missing_ok: bool,
+    only: Option<&std::collections::HashSet<String>>,
+) -> Result<(), TreePlumbingError> {
+    let tracked = index.tracked_entries(0);
+    let entries: Vec<EntryRef<'_>> = match only {
+        Some(names) => tracked
+            .iter()
+            .filter(|entry| names.contains(&entry.name))
+            .map(|entry| EntryRef::Index(*entry))
+            .collect(),
+        None => tracked.iter().map(|entry| EntryRef::Index(*entry)).collect(),
+    };
+    validate_entries(&entries, missing_ok)
+}
+
+fn validate_entries(
+    entries: &[EntryRef<'_>],
+    missing_ok: bool,
+) -> Result<(), TreePlumbingError> {
     let storage = util::objects_storage();
 
-    for entry in index.tracked_entries(0) {
-        let mode = index_mode_to_tree_mode(entry.mode, &entry.name)?;
+    // Fast path: one batched type probe resolves every entry that is present and
+    // correctly typed — in a healthy repository, the whole index. Local storage
+    // answers it from loose/pack headers, so no object body is read; the
+    // alternative is one full object read per entry, which dominates a commit on a
+    // large index. Anything the probe cannot answer (an absent object, or a backend
+    // that cannot probe cheaply) falls through to the per-object read below, so the
+    // error surface and the `missing_ok` valve are unchanged.
+    let probed = storage
+        .get_object_types_bounded_many(&entries.iter().map(|entry| entry.hash()).collect::<Vec<_>>())
+        .ok();
+
+    for entry in entries.iter() {
+        let name = entry.name();
+        let hash = entry.hash();
+        let mode = index_mode_to_tree_mode(entry.mode(), name)?;
         let Some(expected) = expected_object_type(mode) else {
             continue;
         };
-        let actual = match storage.get_object_type(&entry.hash) {
+        match probed.as_ref().and_then(|found| found.get(&hash)) {
+            // Already answered with the expected type: nothing left to check.
+            Some(actual) if *actual == expected => continue,
+            // Answered with a different type: a real mismatch, reported exactly as
+            // the slow path below reports it.
+            Some(actual) => {
+                return Err(TreePlumbingError::WrongObjectType {
+                    path: name.to_string(),
+                    object: hash,
+                    expected,
+                    actual: *actual,
+                });
+            }
+            // Not answered (absent, or the probe was unavailable): let the original
+            // read produce the exact error, including the `missing_ok` exemption.
+            None => {}
+        }
+        let actual = match storage.get_object_type(&hash) {
             Ok(actual) => actual,
             // PD-05: only "the object does not exist" is excusable, and only
             // for blob-typed entries; read/corruption failures stay fatal so
@@ -144,8 +257,8 @@ pub fn validate_index_objects_with(
             }
             Err(error) => {
                 return Err(TreePlumbingError::MissingOrUnreadableObject {
-                    path: entry.name.clone(),
-                    object: entry.hash,
+                    path: name.to_string(),
+                    object: hash,
                     expected,
                     detail: error.to_string(),
                 });
@@ -153,8 +266,8 @@ pub fn validate_index_objects_with(
         };
         if actual != expected {
             return Err(TreePlumbingError::WrongObjectType {
-                path: entry.name.clone(),
-                object: entry.hash,
+                path: name.to_string(),
+                object: hash,
                 expected,
                 actual,
             });
