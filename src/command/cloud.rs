@@ -1832,6 +1832,7 @@ async fn restore_worktree_to_head(render_human: bool) -> CloudResult<()> {
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_progress: false,
+        seed_full_index: true,
     };
 
     if let Err(e) = restore_cmd::execute_checked(restore_args).await {

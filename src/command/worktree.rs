@@ -1669,6 +1669,7 @@ async fn add_worktree(
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_progress: false,
+            seed_full_index: true,
         })
         .await
         {
@@ -3753,6 +3754,7 @@ async fn seed_migrated_worktree(
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_progress: false,
+        seed_full_index: true,
     })
     .await
     .map_err(|e| {
